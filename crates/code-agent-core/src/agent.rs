@@ -9,6 +9,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::checkpoint::CheckpointHandle;
 use crate::conversation::{
     AssistantContent, AssistantMessage, ContentBlock, Conversation, Message, MessageRole,
     SystemInit, ToolCall, ToolResult as ConvToolResult, ToolResultContent,
@@ -62,6 +63,7 @@ pub struct Agent {
     hooks: Hooks,
     pricing: Option<ModelPricing>,
     approval_memory: ApprovalMemory,
+    checkpoint_handle: Option<Arc<dyn CheckpointHandle>>,
 }
 
 #[derive(Default)]
@@ -75,6 +77,7 @@ pub struct AgentBuilder {
     hooks: Hooks,
     pricing: Option<ModelPricing>,
     approval_memory: Option<ApprovalMemory>,
+    checkpoint_handle: Option<Arc<dyn CheckpointHandle>>,
 }
 
 impl AgentBuilder {
@@ -127,6 +130,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn checkpoint_handle(mut self, handle: Arc<dyn CheckpointHandle>) -> Self {
+        self.checkpoint_handle = Some(handle);
+        self
+    }
+
     pub fn build(self) -> Result<Agent, AgentError> {
         let options = self
             .options
@@ -145,6 +153,7 @@ impl AgentBuilder {
             hooks: self.hooks,
             pricing: self.pricing,
             approval_memory: self.approval_memory.unwrap_or_default(),
+            checkpoint_handle: self.checkpoint_handle,
         })
     }
 }
@@ -253,6 +262,7 @@ pub(crate) async fn run_loop(
         hooks,
         pricing,
         approval_memory,
+        checkpoint_handle,
     } = agent;
 
     let session_id = options
@@ -883,6 +893,106 @@ pub(crate) async fn run_loop(
                 )
                 .await;
                 continue;
+            }
+
+            // M3: capture pre-mutation file state. The checkpoint handle is
+            // free to also surface the Bash-not-tracked warning here.
+            if let Some(ckpt) = &checkpoint_handle {
+                if call.name == "Bash" {
+                    // Read the command from `effective_input` (the
+                    // policy- or hook-rewritten input that will actually
+                    // execute), not from the raw `call.input`. Otherwise
+                    // a hook that rewrites `cargo test` to `rm -rf .`
+                    // would bypass the checkpoint Bash policy.
+                    let cmd = effective_input
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    // "Explicit" means the user, or a stored user
+                    // decision, said yes to this exact command. A broad
+                    // allow rule (e.g. `Bash` on the simple-name list)
+                    // doesn't count — that's the case M3 wants to flag.
+                    let explicit = matches!(
+                        pdec.source,
+                        crate::policy::PolicyDecisionSource::ApprovalCallback
+                            | crate::policy::PolicyDecisionSource::ApprovalMemory
+                    );
+                    let action = ckpt
+                        .before_bash(&session_id, &cfg.run_id, cmd, explicit)
+                        .await;
+                    for ev in action.events {
+                        emit(
+                            &tx,
+                            &session_sink,
+                            &session_id,
+                            AgentEvent::CheckpointEvent(ev),
+                        )
+                        .await;
+                    }
+                    if let Some(reason) = action.deny {
+                        emit(
+                            &tx,
+                            &session_sink,
+                            &session_id,
+                            AgentEvent::ToolCallDenied(ToolCallDenied {
+                                tool_use_id: call.id.clone(),
+                                tool_name: call.name.clone(),
+                                reason: reason.clone(),
+                            }),
+                        )
+                        .await;
+                        let body = format!("Tool denied: {}", reason);
+                        push_tool_result_user(
+                            &tx,
+                            &session_sink,
+                            &session_id,
+                            &mut tool_result_blocks,
+                            call,
+                            &body,
+                            true,
+                        )
+                        .await;
+                        continue;
+                    }
+                } else {
+                    let result = ckpt
+                        .capture_for_tool(&session_id, &cfg.run_id, &call.name, &effective_input)
+                        .await;
+                    for ev in result.events {
+                        emit(
+                            &tx,
+                            &session_sink,
+                            &session_id,
+                            AgentEvent::CheckpointEvent(ev),
+                        )
+                        .await;
+                    }
+                    if let Some(reason) = result.deny {
+                        emit(
+                            &tx,
+                            &session_sink,
+                            &session_id,
+                            AgentEvent::ToolCallDenied(ToolCallDenied {
+                                tool_use_id: call.id.clone(),
+                                tool_name: call.name.clone(),
+                                reason: reason.clone(),
+                            }),
+                        )
+                        .await;
+                        let body = format!("Tool denied: checkpoint capture failed ({})", reason);
+                        push_tool_result_user(
+                            &tx,
+                            &session_sink,
+                            &session_id,
+                            &mut tool_result_blocks,
+                            call,
+                            &body,
+                            true,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
             }
 
             let ctx = ToolContext {

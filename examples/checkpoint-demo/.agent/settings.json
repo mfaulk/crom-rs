@@ -1,0 +1,34 @@
+{
+  "model": "claude-sonnet-4-6",
+  "permission_mode": "acceptEdits",
+  "allowed_tools": [
+    "Read",
+    "Glob",
+    "Grep",
+    "Edit",
+    "Write",
+    "TodoWrite",
+    {"tool": "Bash", "command_regex": "^cargo (test|check|fmt|clippy|build)( |$)"}
+  ],
+  "disallowed_tools": [
+    {"tool": "Edit", "path_glob": "**/.env*"},
+    {"tool": "Write", "path_glob": "**/.env*"}
+  ],
+  "checkpointing": {
+    "enabled": true,
+    "failure_mode": "strict",
+    "create_on_user_message": true,
+    "max_checkpoint_bytes_per_file": 5242880,
+    "max_total_checkpoint_bytes_per_session": 104857600,
+    "retention": {
+      "max_checkpoints_per_session": 50,
+      "max_age_days": 14
+    },
+    "bash_policy": "allow_with_warning"
+  },
+  "validation": {
+    "commands": ["cargo test"],
+    "timeout_seconds": 60,
+    "rewind_on_failure": false
+  }
+}

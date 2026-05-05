@@ -69,6 +69,51 @@ pub struct SettingsFile {
     pub max_turns: Option<u32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub checkpointing: Option<CheckpointingConfig>,
+    #[serde(default)]
+    pub validation: Option<ValidationConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointingConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub failure_mode: Option<String>,
+    #[serde(default)]
+    pub create_on_user_message: Option<bool>,
+    #[serde(default)]
+    pub max_checkpoint_bytes_per_file: Option<u64>,
+    #[serde(default)]
+    pub max_total_checkpoint_bytes_per_session: Option<u64>,
+    #[serde(default)]
+    pub retention: Option<CheckpointRetentionConfig>,
+    #[serde(default)]
+    pub bash_policy: Option<String>,
+    #[serde(default)]
+    pub max_diff_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointRetentionConfig {
+    #[serde(default)]
+    pub max_checkpoints_per_session: Option<usize>,
+    #[serde(default)]
+    pub max_age_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationConfig {
+    #[serde(default)]
+    pub commands: Option<Vec<String>>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub rewind_on_failure: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +166,8 @@ pub struct Settings {
     pub project_instructions_mode: ProjectInstructionsMode,
     pub max_turns: Option<u32>,
     pub max_tokens: Option<u32>,
+    pub checkpointing: CheckpointingConfig,
+    pub validation: ValidationConfig,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -142,6 +189,10 @@ pub enum SettingsError {
     },
     #[error("invalid permission_mode: {0}")]
     BadPermissionMode(String),
+    #[error("invalid checkpointing.failure_mode: {0}")]
+    BadCheckpointFailureMode(String),
+    #[error("invalid checkpointing.bash_policy: {0}")]
+    BadBashCheckpointPolicy(String),
 }
 
 /// Load project settings from `<cwd>/.agent/settings.json` if present.
@@ -288,6 +339,72 @@ fn merge_into(dst: &mut Settings, src: SettingsFile, _is_user: bool) -> Result<(
     }
     if let Some(t) = src.max_tokens {
         dst.max_tokens = Some(t);
+    }
+    if let Some(c) = src.checkpointing {
+        if let Some(v) = c.enabled {
+            dst.checkpointing.enabled = Some(v);
+        }
+        if let Some(v) = c.failure_mode {
+            // Validate the string value here so an invalid setting fails
+            // loudly at load time rather than silently defaulting.
+            if !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "strict" | "best_effort" | "best-effort" | "besteffort"
+            ) {
+                return Err(SettingsError::BadCheckpointFailureMode(v));
+            }
+            dst.checkpointing.failure_mode = Some(v);
+        }
+        if let Some(v) = c.create_on_user_message {
+            dst.checkpointing.create_on_user_message = Some(v);
+        }
+        if let Some(v) = c.max_checkpoint_bytes_per_file {
+            dst.checkpointing.max_checkpoint_bytes_per_file = Some(v);
+        }
+        if let Some(v) = c.max_total_checkpoint_bytes_per_session {
+            dst.checkpointing.max_total_checkpoint_bytes_per_session = Some(v);
+        }
+        if let Some(r) = c.retention {
+            let dest_r = dst
+                .checkpointing
+                .retention
+                .get_or_insert(CheckpointRetentionConfig::default());
+            if let Some(v) = r.max_checkpoints_per_session {
+                dest_r.max_checkpoints_per_session = Some(v);
+            }
+            if let Some(v) = r.max_age_days {
+                dest_r.max_age_days = Some(v);
+            }
+        }
+        if let Some(v) = c.bash_policy {
+            if !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "allow_with_warning"
+                    | "allow-with-warning"
+                    | "require_explicit_approval"
+                    | "require-explicit-approval"
+                    | "deny_likely_mutating_commands"
+                    | "deny-likely-mutating-commands"
+                    | "deny_likely_mutating"
+            ) {
+                return Err(SettingsError::BadBashCheckpointPolicy(v));
+            }
+            dst.checkpointing.bash_policy = Some(v);
+        }
+        if let Some(v) = c.max_diff_bytes {
+            dst.checkpointing.max_diff_bytes = Some(v);
+        }
+    }
+    if let Some(v) = src.validation {
+        if let Some(c) = v.commands {
+            dst.validation.commands = Some(c);
+        }
+        if let Some(t) = v.timeout_seconds {
+            dst.validation.timeout_seconds = Some(t);
+        }
+        if let Some(r) = v.rewind_on_failure {
+            dst.validation.rewind_on_failure = Some(r);
+        }
     }
     Ok(())
 }

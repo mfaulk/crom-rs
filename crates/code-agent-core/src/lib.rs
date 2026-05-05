@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod builtin_hooks;
+pub mod checkpoint;
 pub mod client;
 pub mod conversation;
 pub mod errors;
@@ -24,6 +25,9 @@ pub use builtin_hooks::{
     redact_secrets_in_value, AuditEntry, AuditLogHook, BlockDangerousBashHook,
     BlockEnvFileWritesHook, MaxPatchSizeHook, SecretRedactionHook,
 };
+pub use checkpoint::{
+    CheckpointApi, CheckpointBashAction, CheckpointCaptureResult, CheckpointHandle,
+};
 pub use client::{AgentClient, AgentClientBuilder, AgentEventStream, SessionStart};
 pub use conversation::{
     AssistantContent, AssistantMessage, ContentBlock, Conversation, Message, MessageRole,
@@ -31,8 +35,9 @@ pub use conversation::{
 };
 pub use errors::{AgentError, ProviderError, ToolError};
 pub use events::{
-    AgentEvent, AgentResult, HookEvaluated, HookOutcomeKind, InterruptedEvent, PolicyDecisionEvent,
-    ResultSubtype, TodoUpdate, ToolCallCompleted, ToolCallDenied, ToolCallStarted, UserToolResult,
+    AgentEvent, AgentResult, CheckpointEventPayload, HookEvaluated, HookOutcomeKind,
+    InterruptedEvent, PolicyDecisionEvent, ResultSubtype, TodoUpdate, ToolCallCompleted,
+    ToolCallDenied, ToolCallStarted, UserToolResult,
 };
 pub use hooks::{
     aggregate, Hook, HookAddedContext, HookAggregateDecision, HookCallRecord, HookError,
@@ -50,8 +55,8 @@ pub use policy::{
 pub use provider::{ModelEvent, ModelProvider, ModelRequest};
 pub use run_id::RunId;
 pub use settings::{
-    HooksConfig, ProjectInstructionsMode, SettingSource, Settings, SettingsError, SettingsFile,
-    ToolLimitsConfig,
+    CheckpointRetentionConfig, CheckpointingConfig, HooksConfig, ProjectInstructionsMode,
+    SettingSource, Settings, SettingsError, SettingsFile, ToolLimitsConfig, ValidationConfig,
 };
 pub use telemetry::{AgentTelemetryEvent, ModelPricing, SessionLoadKind, TelemetryOutcome};
 pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};

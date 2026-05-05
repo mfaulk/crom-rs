@@ -5,9 +5,14 @@ members = [
     "crates/code-agent-anthropic",
     "crates/code-agent-tools",
     "crates/code-agent-session",
+    "crates/code-agent-checkpoint",
     "crates/code-agent-cli",
 ]
-exclude = ["examples/bugfix-demo", "examples/policy-demo"]
+exclude = [
+    "examples/bugfix-demo",
+    "examples/policy-demo",
+    "examples/checkpoint-demo",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -39,11 +44,14 @@ similar = "2"
 time = { version = "0.3", features = ["serde", "formatting", "macros"] }
 bytes = "1"
 tempfile = "3"
+sha2 = "0.10"
+hex = "0.4"
 
 code-agent-core = { path = "crates/code-agent-core", version = "0.1.0" }
 code-agent-anthropic = { path = "crates/code-agent-anthropic", version = "0.1.0" }
 code-agent-tools = { path = "crates/code-agent-tools", version = "0.1.0" }
 code-agent-session = { path = "crates/code-agent-session", version = "0.1.0" }
+code-agent-checkpoint = { path = "crates/code-agent-checkpoint", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

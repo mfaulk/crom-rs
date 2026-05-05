@@ -5,13 +5,15 @@ Messages API provider. Targets approximate architectural parity with the
 public surface of Anthropic's Agent SDK while staying small enough to read in
 one sitting.
 
-This is **Milestone 2: Control Plane + Interactive Runtime Alpha**. M2 turns
-the M1 one-shot agent loop into a controllable runtime: a long-lived
-`AgentClient`, a hook system, a formal permission policy engine, project
-and user settings, richer CLI approval UX with diffs and risk scoring,
-session continue/fork/show/export, structured telemetry, and a `TodoWrite`
-progress tool. M1's narrow surface (one-shot `query()`, six built-in tools,
-JSONL sessions, a thin CLI) still works unchanged.
+This is **Milestone 3: Workspace Checkpointing + Rewind Alpha**. M3 layers
+content-addressed local checkpoints onto the M2 runtime. Each top-level
+user request snapshots the workspace before any `Write` or `Edit` mutation;
+`code-agent rewind <id>` restores files (conversation history is left
+intact). M3 also adds optional validation gates (`--validate`,
+`--rewind-on-validation-failure`) and a Bash-aware checkpoint policy that
+warns or denies when shell commands could change files outside checkpoint
+tracking. M1 and M2 surfaces (`query()`, `AgentClient`, hooks, policy,
+settings, sessions, telemetry) work unchanged with checkpointing turned off.
 
 ## Workspace layout
 
@@ -21,15 +23,18 @@ crates/
   code-agent-anthropic/   Messages API streaming provider
   code-agent-tools/       Read, Write, Edit, Glob, Grep, Bash, TodoWrite
   code-agent-session/     JSONL store + continue/fork/show/export helpers
-  code-agent-cli/         `code-agent` binary (run, resume, continue, fork, chat, sessions)
+  code-agent-checkpoint/  M3: LocalCheckpointStore, CheckpointHandle, validation
+  code-agent-cli/         `code-agent` binary (run, resume, continue, fork, chat,
+                          sessions, checkpoint, checkpoints, rewind)
 examples/
   bugfix-demo/            tiny crate with a deliberately failing test (M1 demo)
   policy-demo/            tiny crate plus .agent/settings.json policy + hooks (M2 demo)
+  checkpoint-demo/        tiny crate exercising checkpoint + rewind + validation (M3 demo)
 ```
 
-`examples/bugfix-demo` is **excluded** from the workspace because it ships an
-intentionally failing test for the agent to fix. Run it from its own
-directory.
+`examples/bugfix-demo`, `examples/policy-demo`, and `examples/checkpoint-demo`
+are **excluded** from the workspace because they ship intentionally failing
+tests for the agent to fix. Run them from their own directories.
 
 ## Quick start
 
@@ -63,6 +68,20 @@ cargo run -p code-agent-cli -- chat --show-usage
 cargo run -p code-agent-cli -- sessions list --cwd .
 cargo run -p code-agent-cli -- sessions show <SESSION_ID>
 cargo run -p code-agent-cli -- sessions export <SESSION_ID> --format json
+
+# Checkpointing (M3): on by default for the CLI when mutating tools are
+# enabled. Pass --validate to add post-run gates and
+# --rewind-on-validation-failure to rewind automatically.
+cargo run -p code-agent-cli -- run "Refactor parser and add a test" \
+    --checkpointing on \
+    --permission-mode acceptEdits \
+    --validate "cargo test"
+
+# Inspect, diff, and rewind checkpoints.
+cargo run -p code-agent-cli -- checkpoints list
+cargo run -p code-agent-cli -- checkpoints diff <CHECKPOINT_ID>
+cargo run -p code-agent-cli -- rewind <CHECKPOINT_ID> --dry-run
+cargo run -p code-agent-cli -- rewind <CHECKPOINT_ID> --yes
 ```
 
 Session ids supplied to `resume`, `fork`, `sessions show`, and
@@ -252,6 +271,94 @@ export ANTHROPIC_API_KEY=...
 
 The script is idempotent — Step 1 restores `examples/policy-demo/src/lib.rs`
 to its committed (buggy) state and clears `.agent/sessions/` on every run.
+
+## Checkpointing and rewind (M3)
+
+When checkpointing is on, the CLI snapshots the workspace before each
+`Write`/`Edit` mutation and stores the result under
+`<cwd>/.agent/checkpoints/<session-id>/`:
+
+```
+checkpoints/<session-id>/
+  checkpoints.jsonl       # index of checkpoints
+  manifests/<id>.json     # per-checkpoint metadata + tracked files
+  blobs/<sha256>          # content-addressed file contents
+```
+
+The agent loop captures snapshots **after** policy approval and **before**
+mutation. The default `failure_mode: strict` denies the mutating call
+when capture fails (e.g. file-too-large, storage cap, symlink escape) so
+the workspace is never modified without a recovery path. Set
+`failure_mode: best_effort` to demote to a warning.
+
+`Bash` is intentionally **not** checkpointed — there's no portable way
+to know what files a shell command touched. The configured
+`bash_policy` decides what to do:
+
+| Policy                            | Behavior                                                        |
+|-----------------------------------|-----------------------------------------------------------------|
+| `allow_with_warning`              | Run normally, emit a `bash_warning` event                       |
+| `require_explicit_approval` (default) | Deny unless approval came from the callback or stored memory |
+| `deny_likely_mutating_commands`   | Deny commands like `sed -i`, `mv`, `rm`, `cargo fmt`, redirects |
+
+Validation gates run after the agent completes:
+
+```sh
+code-agent run "Refactor the parser" \
+    --checkpointing on \
+    --validate "cargo test" \
+    --rewind-on-validation-failure
+```
+
+If any validation command exits non-zero (or times out), the workspace
+is rewound to the start-of-run checkpoint. **Conversation history is
+not rewound** — the next turn will continue from the existing chat,
+with files restored.
+
+Settings:
+
+```json
+{
+  "checkpointing": {
+    "enabled": true,
+    "failure_mode": "strict",
+    "create_on_user_message": true,
+    "max_checkpoint_bytes_per_file": 5242880,
+    "max_total_checkpoint_bytes_per_session": 104857600,
+    "retention": {
+      "max_checkpoints_per_session": 50,
+      "max_age_days": 14
+    },
+    "bash_policy": "require_explicit_approval"
+  },
+  "validation": {
+    "commands": ["cargo test"],
+    "timeout_seconds": 60,
+    "rewind_on_failure": false
+  }
+}
+```
+
+CLI flags:
+
+* `--checkpointing on|off` — overrides settings
+* `--validate "cargo test"` (repeatable) — post-run validation commands
+* `--validation-timeout <SECS>` — per-command timeout
+* `--rewind-on-validation-failure` — auto-rewind when validation fails
+
+`code-agent` subcommands:
+
+* `code-agent checkpoint create [DESCRIPTION]` — manual checkpoint
+* `code-agent checkpoints list [--session ID]`
+* `code-agent checkpoints show <CHECKPOINT_ID>`
+* `code-agent checkpoints diff <CHECKPOINT_ID>` — unified diff vs current files
+* `code-agent rewind <CHECKPOINT_ID> [--yes] [--dry-run] [--force-cwd]`
+
+`AgentClient` exposes the same operations programmatically:
+`create_checkpoint`, `list_checkpoints`, `diff_checkpoint`, `rewind_files`.
+
+The `examples/checkpoint-demo` directory has a one-test crate set up to
+walk through the entire flow.
 
 ## Demo: bugfix-demo
 
