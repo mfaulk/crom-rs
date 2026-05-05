@@ -190,17 +190,75 @@ enum LogFormat {
 fn parse_cli_rule(s: &str) -> Result<ToolRule> {
     if let Some((tool, rest)) = s.split_once(':') {
         if tool == "Bash" {
-            return Ok(ToolRule::BashCommandRegex(rest.to_string()));
+            return ToolRule::try_bash_command_regex(rest)
+                .map_err(|e| anyhow!("--yes-to/--deny rule {s:?}: {e}"));
         }
-        return Ok(ToolRule::FilePathGlob {
-            tool: tool.to_string(),
-            pattern: rest.to_string(),
-        });
+        return ToolRule::try_file_path_glob(tool, rest)
+            .map_err(|e| anyhow!("--yes-to/--deny rule {s:?}: {e}"));
     }
     if s.contains('*') || s.contains('?') {
-        Ok(ToolRule::ToolGlob(s.to_string()))
+        ToolRule::try_tool_glob(s).map_err(|e| anyhow!("--yes-to/--deny rule {s:?}: {e}"))
     } else {
         Ok(ToolRule::ExactTool(s.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod parse_cli_rule_tests {
+    use super::*;
+
+    #[test]
+    // Malformed Bash command regex from the CLI must error, not silently produce a fail-open rule.
+    fn rejects_malformed_bash_regex() {
+        let err = parse_cli_rule("Bash:[").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("command_regex") && msg.contains("\"[\""),
+            "expected error mentioning the bad regex; got: {msg}"
+        );
+    }
+
+    #[test]
+    // Malformed file path glob from the CLI must error.
+    fn rejects_malformed_path_glob() {
+        let err = parse_cli_rule("Edit:[").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("path_glob") && msg.contains("\"[\""),
+            "expected error mentioning the bad path_glob; got: {msg}"
+        );
+    }
+
+    #[test]
+    // Malformed bare tool-glob string must error.
+    fn rejects_malformed_tool_glob() {
+        let err = parse_cli_rule("[*").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("tool glob") && msg.contains("\"[*\""),
+            "expected error mentioning the bad tool glob; got: {msg}"
+        );
+    }
+
+    #[test]
+    // Valid simple inputs still parse to the expected ToolRule shapes.
+    fn parses_valid_inputs() {
+        assert!(matches!(
+            parse_cli_rule("Read").unwrap(),
+            ToolRule::ExactTool(ref n) if n == "Read"
+        ));
+        assert!(matches!(
+            parse_cli_rule("Edit*").unwrap(),
+            ToolRule::ToolGlob(ref g) if g == "Edit*"
+        ));
+        assert!(matches!(
+            parse_cli_rule("Bash:^cargo (test|check)").unwrap(),
+            ToolRule::BashCommandRegex(_)
+        ));
+        assert!(matches!(
+            parse_cli_rule("Edit:**/.env*").unwrap(),
+            ToolRule::FilePathGlob { .. }
+        ));
     }
 }
 

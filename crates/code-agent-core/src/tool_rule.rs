@@ -19,6 +19,34 @@ pub enum ToolRule {
 }
 
 impl ToolRule {
+    /// Construct a `BashCommandRegex` rule, validating the regex string.
+    /// Returns a human-readable error if the regex does not compile.
+    pub fn try_bash_command_regex(pattern: impl Into<String>) -> Result<Self, String> {
+        let p = pattern.into();
+        Regex::new(&p).map_err(|e| format!("invalid command_regex {:?}: {e}", p))?;
+        Ok(ToolRule::BashCommandRegex(p))
+    }
+
+    /// Construct a `FilePathGlob` rule, validating the glob string.
+    pub fn try_file_path_glob(
+        tool: impl Into<String>,
+        pattern: impl Into<String>,
+    ) -> Result<Self, String> {
+        let p = pattern.into();
+        Glob::new(&p).map_err(|e| format!("invalid path_glob {:?}: {e}", p))?;
+        Ok(ToolRule::FilePathGlob {
+            tool: tool.into(),
+            pattern: p,
+        })
+    }
+
+    /// Construct a `ToolGlob` rule, validating the glob string.
+    pub fn try_tool_glob(pattern: impl Into<String>) -> Result<Self, String> {
+        let p = pattern.into();
+        Glob::new(&p).map_err(|e| format!("invalid tool glob {:?}: {e}", p))?;
+        Ok(ToolRule::ToolGlob(p))
+    }
+
     /// Returns true if this rule matches the requested tool name and input.
     pub fn matches(&self, tool_name: &str, input: &Value) -> bool {
         match self {
@@ -99,10 +127,7 @@ impl<'de> Deserialize<'de> for ToolRule {
 
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
                 if value.contains('*') || value.contains('?') {
-                    Glob::new(value).map_err(|e| {
-                        de::Error::custom(format!("invalid tool glob pattern {:?}: {e}", value))
-                    })?;
-                    Ok(ToolRule::ToolGlob(value.to_string()))
+                    ToolRule::try_tool_glob(value).map_err(de::Error::custom)
                 } else {
                     Ok(ToolRule::ExactTool(value.to_string()))
                 }
@@ -141,18 +166,29 @@ impl<'de> Deserialize<'de> for ToolRule {
                 }
                 let tool =
                     tool.ok_or_else(|| de::Error::custom("tool rule object missing `tool`"))?;
-                if let Some(re) = command_regex {
-                    Regex::new(&re).map_err(|e| {
-                        de::Error::custom(format!("invalid command_regex {:?}: {e}", re))
-                    })?;
-                    Ok(ToolRule::BashCommandRegex(re))
-                } else if let Some(p) = path_glob {
-                    Glob::new(&p).map_err(|e| {
-                        de::Error::custom(format!("invalid path_glob {:?}: {e}", p))
-                    })?;
-                    Ok(ToolRule::FilePathGlob { tool, pattern: p })
-                } else {
-                    Ok(ToolRule::ExactTool(tool))
+                // Reject ambiguous rule objects up front: if both `command_regex`
+                // and `path_glob` are present we'd silently pick one and discard
+                // the other (potentially hiding a malformed pattern in the
+                // discarded field). Fail loud instead.
+                match (command_regex, path_glob) {
+                    (Some(_), Some(_)) => Err(de::Error::custom(
+                        "tool rule object cannot specify both `command_regex` and `path_glob`",
+                    )),
+                    (Some(re), None) => {
+                        // `command_regex` is Bash-only. A non-Bash `tool` value would
+                        // be silently ignored at match time, so reject up front.
+                        if tool != "Bash" {
+                            return Err(de::Error::custom(format!(
+                                "command_regex is only valid with tool=\"Bash\", got tool={:?}",
+                                tool
+                            )));
+                        }
+                        ToolRule::try_bash_command_regex(re).map_err(de::Error::custom)
+                    }
+                    (None, Some(p)) => {
+                        ToolRule::try_file_path_glob(tool, p).map_err(de::Error::custom)
+                    }
+                    (None, None) => Ok(ToolRule::ExactTool(tool)),
                 }
             }
         }
@@ -241,38 +277,110 @@ mod issue6_regression {
     use super::*;
 
     #[test]
-    // Malformed BashCommandRegex pattern must fail deserialization with an error mentioning the bad pattern.
+    // Malformed BashCommandRegex pattern fails deserialization and the error
+    // names the field and quotes the bad pattern.
     fn rejects_malformed_bash_command_regex() {
         let r: Result<ToolRule, _> =
             serde_json::from_str(r#"{"tool": "Bash", "command_regex": "["}"#);
+        let err = r.unwrap_err();
+        let msg = format!("{}", err);
         assert!(
-            r.is_err(),
-            "expected deserialization error for malformed regex"
+            msg.contains("command_regex"),
+            "error must name the field, got: {msg}"
         );
-        let msg = format!("{}", r.unwrap_err());
         assert!(
-            msg.contains('[') || msg.contains("regex") || msg.contains("invalid"),
-            "error must mention the bad pattern, got: {msg}"
+            msg.contains("\"[\""),
+            "error must quote the bad pattern, got: {msg}"
         );
     }
 
     #[test]
-    // Malformed FilePathGlob pattern must fail deserialization.
+    // Malformed FilePathGlob pattern fails deserialization and the error
+    // names the field and quotes the bad pattern.
     fn rejects_malformed_file_path_glob() {
         let r: Result<ToolRule, _> = serde_json::from_str(r#"{"tool": "Edit", "path_glob": "["}"#);
+        let err = r.unwrap_err();
+        let msg = format!("{}", err);
         assert!(
-            r.is_err(),
-            "expected deserialization error for malformed glob"
+            msg.contains("path_glob"),
+            "error must name the field, got: {msg}"
+        );
+        assert!(
+            msg.contains("\"[\""),
+            "error must quote the bad pattern, got: {msg}"
         );
     }
 
     #[test]
-    // Malformed ToolGlob string (bare `[` which is invalid glob syntax) must fail deserialization.
+    // Malformed ToolGlob string fails deserialization and the error mentions
+    // the tool-glob context.
     fn rejects_malformed_tool_glob() {
         let r: Result<ToolRule, _> = serde_json::from_str(r#""[*""#);
+        let err = r.unwrap_err();
+        let msg = format!("{}", err);
         assert!(
-            r.is_err(),
-            "expected deserialization error for malformed tool glob"
+            msg.contains("tool glob"),
+            "error must name the rule shape, got: {msg}"
+        );
+        assert!(
+            msg.contains("\"[*\""),
+            "error must quote the bad pattern, got: {msg}"
+        );
+    }
+
+    #[test]
+    // try_bash_command_regex returns Err for malformed regex.
+    fn try_bash_command_regex_rejects_invalid() {
+        let r = ToolRule::try_bash_command_regex("[");
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("command_regex") && msg.contains("\"[\""));
+    }
+
+    #[test]
+    // try_file_path_glob returns Err for malformed glob.
+    fn try_file_path_glob_rejects_invalid() {
+        let r = ToolRule::try_file_path_glob("Edit", "[");
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("path_glob") && msg.contains("\"[\""));
+    }
+
+    #[test]
+    // try_tool_glob returns Err for malformed glob.
+    fn try_tool_glob_rejects_invalid() {
+        let r = ToolRule::try_tool_glob("[*");
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("tool glob") && msg.contains("\"[*\""));
+    }
+
+    #[test]
+    // Object that specifies both command_regex and path_glob is rejected so a
+    // malformed pattern cannot hide in the discarded field.
+    fn rejects_both_command_regex_and_path_glob() {
+        let r: Result<ToolRule, _> = serde_json::from_str(
+            r#"{"tool": "Bash", "command_regex": "^cargo$", "path_glob": "["}"#,
+        );
+        let err = r.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("command_regex") && msg.contains("path_glob"),
+            "error must mention both fields, got: {msg}"
+        );
+    }
+
+    #[test]
+    // command_regex with a non-Bash tool is rejected because the rule would
+    // silently never match at runtime (matches() short-circuits when tool != "Bash").
+    fn rejects_command_regex_with_non_bash_tool() {
+        let r: Result<ToolRule, _> =
+            serde_json::from_str(r#"{"tool": "Edit", "command_regex": "^cargo$"}"#);
+        let err = r.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Bash") && msg.contains("\"Edit\""),
+            "error must mention the requirement and the offending tool, got: {msg}"
         );
     }
 }
