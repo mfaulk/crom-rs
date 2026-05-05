@@ -102,6 +102,8 @@ M1.
 
 ## Demo: bugfix-demo
 
+Quickest path:
+
 ```sh
 cd examples/bugfix-demo
 cargo test          # fails: parse_token has an off-by-one bug
@@ -113,6 +115,26 @@ cargo test          # passes after the agent's edit
 ```
 
 The demo's `AGENTS.md` instructs the agent to edit only `src/lib.rs`.
+
+### Full end-to-end walkthrough
+
+`examples/e2e-demo.sh` is a single script that exercises every M1 surface in
+one run:
+
+* `code-agent run` with `Read`, `Edit`, `Bash` (under `dontAsk`, so it runs
+  unattended) to fix the bug in `examples/bugfix-demo`,
+* `code-agent sessions list` and a peek at the JSONL under `.agent/sessions/`,
+* `code-agent resume <id>` with `Write`, `Glob`, `Grep` for a follow-up that
+  produces `SUMMARY.md`,
+* `AGENTS.md` project memory scoping both turns.
+
+```sh
+export ANTHROPIC_API_KEY=...
+./examples/e2e-demo.sh
+```
+
+The script is idempotent — it resets `examples/bugfix-demo/src/lib.rs` to the
+buggy state and clears `.agent/sessions/` on every run.
 
 ## Library use
 
