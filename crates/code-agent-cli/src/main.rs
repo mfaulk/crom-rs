@@ -13,18 +13,21 @@ use code_agent_checkpoint::{
     LocalCheckpointStore, RewindRequest, ValidationOptions,
 };
 use code_agent_core::agent::{SessionSink, TelemetrySink};
+use code_agent_core::SEARCH_TOOLS_NAME;
 use code_agent_core::{
     is_valid_session_id_str, AgentClient, AgentEvent, AgentOptions, AgentTelemetryEvent,
     ApprovalMemoryMode, AuditLogHook, BlockDangerousBashHook, BlockEnvFileWritesHook,
-    HookOutcomeKind, Hooks, MaxPatchSizeHook, ModelProvider, PermissionCallback,
-    PermissionDecision, PermissionMode, PermissionRequest, ResultSubtype, SecretRedactionHook,
-    SessionId, SessionStart, SettingSource, Settings, ToolRegistry, ToolRule,
+    HookOutcomeKind, Hooks, MaxPatchSizeHook, ModelProvider, NativeToolSearchMode,
+    PermissionCallback, PermissionDecision, PermissionMode, PermissionRequest, ResultSubtype,
+    SearchToolsDefinitionTool, SecretRedactionHook, SessionId, SessionStart, SettingSource,
+    Settings, ToolCatalog, ToolCatalogBuilder, ToolListFilter, ToolLoadingMode, ToolRegistry,
+    ToolRule, ToolSearchOptions, ToolSearchQuery, ToolSearchStrategy, ToolSourceFilter,
 };
 use code_agent_core::{CheckpointApi, CheckpointHandle, RunId};
 use code_agent_session::{
     append_settings_snapshot, append_user_prompt, export_session, fork_session,
-    replay_conversation, summarize_session, ExportFormat, FsSessionStore, SessionSinkAdapter,
-    SessionStore,
+    replay_conversation, summarize_session, ExportFormat, FsSessionStore, SessionPayload,
+    SessionSinkAdapter, SessionStore,
 };
 use code_agent_tools::{register_builtin_with_limits, ToolLimits};
 use futures::StreamExt;
@@ -76,6 +79,99 @@ enum Command {
     /// Inspect and call configured MCP servers.
     #[command(subcommand)]
     Mcp(McpCommand),
+    /// Inspect, search, and explain the tool catalog.
+    #[command(subcommand)]
+    Tools(ToolsCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum ToolsCommand {
+    /// List tools in the catalog.
+    List(ToolsListArgs),
+    /// Search tool metadata.
+    Search(ToolsSearchArgs),
+    /// Show one tool descriptor as JSON.
+    Show(ToolsShowArgs),
+    /// Show tool catalog and budget stats.
+    Stats(ToolsCommonArgs),
+    /// Explain the loading-mode decision.
+    ExplainLoading(ToolsCommonArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+struct ToolsCommonArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long)]
+    mcp_config: Option<PathBuf>,
+    #[arg(long)]
+    mcp_timeout: Option<u64>,
+    #[arg(long)]
+    mcp_strict: bool,
+    #[arg(long = "mcp-server")]
+    mcp_servers: Vec<String>,
+    #[arg(long, default_value = "user-and-project")]
+    settings: String,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, value_delimiter = ',')]
+    allowed_tools: Vec<String>,
+    #[arg(long = "deny")]
+    deny: Vec<String>,
+    #[arg(long)]
+    tool_loading: Option<String>,
+    #[arg(long)]
+    tool_search_strategy: Option<String>,
+    #[arg(long)]
+    native_tool_search: Option<String>,
+    #[arg(long)]
+    tool_search_threshold: Option<u8>,
+    #[arg(long)]
+    max_tool_search_results: Option<usize>,
+    #[arg(long)]
+    max_loaded_tools: Option<usize>,
+    #[arg(long)]
+    max_loaded_tool_tokens: Option<usize>,
+    #[arg(long, value_delimiter = ',')]
+    always_load: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    defer_tools: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    disable_tools: Vec<String>,
+}
+
+#[derive(Parser, Debug)]
+struct ToolsListArgs {
+    #[arg(long)]
+    loaded: bool,
+    #[arg(long)]
+    deferred: bool,
+    #[arg(long)]
+    disabled: bool,
+    #[arg(long)]
+    all: bool,
+    #[command(flatten)]
+    common: ToolsCommonArgs,
+}
+
+#[derive(Parser, Debug)]
+struct ToolsSearchArgs {
+    query: String,
+    #[arg(long)]
+    limit: Option<usize>,
+    #[arg(long)]
+    strategy: Option<String>,
+    #[arg(long)]
+    source: Option<String>,
+    #[command(flatten)]
+    common: ToolsCommonArgs,
+}
+
+#[derive(Parser, Debug)]
+struct ToolsShowArgs {
+    tool: String,
+    #[command(flatten)]
+    common: ToolsCommonArgs,
 }
 
 #[derive(Subcommand, Debug)]
@@ -274,6 +370,36 @@ struct CommonArgs {
     /// Limit MCP loading to this server name (repeatable).
     #[arg(long = "mcp-server")]
     mcp_servers: Vec<String>,
+    /// Tool loading mode: eager|search|auto.
+    #[arg(long)]
+    tool_loading: Option<String>,
+    /// Tool search strategy: regex|bm25|hybrid.
+    #[arg(long)]
+    tool_search_strategy: Option<String>,
+    /// Native provider tool search: off|anthropic-regex|anthropic-bm25|auto.
+    #[arg(long)]
+    native_tool_search: Option<String>,
+    /// Auto-loading activation threshold as percent of context.
+    #[arg(long)]
+    tool_search_threshold: Option<u8>,
+    /// Maximum SearchTools results.
+    #[arg(long)]
+    max_tool_search_results: Option<usize>,
+    /// Maximum loaded tools in search mode.
+    #[arg(long)]
+    max_loaded_tools: Option<usize>,
+    /// Maximum estimated loaded tool-definition tokens in search mode.
+    #[arg(long)]
+    max_loaded_tool_tokens: Option<usize>,
+    /// Comma-separated tool names or globs to always load.
+    #[arg(long, value_delimiter = ',')]
+    always_load: Vec<String>,
+    /// Comma-separated tool names or globs to defer.
+    #[arg(long, value_delimiter = ',')]
+    defer_tools: Vec<String>,
+    /// Comma-separated tool names or globs to disable.
+    #[arg(long, value_delimiter = ',')]
+    disable_tools: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -378,6 +504,25 @@ fn parse_bool_flag(name: &str, value: &str) -> Result<bool> {
         "false" | "no" | "off" | "0" => Ok(false),
         other => Err(anyhow!("invalid {name}: {other}")),
     }
+}
+
+fn parse_tool_loading_mode(
+    value: &str,
+    threshold_percent: u8,
+    min_tool_count: usize,
+) -> Result<ToolLoadingMode> {
+    ToolLoadingMode::from_str_lenient(value, threshold_percent, min_tool_count)
+        .ok_or_else(|| anyhow!("invalid --tool-loading: {value}"))
+}
+
+fn parse_tool_search_strategy(value: &str) -> Result<ToolSearchStrategy> {
+    ToolSearchStrategy::from_str_lenient(value)
+        .ok_or_else(|| anyhow!("invalid --tool-search-strategy: {value}"))
+}
+
+fn parse_native_tool_search(value: &str) -> Result<NativeToolSearchMode> {
+    NativeToolSearchMode::from_str_lenient(value)
+        .ok_or_else(|| anyhow!("invalid --native-tool-search: {value}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,6 +648,7 @@ async fn main() -> ExitCode {
         }) => cmd_checkpoints_diff(checkpoint_id, cwd, session).await,
         Command::Rewind(args) => cmd_rewind(args).await,
         Command::Mcp(args) => cmd_mcp(args).await,
+        Command::Tools(args) => cmd_tools(args).await,
     };
 
     match result {
@@ -583,6 +729,9 @@ async fn resolve_common(
         }
         if let Some(mcp) = file.mcp {
             s.mcp = Some(mcp);
+        }
+        if let Some(tool_search) = file.tool_search {
+            s.tool_search = tool_search;
         }
         s
     } else {
@@ -684,11 +833,12 @@ async fn resolve_common(
             "Write".into(),
             "Bash".into(),
             "TodoWrite".into(),
+            SEARCH_TOOLS_NAME.into(),
         ];
         for r in &settings.allowed_tools {
-            if let ToolRule::ExactTool(n) = r {
-                if !out.contains(n) {
-                    out.push(n.clone());
+            if let Some(pattern) = registry_filter_pattern_for_rule(r) {
+                if !out.contains(&pattern) {
+                    out.push(pattern);
                 }
             }
         }
@@ -713,6 +863,7 @@ async fn resolve_common(
 
     let max_turns = common.max_turns.or(settings.max_turns).unwrap_or(8);
     let max_tokens = settings.max_tokens.unwrap_or(4096);
+    let tool_search = tool_search_options_from_common(&settings, common)?;
 
     let permission_callback: Option<Arc<dyn PermissionCallback>> = if prompt_for_callback {
         Some(Arc::new(StdinApprover::new(
@@ -739,6 +890,7 @@ async fn resolve_common(
         max_tokens,
         approval_memory: ApprovalMemoryMode::Session,
         mcp: mcp_options.clone(),
+        tool_search,
     };
 
     // Build hooks from settings flags.
@@ -890,6 +1042,101 @@ fn resolve_checkpoint_and_validation(
     Ok((opts, validation))
 }
 
+fn registry_filter_pattern_for_rule(rule: &ToolRule) -> Option<String> {
+    match rule {
+        ToolRule::ExactTool(name) => Some(name.clone()),
+        ToolRule::ToolGlob(pattern) => Some(pattern.clone()),
+        ToolRule::McpServerGlob { server, tool_glob } => {
+            Some(format!("mcp__{}__{}", server, tool_glob))
+        }
+        ToolRule::BashCommandRegex(_) | ToolRule::FilePathGlob { .. } => None,
+    }
+}
+
+fn tool_search_options_from_common(
+    settings: &Settings,
+    common: &CommonArgs,
+) -> Result<ToolSearchOptions> {
+    let mut options = ToolSearchOptions::default();
+    options
+        .apply_settings(&settings.tool_search)
+        .map_err(|e| anyhow!("{e}"))?;
+    apply_tool_search_cli_overrides(
+        &mut options,
+        common.tool_loading.as_deref(),
+        common.tool_search_strategy.as_deref(),
+        common.native_tool_search.as_deref(),
+        common.tool_search_threshold,
+        common.max_tool_search_results,
+        common.max_loaded_tools,
+        common.max_loaded_tool_tokens,
+        &common.always_load,
+        &common.defer_tools,
+        &common.disable_tools,
+    )?;
+    Ok(options)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_tool_search_cli_overrides(
+    options: &mut ToolSearchOptions,
+    loading_mode: Option<&str>,
+    strategy: Option<&str>,
+    native: Option<&str>,
+    threshold: Option<u8>,
+    max_results: Option<usize>,
+    max_loaded_tools: Option<usize>,
+    max_loaded_tool_tokens: Option<usize>,
+    always_load: &[String],
+    defer_tools: &[String],
+    disable_tools: &[String],
+) -> Result<()> {
+    if let Some(strategy) = strategy {
+        options.strategy = parse_tool_search_strategy(strategy)?;
+    }
+    if let Some(native) = native {
+        options.native_provider_mode = parse_native_tool_search(native)?;
+    }
+    if let Some(max_results) = max_results {
+        options.max_results = max_results.max(1);
+    }
+    if let Some(max_loaded_tools) = max_loaded_tools {
+        options.max_loaded_tools = max_loaded_tools.max(1);
+    }
+    if let Some(max_loaded_tool_tokens) = max_loaded_tool_tokens {
+        options.max_loaded_tool_tokens = max_loaded_tool_tokens.max(1);
+    }
+    if !always_load.is_empty() {
+        options.always_loaded = always_load.to_vec();
+        if !options
+            .always_loaded
+            .iter()
+            .any(|name| name == SEARCH_TOOLS_NAME)
+        {
+            options.always_loaded.push(SEARCH_TOOLS_NAME.into());
+        }
+    }
+    if !defer_tools.is_empty() {
+        options.deferred = defer_tools.to_vec();
+    }
+    if !disable_tools.is_empty() {
+        options.disabled = disable_tools.to_vec();
+    }
+    if let Some(mode) = loading_mode {
+        options.mode = parse_tool_loading_mode(
+            mode,
+            threshold.unwrap_or(options.activation_threshold_percent()),
+            options.min_tool_count(),
+        )?;
+    } else if let Some(threshold) = threshold {
+        options.mode = ToolLoadingMode::Auto {
+            threshold_percent_of_context: threshold,
+            min_tool_count: options.min_tool_count(),
+        };
+    }
+    Ok(())
+}
+
 fn build_settings_summary(
     s: &Settings,
     model: &str,
@@ -903,6 +1150,7 @@ fn build_settings_summary(
         "disallowed_tools_count": s.disallowed_tools.len(),
         "mcp_settings_present": s.mcp.is_some(),
         "mcp": mcp.redacted_summary(),
+        "tool_search": s.tool_search,
         "settings_source": format!("{:?}", s.source),
         "project_path": s.project_path,
         "user_path": s.user_path,
@@ -1011,25 +1259,30 @@ async fn run_one_shot(
         (id, Some(sink), Some(store))
     };
 
-    let initial_history = if let Some(s) = store.as_ref().or(read_store.as_ref()) {
-        // For resume/continue/fork (forced_session_id is Some) the session
-        // was supposed to exist and load. Propagate the error so the user
-        // sees a corrupted log instead of silently losing prior context
-        // and appending new events on top of a broken history. For fresh
-        // `run` (forced_session_id is None) the just-created file is
-        // empty, so an unreadable load is unlikely but still surfaced.
-        let records = if was_forced {
-            s.load(&session_id)
-                .await
-                .with_context(|| format!("failed to load session {}", session_id))?
+    let (initial_history, preloaded_discovered_tools) =
+        if let Some(s) = store.as_ref().or(read_store.as_ref()) {
+            // For resume/continue/fork (forced_session_id is Some) the session
+            // was supposed to exist and load. Propagate the error so the user
+            // sees a corrupted log instead of silently losing prior context
+            // and appending new events on top of a broken history. For fresh
+            // `run` (forced_session_id is None) the just-created file is
+            // empty, so an unreadable load is unlikely but still surfaced.
+            let records = if was_forced {
+                s.load(&session_id)
+                    .await
+                    .with_context(|| format!("failed to load session {}", session_id))?
+            } else {
+                s.load(&session_id).await.unwrap_or_default()
+            };
+            let discovered = discovered_tools_from_records(&records);
+            let conv = replay_conversation(&records);
+            (
+                drop_trailing_matching_user_prompt(conv.messages, &prompt),
+                discovered,
+            )
         } else {
-            s.load(&session_id).await.unwrap_or_default()
+            (Vec::new(), Vec::new())
         };
-        let conv = replay_conversation(&records);
-        drop_trailing_matching_user_prompt(conv.messages, &prompt)
-    } else {
-        Vec::new()
-    };
 
     if let Some(s) = &store {
         let _ = append_user_prompt(s.as_ref(), &cfg.cwd, &session_id, &prompt).await;
@@ -1037,6 +1290,18 @@ async fn run_one_shot(
 
     let mut options = cfg.options.clone();
     options.session_id = Some(session_id.clone());
+    for tool_name in preloaded_discovered_tools {
+        if !options
+            .tool_search
+            .preloaded_discovered_tools
+            .contains(&tool_name)
+        {
+            options
+                .tool_search
+                .preloaded_discovered_tools
+                .push(tool_name);
+        }
+    }
 
     let telemetry_sink: Option<Arc<dyn TelemetrySink>> =
         if cfg.verbose || matches!(cfg.log_format, LogFormat::Json) {
@@ -1202,6 +1467,16 @@ fn drop_trailing_matching_user_prompt(
         }
     }
     history
+}
+
+fn discovered_tools_from_records(records: &[code_agent_session::SessionRecord]) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for record in records {
+        if let SessionPayload::Event(AgentEvent::ToolLoaded(loaded)) = &record.payload {
+            names.insert(loaded.tool_name.clone());
+        }
+    }
+    names.into_iter().collect()
 }
 
 async fn cmd_chat(args: ChatArgs) -> Result<()> {
@@ -1582,6 +1857,277 @@ async fn cmd_mcp(args: McpCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+struct ToolsCatalogContext {
+    catalog: ToolCatalog,
+    state: code_agent_core::LoadedToolState,
+    options: ToolSearchOptions,
+    settings: Settings,
+}
+
+async fn cmd_tools(args: ToolsCommand) -> Result<()> {
+    match args {
+        ToolsCommand::List(args) => {
+            let ctx = build_tools_catalog(&args.common).await?;
+            let filter = if args.loaded {
+                ToolListFilter::Loaded
+            } else if args.deferred {
+                ToolListFilter::Deferred
+            } else if args.disabled {
+                ToolListFilter::Disabled
+            } else {
+                let _ = args.all;
+                ToolListFilter::All
+            };
+            let previews = ctx.catalog.list_previews(filter, &ctx.state, &ctx.options);
+            println!("NAME\tSOURCE\tCATEGORY\tRISK\tPERMISSION\tDESCRIPTION");
+            for p in previews {
+                println!(
+                    "{}\t{}\t{}\t{:?}\t{:?}\t{}",
+                    p.name,
+                    p.source.label(),
+                    p.category.unwrap_or_else(|| "-".into()),
+                    p.risk_profile,
+                    p.permission_kind,
+                    p.description.replace('\n', " ")
+                );
+            }
+            Ok(())
+        }
+        ToolsCommand::Search(args) => {
+            let mut ctx = build_tools_catalog(&args.common).await?;
+            if let Some(strategy) = args.strategy.as_deref() {
+                ctx.options.strategy = parse_tool_search_strategy(strategy)?;
+            }
+            let source_filter = args
+                .source
+                .as_deref()
+                .map(ToolSourceFilter::parse)
+                .transpose()
+                .map_err(|e| anyhow!("{e}"))?;
+            let visibility = ctx.options.visibility_context(
+                PermissionMode::Default,
+                ctx.settings.allowed_tools.clone(),
+                ctx.settings.disallowed_tools.clone(),
+            );
+            let result = ctx.catalog.search(
+                ToolSearchQuery {
+                    query: args.query,
+                    limit: args.limit.unwrap_or(ctx.options.max_results),
+                    source_filter,
+                    include_risky: true,
+                },
+                ctx.options.strategy,
+                &visibility,
+            )?;
+            println!("NAME\tSCORE\tVISIBILITY\tSOURCE\tREASON\tDESCRIPTION");
+            for m in result.matches {
+                println!(
+                    "{}\t{:.2}\t{:?}\t{}\t{}\t{}",
+                    m.tool_name,
+                    m.score,
+                    m.visibility,
+                    m.descriptor_preview.source.label(),
+                    m.reason,
+                    m.descriptor_preview.description.replace('\n', " ")
+                );
+            }
+            Ok(())
+        }
+        ToolsCommand::Show(args) => {
+            let ctx = build_tools_catalog(&args.common).await?;
+            let descriptor = ctx
+                .catalog
+                .get(&args.tool)
+                .ok_or_else(|| anyhow!("unknown tool {}", args.tool))?;
+            println!("{}", serde_json::to_string_pretty(descriptor)?);
+            Ok(())
+        }
+        ToolsCommand::Stats(common) => {
+            let ctx = build_tools_catalog(&common).await?;
+            let decision = ctx.catalog.resolve_loading_mode(&ctx.options);
+            let loaded = ctx.catalog.loaded_tool_names(&ctx.state, &ctx.options);
+            let deferred = ctx.catalog.deferred_tool_names(&ctx.state, &ctx.options);
+            let loaded_tokens = ctx.catalog.estimated_tokens_for(&loaded);
+            println!("CATALOG");
+            println!("  total tools:        {}", ctx.catalog.len());
+            println!(
+                "  eager tools:        {}",
+                ctx.catalog
+                    .descriptors()
+                    .filter(|d| d.load_policy == code_agent_core::ToolLoadPolicy::Always)
+                    .count()
+            );
+            println!(
+                "  deferred tools:     {}",
+                ctx.catalog
+                    .descriptors()
+                    .filter(|d| d.load_policy == code_agent_core::ToolLoadPolicy::Deferred)
+                    .count()
+            );
+            println!(
+                "  disabled tools:     {}",
+                ctx.catalog
+                    .descriptors()
+                    .filter(|d| d.load_policy == code_agent_core::ToolLoadPolicy::Disabled)
+                    .count()
+            );
+            println!(
+                "  estimated tokens:   {}",
+                ctx.catalog.estimated_total_tokens()
+            );
+            println!("  loaded tokens:      {}", loaded_tokens);
+            println!();
+            println!("SOURCES");
+            let mut sources = std::collections::BTreeMap::<String, usize>::new();
+            for descriptor in ctx.catalog.descriptors() {
+                *sources.entry(descriptor.source.label()).or_default() += 1;
+            }
+            for (source, count) in sources {
+                println!("  {source}:              {count}");
+            }
+            println!();
+            println!("SEARCH");
+            println!("  mode:               {}", ctx.options.mode);
+            println!("  resolved mode:      {}", decision.resolved_mode);
+            println!("  strategy:           {}", ctx.options.strategy);
+            println!("  max results:        {}", ctx.options.max_results);
+            println!("  loaded tools:       {}", loaded.len());
+            println!("  deferred tools:     {}", deferred.len());
+            Ok(())
+        }
+        ToolsCommand::ExplainLoading(common) => {
+            let ctx = build_tools_catalog(&common).await?;
+            let decision = ctx.catalog.resolve_loading_mode(&ctx.options);
+            println!("TOOL LOADING DECISION");
+            println!("  mode: {}", ctx.options.mode);
+            println!("  resolved: {}", decision.resolved_mode);
+            println!("  reason: {}", decision.reason);
+            println!(
+                "  total estimated tokens: {}",
+                ctx.catalog.estimated_total_tokens()
+            );
+            println!(
+                "  threshold: {}% of context",
+                ctx.options.activation_threshold_percent()
+            );
+            println!();
+            println!("ALWAYS LOADED");
+            for descriptor in ctx
+                .catalog
+                .descriptors()
+                .filter(|d| d.load_policy == code_agent_core::ToolLoadPolicy::Always)
+            {
+                println!("  {}", descriptor.name);
+            }
+            println!();
+            println!("DEFERRED");
+            let deferred = ctx
+                .catalog
+                .descriptors()
+                .filter(|d| d.load_policy == code_agent_core::ToolLoadPolicy::Deferred)
+                .count();
+            println!("  {} tools", deferred);
+            Ok(())
+        }
+    }
+}
+
+async fn build_tools_catalog(common: &ToolsCommonArgs) -> Result<ToolsCatalogContext> {
+    let cwd = common.cwd.canonicalize().context("--cwd")?;
+    let source = parse_setting_source(&common.settings)?;
+    let mut settings = if let Some(path) = &common.config {
+        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let file: code_agent_core::SettingsFile =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        let mut s = Settings {
+            source: SettingSource::None,
+            project_path: Some(path.clone()),
+            ..Settings::default()
+        };
+        if let Some(rules) = file.allowed_tools {
+            s.allowed_tools = rules;
+        }
+        if let Some(rules) = file.disallowed_tools {
+            s.disallowed_tools = rules;
+        }
+        if let Some(mcp) = file.mcp {
+            s.mcp = Some(mcp);
+        }
+        if let Some(tool_search) = file.tool_search {
+            s.tool_search = tool_search;
+        }
+        s
+    } else {
+        code_agent_core::settings::load(&cwd, source).context("load settings")?
+    };
+    for allowed in &common.allowed_tools {
+        settings.allowed_tools.push(parse_cli_rule(allowed)?);
+    }
+    for denied in &common.deny {
+        settings.disallowed_tools.push(parse_cli_rule(denied)?);
+    }
+    let mut options = ToolSearchOptions::default();
+    options
+        .apply_settings(&settings.tool_search)
+        .map_err(|e| anyhow!("{e}"))?;
+    apply_tool_search_cli_overrides(
+        &mut options,
+        common.tool_loading.as_deref(),
+        common.tool_search_strategy.as_deref(),
+        common.native_tool_search.as_deref(),
+        common.tool_search_threshold,
+        common.max_tool_search_results,
+        common.max_loaded_tools,
+        common.max_loaded_tool_tokens,
+        &common.always_load,
+        &common.defer_tools,
+        &common.disable_tools,
+    )?;
+
+    let mcp_timeout = common.mcp_timeout.map(Duration::from_secs);
+    let mut mcp_options = code_agent_mcp::load_mcp_options(
+        &cwd,
+        settings.mcp.as_ref(),
+        common.mcp_config.as_deref(),
+        common.mcp_config.as_ref().map(|_| true),
+        common.mcp_strict.then_some(true),
+        mcp_timeout,
+    )
+    .context("load MCP config")?;
+    if !common.mcp_servers.is_empty() {
+        mcp_options
+            .servers
+            .retain(|name, _| common.mcp_servers.iter().any(|wanted| wanted == name));
+    }
+
+    let mut registry = ToolRegistry::new();
+    register_builtin_with_limits(&mut registry, ToolLimits::default());
+    registry.register(Arc::new(SearchToolsDefinitionTool::new(
+        options.max_results,
+    )));
+    let report = code_agent_core::register_mcp_tools(&mut registry, &mcp_options).await;
+    if mcp_options.strict
+        && report
+            .statuses
+            .iter()
+            .any(|s| matches!(s.status, code_agent_mcp::McpConnectionStatus::Failed))
+    {
+        return Err(anyhow!("strict MCP mode: one or more MCP servers failed"));
+    }
+    let mut builder = ToolCatalogBuilder::new(options.clone()).ingest_registry(&registry);
+    for status in &report.statuses {
+        builder = builder.mcp_transport(status.name.clone(), status.transport);
+    }
+    let catalog = builder.build();
+    let state = catalog.initial_loaded_state(&options);
+    Ok(ToolsCatalogContext {
+        catalog,
+        state,
+        options,
+        settings,
+    })
 }
 
 async fn resolve_mcp_cli_options(common: &McpCommonArgs) -> Result<code_agent_mcp::McpOptions> {
@@ -2092,6 +2638,64 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
                 println!("[mcp-log] {} {:?}: {}", e.server_name, e.stream, e.message);
             }
         }
+        AgentEvent::ToolCatalogBuilt(e) => {
+            if !quiet {
+                println!(
+                    "[tools] catalog built: {} tools, {} eager, {} deferred, {} disabled (~{} tokens)",
+                    e.total_tools,
+                    e.eager_tools,
+                    e.deferred_tools,
+                    e.disabled_tools,
+                    e.estimated_total_tokens
+                );
+            }
+        }
+        AgentEvent::ToolLoadingModeResolved(e) => {
+            if !quiet {
+                println!(
+                    "[tools] loading mode: {} -> {} ({})",
+                    e.configured_mode, e.resolved_mode, e.reason
+                );
+            }
+        }
+        AgentEvent::ToolContextBudgetUpdated(e) => {
+            if !quiet {
+                println!(
+                    "[tools] loaded this turn: {} tools, ~{} tokens; deferred: {} tools, ~{} tokens",
+                    e.loaded_tool_count,
+                    e.estimated_loaded_tool_tokens,
+                    e.deferred_tool_count,
+                    e.estimated_deferred_tool_tokens
+                );
+            }
+        }
+        AgentEvent::ToolSearchStarted(e) => {
+            if !quiet {
+                println!("[tool-search] query={:?}", e.query);
+            }
+        }
+        AgentEvent::ToolSearchCompleted(e) => {
+            if !quiet {
+                let loaded: Vec<String> = e
+                    .matches
+                    .iter()
+                    .filter(|m| m.loaded)
+                    .map(|m| m.tool_name.clone())
+                    .collect();
+                if loaded.is_empty() {
+                    println!("[tool-search] no tools loaded");
+                } else {
+                    println!("[tool-search] loaded:");
+                    for name in loaded {
+                        println!("  {}", name);
+                    }
+                }
+            }
+        }
+        AgentEvent::ToolSearchFailed(e) => {
+            println!("[tool-search-error] {}: {}", e.query, e.error);
+        }
+        AgentEvent::ToolLoaded(_) | AgentEvent::ToolDeferred(_) | AgentEvent::ToolDisabled(_) => {}
         AgentEvent::Result(r) => {
             println!(
                 "[result] {} (turns={}, subtype={:?})",

@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use code_agent_core::{
-    ContentBlock, MessageRole, ModelEvent, ModelProvider, ModelRequest, ProviderError, TokenUsage,
-    ToolCall, ToolResultContent,
+    ContentBlock, MessageRole, ModelEvent, ModelProvider, ModelRequest, NativeToolSearchMode,
+    ProviderError, TokenUsage, ToolCall, ToolResultContent,
 };
 use eventsource_stream::Eventsource;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -130,6 +130,12 @@ struct AnthropicTool<'a> {
     name: &'a str,
     description: &'a str,
     input_schema: &'a Value,
+    #[serde(skip_serializing_if = "is_false")]
+    deferred: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize)]
@@ -179,6 +185,8 @@ struct RequestBody<'a> {
     messages: Vec<ApiMessage<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_search: Option<serde_json::Value>,
 }
 
 fn build_body(req: &ModelRequest) -> serde_json::Value {
@@ -203,15 +211,45 @@ fn build_body(req: &ModelRequest) -> serde_json::Value {
         })
         .collect();
 
-    let tools: Vec<AnthropicTool> = req
+    let native_mode = req
+        .tool_search_config
+        .as_ref()
+        .map(|config| config.native_mode)
+        .unwrap_or(NativeToolSearchMode::Off);
+    let native_deferred_enabled = matches!(
+        native_mode,
+        NativeToolSearchMode::AnthropicRegex | NativeToolSearchMode::AnthropicBm25
+    );
+
+    let mut tools: Vec<AnthropicTool> = req
         .tools
         .iter()
         .map(|t| AnthropicTool {
             name: &t.name,
             description: &t.description,
             input_schema: &t.input_schema,
+            deferred: false,
         })
         .collect();
+    if native_deferred_enabled && !req.tools.is_empty() {
+        tools.extend(req.deferred_tools.iter().map(|t| AnthropicTool {
+            name: &t.name,
+            description: &t.description,
+            input_schema: &t.input_schema,
+            deferred: true,
+        }));
+    }
+    let tool_search = if native_deferred_enabled {
+        Some(serde_json::json!({
+            "type": match native_mode {
+                NativeToolSearchMode::AnthropicRegex => "regex",
+                NativeToolSearchMode::AnthropicBm25 => "bm25",
+                _ => "off",
+            }
+        }))
+    } else {
+        None
+    };
 
     let body = RequestBody {
         model: &req.model,
@@ -220,6 +258,7 @@ fn build_body(req: &ModelRequest) -> serde_json::Value {
         system: req.system.as_deref(),
         messages,
         tools,
+        tool_search,
     };
     serde_json::to_value(&body).unwrap_or(serde_json::Value::Null)
 }
@@ -515,6 +554,8 @@ mod tests {
                 description: "read".into(),
                 input_schema: serde_json::json!({"type": "object"}),
             }],
+            deferred_tools: vec![],
+            tool_search_config: None,
             max_tokens: 1024,
         };
         let body = build_body(&req);
@@ -542,6 +583,8 @@ mod tests {
                 Message::user_text("hello"),
             ],
             tools: vec![],
+            deferred_tools: vec![],
+            tool_search_config: None,
             max_tokens: 256,
         };
         let body = build_body(&req);
@@ -549,5 +592,35 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    // Explicit Anthropic-native BM25 mode marks deferred tools separately in the request body.
+    fn native_bm25_marks_deferred_tools() {
+        let req = ModelRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: None,
+            messages: vec![code_agent_core::Message::user_text("hi")],
+            tools: vec![code_agent_core::provider::ToolSchema {
+                name: "SearchTools".into(),
+                description: "search tools".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            deferred_tools: vec![code_agent_core::provider::ToolSchema {
+                name: "mcp__github__list_issues".into(),
+                description: "List GitHub issues".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            tool_search_config: Some(code_agent_core::ToolSearchProviderConfig {
+                native_mode: NativeToolSearchMode::AnthropicBm25,
+                local_search_enabled: true,
+                strategy: code_agent_core::ToolSearchStrategy::Hybrid,
+            }),
+            max_tokens: 256,
+        };
+        let body = build_body(&req);
+        assert_eq!(body["tool_search"]["type"], "bm25");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(body["tools"][1]["deferred"], true);
     }
 }

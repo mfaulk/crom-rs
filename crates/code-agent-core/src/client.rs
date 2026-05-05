@@ -28,6 +28,11 @@ use crate::provider::ModelProvider;
 use crate::run_id::RunId;
 use crate::telemetry::ModelPricing;
 use crate::tool::ToolRegistry;
+use crate::tool_catalog::{
+    LoadedToolState, SearchToolsDefinitionTool, ToolCatalog, ToolCatalogBuilder,
+    ToolCatalogSummary, ToolContextBudget, ToolDescriptor, ToolDescriptorPreview, ToolListFilter,
+    ToolLoadingMode, ToolSearchOptions, ToolSearchQuery, ToolSearchResult, SEARCH_TOOLS_NAME,
+};
 
 /// How the client should start the session.
 #[derive(Debug, Clone, Default)]
@@ -67,6 +72,8 @@ pub struct AgentClientBuilder {
     checkpoint_api: Option<Arc<dyn CheckpointApi>>,
     mcp_options: Option<code_agent_mcp::McpOptions>,
     mcp_config_file: Option<PathBuf>,
+    tool_search_options: Option<ToolSearchOptions>,
+    tool_loading_mode: Option<ToolLoadingMode>,
 }
 
 impl AgentClientBuilder {
@@ -183,6 +190,16 @@ impl AgentClientBuilder {
         self
     }
 
+    pub fn tool_search_options(mut self, options: ToolSearchOptions) -> Self {
+        self.tool_search_options = Some(options);
+        self
+    }
+
+    pub fn tool_loading_mode(mut self, mode: ToolLoadingMode) -> Self {
+        self.tool_loading_mode = Some(mode);
+        self
+    }
+
     pub async fn build(self) -> Result<AgentClient, AgentError> {
         let provider = self
             .provider
@@ -215,6 +232,12 @@ impl AgentClientBuilder {
                 None,
             )
             .map_err(|e| AgentError::InvalidConfig(e.to_string()))?;
+        }
+        if let Some(tool_search) = self.tool_search_options {
+            options.tool_search = tool_search;
+        }
+        if let Some(mode) = self.tool_loading_mode {
+            options.tool_search.mode = mode;
         }
 
         let session_id = self
@@ -482,6 +505,68 @@ impl AgentClient {
         })
     }
 
+    pub async fn tool_catalog_summary(&self) -> Result<ToolCatalogSummary, AgentError> {
+        let (catalog, _, _) = self.build_tool_catalog_snapshot().await?;
+        Ok(catalog.summary())
+    }
+
+    pub async fn search_tools(
+        &mut self,
+        query: ToolSearchQuery,
+    ) -> Result<ToolSearchResult, AgentError> {
+        let (catalog, mut state, options) = self.build_tool_catalog_snapshot().await?;
+        let visibility = options.visibility_context(
+            self.inner.options.lock().await.permission_mode,
+            self.inner.options.lock().await.allowed_tool_rules.clone(),
+            self.inner
+                .options
+                .lock()
+                .await
+                .disallowed_tool_rules
+                .clone(),
+        );
+        let (result, loaded) = catalog
+            .search_and_mark_loaded(query, options.strategy, &visibility, &mut state, &options)
+            .map_err(|e| AgentError::Other(e.to_string()))?;
+        if !loaded.is_empty() {
+            let mut options_guard = self.inner.options.lock().await;
+            for name in loaded {
+                if !options_guard
+                    .tool_search
+                    .preloaded_discovered_tools
+                    .contains(&name)
+                {
+                    options_guard
+                        .tool_search
+                        .preloaded_discovered_tools
+                        .push(name);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn list_tools(
+        &self,
+        filter: ToolListFilter,
+    ) -> Result<Vec<ToolDescriptorPreview>, AgentError> {
+        let (catalog, state, options) = self.build_tool_catalog_snapshot().await?;
+        Ok(catalog.list_previews(filter, &state, &options))
+    }
+
+    pub async fn show_tool(&self, tool_name: &str) -> Result<ToolDescriptor, AgentError> {
+        let (catalog, _, _) = self.build_tool_catalog_snapshot().await?;
+        catalog
+            .get(tool_name)
+            .cloned()
+            .ok_or_else(|| AgentError::Other(format!("unknown tool {tool_name}")))
+    }
+
+    pub async fn tool_context_budget(&self) -> Result<ToolContextBudget, AgentError> {
+        let (catalog, state, options) = self.build_tool_catalog_snapshot().await?;
+        Ok(catalog.context_budget(&state, &options))
+    }
+
     /// Shut down the runtime. Pending queued messages are dropped.
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         let _ = self.cmd_tx.send(ClientCommand::Shutdown).await;
@@ -489,6 +574,42 @@ impl AgentClient {
             let _ = h.await;
         }
         Ok(())
+    }
+
+    async fn build_tool_catalog_snapshot(
+        &self,
+    ) -> Result<(ToolCatalog, LoadedToolState, ToolSearchOptions), AgentError> {
+        let options = self.inner.options.lock().await.clone();
+        let mut registry = self.inner.tools.clone();
+        if registry.get(SEARCH_TOOLS_NAME).is_none() {
+            registry.register(Arc::new(SearchToolsDefinitionTool::new(
+                options.tool_search.max_results,
+            )));
+        }
+        let report = crate::mcp::register_mcp_tools(&mut registry, &options.mcp).await;
+        if options.mcp.strict
+            && report
+                .statuses
+                .iter()
+                .any(|s| matches!(s.status, code_agent_mcp::McpConnectionStatus::Failed))
+        {
+            return Err(AgentError::InvalidConfig(
+                "strict MCP mode: one or more MCP servers failed".into(),
+            ));
+        }
+        let allowed = if options.allowed_tools.is_empty() {
+            registry
+        } else {
+            registry.filter(&options.allowed_tools)
+        };
+        let mut builder =
+            ToolCatalogBuilder::new(options.tool_search.clone()).ingest_registry(&allowed);
+        for status in &report.statuses {
+            builder = builder.mcp_transport(status.name.clone(), status.transport);
+        }
+        let catalog = builder.build();
+        let state = catalog.initial_loaded_state(&options.tool_search);
+        Ok((catalog, state, options.tool_search))
     }
 }
 
@@ -802,6 +923,20 @@ impl ClientRuntime {
                 drop(hist);
                 // Still forward the event so AgentClient consumers can see
                 // tool-result payloads, not just the started/completed pair.
+            }
+            if let AgentEvent::ToolLoaded(loaded) = &ev {
+                let mut options = self.inner.options.lock().await;
+                if options.tool_search.persist_discovered_tools
+                    && !options
+                        .tool_search
+                        .preloaded_discovered_tools
+                        .contains(&loaded.tool_name)
+                {
+                    options
+                        .tool_search
+                        .preloaded_discovered_tools
+                        .push(loaded.tool_name.clone());
+                }
             }
             let _ = self.event_tx.send(ev).await;
         }

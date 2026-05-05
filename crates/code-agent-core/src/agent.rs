@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,11 +18,14 @@ use crate::conversation::{
 use crate::errors::{AgentError, ToolError};
 use crate::events::{
     AgentEvent, AgentResult, HookEvaluated, HookOutcomeKind, InterruptedEvent, PolicyDecisionEvent,
-    ResultSubtype, ToolCallCompleted, ToolCallDenied, ToolCallStarted, UserToolResult,
+    ResultSubtype, ToolCallCompleted, ToolCallDenied, ToolCallStarted, ToolCatalogBuilt,
+    ToolContextBudgetUpdated, ToolDeferred, ToolDisabled, ToolLoaded, ToolLoadingModeResolved,
+    ToolSearchCompleted, ToolSearchFailed, ToolSearchStarted, UserToolResult,
 };
 use crate::hooks::{aggregate, HookAggregateDecision, HookEventName, HookInput, Hooks, StopReason};
 use crate::mcp::{
     mcp_completion_from_result, mcp_failure_from_error, register_mcp_tools, tool_metadata,
+    McpRegistrationReport,
 };
 use crate::options::{AgentOptions, SessionId};
 use crate::permission::PermissionMode;
@@ -30,7 +34,12 @@ use crate::provider::{ModelEvent, ModelProvider, ModelRequest, ToolSchema};
 use crate::run_id::RunId;
 use crate::telemetry::{AgentTelemetryEvent, ModelPricing, TelemetryOutcome};
 use crate::todo::{TodoItem, TodoList};
-use crate::tool::{ToolContext, ToolRegistry};
+use crate::tool::{Tool, ToolContext, ToolRegistry};
+use crate::tool_catalog::{
+    ResolvedToolLoadingMode, SearchToolsDefinitionTool, SearchToolsTool, ToolCatalog,
+    ToolCatalogBuilder, ToolLoadPolicy, ToolLoadReason, ToolSearchMatch, ToolSearchMatchSummary,
+    ToolSearchProviderConfig, ToolSearchRuntime, ToolSourceFilter, SEARCH_TOOLS_NAME,
+};
 use crate::usage::TokenUsage;
 
 /// Convert an elapsed duration to milliseconds, saturating at u64::MAX.
@@ -422,19 +431,102 @@ pub(crate) async fn run_loop(
         return Ok(());
     }
 
-    // Build effective tool registry by allowed names.
-    let allowed_tools = if options.allowed_tools.is_empty() {
+    // Build the catalog before the first model request so tool loading can
+    // resolve deterministically from the complete local + MCP tool set.
+    let provisional_allowed_tools = if options.allowed_tools.is_empty() {
         tools.clone()
     } else {
         tools.filter(&options.allowed_tools)
     };
+    let provisional_catalog = build_tool_catalog(
+        &provisional_allowed_tools,
+        &options.tool_search,
+        &mcp_report,
+    );
+    let loading_decision = provisional_catalog.resolve_loading_mode(&options.tool_search);
+
+    let mut allowed_tool_patterns = options.allowed_tools.clone();
+    if matches!(
+        loading_decision.resolved_mode,
+        ResolvedToolLoadingMode::Search
+    ) && !allowed_tool_patterns.is_empty()
+        && !allowed_tool_patterns
+            .iter()
+            .any(|name| name == SEARCH_TOOLS_NAME)
+    {
+        allowed_tool_patterns.push(SEARCH_TOOLS_NAME.into());
+    }
+
+    if matches!(
+        loading_decision.resolved_mode,
+        ResolvedToolLoadingMode::Search
+    ) && tools.get(SEARCH_TOOLS_NAME).is_none()
+    {
+        tools.register(Arc::new(SearchToolsDefinitionTool::new(
+            options.tool_search.max_results,
+        )) as Arc<dyn Tool>);
+    }
+
+    // Build effective tool registry by allowed names.
+    let mut allowed_tools = if allowed_tool_patterns.is_empty() {
+        tools.clone()
+    } else {
+        tools.filter(&allowed_tool_patterns)
+    };
+
+    let catalog = build_tool_catalog(&allowed_tools, &options.tool_search, &mcp_report);
+    let loading_decision = catalog.resolve_loading_mode(&options.tool_search);
+    let mut loaded_state = catalog.initial_loaded_state(&options.tool_search);
+    loaded_state.discovered_this_session.extend(
+        options
+            .tool_search
+            .preloaded_discovered_tools
+            .iter()
+            .cloned(),
+    );
+    let visibility_context = options.tool_search.visibility_context(
+        options.permission_mode,
+        options.allowed_tool_rules.clone(),
+        options.disallowed_tool_rules.clone(),
+    );
+    let search_runtime = if matches!(
+        loading_decision.resolved_mode,
+        ResolvedToolLoadingMode::Search
+    ) {
+        let runtime = Arc::new(ToolSearchRuntime::new(
+            catalog.clone(),
+            loaded_state,
+            options.tool_search.clone(),
+            visibility_context,
+        ));
+        allowed_tools.register(Arc::new(SearchToolsTool::new(runtime.clone())) as Arc<dyn Tool>);
+        Some(runtime)
+    } else {
+        None
+    };
+
+    emit_tool_catalog_events(
+        &tx,
+        &session_sink,
+        &telemetry_sink,
+        &session_id,
+        &cfg.run_id,
+        &catalog,
+        &loading_decision,
+        &search_runtime,
+        &allowed_tools,
+        &options,
+    )
+    .await;
 
     if cfg.emit_system_init {
+        let init_tool_names =
+            loaded_tool_names_for_turn(&allowed_tools, search_runtime.as_ref()).await;
         let init = SystemInit {
             session_id: session_id.clone(),
             cwd: options.cwd.clone(),
             model: options.model.clone(),
-            tools: allowed_tools.names(),
+            tools: init_tool_names.into_iter().collect(),
             permission_mode: options.permission_mode,
             mcp_servers: mcp_report.statuses.clone(),
         };
@@ -552,6 +644,14 @@ pub(crate) async fn run_loop(
         system_text_owned.push_str(&added_ctx.0);
     }
 
+    if search_runtime.is_some() && options.tool_search.include_tool_category_hints {
+        if !system_text_owned.is_empty() {
+            system_text_owned.push_str("\n\n");
+        }
+        system_text_owned.push_str("## Tool Catalog Summary\n");
+        system_text_owned.push_str(&catalog.compact_summary_text());
+    }
+
     let system = if system_text_owned.is_empty() {
         None
     } else {
@@ -559,15 +659,6 @@ pub(crate) async fn run_loop(
     };
 
     conversation.push(Message::user_text(prompt.clone()));
-
-    let tool_schemas: Vec<ToolSchema> = allowed_tools
-        .iter()
-        .map(|t| ToolSchema {
-            name: t.name().to_string(),
-            description: t.description().to_string(),
-            input_schema: t.input_schema(),
-        })
-        .collect();
 
     let max_turns = options.max_turns.unwrap_or(8);
 
@@ -622,11 +713,40 @@ pub(crate) async fn run_loop(
         }
         turns += 1;
 
+        let turn_loaded_names =
+            loaded_tool_names_for_turn(&allowed_tools, search_runtime.as_ref()).await;
+        let tool_schemas = tool_schemas_for_names(&allowed_tools, &turn_loaded_names);
+        let deferred_names = if let Some(runtime) = search_runtime.as_ref() {
+            runtime.deferred_tool_names().await
+        } else {
+            BTreeSet::new()
+        };
+        let deferred_tool_schemas = tool_schemas_for_names(&allowed_tools, &deferred_names);
+        emit_tool_budget_event(
+            &tx,
+            &session_sink,
+            &telemetry_sink,
+            &session_id,
+            &cfg.run_id,
+            turns,
+            &catalog,
+            &turn_loaded_names,
+            &deferred_names,
+            &options,
+        )
+        .await;
+
         let req = ModelRequest {
             model: options.model.clone(),
             system: system.clone(),
             messages: conversation.messages.clone(),
-            tools: tool_schemas.clone(),
+            tools: tool_schemas,
+            deferred_tools: deferred_tool_schemas,
+            tool_search_config: search_runtime.as_ref().map(|_| ToolSearchProviderConfig {
+                native_mode: options.tool_search.native_provider_mode,
+                local_search_enabled: true,
+                strategy: options.tool_search.strategy,
+            }),
             max_tokens: options.max_tokens,
         };
 
@@ -946,6 +1066,33 @@ pub(crate) async fn run_loop(
             )
             .await;
 
+            if search_runtime.is_some() && !turn_loaded_names.contains(&call.name) {
+                let reason = format!("tool not loaded: {}", call.name);
+                emit(
+                    &tx,
+                    &session_sink,
+                    &session_id,
+                    AgentEvent::ToolCallDenied(ToolCallDenied {
+                        tool_use_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        reason: reason.clone(),
+                    }),
+                )
+                .await;
+                let body = format!("Tool denied: {}", reason);
+                push_tool_result_user(
+                    &tx,
+                    &session_sink,
+                    &session_id,
+                    &mut tool_result_blocks,
+                    call,
+                    &body,
+                    true,
+                )
+                .await;
+                continue;
+            }
+
             let tool = match allowed_tools.get(&call.name) {
                 Some(t) => t,
                 None => {
@@ -1188,6 +1335,31 @@ pub(crate) async fn run_loop(
                 )
                 .await;
             }
+            if call.name == SEARCH_TOOLS_NAME {
+                if let Some(started) =
+                    tool_search_started_from_input(&effective_input, options.tool_search.strategy)
+                {
+                    emit_telemetry(
+                        &telemetry_sink,
+                        AgentTelemetryEvent::ToolSearchStarted {
+                            session_id: session_id.clone(),
+                            run_id: cfg.run_id.clone(),
+                            turn_index: turns,
+                            query: started.query.clone(),
+                            strategy: started.strategy,
+                            limit: started.limit,
+                        },
+                    )
+                    .await;
+                    emit(
+                        &tx,
+                        &session_sink,
+                        &session_id,
+                        AgentEvent::ToolSearchStarted(started),
+                    )
+                    .await;
+                }
+            }
             let exec = tool.execute(effective_input.clone(), ctx).await;
             let duration_ms = elapsed_ms(started);
             let (text, is_error, tool_result_obj) = match &exec {
@@ -1260,6 +1432,22 @@ pub(crate) async fn run_loop(
                         .await;
                     }
                 }
+            }
+
+            if call.name == SEARCH_TOOLS_NAME {
+                emit_search_tools_result_events(
+                    &tx,
+                    &session_sink,
+                    &telemetry_sink,
+                    &session_id,
+                    &cfg.run_id,
+                    turns,
+                    &catalog,
+                    &effective_input,
+                    &exec,
+                    options.tool_search.strategy,
+                )
+                .await;
             }
 
             // If the tool was TodoWrite, broadcast a TodoUpdate.
@@ -1470,6 +1658,424 @@ async fn handle_interrupt(
         cwd,
         turns,
         StopReason::Cancelled,
+    )
+    .await;
+}
+
+fn build_tool_catalog(
+    registry: &ToolRegistry,
+    options: &crate::tool_catalog::ToolSearchOptions,
+    mcp_report: &McpRegistrationReport,
+) -> ToolCatalog {
+    let mut builder = ToolCatalogBuilder::new(options.clone()).ingest_registry(registry);
+    for status in &mcp_report.statuses {
+        builder = builder.mcp_transport(status.name.clone(), status.transport);
+    }
+    builder.build()
+}
+
+async fn loaded_tool_names_for_turn(
+    registry: &ToolRegistry,
+    runtime: Option<&Arc<ToolSearchRuntime>>,
+) -> BTreeSet<String> {
+    if let Some(runtime) = runtime {
+        runtime.loaded_tool_names().await
+    } else {
+        registry.names().into_iter().collect()
+    }
+}
+
+fn tool_schemas_for_names(registry: &ToolRegistry, names: &BTreeSet<String>) -> Vec<ToolSchema> {
+    names
+        .iter()
+        .filter_map(|name| registry.get(name))
+        .map(|tool| ToolSchema {
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            input_schema: tool.input_schema(),
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_tool_catalog_events(
+    tx: &mpsc::Sender<AgentEvent>,
+    sink: &Option<Arc<dyn SessionSink>>,
+    telemetry: &Option<Arc<dyn TelemetrySink>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    catalog: &ToolCatalog,
+    decision: &crate::tool_catalog::ToolLoadingDecision,
+    runtime: &Option<Arc<ToolSearchRuntime>>,
+    registry: &ToolRegistry,
+    options: &AgentOptions,
+) {
+    let loaded = loaded_tool_names_for_turn(registry, runtime.as_ref()).await;
+    let deferred = if let Some(runtime) = runtime {
+        runtime.deferred_tool_names().await
+    } else {
+        BTreeSet::new()
+    };
+    let built = ToolCatalogBuilt {
+        total_tools: catalog.len(),
+        eager_tools: catalog
+            .descriptors()
+            .filter(|d| d.load_policy == ToolLoadPolicy::Always)
+            .count(),
+        deferred_tools: catalog
+            .descriptors()
+            .filter(|d| d.load_policy == ToolLoadPolicy::Deferred)
+            .count(),
+        disabled_tools: catalog
+            .descriptors()
+            .filter(|d| d.load_policy == ToolLoadPolicy::Disabled)
+            .count(),
+        estimated_total_tokens: catalog.estimated_total_tokens(),
+    };
+    emit(
+        tx,
+        sink,
+        session_id,
+        AgentEvent::ToolCatalogBuilt(built.clone()),
+    )
+    .await;
+    emit_telemetry(
+        telemetry,
+        AgentTelemetryEvent::ToolCatalogBuilt {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            total_tool_count: built.total_tools,
+            loaded_tool_count: loaded.len(),
+            deferred_tool_count: deferred.len(),
+            estimated_total_tool_tokens: built.estimated_total_tokens,
+            outcome: TelemetryOutcome::Ok,
+        },
+    )
+    .await;
+    emit(
+        tx,
+        sink,
+        session_id,
+        AgentEvent::ToolLoadingModeResolved(ToolLoadingModeResolved {
+            configured_mode: decision.configured_mode.clone(),
+            resolved_mode: decision.resolved_mode,
+            reason: decision.reason.clone(),
+        }),
+    )
+    .await;
+    emit_telemetry(
+        telemetry,
+        AgentTelemetryEvent::ToolLoadingModeResolved {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            configured_mode: decision.configured_mode.clone(),
+            resolved_mode: decision.resolved_mode,
+            reason: decision.reason.clone(),
+        },
+    )
+    .await;
+    for descriptor in catalog.descriptors() {
+        match descriptor.load_policy {
+            ToolLoadPolicy::Deferred => {
+                emit(
+                    tx,
+                    sink,
+                    session_id,
+                    AgentEvent::ToolDeferred(ToolDeferred {
+                        tool_name: descriptor.name.clone(),
+                        source: descriptor.source.clone(),
+                        estimated_tokens: descriptor.estimated_tokens,
+                    }),
+                )
+                .await;
+                emit_telemetry(
+                    telemetry,
+                    AgentTelemetryEvent::ToolDeferred {
+                        session_id: session_id.clone(),
+                        run_id: run_id.clone(),
+                        tool_name: descriptor.name.clone(),
+                        estimated_tokens: descriptor.estimated_tokens,
+                    },
+                )
+                .await;
+            }
+            ToolLoadPolicy::Disabled => {
+                emit(
+                    tx,
+                    sink,
+                    session_id,
+                    AgentEvent::ToolDisabled(ToolDisabled {
+                        tool_name: descriptor.name.clone(),
+                        source: descriptor.source.clone(),
+                    }),
+                )
+                .await;
+                emit_telemetry(
+                    telemetry,
+                    AgentTelemetryEvent::ToolDisabled {
+                        session_id: session_id.clone(),
+                        run_id: run_id.clone(),
+                        tool_name: descriptor.name.clone(),
+                    },
+                )
+                .await;
+            }
+            ToolLoadPolicy::Always => {
+                if matches!(
+                    decision.resolved_mode,
+                    crate::tool_catalog::ResolvedToolLoadingMode::Search
+                ) {
+                    emit(
+                        tx,
+                        sink,
+                        session_id,
+                        AgentEvent::ToolLoaded(ToolLoaded {
+                            tool_name: descriptor.name.clone(),
+                            source: descriptor.source.clone(),
+                            reason: ToolLoadReason::AlwaysLoaded,
+                        }),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    if matches!(
+        decision.resolved_mode,
+        crate::tool_catalog::ResolvedToolLoadingMode::Search
+    ) {
+        tracing::info!(
+            total_tools = built.total_tools,
+            loaded_tools = loaded.len(),
+            deferred_tools = deferred.len(),
+            max_results = options.tool_search.max_results,
+            strategy = %options.tool_search.strategy,
+            "tool search enabled"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_tool_budget_event(
+    tx: &mpsc::Sender<AgentEvent>,
+    sink: &Option<Arc<dyn SessionSink>>,
+    telemetry: &Option<Arc<dyn TelemetrySink>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turn_index: u32,
+    catalog: &ToolCatalog,
+    loaded_names: &BTreeSet<String>,
+    deferred_names: &BTreeSet<String>,
+    options: &AgentOptions,
+) {
+    let loaded_tokens = catalog.estimated_tokens_for(loaded_names);
+    let total_tokens = catalog.estimated_total_tokens();
+    let event = ToolContextBudgetUpdated {
+        estimated_total_tool_tokens: total_tokens,
+        estimated_loaded_tool_tokens: loaded_tokens,
+        estimated_deferred_tool_tokens: total_tokens.saturating_sub(loaded_tokens),
+        loaded_tool_count: loaded_names.len(),
+        deferred_tool_count: deferred_names.len(),
+    };
+    emit(
+        tx,
+        sink,
+        session_id,
+        AgentEvent::ToolContextBudgetUpdated(event.clone()),
+    )
+    .await;
+    emit_telemetry(
+        telemetry,
+        AgentTelemetryEvent::ToolContextBudgetUpdated {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn_index,
+            loaded_tool_count: event.loaded_tool_count,
+            deferred_tool_count: event.deferred_tool_count,
+            estimated_total_tool_tokens: event.estimated_total_tool_tokens,
+            estimated_loaded_tool_tokens: event.estimated_loaded_tool_tokens,
+            estimated_deferred_tool_tokens: event.estimated_deferred_tool_tokens,
+        },
+    )
+    .await;
+    let _ = options;
+}
+
+fn tool_search_started_from_input(
+    input: &serde_json::Value,
+    strategy: crate::tool_catalog::ToolSearchStrategy,
+) -> Option<ToolSearchStarted> {
+    let query = input.get("query").and_then(|v| v.as_str())?.to_string();
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(5);
+    let source_filter = input
+        .get("source_filter")
+        .and_then(|v| v.as_str())
+        .and_then(|s| ToolSourceFilter::parse(s).ok());
+    Some(ToolSearchStarted {
+        query,
+        strategy,
+        limit,
+        source_filter,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_search_tools_result_events(
+    tx: &mpsc::Sender<AgentEvent>,
+    sink: &Option<Arc<dyn SessionSink>>,
+    telemetry: &Option<Arc<dyn TelemetrySink>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turn_index: u32,
+    catalog: &ToolCatalog,
+    input: &serde_json::Value,
+    exec: &Result<crate::tool::ToolResult, ToolError>,
+    strategy: crate::tool_catalog::ToolSearchStrategy,
+) {
+    let query = input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    match exec {
+        Ok(result) if !result.is_error => {
+            let Some(metadata) = result.metadata.get("tool_search") else {
+                return;
+            };
+            let matches: Vec<ToolSearchMatch> = metadata
+                .get("matches")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let loaded: Vec<String> = metadata
+                .get("loaded")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let duration_ms = metadata
+                .get("duration_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            emit(
+                tx,
+                sink,
+                session_id,
+                AgentEvent::ToolSearchCompleted(ToolSearchCompleted {
+                    query: query.clone(),
+                    matches: matches.iter().map(ToolSearchMatchSummary::from).collect(),
+                    duration_ms,
+                }),
+            )
+            .await;
+            emit_telemetry(
+                telemetry,
+                AgentTelemetryEvent::ToolSearchCompleted {
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    turn_index,
+                    query: query.clone(),
+                    strategy,
+                    result_count: matches.len(),
+                    loaded_tool_count: loaded.len(),
+                    duration_ms,
+                    outcome: TelemetryOutcome::Ok,
+                },
+            )
+            .await;
+            for tool_name in loaded {
+                if let Some(descriptor) = catalog.get(&tool_name) {
+                    emit(
+                        tx,
+                        sink,
+                        session_id,
+                        AgentEvent::ToolLoaded(ToolLoaded {
+                            tool_name: tool_name.clone(),
+                            source: descriptor.source.clone(),
+                            reason: ToolLoadReason::SearchResult,
+                        }),
+                    )
+                    .await;
+                    emit_telemetry(
+                        telemetry,
+                        AgentTelemetryEvent::ToolLoaded {
+                            session_id: session_id.clone(),
+                            run_id: run_id.clone(),
+                            turn_index: Some(turn_index),
+                            tool_name,
+                            reason: "search_result".into(),
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(result) => {
+            emit_search_failed(
+                tx,
+                sink,
+                telemetry,
+                session_id,
+                run_id,
+                turn_index,
+                &query,
+                strategy,
+                &result.flatten_text(),
+            )
+            .await;
+        }
+        Err(err) => {
+            emit_search_failed(
+                tx,
+                sink,
+                telemetry,
+                session_id,
+                run_id,
+                turn_index,
+                &query,
+                strategy,
+                &err.to_string(),
+            )
+            .await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_search_failed(
+    tx: &mpsc::Sender<AgentEvent>,
+    sink: &Option<Arc<dyn SessionSink>>,
+    telemetry: &Option<Arc<dyn TelemetrySink>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turn_index: u32,
+    query: &str,
+    strategy: crate::tool_catalog::ToolSearchStrategy,
+    error: &str,
+) {
+    emit(
+        tx,
+        sink,
+        session_id,
+        AgentEvent::ToolSearchFailed(ToolSearchFailed {
+            query: query.to_string(),
+            error: error.to_string(),
+        }),
+    )
+    .await;
+    emit_telemetry(
+        telemetry,
+        AgentTelemetryEvent::ToolSearchFailed {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn_index,
+            query: query.to_string(),
+            strategy,
+            error_category: "tool_search".into(),
+        },
     )
     .await;
 }

@@ -1,0 +1,36 @@
+{
+  "tool_search": {
+    "enabled": true,
+    "mode": "search",
+    "strategy": "hybrid",
+    "native_provider_mode": "off",
+    "max_results": 5,
+    "max_loaded_tools": 20,
+    "always_loaded": [
+      "Read",
+      "Glob",
+      "Grep",
+      "TodoWrite",
+      "SearchTools"
+    ],
+    "deferred": [
+      "mcp__*"
+    ],
+    "include_tool_category_hints": true,
+    "persist_discovered_tools": true
+  },
+  "allowed_tools": [
+    "Read",
+    "Glob",
+    "Grep",
+    "TodoWrite",
+    "SearchTools",
+    "mcp__fake__*"
+  ],
+  "disallowed_tools": [
+    "mcp__fake__github_create_issue",
+    "mcp__fake__github_close_issue",
+    "mcp__fake__slack_send_message"
+  ]
+}
+

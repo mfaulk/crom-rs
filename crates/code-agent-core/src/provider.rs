@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::conversation::{Message, ToolCall};
 use crate::errors::ProviderError;
+use crate::tool_catalog::ToolSearchProviderConfig;
 use crate::usage::TokenUsage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +20,10 @@ pub struct ModelRequest {
     pub system: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSchema>,
+    #[serde(default)]
+    pub deferred_tools: Vec<ToolSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_search_config: Option<ToolSearchProviderConfig>,
     pub max_tokens: u32,
 }
 
