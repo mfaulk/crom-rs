@@ -115,20 +115,16 @@ impl ApprovalMemory {
     pub async fn record(&self, key: String, decision: &PermissionDecision) {
         let mut g = self.inner.lock().await;
         match decision {
-            PermissionDecision::AllowForSession => {
-                if !g.session_allow.contains(&key) {
-                    g.session_allow.push(key);
-                }
+            PermissionDecision::AllowForSession if !g.session_allow.contains(&key) => {
+                g.session_allow.push(key);
             }
-            PermissionDecision::AllowForProject => {
-                if !g.project_allow.contains(&key) {
-                    g.project_allow.push(key);
-                }
+            PermissionDecision::AllowForProject if !g.project_allow.contains(&key) => {
+                g.project_allow.push(key);
             }
-            PermissionDecision::DenyForSession { reason } => {
-                if !g.session_deny.iter().any(|(k, _)| k == &key) {
-                    g.session_deny.push((key, reason.clone()));
-                }
+            PermissionDecision::DenyForSession { reason }
+                if !g.session_deny.iter().any(|(k, _)| k == &key) =>
+            {
+                g.session_deny.push((key, reason.clone()));
             }
             _ => {}
         }
