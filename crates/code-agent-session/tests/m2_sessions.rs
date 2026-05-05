@@ -183,7 +183,9 @@ async fn hook_and_policy_decisions_persist() {
     let sink: A<dyn SessionSink> = A::new(SessionSinkAdapter::new(store.clone(), cwd.clone()));
 
     let provider = A::new(TextProvider { text: "ok".into() });
-    let hooks = Hooks::new().add(HookEventName::UserPromptSubmit, "*", A::new(AddCtx));
+    let hooks = Hooks::new()
+        .add(HookEventName::UserPromptSubmit, "*", A::new(AddCtx))
+        .unwrap();
     let agent = code_agent_core::AgentBuilder::new()
         .options(AgentOptions {
             cwd: cwd.clone(),

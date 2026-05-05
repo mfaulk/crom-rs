@@ -821,7 +821,7 @@ mod tests {
                 })
             }
         }
-        let hooks = Hooks::new().pre_tool_use("*", Arc::new(AllowHook));
+        let hooks = Hooks::new().pre_tool_use("*", Arc::new(AllowHook)).unwrap();
         let cfg = PolicyConfig {
             disallowed_tools: vec![ToolRule::ExactTool("Bash".into())],
             permission_mode: PermissionMode::Default,
@@ -857,7 +857,7 @@ mod tests {
                 })
             }
         }
-        let hooks = Hooks::new().pre_tool_use("*", Arc::new(DenyHook));
+        let hooks = Hooks::new().pre_tool_use("*", Arc::new(DenyHook)).unwrap();
         let cfg = PolicyConfig {
             allowed_tools: vec![ToolRule::ExactTool("Bash".into())],
             ..PolicyConfig::default()
@@ -892,7 +892,9 @@ mod tests {
                 })
             }
         }
-        let hooks = Hooks::new().pre_tool_use("Edit", Arc::new(RewriteHook));
+        let hooks = Hooks::new()
+            .pre_tool_use("Edit", Arc::new(RewriteHook))
+            .unwrap();
         let cfg = PolicyConfig {
             permission_mode: PermissionMode::AcceptEdits,
             ..PolicyConfig::default()

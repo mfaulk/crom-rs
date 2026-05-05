@@ -439,26 +439,38 @@ async fn resolve_common(
     // Build hooks from settings flags.
     let mut hooks = Hooks::new();
     if settings.hooks.block_env_file_writes.unwrap_or(true) {
-        hooks = hooks.pre_tool_use("Edit|Write", Arc::new(BlockEnvFileWritesHook::default()));
+        hooks = hooks
+            .pre_tool_use("Edit|Write", Arc::new(BlockEnvFileWritesHook::default()))
+            .expect("built-in pattern is always valid");
     }
     if settings.hooks.block_dangerous_bash.unwrap_or(true) {
-        hooks = hooks.pre_tool_use("Bash", Arc::new(BlockDangerousBashHook::default()));
+        hooks = hooks
+            .pre_tool_use("Bash", Arc::new(BlockDangerousBashHook::default()))
+            .expect("built-in pattern is always valid");
     }
     if let Some(max_bytes) = settings.hooks.max_patch_size_bytes {
-        hooks = hooks.pre_tool_use("Edit|Write", Arc::new(MaxPatchSizeHook::new(max_bytes)));
+        hooks = hooks
+            .pre_tool_use("Edit|Write", Arc::new(MaxPatchSizeHook::new(max_bytes)))
+            .expect("built-in pattern is always valid");
     }
     // Audit-log every successful and failed tool call into an in-memory log
     // surfaced through `HookEvaluated` events.
     if settings.hooks.audit_log.unwrap_or(false) {
         let audit = Arc::new(AuditLogHook::default());
-        hooks = hooks.post_tool_use("*", audit.clone());
-        hooks = hooks.post_tool_use_failure("*", audit);
+        hooks = hooks
+            .post_tool_use("*", audit.clone())
+            .expect("built-in pattern is always valid");
+        hooks = hooks
+            .post_tool_use_failure("*", audit)
+            .expect("built-in pattern is always valid");
     }
     // Wire SecretRedactionHook so the toggle is honored. The hook itself
     // returns Continue and is informational; the real redaction is applied
     // by the audit-log hook to its own entries (see `redact_secrets_in_value`).
     if settings.hooks.secret_redaction.unwrap_or(true) {
-        hooks = hooks.post_tool_use("*", Arc::new(SecretRedactionHook));
+        hooks = hooks
+            .post_tool_use("*", Arc::new(SecretRedactionHook))
+            .expect("built-in pattern is always valid");
     }
 
     let settings_summary = build_settings_summary(&settings, &model, mode);
@@ -732,21 +744,33 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
     // Hooks.
     let mut hooks = Hooks::new();
     if cfg.settings.hooks.block_env_file_writes.unwrap_or(true) {
-        hooks = hooks.pre_tool_use("Edit|Write", Arc::new(BlockEnvFileWritesHook::default()));
+        hooks = hooks
+            .pre_tool_use("Edit|Write", Arc::new(BlockEnvFileWritesHook::default()))
+            .expect("built-in pattern is always valid");
     }
     if cfg.settings.hooks.block_dangerous_bash.unwrap_or(true) {
-        hooks = hooks.pre_tool_use("Bash", Arc::new(BlockDangerousBashHook::default()));
+        hooks = hooks
+            .pre_tool_use("Bash", Arc::new(BlockDangerousBashHook::default()))
+            .expect("built-in pattern is always valid");
     }
     if let Some(max_bytes) = cfg.settings.hooks.max_patch_size_bytes {
-        hooks = hooks.pre_tool_use("Edit|Write", Arc::new(MaxPatchSizeHook::new(max_bytes)));
+        hooks = hooks
+            .pre_tool_use("Edit|Write", Arc::new(MaxPatchSizeHook::new(max_bytes)))
+            .expect("built-in pattern is always valid");
     }
     if cfg.settings.hooks.audit_log.unwrap_or(false) {
         let audit = Arc::new(AuditLogHook::default());
-        hooks = hooks.post_tool_use("*", audit.clone());
-        hooks = hooks.post_tool_use_failure("*", audit);
+        hooks = hooks
+            .post_tool_use("*", audit.clone())
+            .expect("built-in pattern is always valid");
+        hooks = hooks
+            .post_tool_use_failure("*", audit)
+            .expect("built-in pattern is always valid");
     }
     if cfg.settings.hooks.secret_redaction.unwrap_or(true) {
-        hooks = hooks.post_tool_use("*", Arc::new(SecretRedactionHook));
+        hooks = hooks
+            .post_tool_use("*", Arc::new(SecretRedactionHook))
+            .expect("built-in pattern is always valid");
     }
 
     let mut options = cfg.options.clone();

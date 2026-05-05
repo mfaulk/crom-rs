@@ -321,7 +321,7 @@ async fn pre_tool_use_hook_denies() {
     ]));
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(EchoTool { ran: ran.clone() }));
-    let hooks = Hooks::new().pre_tool_use("*", Arc::new(DenyHook));
+    let hooks = Hooks::new().pre_tool_use("*", Arc::new(DenyHook)).unwrap();
 
     let mut client = AgentClient::builder()
         .options(AgentOptions {
@@ -415,8 +415,9 @@ async fn disallow_path_glob_blocks_env_edit() {
         ..AgentOptions::default()
     };
     // Also wire the built-in env-block hook to verify hook layering.
-    let hooks =
-        Hooks::new().pre_tool_use("Edit|Write", Arc::new(BlockEnvFileWritesHook::default()));
+    let hooks = Hooks::new()
+        .pre_tool_use("Edit|Write", Arc::new(BlockEnvFileWritesHook::default()))
+        .unwrap();
 
     let mut client = AgentClient::builder()
         .options(opts)
@@ -691,7 +692,9 @@ async fn pre_tool_use_ask_overrides_accept_edits() {
     ]));
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(EditTool { ran: ran.clone() }));
-    let hooks = Hooks::new().pre_tool_use("Edit", Arc::new(AskHook));
+    let hooks = Hooks::new()
+        .pre_tool_use("Edit", Arc::new(AskHook))
+        .unwrap();
 
     let mut client = AgentClient::builder()
         .options(AgentOptions {
