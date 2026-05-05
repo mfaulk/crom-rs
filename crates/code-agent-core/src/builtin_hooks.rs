@@ -18,8 +18,12 @@ pub struct BlockEnvFileWritesHook {
 
 impl Default for BlockEnvFileWritesHook {
     fn default() -> Self {
+        // `.env*` covers `.env`, `.env.local`, `.envrc`, etc. The two
+        // depth variants (root and nested) make the matcher independent
+        // of leading `./`. The earlier set ({`.env`, `.env.*`}) missed
+        // `.envrc`, leaving direnv-style files unprotected.
         let mut b = GlobSetBuilder::new();
-        for p in &[".env", ".env.*", "**/.env", "**/.env.*"] {
+        for p in &[".env*", "**/.env*"] {
             if let Ok(g) = Glob::new(p) {
                 b.add(g);
             }
@@ -426,5 +430,55 @@ mod tests {
             entries[0].redacted_input.as_ref().unwrap()["api_key"],
             "[REDACTED]"
         );
+    }
+}
+
+#[cfg(test)]
+mod round3_regression {
+    use super::*;
+    use crate::hooks::{HookEventName, HookInput};
+    use crate::options::SessionId;
+    use crate::run_id::RunId;
+    use std::path::PathBuf;
+
+    fn input_for(tool: &str, body: serde_json::Value) -> HookInput {
+        HookInput {
+            tool_name: Some(tool.into()),
+            tool_input: Some(body),
+            ..HookInput::new(
+                HookEventName::PreToolUse,
+                SessionId::from("s".to_string()),
+                PathBuf::from("/"),
+                RunId::from("r".to_string()),
+            )
+        }
+    }
+
+    #[tokio::test]
+    // Regression: .envrc (direnv) at the root must be blocked.
+    async fn env_block_blocks_dot_envrc_root() {
+        let h = BlockEnvFileWritesHook::default();
+        let r = h
+            .call(input_for(
+                "Edit",
+                serde_json::json!({"file_path": ".envrc"}),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(r, HookOutput::Deny { .. }));
+    }
+
+    #[tokio::test]
+    // Regression: nested .envrc files are also blocked.
+    async fn env_block_blocks_nested_dot_envrc() {
+        let h = BlockEnvFileWritesHook::default();
+        let r = h
+            .call(input_for(
+                "Write",
+                serde_json::json!({"file_path": "subdir/.envrc"}),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(r, HookOutput::Deny { .. }));
     }
 }

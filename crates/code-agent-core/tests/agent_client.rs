@@ -920,3 +920,38 @@ async fn user_prompt_persisted_before_assistant_in_history() {
     );
     let _ = client.shutdown().await;
 }
+
+#[tokio::test]
+// Regression (round 3): `into_event_stream` must keep the runtime task
+// alive for as long as the returned stream is being consumed. Previously
+// `Drop for AgentClient` aborted the join handle, killing pending events.
+async fn into_event_stream_keeps_runtime_alive() {
+    use futures::StreamExt;
+    let provider = Arc::new(ScriptedProvider::with_delay(vec![turn_text("hello")], 50));
+    let mut client = AgentClient::builder()
+        .options(AgentOptions {
+            allowed_tools: vec![],
+            max_turns: Some(2),
+            ..AgentOptions::default()
+        })
+        .provider(provider)
+        .tools(ToolRegistry::new())
+        .build()
+        .await
+        .unwrap();
+    client.send_user_message("hi").await.unwrap();
+
+    // Convert to a stream and ensure the runtime keeps emitting events.
+    let mut stream = client.into_event_stream();
+    let mut got_result = false;
+    while let Some(ev) = stream.next().await {
+        if matches!(ev, AgentEvent::Result(_)) {
+            got_result = true;
+            break;
+        }
+    }
+    assert!(
+        got_result,
+        "stream must receive Result; runtime must not be aborted by Drop"
+    );
+}

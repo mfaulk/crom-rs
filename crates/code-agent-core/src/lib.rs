@@ -24,7 +24,7 @@ pub use builtin_hooks::{
     redact_secrets_in_value, AuditEntry, AuditLogHook, BlockDangerousBashHook,
     BlockEnvFileWritesHook, MaxPatchSizeHook, SecretRedactionHook,
 };
-pub use client::{AgentClient, AgentClientBuilder, SessionStart};
+pub use client::{AgentClient, AgentClientBuilder, AgentEventStream, SessionStart};
 pub use conversation::{
     AssistantContent, AssistantMessage, ContentBlock, Conversation, Message, MessageRole,
     SystemInit, ToolCall, ToolResult as ConvToolResult, ToolResultContent,

@@ -54,18 +54,21 @@ struct CommonArgs {
     /// Workspace directory; tools are sandboxed to this path.
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
-    /// Anthropic model id.
-    #[arg(long, default_value = "claude-sonnet-4-6")]
-    model: String,
+    /// Anthropic model id. When omitted, settings.model wins; otherwise
+    /// falls back to the built-in default `claude-sonnet-4-6`.
+    #[arg(long)]
+    model: Option<String>,
     /// Comma-separated list of tools to expose by name.
     #[arg(long, value_delimiter = ',')]
     allowed_tools: Vec<String>,
-    /// Permission mode: default, acceptEdits, plan, dontAsk.
-    #[arg(long, default_value = "default")]
-    permission_mode: String,
-    /// Maximum agent turns before bailing out.
-    #[arg(long, default_value_t = 8)]
-    max_turns: u32,
+    /// Permission mode: default, acceptEdits, plan, dontAsk. When omitted,
+    /// settings.permission_mode wins; otherwise falls back to `default`.
+    #[arg(long)]
+    permission_mode: Option<String>,
+    /// Maximum agent turns before bailing out. When omitted, settings
+    /// or the built-in default 8 wins.
+    #[arg(long)]
+    max_turns: Option<u32>,
     /// Settings sources to load: none|project|user|user-and-project.
     #[arg(long, default_value = "user-and-project")]
     settings: String,
@@ -337,22 +340,22 @@ async fn resolve_common(
     let mut tools = ToolRegistry::new();
     register_builtin_with_limits(&mut tools, limits);
 
-    // Determine permission mode: CLI flag wins over settings.
-    let mode = if common.permission_mode != "default" {
-        parse_permission_mode(&common.permission_mode)?
+    // Determine permission mode: explicit CLI flag wins over settings.
+    let mode = if let Some(pm) = &common.permission_mode {
+        parse_permission_mode(pm)?
     } else if let Some(pm) = settings.permission_mode {
         pm
     } else {
-        parse_permission_mode(&common.permission_mode)?
+        PermissionMode::Default
     };
 
-    // Determine model: CLI default takes settings if it's the default.
-    let model = if common.model != "claude-sonnet-4-6" {
-        common.model.clone()
+    // Determine model: explicit CLI flag wins over settings.
+    let model = if let Some(m) = &common.model {
+        m.clone()
     } else if let Some(m) = &settings.model {
         m.clone()
     } else {
-        common.model.clone()
+        "claude-sonnet-4-6".to_string()
     };
 
     // Determine allowed tool names: CLI overrides settings if non-empty.
@@ -404,11 +407,7 @@ async fn resolve_common(
         }
     }
 
-    let max_turns = if common.max_turns != 8 {
-        common.max_turns
-    } else {
-        settings.max_turns.unwrap_or(common.max_turns)
-    };
+    let max_turns = common.max_turns.or(settings.max_turns).unwrap_or(8);
     let max_tokens = settings.max_tokens.unwrap_or(4096);
 
     let permission_callback: Option<Arc<dyn PermissionCallback>> = if prompt_for_callback {
@@ -661,7 +660,14 @@ fn drop_trailing_matching_user_prompt(
 }
 
 async fn cmd_chat(args: ChatArgs) -> Result<()> {
-    let cfg = resolve_common(&args.common, true).await?;
+    // Chat owns stdin for the user-input loop. A second stdin reader (the
+    // one StdinApprover would spawn for approval prompts) would race on
+    // FD 0 — Bash answers like `y` could be consumed as chat messages and
+    // vice-versa. We disable the stdin approver in chat mode and require
+    // the user to pre-allow tools via `--yes-to` or `.agent/settings.json`.
+    // Unresolved tool requests are denied with a helpful message.
+    let mut cfg = resolve_common(&args.common, false).await?;
+    cfg.options.permission_callback = Some(Arc::new(ChatNoninteractiveApprover));
     let provider: Arc<dyn ModelProvider> = build_provider(&cfg.options.model)?;
 
     let store: Option<Arc<dyn SessionStore>> = if args.common.no_session {
@@ -1061,6 +1067,25 @@ fn classify_bash_risk(cmd: &str, disallowed: &[ToolRule]) -> BashRisk {
 
 /// Permission callback that prompts the user on stdin with the rich
 /// approval menu.
+/// Permission callback used by `cmd_chat`. Chat owns stdin, so a stdin-
+/// reading approver would race the chat input loop. Instead, this callback
+/// always denies and points the user at `--yes-to` / `.agent/settings.json`.
+/// Read-only tools and explicitly-allowed rules never reach this callback
+/// because the policy engine resolves them upstream.
+struct ChatNoninteractiveApprover;
+
+#[async_trait]
+impl PermissionCallback for ChatNoninteractiveApprover {
+    async fn approve(&self, request: PermissionRequest) -> PermissionDecision {
+        PermissionDecision::Deny {
+            reason: format!(
+                "interactive approval is disabled in chat mode; allow `{}` via --yes-to=<rule> or .agent/settings.json (allowed_tools)",
+                request.tool_name
+            ),
+        }
+    }
+}
+
 struct StdinApprover {
     interactive: bool,
     mode: PermissionMode,

@@ -394,8 +394,10 @@ impl PolicyEngine {
             }
         }
 
-        // 4b. Approval-memory allow lookup.
-        if !matches!(self.config.memory_mode, ApprovalMemoryMode::None) {
+        // 4b. Approval-memory allow lookup. Skipped when a hook returned
+        // `Ask`, because the hook explicitly demanded user confirmation —
+        // a prior `AllowForSession` must not silently bypass that.
+        if !force_callback && !matches!(self.config.memory_mode, ApprovalMemoryMode::None) {
             let key = approval_key(ctx.tool_name, &tool_input);
             if let Some(MemoryDecision::Allow) = self.config.memory.lookup(&key).await {
                 let mut d = PolicyDecision::allow(

@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use futures::stream::Stream;
 use tokio::sync::{mpsc, Mutex};
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::{run_loop, Agent, AgentBuilder, RunConfig, SessionSink, TelemetrySink};
 use crate::conversation::{Message, MessageRole};
@@ -272,12 +271,23 @@ impl AgentClient {
         Ok(self.event_rx.recv().await)
     }
 
-    /// Take the event stream out of the client. Subsequent `next_event` calls
-    /// will return None.
-    pub fn into_event_stream(mut self) -> Pin<Box<dyn Stream<Item = AgentEvent> + Send>> {
+    /// Take the event stream out of the client. The returned stream owns
+    /// the runtime task and a clone of the command channel, so dropping
+    /// the original `AgentClient` does NOT tear the runtime down. The
+    /// runtime exits when the stream is dropped (cmd_tx hits its last
+    /// reference) or when the runtime sees `Shutdown`.
+    pub fn into_event_stream(mut self) -> AgentEventStream {
         let (_dummy_tx, dummy_rx) = mpsc::channel::<AgentEvent>(1);
         let rx = std::mem::replace(&mut self.event_rx, dummy_rx);
-        Box::pin(ReceiverStream::new(rx))
+        let cmd_tx = self.cmd_tx.clone();
+        // Take the handle so Drop on `AgentClient` doesn't abort the task
+        // out from under the returned stream.
+        let handle = self.handle.take();
+        AgentEventStream {
+            rx,
+            _cmd_tx: cmd_tx,
+            _handle: handle,
+        }
     }
 
     /// Cancel the current run cleanly. Queued messages are preserved; the
@@ -310,12 +320,33 @@ impl AgentClient {
 
 impl Drop for AgentClient {
     fn drop(&mut self) {
-        if let Some(h) = self.handle.take() {
-            // Best-effort: tell the runtime to exit. We don't await the join
-            // handle in Drop because it'd be unsound to block here.
-            let _ = self.cmd_tx.try_send(ClientCommand::Shutdown);
-            h.abort();
-        }
+        // Best-effort: signal the runtime to exit. Do NOT abort the
+        // join handle — the runtime task may still be flushing events
+        // to a stream consumer (e.g. via `into_event_stream()` which
+        // takes ownership of the handle). When the last clone of
+        // `cmd_tx` drops, the runtime will see the channel close and
+        // exit cleanly.
+        let _ = self.cmd_tx.try_send(ClientCommand::Shutdown);
+    }
+}
+
+/// Stream of `AgentEvent` returned by [`AgentClient::into_event_stream`].
+/// Owns the runtime task and a command-channel clone so the runtime
+/// stays alive as long as the stream does.
+pub struct AgentEventStream {
+    rx: mpsc::Receiver<AgentEvent>,
+    _cmd_tx: mpsc::Sender<ClientCommand>,
+    _handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Stream for AgentEventStream {
+    type Item = AgentEvent;
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.rx).poll_recv(cx)
     }
 }
 
