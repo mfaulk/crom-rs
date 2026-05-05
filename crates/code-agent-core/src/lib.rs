@@ -38,7 +38,7 @@ pub use hooks::{
     aggregate, Hook, HookAddedContext, HookAggregateDecision, HookCallRecord, HookError,
     HookEventName, HookInput, HookMatcher, HookOutput, Hooks, StopReason, ToolMatcher,
 };
-pub use options::{AgentOptions, SessionId};
+pub use options::{is_valid_session_id_str, AgentOptions, SessionId};
 pub use permission::{
     ApprovalMemoryMode, PermissionCallback, PermissionDecision, PermissionKind, PermissionMode,
     PermissionRequest,

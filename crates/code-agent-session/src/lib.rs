@@ -80,8 +80,11 @@ impl FsSessionStore {
         cwd.join(".agent").join("sessions")
     }
 
-    fn file_path(&self, session_id: &SessionId) -> PathBuf {
-        Self::sessions_dir_for(&self.cwd).join(format!("{}.jsonl", session_id.as_str()))
+    fn file_path(&self, session_id: &SessionId) -> Result<PathBuf, SessionError> {
+        if !session_id.is_valid_format() {
+            return Err(SessionError::InvalidId);
+        }
+        Ok(Self::sessions_dir_for(&self.cwd).join(format!("{}.jsonl", session_id.as_str())))
     }
 }
 
@@ -92,7 +95,7 @@ impl SessionStore for FsSessionStore {
         let dir = Self::sessions_dir_for(&self.cwd);
         tokio::fs::create_dir_all(&dir).await?;
         // Touch the file so it shows up in `list` and `latest_for_cwd`.
-        let path = self.file_path(&id);
+        let path = self.file_path(&id)?;
         tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -106,9 +109,11 @@ impl SessionStore for FsSessionStore {
         session_id: &SessionId,
         event: SessionRecord,
     ) -> Result<(), SessionError> {
+        // Validate first so a bad id never reaches `create_dir_all` or the
+        // filesystem at all.
+        let path = self.file_path(session_id)?;
         let dir = Self::sessions_dir_for(&self.cwd);
         tokio::fs::create_dir_all(&dir).await?;
-        let path = self.file_path(session_id);
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -122,7 +127,7 @@ impl SessionStore for FsSessionStore {
     }
 
     async fn load(&self, session_id: &SessionId) -> Result<Vec<SessionRecord>, SessionError> {
-        let path = self.file_path(session_id);
+        let path = self.file_path(session_id)?;
         if !path.exists() {
             return Err(SessionError::NotFound(session_id.to_string()));
         }
@@ -527,6 +532,152 @@ mod tests {
         let latest = store.latest_for_cwd(dir.path()).await.unwrap().unwrap();
         assert_ne!(id1.as_str(), id2.as_str());
         assert_eq!(latest.as_str(), id2.as_str());
+    }
+
+    #[tokio::test]
+    // load with `..`-style id returns InvalidId rather than escaping the
+    // sessions directory.
+    async fn load_rejects_traversal_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let bad = SessionId::from("../etc/passwd".to_string());
+        let err = store
+            .load(&bad)
+            .await
+            .expect_err("traversal id must be rejected");
+        assert!(
+            matches!(err, SessionError::InvalidId),
+            "expected InvalidId, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    // append with a slash-containing id errors out instead of writing
+    // outside the sessions directory.
+    async fn append_rejects_slash_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let bad = SessionId::from("foo/bar".to_string());
+        let rec = SessionRecord {
+            timestamp: now_iso(),
+            cwd: dir.path().to_path_buf(),
+            session_id: bad.to_string(),
+            payload: SessionPayload::UserPrompt {
+                text: "x".to_string(),
+            },
+        };
+        let err = store
+            .append(&bad, rec)
+            .await
+            .expect_err("slash id must be rejected");
+        assert!(
+            matches!(err, SessionError::InvalidId),
+            "expected InvalidId, got {err:?}"
+        );
+        // Confirm no stray file/directory was created above the sessions dir.
+        let stray = dir.path().join("foo");
+        assert!(
+            !stray.exists(),
+            "append must not create paths outside the sessions dir"
+        );
+    }
+
+    // Helper: build a single SessionRecord with the given id.
+    fn rec_for(dir: &TempDir, id: &SessionId) -> SessionRecord {
+        SessionRecord {
+            timestamp: now_iso(),
+            cwd: dir.path().to_path_buf(),
+            session_id: id.to_string(),
+            payload: SessionPayload::UserPrompt {
+                text: "x".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    // The original CVE: `../foo` would have written `.agent/foo.jsonl`,
+    // one level above the sessions dir. Verify the would-be target file
+    // is not created.
+    async fn append_rejects_dotdot_id_no_filesystem_side_effects() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let bad = SessionId::from("../foo".to_string());
+        let err = store
+            .append(&bad, rec_for(&dir, &bad))
+            .await
+            .expect_err("traversal id must be rejected");
+        assert!(matches!(err, SessionError::InvalidId), "got {err:?}");
+        // The vulnerable path would have been `.agent/foo.jsonl`.
+        let escaped = dir.path().join(".agent").join("foo.jsonl");
+        assert!(!escaped.exists(), "must not create file above sessions dir");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    // An absolute-path id used to replace the joined prefix entirely on
+    // Unix. Must error and must not write to the absolute target.
+    async fn append_rejects_absolute_id() {
+        let outer = TempDir::new().unwrap();
+        let target = outer.path().join("escape.jsonl");
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        // The ID encodes an absolute path with a separator the join would have
+        // honored. Validation must reject it before reaching the filesystem.
+        let bad_str = format!("/{}", target.strip_prefix("/").unwrap().display());
+        let bad = SessionId::from(bad_str);
+        let err = store
+            .append(&bad, rec_for(&dir, &bad))
+            .await
+            .expect_err("absolute-path id must be rejected");
+        assert!(matches!(err, SessionError::InvalidId), "got {err:?}");
+        assert!(
+            !target.exists(),
+            "must not write to absolute path provided as session id"
+        );
+    }
+
+    #[tokio::test]
+    // Backslash in id (Windows-style separator) is also rejected.
+    async fn append_rejects_backslash_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let bad = SessionId::from("foo\\bar".to_string());
+        let err = store
+            .append(&bad, rec_for(&dir, &bad))
+            .await
+            .expect_err("backslash id must be rejected");
+        assert!(matches!(err, SessionError::InvalidId), "got {err:?}");
+    }
+
+    #[tokio::test]
+    // NUL byte in id is rejected (would corrupt path syscalls).
+    async fn append_rejects_nul_byte_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let bad = SessionId::from("foo\0bar".to_string());
+        let err = store
+            .append(&bad, rec_for(&dir, &bad))
+            .await
+            .expect_err("NUL byte id must be rejected");
+        assert!(matches!(err, SessionError::InvalidId), "got {err:?}");
+    }
+
+    #[tokio::test]
+    // create() with an externally-provided invalid id must never produce
+    // a file outside the sessions dir. (FsSessionStore::create currently
+    // generates a fresh uuid internally, so this is a smoke test that the
+    // store can never persist an invalid id even if a buggy caller tries.)
+    async fn append_rejects_unicode_fullwidth_slash_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        // U+FF0F FULLWIDTH SOLIDUS is visually similar to `/` but isn't ASCII;
+        // the alphanumeric allowlist rejects it.
+        let bad = SessionId::from("foo\u{FF0F}bar".to_string());
+        let err = store
+            .append(&bad, rec_for(&dir, &bad))
+            .await
+            .expect_err("unicode-slash id must be rejected");
+        assert!(matches!(err, SessionError::InvalidId), "got {err:?}");
     }
 
     #[tokio::test]
