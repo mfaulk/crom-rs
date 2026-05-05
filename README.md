@@ -223,6 +223,31 @@ The settings file disallows reading or writing any `.env*` file and
 limits Bash to `cargo test|check|fmt|clippy`. Both the `.agent` policy
 and the `BlockEnvFileWritesHook` block any attempt to modify `.env`.
 
+### Full M2 end-to-end walkthrough
+
+`examples/m2-e2e-demo.sh` is a single non-interactive script that drives
+`examples/policy-demo` through every M2 surface in one run:
+
+* loads `.agent/settings.json` (typed allow/disallow `ToolRule`s + built-in
+  hook flags),
+* fixes the failing test under `--permission-mode dontAsk` with
+  `Read,Glob,Grep,Edit,Bash,TodoWrite`,
+* lists / shows / exports the resulting session,
+* appends a follow-up turn via `code-agent continue`,
+* branches the run via `code-agent fork` with `--log-format json` and
+  prints the AgentEvent type histogram from the JSON telemetry,
+* drives a live policy denial — the agent attempts to read `.env`, the
+  `Read:**/.env*` disallow rule fires, and the script asserts the file
+  hash never changed.
+
+```sh
+export ANTHROPIC_API_KEY=...
+./examples/m2-e2e-demo.sh
+```
+
+The script is idempotent — Step 1 restores `examples/policy-demo/src/lib.rs`
+to its committed (buggy) state and clears `.agent/sessions/` on every run.
+
 ## Demo: bugfix-demo
 
 Quickest path:
