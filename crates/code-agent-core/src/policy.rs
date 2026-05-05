@@ -314,17 +314,21 @@ impl PolicyEngine {
             }
         }
 
-        // 3. Permission mode pre-checks. Skipped entirely when a hook
-        // returned `Ask` (force_callback): the user has been explicitly
-        // asked, so we must not auto-allow under any mode.
+        // 3a. Plan mode always denies — even when a hook returned `Ask`
+        // (force_callback). Plan mode is an unconditional execution block.
+        if matches!(self.config.permission_mode, PermissionMode::Plan) {
+            return PolicyDecision::deny(
+                PolicyDecisionSource::PermissionMode,
+                "plan mode does not execute tools".into(),
+            );
+        }
+
+        // 3b. Permission mode pre-checks. Skipped when a hook returned `Ask`
+        // (force_callback): the user has been explicitly asked, so we must
+        // not auto-allow under any mode.
         if !force_callback {
             match self.config.permission_mode {
-                PermissionMode::Plan => {
-                    return PolicyDecision::deny(
-                        PolicyDecisionSource::PermissionMode,
-                        "plan mode does not execute tools".into(),
-                    );
-                }
+                PermissionMode::Plan => unreachable!("handled above"),
                 PermissionMode::DontAsk => {
                     // Allow when the structured rules match,
                     // or when the simple-name list contains the tool.
@@ -843,6 +847,49 @@ mod tests {
             .await;
         assert_eq!(d.outcome, PolicyOutcome::Allow);
         assert_eq!(d.source, PolicyDecisionSource::Hook);
+    }
+
+    #[tokio::test]
+    // Plan mode denies even when a hook returns Ask (force_callback=true), not reaching the callback.
+    async fn plan_mode_denies_when_hook_asks() {
+        struct AskHook;
+        #[async_trait]
+        impl Hook for AskHook {
+            async fn call(&self, _: HookInput) -> Result<HookOutput, HookError> {
+                Ok(HookOutput::Ask {
+                    reason: "hook wants to ask".into(),
+                })
+            }
+        }
+        struct AllowCb;
+        #[async_trait]
+        impl PermissionCallback for AllowCb {
+            async fn approve(&self, _: PermissionRequest) -> PermissionDecision {
+                PermissionDecision::AllowOnce
+            }
+        }
+        let hooks = Hooks::new().pre_tool_use("*", Arc::new(AskHook));
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::Plan,
+            callback: Some(Arc::new(AllowCb)),
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, hooks);
+        let sid = sid();
+        let rid = rid();
+        let cwd = std::path::Path::new(".");
+        let d = engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                cwd,
+                "Bash",
+                PermissionKind::Execution,
+                serde_json::json!({"command": "ls"}),
+            ))
+            .await;
+        assert_eq!(d.outcome, PolicyOutcome::Deny);
+        assert_eq!(d.source, PolicyDecisionSource::PermissionMode);
     }
 
     #[tokio::test]
