@@ -298,6 +298,10 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    // Serializes tests that mutate process-wide env vars (CODE_AGENT_CONFIG_HOME,
+    // XDG_CONFIG_HOME, HOME) so they cannot race under parallel test execution.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     // SettingSource::None short-circuits and returns an empty Settings struct.
     fn none_source_skips_io() {
@@ -341,6 +345,8 @@ mod tests {
     // Project settings override user settings on scalar fields, but list
     // fields concatenate.
     fn project_overrides_user_scalar_concat_lists() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let user_home = TempDir::new().unwrap();
         let user_cfg_dir = user_home.path().join("code-agent");
         fs::create_dir_all(&user_cfg_dir).unwrap();
@@ -379,6 +385,41 @@ mod tests {
 
         assert_eq!(s.model.as_deref(), Some("project-model"));
         assert_eq!(s.allowed_tools.len(), 2);
+    }
+
+    #[test]
+    // CODE_AGENT_CONFIG_HOME resolves to the expected user-settings path.
+    fn code_agent_config_home_resolves_user_settings_path() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let cfg_home = TempDir::new().unwrap();
+        let prev_cah = std::env::var("CODE_AGENT_CONFIG_HOME").ok();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+
+        std::env::set_var("CODE_AGENT_CONFIG_HOME", cfg_home.path().to_str().unwrap());
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("HOME");
+
+        let path = user_settings_path();
+
+        // Restore env.
+        match prev_cah {
+            Some(v) => std::env::set_var("CODE_AGENT_CONFIG_HOME", v),
+            None => std::env::remove_var("CODE_AGENT_CONFIG_HOME"),
+        }
+        if let Some(v) = prev_xdg {
+            std::env::set_var("XDG_CONFIG_HOME", v);
+        }
+        if let Some(v) = prev_home {
+            std::env::set_var("HOME", v);
+        }
+
+        assert_eq!(
+            path,
+            Some(cfg_home.path().join("settings.json")),
+            "CODE_AGENT_CONFIG_HOME should produce <dir>/settings.json"
+        );
     }
 
     #[test]
