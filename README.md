@@ -5,15 +5,13 @@ Messages API provider. Targets approximate architectural parity with the
 public surface of Anthropic's Agent SDK while staying small enough to read in
 one sitting.
 
-This is **Milestone 3: Workspace Checkpointing + Rewind Alpha**. M3 layers
-content-addressed local checkpoints onto the M2 runtime. Each top-level
-user request snapshots the workspace before any `Write` or `Edit` mutation;
-`code-agent rewind <id>` restores files (conversation history is left
-intact). M3 also adds optional validation gates (`--validate`,
-`--rewind-on-validation-failure`) and a Bash-aware checkpoint policy that
-warns or denies when shell commands could change files outside checkpoint
-tracking. M1 and M2 surfaces (`query()`, `AgentClient`, hooks, policy,
-settings, sessions, telemetry) work unchanged with checkpointing turned off.
+This is **Milestone 4: MCP Client Alpha**. M4 adds safe Model Context
+Protocol client support on top of the M3 runtime: configured stdio or basic
+Streamable HTTP MCP servers can be initialized, queried with `tools/list`,
+and exposed as normal agent tools named `mcp__<server>__<tool>`. MCP calls
+flow through the existing hooks, permission policy, approvals, sessions,
+telemetry, and logs. Workspace checkpointing still only covers local files:
+MCP external effects are explicitly marked as not rewindable.
 
 ## Workspace layout
 
@@ -24,17 +22,19 @@ crates/
   code-agent-tools/       Read, Write, Edit, Glob, Grep, Bash, TodoWrite
   code-agent-session/     JSONL store + continue/fork/show/export helpers
   code-agent-checkpoint/  M3: LocalCheckpointStore, CheckpointHandle, validation
+  code-agent-mcp/         M4: MCP client config, protocol, stdio/http transports
   code-agent-cli/         `code-agent` binary (run, resume, continue, fork, chat,
-                          sessions, checkpoint, checkpoints, rewind)
+                          sessions, checkpoint, checkpoints, rewind, mcp)
 examples/
   bugfix-demo/            tiny crate with a deliberately failing test (M1 demo)
   policy-demo/            tiny crate plus .agent/settings.json policy + hooks (M2 demo)
   checkpoint-demo/        tiny crate exercising checkpoint + rewind + validation (M3 demo)
+  mcp-demo/               offline fake MCP server and demo project (M4 demo)
 ```
 
-`examples/bugfix-demo`, `examples/policy-demo`, and `examples/checkpoint-demo`
-are **excluded** from the workspace because they ship intentionally failing
-tests for the agent to fix. Run them from their own directories.
+`examples/bugfix-demo`, `examples/policy-demo`, `examples/checkpoint-demo`,
+and `examples/mcp-demo` are **excluded** from the workspace. Run them from
+their own directories.
 
 ## Quick start
 
@@ -82,6 +82,13 @@ cargo run -p code-agent-cli -- checkpoints list
 cargo run -p code-agent-cli -- checkpoints diff <CHECKPOINT_ID>
 cargo run -p code-agent-cli -- rewind <CHECKPOINT_ID> --dry-run
 cargo run -p code-agent-cli -- rewind <CHECKPOINT_ID> --yes
+
+# MCP inspection and direct calls (no Anthropic key needed with the demo).
+cd examples/mcp-demo
+cargo run -p code-agent-cli --manifest-path ../../Cargo.toml -- mcp status
+cargo run -p code-agent-cli --manifest-path ../../Cargo.toml -- mcp tools fake
+cargo run -p code-agent-cli --manifest-path ../../Cargo.toml -- \
+    mcp call fake list_issues --args-json '{}' --yes
 ```
 
 Session ids supplied to `resume`, `fork`, `sessions show`, and
@@ -132,7 +139,9 @@ Hooks observe and influence the loop at well-defined events:
 Decisions merge with priority `Deny > Ask > Allow > AddContext > Continue`.
 Built-in hooks live in `code_agent_core::builtin_hooks`:
 `BlockEnvFileWritesHook`, `BlockDangerousBashHook`, `MaxPatchSizeHook`,
-`AuditLogHook`, `SecretRedactionHook`.
+`AuditLogHook`, `SecretRedactionHook`, plus MCP-specific hooks such as
+`BlockMcpServerHook`, `BlockMcpToolNameHook`, `BlockMcpWriteLikeToolHook`,
+`McpAuditLogHook`, `McpResultSizeLimitHook`, and `McpSecretRedactionHook`.
 
 The permission policy engine evaluates each tool call as:
 
@@ -144,8 +153,10 @@ Allow / disallow rules are typed (`ToolRule`):
 
 * `"Read"` — exact tool by name
 * `"Edit*"` — glob over tool names
+* `"mcp__github__list_issues"` or `"mcp__github__*"` — MCP tools by exact name or glob
 * `{"tool": "Bash", "command_regex": "^cargo (test|check|fmt|clippy)"}`
 * `{"tool": "Edit", "path_glob": "**/.env*"}`
+* `{"server": "github", "tool_glob": "list_*"}` — MCP server/tool glob
 
 Settings come from `<cwd>/.agent/settings.json` (project) and
 `$CODE_AGENT_CONFIG_HOME/settings.json` (or `~/.config/code-agent/`,
@@ -177,6 +188,8 @@ CLI flags:
 
 * `--settings none|project|user|user-and-project`
 * `--config PATH` — load a single explicit settings file
+* `--mcp-config PATH`, `--mcp-enabled true|false`, `--mcp-strict`,
+  `--mcp-timeout SECONDS`
 * `--yes-to "Bash:^cargo test$"` (repeatable)
 * `--deny "Edit:**/.env*"` (repeatable)
 * `--log-format pretty|json`, `--show-usage`, `--quiet`, `--verbose`
@@ -215,6 +228,70 @@ and the byte size of the change.
 | `dontAsk`    | run only tools that appear in `--allowed-tools`           |
 
 `bypassPermissions` is intentionally not implemented in M1.
+
+## MCP Client (M4)
+
+MCP is disabled by default in the library API. The CLI loads MCP when
+`.agent/mcp.json` exists, when `.agent/settings.json` enables it, or when
+`--mcp-config PATH` is passed.
+
+Example `.agent/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "fake": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "-p", "fake-mcp-server", "--quiet"],
+      "startup_timeout_seconds": 10,
+      "request_timeout_seconds": 60
+    }
+  }
+}
+```
+
+MCP settings can also live under `.agent/settings.json`:
+
+```json
+{
+  "mcp": {
+    "enabled": true,
+    "config_file": ".agent/mcp.json",
+    "max_servers": 10,
+    "max_tools_per_server": 200,
+    "max_tool_result_bytes": 262144,
+    "external_effect_policy": "require_explicit_allow_rule"
+  },
+  "allowed_tools": ["Read", "Grep", "mcp__fake__list_issues"]
+}
+```
+
+Supported commands:
+
+```sh
+code-agent mcp list --cwd .
+code-agent mcp status --cwd . --mcp-config .agent/mcp.json
+code-agent mcp tools fake --cwd . --mcp-config .agent/mcp.json
+code-agent mcp call fake list_issues --args-json '{}' --yes
+code-agent mcp resources fake
+code-agent mcp resource read fake fake://docs/parser
+code-agent mcp prompts fake
+```
+
+Agent runs can expose MCP tools through the existing tool allowlist:
+
+```sh
+code-agent run "Summarize open fake issues" \
+  --mcp-config .agent/mcp.json \
+  --allowed-tools "Read,Grep,mcp__fake__list_issues,mcp__fake__get_issue"
+```
+
+MCP tools use `PermissionKind::External`. `acceptEdits` does not approve
+them, `dontAsk` denies unresolved MCP tools, disallow rules override allow
+rules, and the default external-effect policy requires explicit allow rules.
+The approval prompt warns that MCP effects are external and not covered by
+workspace rewind; mutating-looking tool names get a stronger warning.
 
 ## Session persistence
 

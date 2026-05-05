@@ -50,10 +50,10 @@ struct WriteTextTool;
 
 #[async_trait]
 impl Tool for WriteTextTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Write"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "write"
     }
     fn input_schema(&self) -> serde_json::Value {

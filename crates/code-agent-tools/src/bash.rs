@@ -38,11 +38,11 @@ impl BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Bash"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Run a shell command from the workspace root. Output is capped, stdin is closed, and the command is killed after the configured timeout."
     }
 

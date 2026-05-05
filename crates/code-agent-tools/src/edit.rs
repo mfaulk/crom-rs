@@ -29,11 +29,11 @@ impl EditTool {
 
 #[async_trait]
 impl Tool for EditTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Edit"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Replace exactly one occurrence of `old_string` with `new_string` inside a UTF-8 file. Errors if `old_string` is missing or appears more than once."
     }
 

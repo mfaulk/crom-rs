@@ -16,6 +16,8 @@ pub enum ToolRule {
     BashCommandRegex(String),
     /// Match a tool whose input contains a `file_path` matching the path glob.
     FilePathGlob { tool: String, pattern: String },
+    /// Match MCP tools from a server by remote tool-name glob.
+    McpServerGlob { server: String, tool_glob: String },
 }
 
 impl ToolRule {
@@ -47,6 +49,19 @@ impl ToolRule {
         Ok(ToolRule::ToolGlob(p))
     }
 
+    pub fn try_mcp_server_glob(
+        server: impl Into<String>,
+        tool_glob: impl Into<String>,
+    ) -> Result<Self, String> {
+        let server = server.into();
+        let tool_glob = tool_glob.into();
+        if !code_agent_mcp::is_identifier_safe(&server) {
+            return Err(format!("invalid MCP server name {:?}", server));
+        }
+        Glob::new(&tool_glob).map_err(|e| format!("invalid MCP tool_glob {:?}: {e}", tool_glob))?;
+        Ok(ToolRule::McpServerGlob { server, tool_glob })
+    }
+
     /// Returns true if this rule matches the requested tool name and input.
     pub fn matches(&self, tool_name: &str, input: &Value) -> bool {
         match self {
@@ -71,6 +86,12 @@ impl ToolRule {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
                 glob_match(pattern, path)
+            }
+            ToolRule::McpServerGlob { server, tool_glob } => {
+                let Some(parts) = code_agent_mcp::parse_agent_tool_name(tool_name) else {
+                    return false;
+                };
+                server == &parts.server_name && glob_match(tool_glob, &parts.remote_tool_name)
             }
         }
     }
@@ -107,6 +128,12 @@ impl Serialize for ToolRule {
                 m.serialize_entry("path_glob", pattern)?;
                 m.end()
             }
+            ToolRule::McpServerGlob { server, tool_glob } => {
+                let mut m = serializer.serialize_map(Some(2))?;
+                m.serialize_entry("server", server)?;
+                m.serialize_entry("tool_glob", tool_glob)?;
+                m.end()
+            }
         }
     }
 }
@@ -141,6 +168,8 @@ impl<'de> Deserialize<'de> for ToolRule {
                 let mut tool: Option<String> = None;
                 let mut command_regex: Option<String> = None;
                 let mut path_glob: Option<String> = None;
+                let mut server: Option<String> = None;
+                let mut tool_glob: Option<String> = None;
 
                 // Track unknown keys so a typo like `commandRegex` fails fast
                 // instead of silently degrading to an unconditional
@@ -152,6 +181,8 @@ impl<'de> Deserialize<'de> for ToolRule {
                         "tool" => tool = Some(map.next_value::<String>()?),
                         "command_regex" => command_regex = Some(map.next_value::<String>()?),
                         "path_glob" => path_glob = Some(map.next_value::<String>()?),
+                        "server" => server = Some(map.next_value::<String>()?),
+                        "tool_glob" => tool_glob = Some(map.next_value::<String>()?),
                         other => {
                             unknown_keys.push(other.to_string());
                             let _: serde_json::Value = map.next_value()?;
@@ -160,9 +191,22 @@ impl<'de> Deserialize<'de> for ToolRule {
                 }
                 if !unknown_keys.is_empty() {
                     return Err(de::Error::custom(format!(
-                        "tool rule object has unknown key(s): {} (allowed: tool, command_regex, path_glob)",
+                        "tool rule object has unknown key(s): {} (allowed: tool, command_regex, path_glob, server, tool_glob)",
                         unknown_keys.join(", ")
                     )));
+                }
+                if server.is_some() || tool_glob.is_some() {
+                    if tool.is_some() || command_regex.is_some() || path_glob.is_some() {
+                        return Err(de::Error::custom(
+                            "MCP tool rule cannot be combined with tool, command_regex, or path_glob",
+                        ));
+                    }
+                    let server = server
+                        .ok_or_else(|| de::Error::custom("MCP tool rule missing `server`"))?;
+                    let tool_glob = tool_glob
+                        .ok_or_else(|| de::Error::custom("MCP tool rule missing `tool_glob`"))?;
+                    return ToolRule::try_mcp_server_glob(server, tool_glob)
+                        .map_err(de::Error::custom);
                 }
                 let tool =
                     tool.ok_or_else(|| de::Error::custom("tool rule object missing `tool`"))?;
@@ -269,6 +313,26 @@ mod tests {
         assert!(r.matches("Edit", &serde_json::json!({"file_path": "src/.env.local"})));
         assert!(!r.matches("Edit", &serde_json::json!({"file_path": "src/lib.rs"})));
         assert!(!r.matches("Write", &serde_json::json!({"file_path": ".env"})));
+    }
+
+    #[test]
+    // Parses MCP server/tool glob rule objects.
+    fn parses_mcp_server_glob() {
+        let v: ToolRule =
+            serde_json::from_str(r#"{"server":"github","tool_glob":"list_*"}"#).unwrap();
+        assert!(matches!(v, ToolRule::McpServerGlob { .. }));
+    }
+
+    #[test]
+    // MCP server glob rules match namespaced MCP tool names.
+    fn mcp_server_glob_matches() {
+        let r = ToolRule::McpServerGlob {
+            server: "github".into(),
+            tool_glob: "list_*".into(),
+        };
+        assert!(r.matches("mcp__github__list_issues", &serde_json::json!({})));
+        assert!(!r.matches("mcp__github__delete_issue", &serde_json::json!({})));
+        assert!(!r.matches("mcp__docs__list_issues", &serde_json::json!({})));
     }
 }
 

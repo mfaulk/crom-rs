@@ -108,4 +108,6 @@ pub struct SystemInit {
     pub model: String,
     pub tools: Vec<String>,
     pub permission_mode: crate::permission::PermissionMode,
+    #[serde(default)]
+    pub mcp_servers: Vec<code_agent_mcp::McpServerStatus>,
 }

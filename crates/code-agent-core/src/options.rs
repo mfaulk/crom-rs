@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::permission::{ApprovalMemoryMode, PermissionCallback, PermissionMode};
 use crate::tool_rule::ToolRule;
+use code_agent_mcp::McpOptions;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
@@ -87,6 +88,7 @@ pub struct AgentOptions {
     pub project_instructions: Option<String>,
     pub max_tokens: u32,
     pub approval_memory: ApprovalMemoryMode,
+    pub mcp: McpOptions,
 }
 
 impl Default for AgentOptions {
@@ -113,6 +115,7 @@ impl Default for AgentOptions {
             project_instructions: None,
             max_tokens: 4096,
             approval_memory: ApprovalMemoryMode::Session,
+            mcp: McpOptions::default(),
         }
     }
 }
@@ -130,6 +133,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("session_id", &self.session_id)
             .field("max_tokens", &self.max_tokens)
             .field("approval_memory", &self.approval_memory)
+            .field("mcp_enabled", &self.mcp.enabled)
             .finish()
     }
 }

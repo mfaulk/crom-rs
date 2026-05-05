@@ -15,6 +15,7 @@ code-agent-anthropic = { workspace = true }
 code-agent-tools = { workspace = true }
 code-agent-session = { workspace = true }
 code-agent-checkpoint = { workspace = true }
+code-agent-mcp = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

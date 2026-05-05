@@ -83,6 +83,66 @@ pub enum AgentTelemetryEvent {
         run_id: RunId,
         turn_index: u32,
     },
+    McpServerConnecting {
+        session_id: SessionId,
+        run_id: RunId,
+        server_name: String,
+        transport: code_agent_mcp::McpTransportKind,
+    },
+    McpServerConnected {
+        session_id: SessionId,
+        run_id: RunId,
+        server_name: String,
+        transport: code_agent_mcp::McpTransportKind,
+        tool_count: usize,
+        outcome: TelemetryOutcome,
+    },
+    McpServerFailed {
+        session_id: SessionId,
+        run_id: RunId,
+        server_name: String,
+        transport: code_agent_mcp::McpTransportKind,
+        outcome: TelemetryOutcome,
+        error_category: String,
+    },
+    McpToolsDiscovered {
+        session_id: SessionId,
+        run_id: RunId,
+        server_name: String,
+        tool_count: usize,
+    },
+    McpToolCallStarted {
+        session_id: SessionId,
+        run_id: RunId,
+        server_name: String,
+        tool_name: String,
+    },
+    McpToolCallCompleted {
+        session_id: SessionId,
+        run_id: RunId,
+        server_name: String,
+        tool_name: String,
+        duration_ms: u64,
+        result_bytes: usize,
+        outcome: TelemetryOutcome,
+    },
+    McpToolCallFailed {
+        session_id: SessionId,
+        run_id: RunId,
+        server_name: String,
+        tool_name: String,
+        error_category: String,
+    },
+    McpConfigLoaded {
+        session_id: SessionId,
+        run_id: RunId,
+        server_count: usize,
+    },
+    McpConfigError {
+        session_id: SessionId,
+        run_id: RunId,
+        error_category: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -66,8 +66,8 @@ pub struct ToolContext {
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
     fn input_schema(&self) -> serde_json::Value;
     fn permission_kind(&self) -> PermissionKind;
 
@@ -123,7 +123,16 @@ impl ToolRegistry {
     pub fn filter(&self, allowed: &[String]) -> Self {
         let mut out = ToolRegistry::new();
         for n in allowed {
-            if let Some(t) = self.get(n) {
+            if n.contains('*') || n.contains('?') {
+                if let Ok(glob) = globset::Glob::new(n) {
+                    let matcher = glob.compile_matcher();
+                    for (name, tool) in &self.tools {
+                        if matcher.is_match(name) {
+                            out.register(tool.clone());
+                        }
+                    }
+                }
+            } else if let Some(t) = self.get(n) {
                 out.register(t);
             }
         }

@@ -26,11 +26,11 @@ impl ReadTool {
 
 #[async_trait]
 impl Tool for ReadTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Read"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Read a UTF-8 text file from the workspace. Returns the file's contents. Paths are resolved relative to the workspace root and must stay inside it."
     }
 

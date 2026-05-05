@@ -55,10 +55,10 @@ struct WriteTextTool;
 
 #[async_trait]
 impl Tool for WriteTextTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Write"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "write"
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -404,10 +404,10 @@ async fn bash_require_explicit_approval_denies_implicit() {
     }
     #[async_trait]
     impl Tool for BashStub {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "Bash"
         }
-        fn description(&self) -> &'static str {
+        fn description(&self) -> &str {
             ""
         }
         fn input_schema(&self) -> serde_json::Value {

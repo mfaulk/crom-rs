@@ -52,10 +52,10 @@ struct EchoTool;
 
 #[async_trait]
 impl Tool for EchoTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Echo"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "echo"
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -79,10 +79,10 @@ struct WriteSideEffectTool {
 
 #[async_trait]
 impl Tool for WriteSideEffectTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "WriteFlag"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         ""
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -107,10 +107,10 @@ struct ExecTool {
 
 #[async_trait]
 impl Tool for ExecTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Exec"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         ""
     }
     fn input_schema(&self) -> serde_json::Value {

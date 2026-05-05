@@ -1,0 +1,15 @@
+{
+  "permission_mode": "dontAsk",
+  "allowed_tools": [
+    "Read",
+    "Grep",
+    "mcp__fake__list_issues",
+    "mcp__fake__get_issue",
+    "mcp__fake__search_docs"
+  ],
+  "mcp": {
+    "enabled": true,
+    "config_file": ".agent/mcp.json",
+    "external_effect_policy": "require_explicit_allow_rule"
+  }
+}

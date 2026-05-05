@@ -20,6 +20,9 @@ use crate::events::{
     ResultSubtype, ToolCallCompleted, ToolCallDenied, ToolCallStarted, UserToolResult,
 };
 use crate::hooks::{aggregate, HookAggregateDecision, HookEventName, HookInput, Hooks, StopReason};
+use crate::mcp::{
+    mcp_completion_from_result, mcp_failure_from_error, register_mcp_tools, tool_metadata,
+};
 use crate::options::{AgentOptions, SessionId};
 use crate::permission::PermissionMode;
 use crate::policy::{ApprovalMemory, PolicyConfig, PolicyEngine, PolicyOutcome, PolicyToolContext};
@@ -270,6 +273,155 @@ pub(crate) async fn run_loop(
         .clone()
         .unwrap_or_else(SessionId::default);
 
+    let mut tools = tools;
+    let mcp_report = register_mcp_tools(&mut tools, &options.mcp).await;
+    if options.mcp.enabled {
+        emit_telemetry(
+            &telemetry_sink,
+            AgentTelemetryEvent::McpConfigLoaded {
+                session_id: session_id.clone(),
+                run_id: cfg.run_id.clone(),
+                server_count: options.mcp.servers.len(),
+            },
+        )
+        .await;
+    }
+    for status in &mcp_report.statuses {
+        emit_telemetry(
+            &telemetry_sink,
+            AgentTelemetryEvent::McpServerConnecting {
+                session_id: session_id.clone(),
+                run_id: cfg.run_id.clone(),
+                server_name: status.name.clone(),
+                transport: status.transport,
+            },
+        )
+        .await;
+        emit(
+            &tx,
+            &session_sink,
+            &session_id,
+            AgentEvent::McpServerConnecting(code_agent_mcp::McpServerConnecting {
+                server_name: status.name.clone(),
+                transport: status.transport,
+            }),
+        )
+        .await;
+        match status.status {
+            code_agent_mcp::McpConnectionStatus::Connected => {
+                emit_telemetry(
+                    &telemetry_sink,
+                    AgentTelemetryEvent::McpServerConnected {
+                        session_id: session_id.clone(),
+                        run_id: cfg.run_id.clone(),
+                        server_name: status.name.clone(),
+                        transport: status.transport,
+                        tool_count: status.tool_count,
+                        outcome: TelemetryOutcome::Ok,
+                    },
+                )
+                .await;
+                emit(
+                    &tx,
+                    &session_sink,
+                    &session_id,
+                    AgentEvent::McpServerConnected(code_agent_mcp::McpServerConnected {
+                        server_name: status.name.clone(),
+                        transport: status.transport,
+                        protocol_version: status.protocol_version.clone().unwrap_or_default(),
+                        tool_count: status.tool_count,
+                        resource_count: status.resource_count,
+                        prompt_count: status.prompt_count,
+                        server_info: status.server_info.clone(),
+                    }),
+                )
+                .await;
+            }
+            code_agent_mcp::McpConnectionStatus::Failed => {
+                emit_telemetry(
+                    &telemetry_sink,
+                    AgentTelemetryEvent::McpServerFailed {
+                        session_id: session_id.clone(),
+                        run_id: cfg.run_id.clone(),
+                        server_name: status.name.clone(),
+                        transport: status.transport,
+                        outcome: TelemetryOutcome::Error,
+                        error_category: "mcp_server".into(),
+                    },
+                )
+                .await;
+                emit(
+                    &tx,
+                    &session_sink,
+                    &session_id,
+                    AgentEvent::McpServerFailed(code_agent_mcp::McpServerFailed {
+                        server_name: status.name.clone(),
+                        transport: status.transport,
+                        error: status.error.clone().unwrap_or_else(|| "unknown".into()),
+                    }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+    for discovered in &mcp_report.discovered {
+        emit_telemetry(
+            &telemetry_sink,
+            AgentTelemetryEvent::McpToolsDiscovered {
+                session_id: session_id.clone(),
+                run_id: cfg.run_id.clone(),
+                server_name: discovered.server_name.clone(),
+                tool_count: discovered.tools.len(),
+            },
+        )
+        .await;
+        emit(
+            &tx,
+            &session_sink,
+            &session_id,
+            AgentEvent::McpToolsDiscovered(discovered.clone()),
+        )
+        .await;
+    }
+    for (server_name, log) in &mcp_report.logs {
+        emit(
+            &tx,
+            &session_sink,
+            &session_id,
+            AgentEvent::McpServerLog(code_agent_mcp::McpServerLog {
+                server_name: server_name.clone(),
+                stream: log.stream,
+                message: log.message.clone(),
+                truncated: log.truncated,
+            }),
+        )
+        .await;
+    }
+    if options.mcp.strict
+        && mcp_report
+            .statuses
+            .iter()
+            .any(|s| matches!(s.status, code_agent_mcp::McpConnectionStatus::Failed))
+    {
+        emit(
+            &tx,
+            &session_sink,
+            &session_id,
+            AgentEvent::Result(AgentResult {
+                subtype: ResultSubtype::ErrorDuringExecution,
+                result: Some("strict MCP mode: one or more MCP servers failed".into()),
+                session_id: session_id.clone(),
+                run_id: Some(cfg.run_id.clone()),
+                num_turns: 0,
+                usage: None,
+                total_cost_usd: None,
+            }),
+        )
+        .await;
+        return Ok(());
+    }
+
     // Build effective tool registry by allowed names.
     let allowed_tools = if options.allowed_tools.is_empty() {
         tools.clone()
@@ -284,6 +436,7 @@ pub(crate) async fn run_loop(
             model: options.model.clone(),
             tools: allowed_tools.names(),
             permission_mode: options.permission_mode,
+            mcp_servers: mcp_report.statuses.clone(),
         };
         emit(
             &tx,
@@ -328,6 +481,7 @@ pub(crate) async fn run_loop(
             callback: options.permission_callback.clone(),
             memory: approval_memory.clone(),
             memory_mode: options.approval_memory,
+            mcp_external_effect_policy: options.mcp.external_effect_policy,
         },
         hooks.clone(),
     );
@@ -833,6 +987,7 @@ pub(crate) async fn run_loop(
                 permission_kind: kind,
                 tool_input: call.input.clone(),
                 tool_summary,
+                metadata: tool_metadata(&call.name, None),
             };
             let pdec = policy.evaluate_tool(pctx).await;
 
@@ -1010,6 +1165,29 @@ pub(crate) async fn run_loop(
                 },
             )
             .await;
+            if let Some(parts) = code_agent_mcp::parse_agent_tool_name(&call.name) {
+                emit_telemetry(
+                    &telemetry_sink,
+                    AgentTelemetryEvent::McpToolCallStarted {
+                        session_id: session_id.clone(),
+                        run_id: cfg.run_id.clone(),
+                        server_name: parts.server_name.clone(),
+                        tool_name: call.name.clone(),
+                    },
+                )
+                .await;
+                emit(
+                    &tx,
+                    &session_sink,
+                    &session_id,
+                    AgentEvent::McpToolCallStarted(code_agent_mcp::McpToolCallStarted {
+                        server_name: parts.server_name,
+                        remote_tool_name: parts.remote_tool_name,
+                        agent_tool_name: call.name.clone(),
+                    }),
+                )
+                .await;
+            }
             let exec = tool.execute(effective_input.clone(), ctx).await;
             let duration_ms = elapsed_ms(started);
             let (text, is_error, tool_result_obj) = match &exec {
@@ -1030,6 +1208,59 @@ pub(crate) async fn run_loop(
                 }
                 Err(e) => (format!("Tool error: {e}"), true, None),
             };
+
+            match &exec {
+                Ok(res) => {
+                    if let Some(ev) = mcp_completion_from_result(&call.name, res, duration_ms) {
+                        emit_telemetry(
+                            &telemetry_sink,
+                            AgentTelemetryEvent::McpToolCallCompleted {
+                                session_id: session_id.clone(),
+                                run_id: cfg.run_id.clone(),
+                                server_name: ev.server_name.clone(),
+                                tool_name: ev.agent_tool_name.clone(),
+                                duration_ms: ev.duration_ms,
+                                result_bytes: ev.result_bytes,
+                                outcome: if ev.is_error {
+                                    TelemetryOutcome::Error
+                                } else {
+                                    TelemetryOutcome::Ok
+                                },
+                            },
+                        )
+                        .await;
+                        emit(
+                            &tx,
+                            &session_sink,
+                            &session_id,
+                            AgentEvent::McpToolCallCompleted(ev),
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    if let Some(ev) = mcp_failure_from_error(&call.name, &e.to_string()) {
+                        emit_telemetry(
+                            &telemetry_sink,
+                            AgentTelemetryEvent::McpToolCallFailed {
+                                session_id: session_id.clone(),
+                                run_id: cfg.run_id.clone(),
+                                server_name: ev.server_name.clone(),
+                                tool_name: ev.agent_tool_name.clone(),
+                                error_category: "mcp_tool".into(),
+                            },
+                        )
+                        .await;
+                        emit(
+                            &tx,
+                            &session_sink,
+                            &session_id,
+                            AgentEvent::McpToolCallFailed(ev),
+                        )
+                        .await;
+                    }
+                }
+            }
 
             // If the tool was TodoWrite, broadcast a TodoUpdate.
             if call.name == "TodoWrite" {
@@ -1097,6 +1328,7 @@ pub(crate) async fn run_loop(
                 hi.tool_name = Some(call.name.clone());
                 hi.tool_input = Some(effective_input.clone());
                 hi.tool_result = tool_result_obj.clone();
+                hi.metadata = tool_metadata(&call.name, None);
                 let records = hooks.dispatch(&hi).await;
                 let (agg, _) = aggregate(&records);
                 emit(
