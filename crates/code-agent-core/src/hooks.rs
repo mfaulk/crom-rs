@@ -113,6 +113,16 @@ pub enum HookOutput {
 
 #[derive(Debug, Error)]
 pub enum HookError {
+    /// The tool-name pattern supplied to a hook registration method is invalid.
+    #[error("invalid hook pattern {pattern:?} for event {event:?}: {parser_error}")]
+    Pattern {
+        /// The hook event the pattern was registered for.
+        event: HookEventName,
+        /// The pattern string the caller supplied.
+        pattern: String,
+        /// Underlying parser error from `ToolMatcher::parse`.
+        parser_error: String,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -187,8 +197,17 @@ pub struct HookMatcher {
     pub hook: Arc<dyn Hook>,
 }
 
+impl std::fmt::Debug for HookMatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookMatcher")
+            .field("event", &self.event)
+            .field("matcher", &self.matcher)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Registered hooks for an `AgentClient`.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Hooks {
     matchers: Vec<HookMatcher>,
 }
@@ -199,38 +218,67 @@ impl Hooks {
     }
 
     /// Register a hook for a given event with a tool-name matcher pattern.
-    pub fn add(mut self, event: HookEventName, pattern: &str, hook: Arc<dyn Hook>) -> Self {
-        let matcher = ToolMatcher::parse(pattern).unwrap_or(ToolMatcher::All);
+    ///
+    /// Returns `Err(HookError::Pattern)` if `pattern` fails to compile, so
+    /// callers learn about typos at registration time instead of silently
+    /// falling back to "match every tool".
+    pub fn add(
+        mut self,
+        event: HookEventName,
+        pattern: &str,
+        hook: Arc<dyn Hook>,
+    ) -> Result<Self, HookError> {
+        let matcher = ToolMatcher::parse(pattern).map_err(|e| HookError::Pattern {
+            event,
+            pattern: pattern.to_owned(),
+            parser_error: e,
+        })?;
         self.matchers.push(HookMatcher {
             event,
             matcher,
             hook,
         });
-        self
+        Ok(self)
     }
 
+    /// Register a hook that fires on every `UserPromptSubmit` event.
+    ///
+    /// Infallible because the pattern is always `"*"`.
     pub fn user_prompt_submit(self, hook: Arc<dyn Hook>) -> Self {
         self.add(HookEventName::UserPromptSubmit, "*", hook)
+            .expect("\"*\" is always a valid pattern")
     }
 
-    pub fn pre_tool_use(self, pattern: &str, hook: Arc<dyn Hook>) -> Self {
+    pub fn pre_tool_use(self, pattern: &str, hook: Arc<dyn Hook>) -> Result<Self, HookError> {
         self.add(HookEventName::PreToolUse, pattern, hook)
     }
 
-    pub fn post_tool_use(self, pattern: &str, hook: Arc<dyn Hook>) -> Self {
+    pub fn post_tool_use(self, pattern: &str, hook: Arc<dyn Hook>) -> Result<Self, HookError> {
         self.add(HookEventName::PostToolUse, pattern, hook)
     }
 
-    pub fn post_tool_use_failure(self, pattern: &str, hook: Arc<dyn Hook>) -> Self {
+    pub fn post_tool_use_failure(
+        self,
+        pattern: &str,
+        hook: Arc<dyn Hook>,
+    ) -> Result<Self, HookError> {
         self.add(HookEventName::PostToolUseFailure, pattern, hook)
     }
 
+    /// Register a hook that fires after every tool batch.
+    ///
+    /// Infallible because the pattern is always `"*"`.
     pub fn post_tool_batch(self, hook: Arc<dyn Hook>) -> Self {
         self.add(HookEventName::PostToolBatch, "*", hook)
+            .expect("\"*\" is always a valid pattern")
     }
 
+    /// Register a hook that fires on agent stop.
+    ///
+    /// Infallible because the pattern is always `"*"`.
     pub fn stop(self, hook: Arc<dyn Hook>) -> Self {
         self.add(HookEventName::Stop, "*", hook)
+            .expect("\"*\" is always a valid pattern")
     }
 
     pub fn matchers(&self) -> &[HookMatcher] {
@@ -438,7 +486,9 @@ mod tests {
     async fn dispatch_filters_by_event_and_matcher() {
         let hooks = Hooks::new()
             .pre_tool_use("Bash", Arc::new(FixedHook(HookOutput::Continue)))
-            .post_tool_use("*", Arc::new(FixedHook(HookOutput::Continue)));
+            .unwrap()
+            .post_tool_use("*", Arc::new(FixedHook(HookOutput::Continue)))
+            .unwrap();
         let input = HookInput {
             tool_name: Some("Bash".into()),
             ..HookInput::new(
@@ -450,6 +500,54 @@ mod tests {
         };
         let records = hooks.dispatch(&input).await;
         assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    // An invalid glob pattern (unbalanced bracket + wildcard) returns
+    // Err(HookError::Pattern) carrying the event, the bad pattern, and the
+    // underlying parser error — instead of silently matching all tools.
+    fn add_with_bad_pattern_returns_err() {
+        let h = Arc::new(FixedHook(HookOutput::Continue));
+        // "[bad*" triggers the glob path (contains '*') with an unbalanced '['.
+        let result = Hooks::new().pre_tool_use("[bad*", h);
+        let err = result.expect_err("expected Err(HookError::Pattern)");
+        match &err {
+            HookError::Pattern {
+                event,
+                pattern,
+                parser_error,
+            } => {
+                assert_eq!(*event, HookEventName::PreToolUse);
+                assert_eq!(pattern, "[bad*");
+                assert!(
+                    !parser_error.is_empty(),
+                    "underlying parser error must be preserved"
+                );
+            }
+            other => panic!("expected HookError::Pattern, got {other:?}"),
+        }
+        // The Display form must surface the event and pattern so operators
+        // can locate the bad registration.
+        let msg = format!("{err}");
+        assert!(msg.contains("[bad*"));
+        assert!(msg.contains("PreToolUse"));
+    }
+
+    #[test]
+    // A bad pattern in a chained call propagates the error (carrying the
+    // event of the failing call) and discards the builder.
+    fn chained_bad_pattern_propagates_err() {
+        let h1 = Arc::new(FixedHook(HookOutput::Continue));
+        let h2 = Arc::new(FixedHook(HookOutput::Continue));
+        let result = Hooks::new()
+            .pre_tool_use("Bash", h1)
+            .and_then(|hooks| hooks.post_tool_use("[bad*", h2));
+        let err = result.expect_err("expected Err(HookError::Pattern)");
+        let HookError::Pattern { event, pattern, .. } = &err else {
+            panic!("expected HookError::Pattern, got {err:?}");
+        };
+        assert_eq!(*event, HookEventName::PostToolUse);
+        assert_eq!(pattern, "[bad*");
     }
 
     #[test]

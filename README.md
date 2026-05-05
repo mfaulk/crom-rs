@@ -352,9 +352,12 @@ use code_agent_core::{
     BlockDangerousBashHook, BlockEnvFileWritesHook, Hooks, ToolRule,
 };
 
+// Tool-pattern registration methods return `Result<Self, HookError>` so that
+// a typo'd pattern fails loudly instead of silently widening to "match
+// every tool".
 let hooks = Hooks::new()
-    .pre_tool_use("Edit|Write", Arc::new(BlockEnvFileWritesHook::default()))
-    .pre_tool_use("Bash", Arc::new(BlockDangerousBashHook::default()));
+    .pre_tool_use("Edit|Write", Arc::new(BlockEnvFileWritesHook::default()))?
+    .pre_tool_use("Bash", Arc::new(BlockDangerousBashHook::default()))?;
 
 let opts = code_agent_core::AgentOptions {
     allowed_tool_rules: vec![
