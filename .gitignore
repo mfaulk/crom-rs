@@ -1,6 +1,9 @@
 /target
 **/target
 .agent/
+# Demos commit their .agent/settings.json so the agent loads expected config.
+!examples/*/.agent/
+!examples/*/.agent/settings.json
 *.swp
 .DS_Store
 .env

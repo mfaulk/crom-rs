@@ -16,6 +16,7 @@ use futures::stream::Stream;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::agent::{run_loop, Agent, AgentBuilder, RunConfig, SessionSink, TelemetrySink};
+use crate::checkpoint::{CheckpointApi, CheckpointHandle};
 use crate::conversation::{Message, MessageRole};
 use crate::errors::AgentError;
 use crate::events::{AgentEvent, AgentResult, ResultSubtype};
@@ -62,6 +63,8 @@ pub struct AgentClientBuilder {
     session_start: SessionStart,
     forced_session_id: Option<SessionId>,
     source_session_id: Option<SessionId>,
+    checkpoint_handle: Option<Arc<dyn CheckpointHandle>>,
+    checkpoint_api: Option<Arc<dyn CheckpointApi>>,
 }
 
 impl AgentClientBuilder {
@@ -154,6 +157,20 @@ impl AgentClientBuilder {
         self
     }
 
+    /// Attach a checkpoint handle. The handle is consulted before each
+    /// mutating tool call.
+    pub fn checkpoint_handle(mut self, handle: Arc<dyn CheckpointHandle>) -> Self {
+        self.checkpoint_handle = Some(handle);
+        self
+    }
+
+    /// Attach a checkpoint API used by `AgentClient::create_checkpoint`,
+    /// `list_checkpoints`, `diff_checkpoint`, and `rewind_files`.
+    pub fn checkpoint_api(mut self, api: Arc<dyn CheckpointApi>) -> Self {
+        self.checkpoint_api = Some(api);
+        self
+    }
+
     pub async fn build(self) -> Result<AgentClient, AgentError> {
         let provider = self
             .provider
@@ -195,6 +212,8 @@ impl AgentClientBuilder {
             cancel: Mutex::new(None),
             approval_memory,
             session_id: session_id.clone(),
+            checkpoint_handle: self.checkpoint_handle,
+            checkpoint_api: self.checkpoint_api,
         };
 
         let inner = Arc::new(inner);
@@ -308,6 +327,58 @@ impl AgentClient {
             .map_err(|_| AgentError::other("client runtime ended"))
     }
 
+    /// Create a manual checkpoint. Requires a `CheckpointApi` to have been
+    /// attached at build time.
+    pub async fn create_checkpoint(
+        &mut self,
+        description: impl Into<String>,
+    ) -> Result<String, AgentError> {
+        let api = self
+            .inner
+            .checkpoint_api
+            .clone()
+            .ok_or_else(|| AgentError::other("checkpointing not enabled"))?;
+        api.create_checkpoint(Some(description.into())).await
+    }
+
+    /// List checkpoints for the active session. Returns JSON for cross-crate
+    /// transport.
+    pub async fn list_checkpoints(&self) -> Result<serde_json::Value, AgentError> {
+        let api = self
+            .inner
+            .checkpoint_api
+            .clone()
+            .ok_or_else(|| AgentError::other("checkpointing not enabled"))?;
+        api.list_checkpoints().await
+    }
+
+    /// Diff a checkpoint against the current workspace.
+    pub async fn diff_checkpoint(
+        &self,
+        checkpoint_id: impl AsRef<str>,
+    ) -> Result<serde_json::Value, AgentError> {
+        let api = self
+            .inner
+            .checkpoint_api
+            .clone()
+            .ok_or_else(|| AgentError::other("checkpointing not enabled"))?;
+        api.diff_checkpoint(checkpoint_id.as_ref()).await
+    }
+
+    /// Rewind workspace files to a checkpoint. Conversation history is not
+    /// rewound.
+    pub async fn rewind_files(
+        &mut self,
+        checkpoint_id: impl AsRef<str>,
+    ) -> Result<serde_json::Value, AgentError> {
+        let api = self
+            .inner
+            .checkpoint_api
+            .clone()
+            .ok_or_else(|| AgentError::other("checkpointing not enabled"))?;
+        api.rewind(checkpoint_id.as_ref(), false, false).await
+    }
+
     /// Shut down the runtime. Pending queued messages are dropped.
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         let _ = self.cmd_tx.send(ClientCommand::Shutdown).await;
@@ -363,6 +434,8 @@ struct ClientInner {
     cancel: Mutex<Option<CancelHandle>>,
     approval_memory: ApprovalMemory,
     session_id: SessionId,
+    checkpoint_handle: Option<Arc<dyn CheckpointHandle>>,
+    checkpoint_api: Option<Arc<dyn CheckpointApi>>,
 }
 
 #[derive(Clone)]
@@ -475,7 +548,7 @@ impl ClientRuntime {
         let options_snapshot = self.inner.options.lock().await.clone();
         let initial_history = self.inner.initial_history.lock().await.clone();
 
-        let agent_result = AgentBuilder::new()
+        let mut builder = AgentBuilder::new()
             .options(options_snapshot.clone())
             .provider(self.inner.provider.clone())
             .tools(self.inner.tools.clone())
@@ -484,8 +557,11 @@ impl ClientRuntime {
             .initial_history(initial_history.clone())
             .session_sink_opt(self.inner.session_sink.clone())
             .telemetry_sink_opt(self.inner.telemetry_sink.clone())
-            .pricing_opt(self.inner.pricing)
-            .build();
+            .pricing_opt(self.inner.pricing);
+        if let Some(h) = self.inner.checkpoint_handle.clone() {
+            builder = builder.checkpoint_handle(h);
+        }
+        let agent_result = builder.build();
         let agent = match agent_result {
             Ok(a) => a,
             Err(e) => {

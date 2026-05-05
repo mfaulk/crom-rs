@@ -7,6 +7,11 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use code_agent_anthropic::{AnthropicConfig, AnthropicProvider};
+use code_agent_checkpoint::{
+    AgentCheckpointHandle, BashCheckpointPolicy, CheckpointFailureMode, CheckpointOptions,
+    CheckpointStore, CreateCheckpointRequest, DiffCheckpointRequest, FileDiff, LocalCheckpointApi,
+    LocalCheckpointStore, RewindRequest, ValidationOptions,
+};
 use code_agent_core::agent::{SessionSink, TelemetrySink};
 use code_agent_core::{
     is_valid_session_id_str, AgentClient, AgentEvent, AgentOptions, AgentTelemetryEvent,
@@ -15,6 +20,7 @@ use code_agent_core::{
     PermissionDecision, PermissionMode, PermissionRequest, ResultSubtype, SecretRedactionHook,
     SessionId, SessionStart, SettingSource, Settings, ToolRegistry, ToolRule,
 };
+use code_agent_core::{CheckpointApi, CheckpointHandle, RunId};
 use code_agent_session::{
     append_settings_snapshot, append_user_prompt, export_session, fork_session,
     replay_conversation, summarize_session, ExportFormat, FsSessionStore, SessionSinkAdapter,
@@ -22,6 +28,19 @@ use code_agent_session::{
 };
 use code_agent_tools::{register_builtin_with_limits, ToolLimits};
 use futures::StreamExt;
+use std::time::Duration as StdDuration;
+
+type RunCheckpointSetup = (
+    Option<Arc<dyn CheckpointHandle>>,
+    Option<Arc<LocalCheckpointStore>>,
+    Option<String>,
+);
+
+type ChatCheckpointSetup = (
+    Option<Arc<LocalCheckpointStore>>,
+    Option<Arc<code_agent_checkpoint::RotatingCheckpointHandle>>,
+    Option<Arc<dyn CheckpointApi>>,
+);
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -47,6 +66,70 @@ enum Command {
     /// Manage sessions.
     #[command(subcommand)]
     Sessions(SessionsCommand),
+    /// Create a manual workspace checkpoint.
+    Checkpoint(CheckpointCreateArgs),
+    /// Manage workspace checkpoints.
+    #[command(subcommand)]
+    Checkpoints(CheckpointsCommand),
+    /// Rewind workspace files to a checkpoint.
+    Rewind(RewindArgs),
+}
+
+#[derive(Parser, Debug)]
+struct CheckpointCreateArgs {
+    /// Optional description for the checkpoint.
+    description: Option<String>,
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    /// Session id to attach the checkpoint to. If omitted, the latest
+    /// session for the cwd is used.
+    #[arg(long)]
+    session: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum CheckpointsCommand {
+    /// List checkpoints for a session.
+    List {
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        /// Session id. If omitted, the latest session for the cwd is used.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Show a checkpoint's metadata.
+    Show {
+        checkpoint_id: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Diff a checkpoint against the current workspace.
+    Diff {
+        checkpoint_id: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Parser, Debug)]
+struct RewindArgs {
+    /// Checkpoint id to rewind to.
+    checkpoint_id: String,
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    /// Skip the confirmation prompt.
+    #[arg(long)]
+    yes: bool,
+    /// Print actions without modifying files.
+    #[arg(long)]
+    dry_run: bool,
+    /// Allow rewind even if checkpoint cwd does not match current cwd.
+    #[arg(long)]
+    force_cwd: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -96,6 +179,19 @@ struct CommonArgs {
     /// Disallow rule overrides (repeatable). Format: `Tool` or `Edit:**/.env*`.
     #[arg(long = "deny")]
     deny: Vec<String>,
+    /// Checkpointing: on|off. Defaults to settings.checkpointing.enabled,
+    /// then on for mutating CLI commands.
+    #[arg(long)]
+    checkpointing: Option<String>,
+    /// Validation command(s) to run after the agent completes (repeatable).
+    #[arg(long = "validate")]
+    validate: Vec<String>,
+    /// Per-validation-command timeout, in seconds.
+    #[arg(long)]
+    validation_timeout: Option<u64>,
+    /// Automatically rewind to the run's checkpoint when validation fails.
+    #[arg(long)]
+    rewind_on_validation_failure: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -301,6 +397,21 @@ async fn main() -> ExitCode {
             cwd,
             format,
         }) => cmd_sessions_export(session_id, cwd, format).await,
+        Command::Checkpoint(args) => cmd_checkpoint_create(args).await,
+        Command::Checkpoints(CheckpointsCommand::List { cwd, session }) => {
+            cmd_checkpoints_list(cwd, session).await
+        }
+        Command::Checkpoints(CheckpointsCommand::Show {
+            checkpoint_id,
+            cwd,
+            session,
+        }) => cmd_checkpoints_show(checkpoint_id, cwd, session).await,
+        Command::Checkpoints(CheckpointsCommand::Diff {
+            checkpoint_id,
+            cwd,
+            session,
+        }) => cmd_checkpoints_diff(checkpoint_id, cwd, session).await,
+        Command::Rewind(args) => cmd_rewind(args).await,
     };
 
     match result {
@@ -323,6 +434,8 @@ struct ResolvedRunConfig {
     verbose: bool,
     settings: Settings,
     settings_summary: String,
+    checkpointing: CheckpointOptions,
+    validation: ValidationOptions,
 }
 
 async fn resolve_common(
@@ -545,6 +658,7 @@ async fn resolve_common(
     }
 
     let settings_summary = build_settings_summary(&settings, &model, mode);
+    let (checkpointing, validation) = resolve_checkpoint_and_validation(common, &settings)?;
 
     Ok(ResolvedRunConfig {
         cwd,
@@ -557,7 +671,102 @@ async fn resolve_common(
         verbose: common.verbose,
         settings,
         settings_summary,
+        checkpointing,
+        validation,
     })
+}
+
+fn resolve_checkpoint_and_validation(
+    common: &CommonArgs,
+    settings: &Settings,
+) -> Result<(CheckpointOptions, ValidationOptions)> {
+    // Default: enabled when settings says so, otherwise on for CLI.
+    let cli_override: Option<bool> = match common.checkpointing.as_deref() {
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => Some(true),
+            "off" | "false" | "no" | "0" => Some(false),
+            other => return Err(anyhow!("invalid --checkpointing: {other}")),
+        },
+        None => None,
+    };
+    let enabled = cli_override
+        .or(settings.checkpointing.enabled)
+        .unwrap_or(true);
+
+    let failure_mode = settings
+        .checkpointing
+        .failure_mode
+        .as_deref()
+        .map(|s| {
+            CheckpointFailureMode::from_str_lenient(s)
+                .ok_or_else(|| anyhow!("invalid checkpointing.failure_mode: {s}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    let bash_policy = settings
+        .checkpointing
+        .bash_policy
+        .as_deref()
+        .map(|s| {
+            BashCheckpointPolicy::from_str_lenient(s)
+                .ok_or_else(|| anyhow!("invalid checkpointing.bash_policy: {s}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    let mut limits = code_agent_checkpoint::CheckpointLimits::default();
+    if let Some(v) = settings.checkpointing.max_checkpoint_bytes_per_file {
+        limits.max_checkpoint_bytes_per_file = v;
+    }
+    if let Some(v) = settings
+        .checkpointing
+        .max_total_checkpoint_bytes_per_session
+    {
+        limits.max_total_checkpoint_bytes_per_session = v;
+    }
+    if let Some(r) = &settings.checkpointing.retention {
+        if let Some(v) = r.max_checkpoints_per_session {
+            limits.max_checkpoints_per_session = v;
+        }
+        if let Some(v) = r.max_age_days {
+            limits.max_age_days = Some(v);
+        }
+    }
+    if let Some(v) = settings.checkpointing.max_diff_bytes {
+        limits.max_diff_bytes = v;
+    }
+
+    let opts = CheckpointOptions {
+        enabled,
+        failure_mode,
+        create_on_user_message: settings
+            .checkpointing
+            .create_on_user_message
+            .unwrap_or(true),
+        limits,
+        bash_policy,
+    };
+
+    // Validation: CLI flags override settings.
+    let cmds = if !common.validate.is_empty() {
+        common.validate.clone()
+    } else {
+        settings.validation.commands.clone().unwrap_or_default()
+    };
+    let timeout_secs = common
+        .validation_timeout
+        .or(settings.validation.timeout_seconds)
+        .unwrap_or(60);
+    let rewind_on_failure = common.rewind_on_validation_failure
+        || settings.validation.rewind_on_failure.unwrap_or(false);
+    let validation = ValidationOptions {
+        commands: cmds,
+        timeout: StdDuration::from_secs(timeout_secs),
+        rewind_on_failure,
+    };
+
+    Ok((opts, validation))
 }
 
 fn build_settings_summary(s: &Settings, model: &str, mode: PermissionMode) -> String {
@@ -641,6 +850,8 @@ async fn run_one_shot(
     forced_session_id: Option<SessionId>,
     fork_source: Option<SessionId>,
 ) -> Result<()> {
+    let validation = cfg.validation.clone();
+    let checkpointing = cfg.checkpointing.clone();
     let provider: Arc<dyn ModelProvider> = build_provider(&cfg.options.model)?;
 
     // `--no-session` disables session WRITES, but resume/continue/fork still
@@ -712,6 +923,42 @@ async fn run_one_shot(
     let show_usage = cfg.show_usage;
     let quiet = cfg.quiet;
 
+    // Set up checkpointing. The store is created when checkpointing is on.
+    let (checkpoint_handle, checkpoint_store_for_validation, run_checkpoint_id): RunCheckpointSetup =
+        if checkpointing.enabled && checkpointing.create_on_user_message {
+        let store = Arc::new(LocalCheckpointStore::with_limits(
+            cfg.cwd.clone(),
+            checkpointing.limits.clone(),
+        ));
+        let run_id = RunId::new();
+        let git_state = code_agent_checkpoint::probe_git_state(&cfg.cwd).await;
+        let checkpoint_id = store
+            .create_checkpoint(CreateCheckpointRequest {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                cwd: cfg.cwd.clone(),
+                description: Some("user message".to_string()),
+                user_message_id: None,
+                git_state: git_state.clone(),
+            })
+            .await
+            .map_err(|e| anyhow!("failed to create checkpoint: {e}"))?;
+        if !quiet {
+            println!("[checkpoint] created {} before user request", checkpoint_id);
+        }
+        let handle: Arc<dyn CheckpointHandle> = Arc::new(AgentCheckpointHandle::new(
+            store.clone(),
+            session_id.clone(),
+            run_id,
+            cfg.cwd.clone(),
+            checkpoint_id.clone(),
+            checkpointing.clone(),
+        ));
+        (Some(handle), Some(store), Some(checkpoint_id.to_string()))
+    } else {
+        (None, None, None)
+    };
+
     let mut builder = code_agent_core::AgentBuilder::new()
         .options(options)
         .provider(provider)
@@ -727,15 +974,89 @@ async fn run_one_shot(
     if let Some(t) = telemetry_sink {
         builder = builder.telemetry_sink(t);
     }
+    if let Some(h) = checkpoint_handle {
+        builder = builder.checkpoint_handle(h);
+    }
     let agent = builder.build()?;
 
     let mut stream = agent.run(prompt);
     let exit_ok = drain_events_inline(&mut stream, log_format, show_usage, quiet).await;
-    if exit_ok {
-        Ok(())
-    } else {
-        Err(anyhow!("agent did not finish successfully"))
+
+    // Post-run validation gates. When validation is configured, its
+    // outcome must affect the CLI exit code so `--validate "cargo test"`
+    // is meaningful in CI.
+    let mut validation_passed = true;
+    if validation.is_enabled() {
+        let report = code_agent_checkpoint::validation::run_validation(
+            &cfg.cwd,
+            &validation.commands,
+            validation.timeout,
+        )
+        .await;
+        validation_passed = report.passed;
+        if !quiet {
+            for r in &report.results {
+                println!(
+                    "[validation] {} -> exit={:?} timed_out={} ({}ms)",
+                    r.command, r.exit_code, r.timed_out, r.duration_ms
+                );
+            }
+            if report.passed {
+                println!("[validation] passed");
+            } else {
+                println!("[validation] failed");
+            }
+        }
+        if !report.passed && validation.rewind_on_failure {
+            if let (Some(store), Some(id_str)) =
+                (&checkpoint_store_for_validation, &run_checkpoint_id)
+            {
+                let id = code_agent_checkpoint::CheckpointId::from(id_str.clone());
+                if !quiet {
+                    println!("[rewind] validation failed; rewinding to {}", id);
+                }
+                match store
+                    .rewind(RewindRequest {
+                        checkpoint_id: id.clone(),
+                        cwd: cfg.cwd.clone(),
+                        force_cwd: false,
+                        dry_run: false,
+                    })
+                    .await
+                {
+                    Ok(report) => {
+                        if !quiet {
+                            for p in &report.restored_files {
+                                println!("[rewind] restored {}", p);
+                            }
+                            for p in &report.recreated_files {
+                                println!("[rewind] recreated {}", p);
+                            }
+                            for p in &report.deleted_files {
+                                println!("[rewind] deleted {}", p);
+                            }
+                            for s in &report.skipped_files {
+                                println!("[rewind] skipped {} ({})", s.path, s.reason);
+                            }
+                            println!("[rewind] complete");
+                            println!("[note] conversation history was not rewound");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[rewind] failed: {}", e);
+                    }
+                }
+            }
+        }
     }
+
+    if !exit_ok {
+        return Err(anyhow!("agent did not finish successfully"));
+    }
+    if !validation_passed {
+        return Err(anyhow!("validation failed"));
+    }
+    Ok(())
 }
 
 fn drop_trailing_matching_user_prompt(
@@ -847,6 +1168,47 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
     let mut options = cfg.options.clone();
     options.session_id = Some(session_id.clone());
 
+    // Optional checkpointing for chat: a rotating handle whose active id is
+    // refreshed before each user prompt below.
+    let (checkpoint_store, rotating_handle, checkpoint_api): ChatCheckpointSetup =
+        if cfg.checkpointing.enabled && cfg.checkpointing.create_on_user_message {
+            let store = Arc::new(LocalCheckpointStore::with_limits(
+                cfg.cwd.clone(),
+                cfg.checkpointing.limits.clone(),
+            ));
+            let initial_run = RunId::new();
+            let initial_id = store
+                .create_checkpoint(CreateCheckpointRequest {
+                    session_id: session_id.clone(),
+                    run_id: initial_run.clone(),
+                    cwd: cfg.cwd.clone(),
+                    description: Some("chat session start".to_string()),
+                    user_message_id: None,
+                    git_state: code_agent_checkpoint::probe_git_state(&cfg.cwd).await,
+                })
+                .await
+                .map_err(|e| anyhow!("create checkpoint: {e}"))?;
+            if !cfg.quiet {
+                println!("[checkpoint] created {} (chat start)", initial_id);
+            }
+            let rot = Arc::new(code_agent_checkpoint::RotatingCheckpointHandle::new(
+                store.clone(),
+                session_id.clone(),
+                cfg.cwd.clone(),
+                initial_id,
+                initial_run,
+                cfg.checkpointing.clone(),
+            ));
+            let api: Arc<dyn CheckpointApi> = Arc::new(LocalCheckpointApi::new(
+                store.clone(),
+                session_id.clone(),
+                cfg.cwd.clone(),
+            ));
+            (Some(store), Some(rot), Some(api))
+        } else {
+            (None, None, None)
+        };
+
     let mut client_builder = AgentClient::builder()
         .cwd(cfg.cwd.clone())
         .model(cfg.options.model.clone())
@@ -863,8 +1225,16 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
     if let Some(t) = telemetry_sink {
         client_builder = client_builder.telemetry_sink(t);
     }
+    if let Some(h) = rotating_handle.clone() {
+        let h: Arc<dyn CheckpointHandle> = h;
+        client_builder = client_builder.checkpoint_handle(h);
+    }
+    if let Some(api) = checkpoint_api {
+        client_builder = client_builder.checkpoint_api(api);
+    }
 
     let mut client = client_builder.build().await?;
+    let _ = checkpoint_store;
 
     if !cfg.quiet {
         println!("[chat] session {}", session_id);
@@ -875,6 +1245,7 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
         if let Some(s) = &store {
             let _ = append_user_prompt(s.as_ref(), &cfg.cwd, &session_id, &initial).await;
         }
+        rotate_checkpoint(rotating_handle.as_ref(), &cfg.cwd, &session_id, cfg.quiet).await;
         client.send_user_message(initial).await?;
     }
 
@@ -930,6 +1301,7 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
                         if let Some(s) = &store {
                             let _ = append_user_prompt(s.as_ref(), &cfg.cwd, &session_id, trimmed).await;
                         }
+                        rotate_checkpoint(rotating_handle.as_ref(), &cfg.cwd, &session_id, cfg.quiet).await;
                         client.send_user_message(trimmed.to_string()).await?;
                     }
                     None => break,
@@ -978,6 +1350,276 @@ async fn cmd_sessions_export(session_id: String, cwd: PathBuf, format: String) -
         .ok_or_else(|| anyhow!("invalid --format: {format}"))?;
     let s = export_session(&store, &id, fmt).await?;
     print!("{s}");
+    Ok(())
+}
+
+async fn rotate_checkpoint(
+    handle: Option<&Arc<code_agent_checkpoint::RotatingCheckpointHandle>>,
+    cwd: &Path,
+    session_id: &SessionId,
+    quiet: bool,
+) {
+    let h = match handle {
+        Some(h) => h,
+        None => return,
+    };
+    let run_id = RunId::new();
+    let res = h
+        .store
+        .create_checkpoint(CreateCheckpointRequest {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            cwd: cwd.to_path_buf(),
+            description: Some("user message".into()),
+            user_message_id: None,
+            git_state: code_agent_checkpoint::probe_git_state(cwd).await,
+        })
+        .await;
+    match res {
+        Ok(id) => {
+            if !quiet {
+                println!("[checkpoint] created {} before user request", id);
+            }
+            h.set_active(id, run_id).await;
+        }
+        Err(e) => {
+            tracing::warn!("failed to create per-prompt checkpoint: {e}");
+        }
+    }
+}
+
+async fn resolve_session_for_checkpoints(
+    cwd: &Path,
+    explicit: Option<String>,
+) -> Result<SessionId> {
+    if let Some(s) = explicit {
+        return parse_session_id(&s);
+    }
+    let store = FsSessionStore::new(cwd.to_path_buf());
+    store
+        .latest_for_cwd(cwd)
+        .await?
+        .ok_or_else(|| anyhow!("no sessions found for cwd; pass --session"))
+}
+
+async fn cmd_checkpoint_create(args: CheckpointCreateArgs) -> Result<()> {
+    let cwd = args.cwd.canonicalize().context("--cwd")?;
+    let session_id = resolve_session_for_checkpoints(&cwd, args.session).await?;
+    let store = Arc::new(LocalCheckpointStore::new(cwd.clone()));
+    let api = LocalCheckpointApi::new(store, session_id, cwd);
+    let id = api
+        .create_checkpoint(args.description)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    println!("[checkpoint] created {}", id);
+    Ok(())
+}
+
+async fn cmd_checkpoints_list(cwd: PathBuf, session: Option<String>) -> Result<()> {
+    let cwd = cwd.canonicalize().context("--cwd")?;
+    let session_id = resolve_session_for_checkpoints(&cwd, session).await?;
+    let store = LocalCheckpointStore::new(cwd.clone());
+    let list = store
+        .list_checkpoints(&session_id)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    if list.is_empty() {
+        println!("(no checkpoints for session {session_id})");
+    } else {
+        for s in list {
+            let desc = s.description.clone().unwrap_or_default();
+            println!(
+                "{}\t{}\tfiles={}\t{}",
+                s.checkpoint_id, s.created_at, s.files_tracked_count, desc
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_checkpoints_show(
+    checkpoint_id: String,
+    cwd: PathBuf,
+    session: Option<String>,
+) -> Result<()> {
+    let cwd = cwd.canonicalize().context("--cwd")?;
+    let store = LocalCheckpointStore::new(cwd.clone());
+    let id = code_agent_checkpoint::CheckpointId::from(checkpoint_id);
+    let session_id = if let Some(s) = session {
+        parse_session_id(&s)?
+    } else {
+        store
+            .find_session_for_checkpoint(&id)
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+    };
+    let meta = store
+        .get_checkpoint(&session_id, &id)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    println!("{}", serde_json::to_string_pretty(&meta)?);
+    Ok(())
+}
+
+async fn cmd_checkpoints_diff(
+    checkpoint_id: String,
+    cwd: PathBuf,
+    session: Option<String>,
+) -> Result<()> {
+    let cwd = cwd.canonicalize().context("--cwd")?;
+    let store = LocalCheckpointStore::new(cwd.clone());
+    let id = code_agent_checkpoint::CheckpointId::from(checkpoint_id.clone());
+    let session_id = if let Some(s) = session {
+        parse_session_id(&s)?
+    } else {
+        store
+            .find_session_for_checkpoint(&id)
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+    };
+    let diff = store
+        .diff_checkpoint(DiffCheckpointRequest {
+            checkpoint_id: id.clone(),
+            session_id,
+            cwd,
+            max_bytes: None,
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    println!("[checkpoint] diff {}", id);
+    for fd in &diff.file_diffs {
+        match fd {
+            FileDiff::Modified {
+                path, unified_diff, ..
+            } => {
+                print!("{unified_diff}");
+                if !unified_diff.ends_with('\n') {
+                    println!();
+                }
+                let _ = path;
+            }
+            FileDiff::Created {
+                path,
+                current_content_preview,
+                ..
+            } => {
+                println!("+++ created {}\n{}", path, current_content_preview);
+            }
+            FileDiff::Deleted {
+                path,
+                original_content_preview,
+                ..
+            } => {
+                println!("--- deleted {}\n{}", path, original_content_preview);
+            }
+            FileDiff::Binary { path, change_kind } => {
+                println!("[binary {:?}] {}", change_kind, path);
+            }
+            FileDiff::Redacted { path, change_kind } => {
+                println!("[redacted {:?}] {}", change_kind, path);
+            }
+        }
+    }
+    if diff.truncated {
+        println!("(diff output truncated)");
+    }
+    Ok(())
+}
+
+async fn cmd_rewind(args: RewindArgs) -> Result<()> {
+    let cwd = args.cwd.canonicalize().context("--cwd")?;
+    let store = LocalCheckpointStore::new(cwd.clone());
+    let id = code_agent_checkpoint::CheckpointId::from(args.checkpoint_id.clone());
+
+    if !args.yes && !args.dry_run {
+        eprintln!(
+            "About to rewind workspace files at {} to {}.",
+            cwd.display(),
+            id
+        );
+        eprintln!("Conversation history will not be rewound.");
+        eprint!("Proceed? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf).ok();
+        let answer = buf.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("[rewind] cancelled");
+            return Ok(());
+        }
+    }
+
+    if args.dry_run {
+        println!("[rewind] dry run for checkpoint {}", id);
+    } else {
+        println!("[rewind] restoring workspace to {}", id);
+    }
+
+    let report = store
+        .rewind(RewindRequest {
+            checkpoint_id: id.clone(),
+            cwd: cwd.clone(),
+            force_cwd: args.force_cwd,
+            dry_run: args.dry_run,
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+
+    if args.dry_run {
+        for p in &report.restored_files {
+            println!("would restore: {}", p);
+        }
+        for p in &report.recreated_files {
+            println!("would recreate: {}", p);
+        }
+        for p in &report.deleted_files {
+            println!("would delete: {}", p);
+        }
+        for s in &report.skipped_files {
+            println!("would skip: {} ({})", s.path, s.reason);
+        }
+        println!("conversation history will not be rewound");
+    } else {
+        for p in &report.restored_files {
+            println!("[rewind] restored {}", p);
+        }
+        for p in &report.recreated_files {
+            println!("[rewind] recreated {}", p);
+        }
+        for p in &report.deleted_files {
+            println!("[rewind] deleted {}", p);
+        }
+        for s in &report.skipped_files {
+            println!("[rewind] skipped {} ({})", s.path, s.reason);
+        }
+        println!("[rewind] complete");
+        println!("[note] conversation history was not rewound");
+
+        // Append a session record noting the rewind into the checkpoint's
+        // OWNER session (not `latest_for_cwd`, which can resolve to an
+        // unrelated session if a newer one was started since). Falls back
+        // to silent no-op if the checkpoint can't be located — at this
+        // point the rewind already succeeded on disk and the note is
+        // best-effort context for the next agent turn.
+        if let Ok(owner_session) = store.find_session_for_checkpoint(&id).await {
+            let session_store: Arc<dyn SessionStore> = Arc::new(FsSessionStore::new(cwd.clone()));
+            let note = format!(
+                "rewind to {} restored={} deleted={} recreated={} skipped={}",
+                id,
+                report.restored_files.len(),
+                report.deleted_files.len(),
+                report.recreated_files.len(),
+                report.skipped_files.len(),
+            );
+            let _ = code_agent_session::append_user_prompt(
+                session_store.as_ref(),
+                &cwd,
+                &owner_session,
+                &format!("[system note] {note}; conversation history was not rewound"),
+            )
+            .await;
+        }
+    }
     Ok(())
 }
 
@@ -1103,6 +1745,11 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
         AgentEvent::Interrupted(_) => {
             println!("[interrupted]");
         }
+        AgentEvent::CheckpointEvent(p) => {
+            if !quiet {
+                render_checkpoint_event(p);
+            }
+        }
         AgentEvent::Result(r) => {
             println!(
                 "[result] {} (turns={}, subtype={:?})",
@@ -1110,6 +1757,107 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
                 r.num_turns,
                 r.subtype
             );
+        }
+    }
+}
+
+fn render_checkpoint_event(p: &code_agent_core::CheckpointEventPayload) {
+    match p.event.as_str() {
+        "created" => {
+            let id = p
+                .data
+                .get("checkpoint_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let desc = p.data.get("description").and_then(|v| v.as_str());
+            match desc {
+                Some(d) => println!("[checkpoint] created {} ({})", id, d),
+                None => println!("[checkpoint] created {}", id),
+            }
+        }
+        "snapshot_captured" => {
+            let path = p.data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let kind = p
+                .data
+                .get("capture")
+                .and_then(|v| v.get("kind").and_then(|s| s.as_str()))
+                .unwrap_or("?");
+            match kind {
+                "missing_before_change" => {
+                    println!("[checkpoint] tracked missing file {}", path);
+                }
+                "skipped" => {
+                    let reason = p
+                        .data
+                        .get("capture")
+                        .and_then(|v| v.get("reason").and_then(|s| s.as_str()))
+                        .unwrap_or("");
+                    println!("[checkpoint] skipped {} ({})", path, reason);
+                }
+                _ => println!("[checkpoint] captured {} before change", path),
+            }
+        }
+        "capture_failed" => {
+            let reason = p.data.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            println!("[checkpoint] capture failed: {}", reason);
+        }
+        "bash_warning" => {
+            let msg = p.data.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            println!("[warning] {}", msg);
+        }
+        "rewind_started" => {
+            let id = p
+                .data
+                .get("checkpoint_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            println!("[rewind] restoring workspace to {}", id);
+        }
+        "file_rewound" => {
+            let path = p.data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let action = p.data.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+            match action {
+                "restored" => println!("[rewind] restored {}", path),
+                "recreated" => println!("[rewind] recreated {}", path),
+                "deleted" => println!("[rewind] deleted {}", path),
+                _ => println!("[rewind] {} {}", action, path),
+            }
+        }
+        "rewind_completed" => {
+            println!("[rewind] complete");
+        }
+        "rewind_failed" => {
+            let reason = p.data.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            println!("[rewind] failed: {}", reason);
+        }
+        "validation_started" => {
+            let cmds = p
+                .data
+                .get("commands")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            println!("[validation] running {}", cmds);
+        }
+        "validation_completed" => {
+            let passed = p
+                .data
+                .get("passed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if passed {
+                println!("[validation] passed");
+            } else {
+                println!("[validation] failed");
+            }
+        }
+        other => {
+            println!("[checkpoint] {}", other);
         }
     }
 }

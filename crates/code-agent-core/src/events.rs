@@ -22,7 +22,22 @@ pub enum AgentEvent {
     PolicyDecision(PolicyDecisionEvent),
     TodoUpdate(TodoUpdate),
     Interrupted(InterruptedEvent),
+    /// Emitted by the checkpoint subsystem (M3). The payload's `event` field
+    /// names the concrete checkpoint event (e.g. `created`,
+    /// `file_snapshot_captured`, `rewind_completed`); structured data is
+    /// flattened alongside it.
+    CheckpointEvent(CheckpointEventPayload),
     Result(AgentResult),
+}
+
+/// Loosely-typed checkpoint event delivered through `AgentEvent`. The
+/// `code-agent-checkpoint` crate produces these by serializing its
+/// concrete `CheckpointEvent` enum into JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointEventPayload {
+    pub event: String,
+    #[serde(flatten)]
+    pub data: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
