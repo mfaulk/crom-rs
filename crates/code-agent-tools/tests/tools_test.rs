@@ -186,6 +186,30 @@ async fn bash_timeout_kills_command() {
 }
 
 #[tokio::test]
+// Bash treats a non-zero exit as ordinary output, not a tool failure: a
+// failing `cargo test` (or any command exiting non-zero) must surface its
+// exit code in metadata and text without flipping `is_error`, which the
+// API uses to signal that the tool itself failed.
+async fn bash_nonzero_exit_is_not_tool_error() {
+    let dir = TempDir::new().unwrap();
+    let tool = BashTool::new(Arc::new(ToolLimits::default()));
+    let res = tool
+        .execute(json!({"command": "exit 7"}), ctx_for(&dir))
+        .await
+        .unwrap();
+    assert!(
+        !res.is_error,
+        "non-zero exit should not be reported as a tool error"
+    );
+    assert_eq!(
+        res.metadata.get("exit_code").and_then(|v| v.as_i64()),
+        Some(7)
+    );
+    assert!(!res.metadata.get("timed_out").unwrap().as_bool().unwrap());
+    assert!(res.flatten_text().contains("[exit: 7]"));
+}
+
+#[tokio::test]
 // Bash truncates output exceeding the configured cap.
 async fn bash_output_capped() {
     let dir = TempDir::new().unwrap();

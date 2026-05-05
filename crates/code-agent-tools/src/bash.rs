@@ -186,19 +186,19 @@ impl Tool for BashTool {
             ));
         }
 
-        let is_error = timed_out || exit_code.map(|c| c != 0).unwrap_or(true);
+        // `is_error` flows to the Anthropic tool_result block and signals
+        // that the tool itself failed. A non-zero exit code is *output*, not
+        // a tool failure — the model and CLI can read the `[exit: N]` line
+        // and decide what it means in domain terms (e.g. failing tests are
+        // exactly what the agent was asked to surface). Only flip the flag
+        // when we couldn't run the command to a clean exit: timeouts, or a
+        // signal-killed child where no exit code is available.
+        let is_error = timed_out || exit_code.is_none();
         let metadata = json!({
             "exit_code": exit_code,
             "timed_out": timed_out,
             "command_redacted": redact(&parsed.command),
         });
-        if timed_out {
-            return Ok(ToolResult {
-                content: vec![code_agent_core::ToolContent::Text(text)],
-                is_error: true,
-                metadata,
-            });
-        }
         Ok(ToolResult {
             content: vec![code_agent_core::ToolContent::Text(text)],
             is_error,
