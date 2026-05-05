@@ -360,6 +360,41 @@ CLI flags:
 The `examples/checkpoint-demo` directory has a one-test crate set up to
 walk through the entire flow.
 
+### Full M3 end-to-end walkthrough
+
+`examples/m3-e2e-demo.sh` is a single non-interactive script that drives
+`examples/checkpoint-demo` through every M3 surface in one run:
+
+* runs the agent under `--checkpointing on` with a `--validate "cargo test"`
+  gate and asserts the start-of-run checkpoint, per-mutation snapshots, and
+  `[validation] passed` events all fire,
+* lists / shows / diffs checkpoints via `code-agent checkpoints …`,
+* creates a manual checkpoint via `code-agent checkpoint …`,
+* previews then performs a rewind (`rewind --dry-run`, then `rewind --yes`)
+  and verifies `src/lib.rs` is restored byte-for-byte to the buggy starting
+  state while conversation history is left intact,
+* exercises auto-rewind: `--validate "false" --rewind-on-validation-failure`
+  forces the post-run gate to fail and verifies the agent's edit is
+  reverted automatically,
+* counts `[warning]` events from the `bash_policy: allow_with_warning`
+  setting so shell tool calls are visible as not-checkpointed,
+* prints the on-disk content-addressed layout under
+  `.agent/checkpoints/<session-id>/{checkpoints.jsonl, manifests/, blobs/}`.
+
+```sh
+export ANTHROPIC_API_KEY=...
+./examples/m3-e2e-demo.sh
+```
+
+The script is idempotent — Step 1 runs `git checkout HEAD -- .` and
+`git clean -fd -- .` inside `examples/checkpoint-demo` to restore every
+tracked file and drop every untracked non-ignored file (`target/` and
+`.agent/sessions/`/`.agent/checkpoints/` are gitignored, so they
+survive `git clean`; the script wipes the latter two explicitly).
+
+For a smaller, no-API-key smoke test of just the checkpoint subcommands
+and rewind preview, see `examples/m3-checkpoint-demo.sh`.
+
 ## Demo: bugfix-demo
 
 Quickest path:
