@@ -27,12 +27,27 @@ impl SessionId {
     }
 }
 
+/// Windows reserved device basenames. Even with a `.jsonl` extension these
+/// resolve to special device paths on Windows, not regular files. We reject
+/// them here so the same validation contract holds across platforms.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// Returns true iff `s` is a syntactically valid session id.
-/// Accepts only `[A-Za-z0-9_-]+` and rejects empty strings.
+/// Accepts only `[A-Za-z0-9_-]+`, rejects empty strings, and rejects
+/// Windows reserved device basenames (case-insensitive).
 pub fn is_valid_session_id_str(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
+    if s.is_empty()
+        || !s
+            .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return false;
+    }
+    let upper = s.to_ascii_uppercase();
+    !WINDOWS_RESERVED_NAMES.iter().any(|r| *r == upper)
 }
 
 impl std::fmt::Display for SessionId {
@@ -168,5 +183,28 @@ mod tests {
     fn dot_is_rejected() {
         assert!(!SessionId::from(".".to_string()).is_valid_format());
         assert!(!SessionId::from("a.b".to_string()).is_valid_format());
+    }
+
+    #[test]
+    // Windows reserved device basenames are rejected case-insensitively
+    // even though they would otherwise pass the alphanumeric check —
+    // `NUL.jsonl` resolves to the null device on Windows, not a file.
+    fn windows_reserved_names_rejected() {
+        for name in &[
+            "NUL", "nul", "Nul", "CON", "con", "PRN", "AUX", "COM1", "lpt9",
+        ] {
+            assert!(
+                !is_valid_session_id_str(name),
+                "{name} should be rejected as a Windows reserved name"
+            );
+        }
+    }
+
+    #[test]
+    // Names that *contain* a reserved substring but aren't equal to one are fine.
+    fn names_containing_reserved_substring_accepted() {
+        assert!(is_valid_session_id_str("CONversation"));
+        assert!(is_valid_session_id_str("my-NUL-id"));
+        assert!(is_valid_session_id_str("nullable"));
     }
 }

@@ -582,6 +582,104 @@ mod tests {
         );
     }
 
+    // Helper: build a single SessionRecord with the given id.
+    fn rec_for(dir: &TempDir, id: &SessionId) -> SessionRecord {
+        SessionRecord {
+            timestamp: now_iso(),
+            cwd: dir.path().to_path_buf(),
+            session_id: id.to_string(),
+            payload: SessionPayload::UserPrompt {
+                text: "x".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    // The original CVE: `../foo` would have written `.agent/foo.jsonl`,
+    // one level above the sessions dir. Verify the would-be target file
+    // is not created.
+    async fn append_rejects_dotdot_id_no_filesystem_side_effects() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let bad = SessionId::from("../foo".to_string());
+        let err = store
+            .append(&bad, rec_for(&dir, &bad))
+            .await
+            .expect_err("traversal id must be rejected");
+        assert!(matches!(err, SessionError::InvalidId), "got {err:?}");
+        // The vulnerable path would have been `.agent/foo.jsonl`.
+        let escaped = dir.path().join(".agent").join("foo.jsonl");
+        assert!(!escaped.exists(), "must not create file above sessions dir");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    // An absolute-path id used to replace the joined prefix entirely on
+    // Unix. Must error and must not write to the absolute target.
+    async fn append_rejects_absolute_id() {
+        let outer = TempDir::new().unwrap();
+        let target = outer.path().join("escape.jsonl");
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        // The ID encodes an absolute path with a separator the join would have
+        // honored. Validation must reject it before reaching the filesystem.
+        let bad_str = format!("/{}", target.strip_prefix("/").unwrap().display());
+        let bad = SessionId::from(bad_str);
+        let err = store
+            .append(&bad, rec_for(&dir, &bad))
+            .await
+            .expect_err("absolute-path id must be rejected");
+        assert!(matches!(err, SessionError::InvalidId), "got {err:?}");
+        assert!(
+            !target.exists(),
+            "must not write to absolute path provided as session id"
+        );
+    }
+
+    #[tokio::test]
+    // Backslash in id (Windows-style separator) is also rejected.
+    async fn append_rejects_backslash_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let bad = SessionId::from("foo\\bar".to_string());
+        let err = store
+            .append(&bad, rec_for(&dir, &bad))
+            .await
+            .expect_err("backslash id must be rejected");
+        assert!(matches!(err, SessionError::InvalidId), "got {err:?}");
+    }
+
+    #[tokio::test]
+    // NUL byte in id is rejected (would corrupt path syscalls).
+    async fn append_rejects_nul_byte_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let bad = SessionId::from("foo\0bar".to_string());
+        let err = store
+            .append(&bad, rec_for(&dir, &bad))
+            .await
+            .expect_err("NUL byte id must be rejected");
+        assert!(matches!(err, SessionError::InvalidId), "got {err:?}");
+    }
+
+    #[tokio::test]
+    // create() with an externally-provided invalid id must never produce
+    // a file outside the sessions dir. (FsSessionStore::create currently
+    // generates a fresh uuid internally, so this is a smoke test that the
+    // store can never persist an invalid id even if a buggy caller tries.)
+    async fn append_rejects_unicode_fullwidth_slash_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        // U+FF0F FULLWIDTH SOLIDUS is visually similar to `/` but isn't ASCII;
+        // the alphanumeric allowlist rejects it.
+        let bad = SessionId::from("foo\u{FF0F}bar".to_string());
+        let err = store
+            .append(&bad, rec_for(&dir, &bad))
+            .await
+            .expect_err("unicode-slash id must be rejected");
+        assert!(matches!(err, SessionError::InvalidId), "got {err:?}");
+    }
+
     #[tokio::test]
     // replay_conversation reconstructs user/assistant/tool-result messages.
     async fn replay_includes_prior_context() {

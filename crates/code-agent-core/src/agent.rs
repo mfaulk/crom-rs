@@ -1200,7 +1200,19 @@ async fn emit(
     ev: AgentEvent,
 ) {
     if let Some(s) = sink {
-        let _ = s.record(sid, &ev).await;
+        // Persistence errors must not crash the run, but they must not
+        // disappear silently either — a buggy/internal caller could supply
+        // an invalid `SessionId` (the public `From<String>` constructor
+        // accepts arbitrary strings) and we'd otherwise complete a run
+        // with no on-disk record. Surface the failure on the tracing
+        // channel so it shows up in operator logs.
+        if let Err(e) = s.record(sid, &ev).await {
+            tracing::warn!(
+                session_id = %sid,
+                error = %e,
+                "session sink failed to record event; continuing without persistence"
+            );
+        }
     }
     let _ = tx.send(ev).await;
 }
