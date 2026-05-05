@@ -883,7 +883,9 @@ mod tests {
             }
         }
         let calls = Arc::new(Mutex::new(0u32));
-        let hooks = Hooks::new().pre_tool_use("*", Arc::new(AskHook));
+        let hooks = Hooks::new()
+            .pre_tool_use("*", Arc::new(AskHook))
+            .expect("\"*\" is a valid hook pattern");
         let cfg = PolicyConfig {
             permission_mode: PermissionMode::Plan,
             callback: Some(Arc::new(CountingCb {
@@ -923,7 +925,9 @@ mod tests {
                 })
             }
         }
-        let hooks = Hooks::new().pre_tool_use("*", Arc::new(AllowHook));
+        let hooks = Hooks::new()
+            .pre_tool_use("*", Arc::new(AllowHook))
+            .expect("\"*\" is a valid hook pattern");
         let cfg = PolicyConfig {
             permission_mode: PermissionMode::Plan,
             ..PolicyConfig::default()
