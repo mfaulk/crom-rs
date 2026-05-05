@@ -5,13 +5,12 @@ Messages API provider. Targets approximate architectural parity with the
 public surface of Anthropic's Agent SDK while staying small enough to read in
 one sitting.
 
-This is **Milestone 4: MCP Client Alpha**. M4 adds safe Model Context
-Protocol client support on top of the M3 runtime: configured stdio or basic
-Streamable HTTP MCP servers can be initialized, queried with `tools/list`,
-and exposed as normal agent tools named `mcp__<server>__<tool>`. MCP calls
-flow through the existing hooks, permission policy, approvals, sessions,
-telemetry, and logs. Workspace checkpointing still only covers local files:
-MCP external effects are explicitly marked as not rewindable.
+This is **Milestone 5: Tool Search + Deferred Tool Loading Alpha**. M5 adds
+a central tool catalog, approximate tool-definition budget accounting,
+provider-agnostic lexical tool search, the built-in `SearchTools` tool, and
+deferred loading for large local + MCP catalogs. MCP tools are deferred by
+default in search mode, local coding tools stay eager, and tool loading never
+bypasses hooks, policy, approvals, sessions, telemetry, or checkpointing.
 
 ## Workspace layout
 
@@ -24,17 +23,18 @@ crates/
   code-agent-checkpoint/  M3: LocalCheckpointStore, CheckpointHandle, validation
   code-agent-mcp/         M4: MCP client config, protocol, stdio/http transports
   code-agent-cli/         `code-agent` binary (run, resume, continue, fork, chat,
-                          sessions, checkpoint, checkpoints, rewind, mcp)
+                          sessions, checkpoint, checkpoints, rewind, mcp, tools)
 examples/
   bugfix-demo/            tiny crate with a deliberately failing test (M1 demo)
   policy-demo/            tiny crate plus .agent/settings.json policy + hooks (M2 demo)
   checkpoint-demo/        tiny crate exercising checkpoint + rewind + validation (M3 demo)
   mcp-demo/               offline fake MCP server and demo project (M4 demo)
+  tool-search-demo/       large fake MCP catalog for deferred loading (M5 demo)
 ```
 
 `examples/bugfix-demo`, `examples/policy-demo`, `examples/checkpoint-demo`,
-and `examples/mcp-demo` are **excluded** from the workspace. Run them from
-their own directories.
+`examples/mcp-demo`, and `examples/tool-search-demo` are **excluded** from
+the workspace. Run them from their own directories.
 
 ## Quick start
 
@@ -89,6 +89,12 @@ cargo run -p code-agent-cli --manifest-path ../../Cargo.toml -- mcp status
 cargo run -p code-agent-cli --manifest-path ../../Cargo.toml -- mcp tools fake
 cargo run -p code-agent-cli --manifest-path ../../Cargo.toml -- \
     mcp call fake list_issues --args-json '{}' --yes
+
+# Tool catalog inspection and search (no Anthropic key needed with the demo).
+cd ../tool-search-demo
+../../target/debug/code-agent tools stats --mcp-config .agent/mcp.json
+../../target/debug/code-agent tools search "github issue bug" --mcp-config .agent/mcp.json
+../../target/debug/code-agent tools explain-loading --mcp-config .agent/mcp.json
 ```
 
 Session ids supplied to `resume`, `fork`, `sessions show`, and
@@ -118,6 +124,7 @@ The CLI prints:
 | Grep      | ReadOnly  | Regex over UTF-8 files; max 500 hits                    |
 | Bash      | Execution | 30s timeout, 64 KiB stdout/stderr cap, stdin closed     |
 | TodoWrite | ReadOnly  | Replaces the agent's task list and emits `TodoUpdate`   |
+| SearchTools | ReadOnly | Search and load deferred tools in search mode          |
 
 All filesystem tools resolve paths relative to the workspace root, refuse
 parent-traversal escapes, and reject symlinks whose target is outside the
@@ -190,6 +197,13 @@ CLI flags:
 * `--config PATH` — load a single explicit settings file
 * `--mcp-config PATH`, `--mcp-enabled true|false`, `--mcp-strict`,
   `--mcp-timeout SECONDS`
+* `--tool-loading eager|search|auto`
+* `--tool-search-strategy regex|bm25|hybrid`
+* `--native-tool-search off|anthropic-regex|anthropic-bm25|auto`
+* `--tool-search-threshold N`, `--max-tool-search-results N`
+* `--max-loaded-tools N`, `--max-loaded-tool-tokens N`
+* `--always-load "Read,Grep,SearchTools"`, `--defer-tools "mcp__*"`,
+  `--disable-tools "mcp__github__delete_*"`
 * `--yes-to "Bash:^cargo test$"` (repeatable)
 * `--deny "Edit:**/.env*"` (repeatable)
 * `--log-format pretty|json`, `--show-usage`, `--quiet`, `--verbose`
@@ -287,11 +301,96 @@ code-agent run "Summarize open fake issues" \
   --allowed-tools "Read,Grep,mcp__fake__list_issues,mcp__fake__get_issue"
 ```
 
+With M5 search mode, expose a broad MCP namespace without sending every MCP
+schema to the model on the first turn:
+
+```sh
+code-agent run "Find the parser bug issue and inspect the likely source" \
+  --mcp-config .agent/mcp.json \
+  --tool-loading search \
+  --allowed-tools "Read,Grep,Glob,SearchTools,mcp__fake__*"
+```
+
 MCP tools use `PermissionKind::External`. `acceptEdits` does not approve
 them, `dontAsk` denies unresolved MCP tools, disallow rules override allow
 rules, and the default external-effect policy requires explicit allow rules.
 The approval prompt warns that MCP effects are external and not covered by
 workspace rewind; mutating-looking tool names get a stronger warning.
+
+## Tool Search and Deferred Loading (M5)
+
+The agent builds a deterministic catalog from local tools and discovered MCP
+tools. Loading modes are:
+
+* `eager` — send all permitted tool definitions, preserving M1-M4 behavior.
+* `search` — send always-loaded tools plus tools discovered by `SearchTools`.
+* `auto` — use eager for small catalogs and search when tool count or
+  estimated tool-definition tokens exceed the configured threshold.
+
+`SearchTools` accepts:
+
+```json
+{
+  "query": "github issue search repository bugs",
+  "limit": 5,
+  "source_filter": "mcp:fake",
+  "include_risky": false
+}
+```
+
+Search supports regex, BM25-like lexical ranking, and hybrid ranking over tool
+name, MCP server name, description, schema property names/descriptions, tags,
+aliases, and category. Search results are filtered through the same allow and
+deny rules used by tool invocation. Loading a tool only makes its definition
+available on the next turn; the actual call still runs through policy, hooks,
+approvals, and MCP external-effect checks.
+
+Tool-search settings live under `.agent/settings.json`:
+
+```json
+{
+  "tool_search": {
+    "enabled": true,
+    "mode": "auto",
+    "strategy": "hybrid",
+    "native_provider_mode": "auto",
+    "activation_threshold_percent": 10,
+    "min_tool_count": 10,
+    "max_results": 5,
+    "max_loaded_tools": 20,
+    "max_loaded_tool_tokens": 12000,
+    "always_loaded": ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite", "SearchTools"],
+    "deferred": ["mcp__*"],
+    "disabled": [],
+    "include_schema_arguments": true,
+    "include_tool_category_hints": true,
+    "persist_discovered_tools": true
+  }
+}
+```
+
+Catalog inspection commands:
+
+```sh
+code-agent tools list --cwd . --mcp-config .agent/mcp.json --all
+code-agent tools list --cwd . --mcp-config .agent/mcp.json --loaded
+code-agent tools list --cwd . --mcp-config .agent/mcp.json --deferred
+code-agent tools search "github issues" --cwd . --mcp-config .agent/mcp.json --limit 5
+code-agent tools show mcp__fake__github_list_issues --cwd . --mcp-config .agent/mcp.json
+code-agent tools stats --cwd . --mcp-config .agent/mcp.json
+code-agent tools explain-loading --cwd . --mcp-config .agent/mcp.json
+```
+
+The `tools` subcommands mirror the agent's runtime semantics: `allowed_tools`
+from settings (or `--allowed-tools`) narrows the registry the same way the
+agent does, and `--permission-mode` (or `permissionMode` in settings) is
+honored when computing search visibility.
+
+M5 emits `ToolCatalogBuilt`, `ToolLoadingModeResolved`,
+`ToolContextBudgetUpdated`, `ToolSearchStarted`, `ToolSearchCompleted`,
+`ToolLoaded`, `ToolDeferred`, `ToolDisabled`, and `ToolSearchFailed` events
+to the normal event stream and session JSONL. JSON log mode serializes these
+as valid JSON lines.
 
 ## Session persistence
 

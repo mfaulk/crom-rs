@@ -18,6 +18,7 @@ pub mod settings;
 pub mod telemetry;
 pub mod todo;
 pub mod tool;
+pub mod tool_catalog;
 pub mod tool_rule;
 pub mod usage;
 
@@ -46,7 +47,9 @@ pub use errors::{AgentError, ProviderError, ToolError};
 pub use events::{
     AgentEvent, AgentResult, CheckpointEventPayload, HookEvaluated, HookOutcomeKind,
     InterruptedEvent, PolicyDecisionEvent, ResultSubtype, TodoUpdate, ToolCallCompleted,
-    ToolCallDenied, ToolCallStarted, UserToolResult,
+    ToolCallDenied, ToolCallStarted, ToolCatalogBuilt, ToolContextBudgetUpdated, ToolDeferred,
+    ToolDisabled, ToolLoaded, ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed,
+    ToolSearchStarted, UserToolResult,
 };
 pub use hooks::{
     aggregate, Hook, HookAddedContext, HookAggregateDecision, HookCallRecord, HookError,
@@ -71,5 +74,15 @@ pub use settings::{
 pub use telemetry::{AgentTelemetryEvent, ModelPricing, SessionLoadKind, TelemetryOutcome};
 pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};
 pub use tool::{Tool, ToolContent, ToolContext, ToolRegistry, ToolResult};
+pub use tool_catalog::{
+    LoadedToolState, NativeToolSearchMode, ResolvedToolLoadingMode, SearchToolsDefinitionTool,
+    SearchToolsTool, ToolCatalog, ToolCatalogBuilder, ToolCatalogSummary, ToolCategorySummary,
+    ToolContextBudget, ToolDescriptor, ToolDescriptorPreview, ToolListFilter, ToolLoadPolicy,
+    ToolLoadReason, ToolLoadingDecision, ToolLoadingMode, ToolRiskProfile, ToolSearchError,
+    ToolSearchMatch, ToolSearchMatchSummary, ToolSearchOptions, ToolSearchProviderConfig,
+    ToolSearchQuery, ToolSearchResult, ToolSearchRuntime, ToolSearchSettingsConfig,
+    ToolSearchStrategy, ToolSource, ToolSourceFilter, ToolVisibility, ToolVisibilityContext,
+    SEARCH_TOOLS_NAME,
+};
 pub use tool_rule::ToolRule;
 pub use usage::TokenUsage;

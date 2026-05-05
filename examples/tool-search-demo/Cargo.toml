@@ -1,0 +1,11 @@
+[package]
+name = "tool-search-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+members = ["fake-large-mcp-server"]
+
+[dependencies]
+

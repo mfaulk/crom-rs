@@ -6,6 +6,10 @@ use crate::options::SessionId;
 use crate::policy::{PolicyDecisionSource, PolicyOutcome};
 use crate::run_id::RunId;
 use crate::todo::TodoList;
+use crate::tool_catalog::{
+    ResolvedToolLoadingMode, ToolContextBudget, ToolLoadReason, ToolLoadingMode,
+    ToolSearchMatchSummary, ToolSearchStrategy, ToolSource, ToolSourceFilter,
+};
 use crate::usage::TokenUsage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +39,15 @@ pub enum AgentEvent {
     McpToolCallCompleted(code_agent_mcp::McpToolCallCompleted),
     McpToolCallFailed(code_agent_mcp::McpToolCallFailed),
     McpServerLog(code_agent_mcp::McpServerLog),
+    ToolCatalogBuilt(ToolCatalogBuilt),
+    ToolSearchStarted(ToolSearchStarted),
+    ToolSearchCompleted(ToolSearchCompleted),
+    ToolLoaded(ToolLoaded),
+    ToolDeferred(ToolDeferred),
+    ToolDisabled(ToolDisabled),
+    ToolSearchFailed(ToolSearchFailed),
+    ToolContextBudgetUpdated(ToolContextBudgetUpdated),
+    ToolLoadingModeResolved(ToolLoadingModeResolved),
     Result(AgentResult),
 }
 
@@ -138,4 +151,83 @@ pub struct InterruptedEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
     pub turn_index: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCatalogBuilt {
+    pub total_tools: usize,
+    pub eager_tools: usize,
+    pub deferred_tools: usize,
+    pub disabled_tools: usize,
+    pub estimated_total_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSearchStarted {
+    pub query: String,
+    pub strategy: ToolSearchStrategy,
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_filter: Option<ToolSourceFilter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSearchCompleted {
+    pub query: String,
+    pub matches: Vec<ToolSearchMatchSummary>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolLoaded {
+    pub tool_name: String,
+    pub source: ToolSource,
+    pub reason: ToolLoadReason,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDeferred {
+    pub tool_name: String,
+    pub source: ToolSource,
+    pub estimated_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDisabled {
+    pub tool_name: String,
+    pub source: ToolSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSearchFailed {
+    pub query: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolContextBudgetUpdated {
+    pub estimated_total_tool_tokens: usize,
+    pub estimated_loaded_tool_tokens: usize,
+    pub estimated_deferred_tool_tokens: usize,
+    pub loaded_tool_count: usize,
+    pub deferred_tool_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolLoadingModeResolved {
+    pub configured_mode: ToolLoadingMode,
+    pub resolved_mode: ResolvedToolLoadingMode,
+    pub reason: String,
+}
+
+impl From<ToolContextBudget> for ToolContextBudgetUpdated {
+    fn from(value: ToolContextBudget) -> Self {
+        Self {
+            estimated_total_tool_tokens: value.estimated_total_tool_tokens,
+            estimated_loaded_tool_tokens: value.estimated_loaded_tool_tokens,
+            estimated_deferred_tool_tokens: value.estimated_deferred_tool_tokens,
+            loaded_tool_count: 0,
+            deferred_tool_count: 0,
+        }
+    }
 }

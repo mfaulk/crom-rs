@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::permission::{ApprovalMemoryMode, PermissionCallback, PermissionMode};
+use crate::tool_catalog::ToolSearchOptions;
 use crate::tool_rule::ToolRule;
 use code_agent_mcp::McpOptions;
 
@@ -89,6 +90,7 @@ pub struct AgentOptions {
     pub max_tokens: u32,
     pub approval_memory: ApprovalMemoryMode,
     pub mcp: McpOptions,
+    pub tool_search: ToolSearchOptions,
 }
 
 impl Default for AgentOptions {
@@ -104,6 +106,7 @@ impl Default for AgentOptions {
                 "Write".to_string(),
                 "Bash".to_string(),
                 "TodoWrite".to_string(),
+                "SearchTools".to_string(),
             ],
             allowed_tool_rules: Vec::new(),
             disallowed_tool_rules: Vec::new(),
@@ -116,6 +119,7 @@ impl Default for AgentOptions {
             max_tokens: 4096,
             approval_memory: ApprovalMemoryMode::Session,
             mcp: McpOptions::default(),
+            tool_search: ToolSearchOptions::default(),
         }
     }
 }
@@ -134,6 +138,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("max_tokens", &self.max_tokens)
             .field("approval_memory", &self.approval_memory)
             .field("mcp_enabled", &self.mcp.enabled)
+            .field("tool_search", &self.tool_search)
             .finish()
     }
 }

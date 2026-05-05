@@ -8,6 +8,7 @@ use crate::hooks::HookEventName;
 use crate::options::SessionId;
 use crate::policy::{PolicyDecisionSource, PolicyOutcome};
 use crate::run_id::RunId;
+use crate::tool_catalog::{ResolvedToolLoadingMode, ToolLoadingMode, ToolSearchStrategy};
 use crate::usage::TokenUsage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +142,89 @@ pub enum AgentTelemetryEvent {
     McpConfigError {
         session_id: SessionId,
         run_id: RunId,
+        error_category: String,
+    },
+    ToolCatalogBuilt {
+        session_id: SessionId,
+        run_id: RunId,
+        total_tool_count: usize,
+        loaded_tool_count: usize,
+        deferred_tool_count: usize,
+        estimated_total_tool_tokens: usize,
+        outcome: TelemetryOutcome,
+    },
+    ToolLoadingModeResolved {
+        session_id: SessionId,
+        run_id: RunId,
+        configured_mode: ToolLoadingMode,
+        resolved_mode: ResolvedToolLoadingMode,
+        reason: String,
+    },
+    ToolContextBudgetUpdated {
+        session_id: SessionId,
+        run_id: RunId,
+        turn_index: u32,
+        loaded_tool_count: usize,
+        deferred_tool_count: usize,
+        estimated_total_tool_tokens: usize,
+        estimated_loaded_tool_tokens: usize,
+        estimated_deferred_tool_tokens: usize,
+    },
+    ToolSearchStarted {
+        session_id: SessionId,
+        run_id: RunId,
+        turn_index: u32,
+        query: String,
+        strategy: ToolSearchStrategy,
+        limit: usize,
+    },
+    ToolSearchCompleted {
+        session_id: SessionId,
+        run_id: RunId,
+        turn_index: u32,
+        query: String,
+        strategy: ToolSearchStrategy,
+        result_count: usize,
+        loaded_tool_count: usize,
+        duration_ms: u64,
+        outcome: TelemetryOutcome,
+    },
+    ToolSearchFailed {
+        session_id: SessionId,
+        run_id: RunId,
+        turn_index: u32,
+        query: String,
+        strategy: ToolSearchStrategy,
+        error_category: String,
+    },
+    ToolLoaded {
+        session_id: SessionId,
+        run_id: RunId,
+        turn_index: Option<u32>,
+        tool_name: String,
+        reason: String,
+    },
+    ToolDeferred {
+        session_id: SessionId,
+        run_id: RunId,
+        tool_name: String,
+        estimated_tokens: usize,
+    },
+    ToolDisabled {
+        session_id: SessionId,
+        run_id: RunId,
+        tool_name: String,
+    },
+    ToolProviderNativeSearchEnabled {
+        session_id: SessionId,
+        run_id: RunId,
+        mode: String,
+        outcome: TelemetryOutcome,
+    },
+    ToolProviderNativeSearchFallback {
+        session_id: SessionId,
+        run_id: RunId,
+        mode: String,
         error_category: String,
     },
 }

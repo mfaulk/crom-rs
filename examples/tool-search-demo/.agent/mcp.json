@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "fake": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": [
+        "run",
+        "--quiet",
+        "--manifest-path",
+        "fake-large-mcp-server/Cargo.toml"
+      ],
+      "startup_timeout_seconds": 10,
+      "request_timeout_seconds": 10
+    }
+  }
+}
+

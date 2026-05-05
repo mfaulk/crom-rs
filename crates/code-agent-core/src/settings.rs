@@ -14,6 +14,7 @@ use thiserror::Error;
 use code_agent_mcp::McpSettingsConfig;
 
 use crate::permission::PermissionMode;
+use crate::tool_catalog::ToolSearchSettingsConfig;
 use crate::tool_rule::ToolRule;
 
 /// Which settings sources should be loaded.
@@ -77,6 +78,8 @@ pub struct SettingsFile {
     pub validation: Option<ValidationConfig>,
     #[serde(default)]
     pub mcp: Option<McpSettingsConfig>,
+    #[serde(default)]
+    pub tool_search: Option<ToolSearchSettingsConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -173,6 +176,7 @@ pub struct Settings {
     pub checkpointing: CheckpointingConfig,
     pub validation: ValidationConfig,
     pub mcp: Option<McpSettingsConfig>,
+    pub tool_search: ToolSearchSettingsConfig,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -198,6 +202,8 @@ pub enum SettingsError {
     BadCheckpointFailureMode(String),
     #[error("invalid checkpointing.bash_policy: {0}")]
     BadBashCheckpointPolicy(String),
+    #[error("{0}")]
+    BadToolSearch(String),
 }
 
 /// Load project settings from `<cwd>/.agent/settings.json` if present.
@@ -417,7 +423,62 @@ fn merge_into(dst: &mut Settings, src: SettingsFile, _is_user: bool) -> Result<(
             None => dst.mcp = Some(mcp),
         }
     }
+    if let Some(tool_search) = src.tool_search {
+        merge_tool_search_settings(&mut dst.tool_search, tool_search);
+        let mut options = crate::tool_catalog::ToolSearchOptions::default();
+        options
+            .apply_settings(&dst.tool_search)
+            .map_err(SettingsError::BadToolSearch)?;
+    }
     Ok(())
+}
+
+fn merge_tool_search_settings(dst: &mut ToolSearchSettingsConfig, src: ToolSearchSettingsConfig) {
+    if src.enabled.is_some() {
+        dst.enabled = src.enabled;
+    }
+    if src.mode.is_some() {
+        dst.mode = src.mode;
+    }
+    if src.strategy.is_some() {
+        dst.strategy = src.strategy;
+    }
+    if src.native_provider_mode.is_some() {
+        dst.native_provider_mode = src.native_provider_mode;
+    }
+    if src.activation_threshold_percent.is_some() {
+        dst.activation_threshold_percent = src.activation_threshold_percent;
+    }
+    if src.min_tool_count.is_some() {
+        dst.min_tool_count = src.min_tool_count;
+    }
+    if src.max_results.is_some() {
+        dst.max_results = src.max_results;
+    }
+    if src.max_loaded_tools.is_some() {
+        dst.max_loaded_tools = src.max_loaded_tools;
+    }
+    if src.max_loaded_tool_tokens.is_some() {
+        dst.max_loaded_tool_tokens = src.max_loaded_tool_tokens;
+    }
+    if src.always_loaded.is_some() {
+        dst.always_loaded = src.always_loaded;
+    }
+    if src.deferred.is_some() {
+        dst.deferred = src.deferred;
+    }
+    if src.disabled.is_some() {
+        dst.disabled = src.disabled;
+    }
+    if src.include_schema_arguments.is_some() {
+        dst.include_schema_arguments = src.include_schema_arguments;
+    }
+    if src.include_tool_category_hints.is_some() {
+        dst.include_tool_category_hints = src.include_tool_category_hints;
+    }
+    if src.persist_discovered_tools.is_some() {
+        dst.persist_discovered_tools = src.persist_discovered_tools;
+    }
 }
 
 fn merge_mcp_settings(dst: &mut McpSettingsConfig, src: McpSettingsConfig) {
@@ -597,5 +658,46 @@ mod tests {
         fs::write(agent_dir.join("settings.json"), cfg.to_string()).unwrap();
         let err = load(dir.path(), SettingSource::Project).unwrap_err();
         assert!(matches!(err, SettingsError::BadPermissionMode(_)));
+    }
+
+    #[test]
+    // Loads and validates the tool_search settings block.
+    fn loads_tool_search_settings() {
+        let dir = TempDir::new().unwrap();
+        let agent_dir = dir.path().join(".agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let cfg = serde_json::json!({
+            "tool_search": {
+                "enabled": true,
+                "mode": "search",
+                "strategy": "bm25",
+                "native_provider_mode": "off",
+                "max_results": 7,
+                "always_loaded": ["Read", "SearchTools"],
+                "deferred": ["mcp__*"],
+                "disabled": ["mcp__fake__delete_*"]
+            }
+        });
+        fs::write(agent_dir.join("settings.json"), cfg.to_string()).unwrap();
+        let s = load(dir.path(), SettingSource::Project).unwrap();
+        assert_eq!(s.tool_search.mode.as_deref(), Some("search"));
+        assert_eq!(s.tool_search.strategy.as_deref(), Some("bm25"));
+        assert_eq!(s.tool_search.max_results, Some(7));
+        assert_eq!(
+            s.tool_search.disabled.as_deref(),
+            Some(&["mcp__fake__delete_*".to_string()][..])
+        );
+    }
+
+    #[test]
+    // Invalid tool_search values produce a clear settings error.
+    fn invalid_tool_search_setting_errors() {
+        let dir = TempDir::new().unwrap();
+        let agent_dir = dir.path().join(".agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let cfg = serde_json::json!({"tool_search": {"strategy": "semantic"}});
+        fs::write(agent_dir.join("settings.json"), cfg.to_string()).unwrap();
+        let err = load(dir.path(), SettingSource::Project).unwrap_err();
+        assert!(matches!(err, SettingsError::BadToolSearch(_)));
     }
 }
