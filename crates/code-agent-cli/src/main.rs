@@ -9,10 +9,11 @@ use clap::{Parser, Subcommand};
 use code_agent_anthropic::{AnthropicConfig, AnthropicProvider};
 use code_agent_core::agent::{SessionSink, TelemetrySink};
 use code_agent_core::{
-    AgentClient, AgentEvent, AgentOptions, AgentTelemetryEvent, ApprovalMemoryMode,
+    AgentClient, AgentEvent, AgentOptions, AgentTelemetryEvent, ApprovalMemoryMode, AuditLogHook,
     BlockDangerousBashHook, BlockEnvFileWritesHook, HookOutcomeKind, Hooks, MaxPatchSizeHook,
     ModelProvider, PermissionCallback, PermissionDecision, PermissionMode, PermissionRequest,
-    ResultSubtype, SessionId, SessionStart, SettingSource, Settings, ToolRegistry, ToolRule,
+    ResultSubtype, SecretRedactionHook, SessionId, SessionStart, SettingSource, Settings,
+    ToolRegistry, ToolRule,
 };
 use code_agent_session::{
     append_settings_snapshot, append_user_prompt, export_session, fork_session,
@@ -355,10 +356,19 @@ async fn resolve_common(
     };
 
     // Determine allowed tool names: CLI overrides settings if non-empty.
+    //
+    // In `dontAsk` mode the simple-name list acts as an implicit allowlist
+    // (M1 contract). If the user did not explicitly set `--allowed-tools`,
+    // we MUST NOT auto-fill the default 7 names there, because that would
+    // silently widen permissions past whatever structured rules say. So in
+    // dontAsk we only honor explicit `--allowed-tools` and leave the list
+    // empty otherwise — the policy engine then evaluates structured rules
+    // alone.
     let allowed_tools = if !common.allowed_tools.is_empty() {
         common.allowed_tools.clone()
+    } else if matches!(mode, PermissionMode::DontAsk) {
+        Vec::new()
     } else {
-        // Default to the registry plus the rule list extracted exact-tool names.
         let mut out: Vec<String> = vec![
             "Read".into(),
             "Glob".into(),
@@ -438,6 +448,19 @@ async fn resolve_common(
     if let Some(max_bytes) = settings.hooks.max_patch_size_bytes {
         hooks = hooks.pre_tool_use("Edit|Write", Arc::new(MaxPatchSizeHook::new(max_bytes)));
     }
+    // Audit-log every successful and failed tool call into an in-memory log
+    // surfaced through `HookEvaluated` events.
+    if settings.hooks.audit_log.unwrap_or(false) {
+        let audit = Arc::new(AuditLogHook::default());
+        hooks = hooks.post_tool_use("*", audit.clone());
+        hooks = hooks.post_tool_use_failure("*", audit);
+    }
+    // Wire SecretRedactionHook so the toggle is honored. The hook itself
+    // returns Continue and is informational; the real redaction is applied
+    // by the audit-log hook to its own entries (see `redact_secrets_in_value`).
+    if settings.hooks.secret_redaction.unwrap_or(true) {
+        hooks = hooks.post_tool_use("*", Arc::new(SecretRedactionHook));
+    }
 
     let settings_summary = build_settings_summary(&settings, &model, mode);
 
@@ -476,16 +499,15 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
 async fn cmd_resume(args: ResumeArgs) -> Result<()> {
     let cfg = resolve_common(&args.common, true).await?;
     let session_id = SessionId::from(args.session_id.clone());
-    if !args.common.no_session {
-        // Verify the session exists and is loadable BEFORE running. Without
-        // this we'd silently start fresh on a typo'd id, which is a true
-        // resume-semantics regression.
-        let store = FsSessionStore::new(cfg.cwd.clone());
-        store
-            .load(&session_id)
-            .await
-            .with_context(|| format!("session {} not found", session_id))?;
-    }
+    // Verify the session exists and is loadable BEFORE running, regardless
+    // of `--no-session`. Even read-only resume requires the session file to
+    // exist; otherwise we'd silently start fresh on a typo'd id, a real
+    // resume-semantics regression.
+    let store = FsSessionStore::new(cfg.cwd.clone());
+    store
+        .load(&session_id)
+        .await
+        .with_context(|| format!("session {} not found", session_id))?;
     run_one_shot(
         cfg,
         args.common.no_session,
@@ -539,6 +561,14 @@ async fn run_one_shot(
 ) -> Result<()> {
     let provider: Arc<dyn ModelProvider> = build_provider(&cfg.options.model)?;
 
+    // `--no-session` disables session WRITES, but resume/continue/fork still
+    // need to READ prior history to honor their semantics. When the caller
+    // supplied an explicit session id (resume, continue, fork) we always open
+    // the store for reading, even with --no-session.
+    let read_store: Option<Arc<dyn SessionStore>> = forced_session_id
+        .as_ref()
+        .map(|_| Arc::new(FsSessionStore::new(cfg.cwd.clone())) as Arc<dyn SessionStore>);
+
     let (session_id, session_sink, store) = if no_session {
         (forced_session_id.unwrap_or_default(), None, None)
     } else {
@@ -559,7 +589,7 @@ async fn run_one_shot(
         (id, Some(sink), Some(store))
     };
 
-    let initial_history = if let Some(s) = &store {
+    let initial_history = if let Some(s) = store.as_ref().or(read_store.as_ref()) {
         let records = s.load(&session_id).await.unwrap_or_default();
         let conv = replay_conversation(&records);
         drop_trailing_matching_user_prompt(conv.messages, &prompt)
@@ -690,6 +720,14 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
     }
     if let Some(max_bytes) = cfg.settings.hooks.max_patch_size_bytes {
         hooks = hooks.pre_tool_use("Edit|Write", Arc::new(MaxPatchSizeHook::new(max_bytes)));
+    }
+    if cfg.settings.hooks.audit_log.unwrap_or(false) {
+        let audit = Arc::new(AuditLogHook::default());
+        hooks = hooks.post_tool_use("*", audit.clone());
+        hooks = hooks.post_tool_use_failure("*", audit);
+    }
+    if cfg.settings.hooks.secret_redaction.unwrap_or(true) {
+        hooks = hooks.post_tool_use("*", Arc::new(SecretRedactionHook));
     }
 
     let mut options = cfg.options.clone();

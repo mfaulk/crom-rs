@@ -114,15 +114,27 @@ impl<'de> Deserialize<'de> for ToolRule {
                 let mut command_regex: Option<String> = None;
                 let mut path_glob: Option<String> = None;
 
+                // Track unknown keys so a typo like `commandRegex` fails fast
+                // instead of silently degrading to an unconditional
+                // `ExactTool(tool)` rule, which would widen Bash permissions
+                // unintentionally.
+                let mut unknown_keys: Vec<String> = Vec::new();
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "tool" => tool = Some(map.next_value::<String>()?),
                         "command_regex" => command_regex = Some(map.next_value::<String>()?),
                         "path_glob" => path_glob = Some(map.next_value::<String>()?),
-                        _ => {
+                        other => {
+                            unknown_keys.push(other.to_string());
                             let _: serde_json::Value = map.next_value()?;
                         }
                     }
+                }
+                if !unknown_keys.is_empty() {
+                    return Err(de::Error::custom(format!(
+                        "tool rule object has unknown key(s): {} (allowed: tool, command_regex, path_glob)",
+                        unknown_keys.join(", ")
+                    )));
                 }
                 let tool =
                     tool.ok_or_else(|| de::Error::custom("tool rule object missing `tool`"))?;
@@ -212,5 +224,33 @@ mod tests {
         assert!(r.matches("Edit", &serde_json::json!({"file_path": "src/.env.local"})));
         assert!(!r.matches("Edit", &serde_json::json!({"file_path": "src/lib.rs"})));
         assert!(!r.matches("Write", &serde_json::json!({"file_path": ".env"})));
+    }
+}
+
+#[cfg(test)]
+mod round2_regression {
+    use super::*;
+
+    #[test]
+    // Regression: a typo'd discriminator key (e.g. `commandRegex` instead of
+    // `command_regex`) must fail deserialization, not silently degrade to
+    // ExactTool which would unconditionally allow the tool.
+    fn rejects_unknown_discriminator_keys() {
+        let r: Result<ToolRule, _> =
+            serde_json::from_str(r#"{"tool": "Bash", "commandRegex": "^cargo test"}"#);
+        assert!(r.is_err(), "expected deserialization error for typo'd key");
+        let msg = format!("{}", r.unwrap_err());
+        assert!(
+            msg.contains("commandRegex") || msg.contains("unknown"),
+            "error must mention the unknown key, got: {msg}"
+        );
+    }
+
+    #[test]
+    // Plain `{"tool": "Foo"}` (no rule discriminator) is still treated as an
+    // exact tool — that's the documented escape hatch and should keep working.
+    fn plain_tool_object_still_parses_as_exact() {
+        let r: ToolRule = serde_json::from_str(r#"{"tool": "Foo"}"#).unwrap();
+        assert!(matches!(r, ToolRule::ExactTool(ref n) if n == "Foo"));
     }
 }

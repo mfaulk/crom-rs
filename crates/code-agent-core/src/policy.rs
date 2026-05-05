@@ -88,6 +88,13 @@ impl PolicyDecision {
 }
 
 /// In-memory approval cache keyed by approval-key strings.
+///
+/// `AllowForSession` and `AllowForProject` decisions are stored in
+/// separate vectors so a future on-disk persistence layer (M3) can
+/// distinguish them. At M2-runtime the evaluator treats both as
+/// "allow this key again," so within a single live process they are
+/// behaviorally equivalent. The intent of the variant is preserved
+/// for the snapshot/persistence path.
 #[derive(Default, Clone)]
 pub struct ApprovalMemory {
     inner: Arc<Mutex<ApprovalMemoryInner>>,
