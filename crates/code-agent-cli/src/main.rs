@@ -9,11 +9,11 @@ use clap::{Parser, Subcommand};
 use code_agent_anthropic::{AnthropicConfig, AnthropicProvider};
 use code_agent_core::agent::{SessionSink, TelemetrySink};
 use code_agent_core::{
-    AgentClient, AgentEvent, AgentOptions, AgentTelemetryEvent, ApprovalMemoryMode, AuditLogHook,
-    BlockDangerousBashHook, BlockEnvFileWritesHook, HookOutcomeKind, Hooks, MaxPatchSizeHook,
-    ModelProvider, PermissionCallback, PermissionDecision, PermissionMode, PermissionRequest,
-    ResultSubtype, SecretRedactionHook, SessionId, SessionStart, SettingSource, Settings,
-    ToolRegistry, ToolRule,
+    is_valid_session_id_str, AgentClient, AgentEvent, AgentOptions, AgentTelemetryEvent,
+    ApprovalMemoryMode, AuditLogHook, BlockDangerousBashHook, BlockEnvFileWritesHook,
+    HookOutcomeKind, Hooks, MaxPatchSizeHook, ModelProvider, PermissionCallback,
+    PermissionDecision, PermissionMode, PermissionRequest, ResultSubtype, SecretRedactionHook,
+    SessionId, SessionStart, SettingSource, Settings, ToolRegistry, ToolRule,
 };
 use code_agent_session::{
     append_settings_snapshot, append_user_prompt, export_session, fork_session,
@@ -167,6 +167,19 @@ enum SessionsCommand {
 
 fn parse_permission_mode(s: &str) -> Result<PermissionMode> {
     PermissionMode::from_str_lenient(s).ok_or_else(|| anyhow!("invalid --permission-mode: {s}"))
+}
+
+/// Reject session ids that contain path separators, `..`, or other
+/// non-`[A-Za-z0-9_-]` characters. Defends against path traversal via the
+/// user-supplied `--session-id` (it ultimately becomes a file name under
+/// `<cwd>/.agent/sessions/`).
+fn parse_session_id(s: &str) -> Result<SessionId> {
+    if !is_valid_session_id_str(s) {
+        return Err(anyhow!(
+            "invalid session id: must match [A-Za-z0-9_-]+ and contain no path separators"
+        ));
+    }
+    Ok(SessionId::from(s.to_string()))
 }
 
 fn parse_setting_source(s: &str) -> Result<SettingSource> {
@@ -497,7 +510,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
 
 async fn cmd_resume(args: ResumeArgs) -> Result<()> {
     let cfg = resolve_common(&args.common, true).await?;
-    let session_id = SessionId::from(args.session_id.clone());
+    let session_id = parse_session_id(&args.session_id)?;
     // Verify the session exists and is loadable BEFORE running, regardless
     // of `--no-session`. Even read-only resume requires the session file to
     // exist; otherwise we'd silently start fresh on a typo'd id, a real
@@ -536,7 +549,7 @@ async fn cmd_continue(args: ContinueArgs) -> Result<()> {
 async fn cmd_fork(args: ForkArgs) -> Result<()> {
     let cfg = resolve_common(&args.common, true).await?;
     let store: Arc<dyn SessionStore> = Arc::new(FsSessionStore::new(cfg.cwd.clone()));
-    let source = SessionId::from(args.session_id.clone());
+    let source = parse_session_id(&args.session_id)?;
     let new_id = fork_session(store.as_ref(), &cfg.cwd, &source).await?;
     if !cfg.quiet {
         println!("[fork] {} -> {}", source, new_id);
@@ -869,7 +882,7 @@ async fn cmd_sessions_list(cwd: PathBuf) -> Result<()> {
 async fn cmd_sessions_show(session_id: String, cwd: PathBuf) -> Result<()> {
     let cwd = cwd.canonicalize().context("--cwd")?;
     let store = FsSessionStore::new(cwd.clone());
-    let id = SessionId::from(session_id);
+    let id = parse_session_id(&session_id)?;
     let summary = summarize_session(&store, &id).await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
@@ -878,7 +891,7 @@ async fn cmd_sessions_show(session_id: String, cwd: PathBuf) -> Result<()> {
 async fn cmd_sessions_export(session_id: String, cwd: PathBuf, format: String) -> Result<()> {
     let cwd = cwd.canonicalize().context("--cwd")?;
     let store = FsSessionStore::new(cwd.clone());
-    let id = SessionId::from(session_id);
+    let id = parse_session_id(&session_id)?;
     let fmt = ExportFormat::from_str_lenient(&format)
         .ok_or_else(|| anyhow!("invalid --format: {format}"))?;
     let s = export_session(&store, &id, fmt).await?;

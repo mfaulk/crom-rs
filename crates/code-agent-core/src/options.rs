@@ -17,6 +17,22 @@ impl SessionId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns true iff the id is safe to use as a filesystem path
+    /// component: non-empty, only `[A-Za-z0-9_-]`, no path separators
+    /// or `..`. UUID v4 ids satisfy this. Used to defend against
+    /// path-traversal via user-supplied `--session-id`.
+    pub fn is_valid_format(&self) -> bool {
+        is_valid_session_id_str(&self.0)
+    }
+}
+
+/// Returns true iff `s` is a syntactically valid session id.
+/// Accepts only `[A-Za-z0-9_-]+` and rejects empty strings.
+pub fn is_valid_session_id_str(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 impl std::fmt::Display for SessionId {
@@ -100,5 +116,57 @@ impl std::fmt::Debug for AgentOptions {
             .field("max_tokens", &self.max_tokens)
             .field("approval_memory", &self.approval_memory)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    // A freshly generated UUID v4 session id is recognized as valid.
+    fn uuid_v4_is_valid() {
+        let id = SessionId::new();
+        assert!(id.is_valid_format(), "uuid id should be valid: {id}");
+    }
+
+    #[test]
+    // Plain ASCII alphanumeric, dash, and underscore ids are valid.
+    fn alnum_dash_underscore_is_valid() {
+        assert!(SessionId::from("abc123".to_string()).is_valid_format());
+        assert!(SessionId::from("a-b_c-1".to_string()).is_valid_format());
+        assert!(SessionId::from("Z".to_string()).is_valid_format());
+    }
+
+    #[test]
+    // A bare `..` is rejected as a session id.
+    fn dotdot_is_rejected() {
+        assert!(!SessionId::from("..".to_string()).is_valid_format());
+    }
+
+    #[test]
+    // Path separators in a session id are rejected.
+    fn slash_is_rejected() {
+        assert!(!SessionId::from("foo/bar".to_string()).is_valid_format());
+        assert!(!SessionId::from("../etc/passwd".to_string()).is_valid_format());
+    }
+
+    #[test]
+    // Absolute Unix paths are rejected as session ids.
+    fn absolute_path_is_rejected() {
+        assert!(!SessionId::from("/etc/passwd".to_string()).is_valid_format());
+    }
+
+    #[test]
+    // Empty session ids are rejected.
+    fn empty_is_rejected() {
+        assert!(!SessionId::from(String::new()).is_valid_format());
+    }
+
+    #[test]
+    // A single dot is rejected because `.` is not in [A-Za-z0-9_-].
+    fn dot_is_rejected() {
+        assert!(!SessionId::from(".".to_string()).is_valid_format());
+        assert!(!SessionId::from("a.b".to_string()).is_valid_format());
     }
 }

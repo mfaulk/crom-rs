@@ -80,8 +80,11 @@ impl FsSessionStore {
         cwd.join(".agent").join("sessions")
     }
 
-    fn file_path(&self, session_id: &SessionId) -> PathBuf {
-        Self::sessions_dir_for(&self.cwd).join(format!("{}.jsonl", session_id.as_str()))
+    fn file_path(&self, session_id: &SessionId) -> Result<PathBuf, SessionError> {
+        if !session_id.is_valid_format() {
+            return Err(SessionError::InvalidId);
+        }
+        Ok(Self::sessions_dir_for(&self.cwd).join(format!("{}.jsonl", session_id.as_str())))
     }
 }
 
@@ -92,7 +95,7 @@ impl SessionStore for FsSessionStore {
         let dir = Self::sessions_dir_for(&self.cwd);
         tokio::fs::create_dir_all(&dir).await?;
         // Touch the file so it shows up in `list` and `latest_for_cwd`.
-        let path = self.file_path(&id);
+        let path = self.file_path(&id)?;
         tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -106,9 +109,11 @@ impl SessionStore for FsSessionStore {
         session_id: &SessionId,
         event: SessionRecord,
     ) -> Result<(), SessionError> {
+        // Validate first so a bad id never reaches `create_dir_all` or the
+        // filesystem at all.
+        let path = self.file_path(session_id)?;
         let dir = Self::sessions_dir_for(&self.cwd);
         tokio::fs::create_dir_all(&dir).await?;
-        let path = self.file_path(session_id);
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -122,7 +127,7 @@ impl SessionStore for FsSessionStore {
     }
 
     async fn load(&self, session_id: &SessionId) -> Result<Vec<SessionRecord>, SessionError> {
-        let path = self.file_path(session_id);
+        let path = self.file_path(session_id)?;
         if !path.exists() {
             return Err(SessionError::NotFound(session_id.to_string()));
         }
@@ -527,6 +532,54 @@ mod tests {
         let latest = store.latest_for_cwd(dir.path()).await.unwrap().unwrap();
         assert_ne!(id1.as_str(), id2.as_str());
         assert_eq!(latest.as_str(), id2.as_str());
+    }
+
+    #[tokio::test]
+    // load with `..`-style id returns InvalidId rather than escaping the
+    // sessions directory.
+    async fn load_rejects_traversal_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let bad = SessionId::from("../etc/passwd".to_string());
+        let err = store
+            .load(&bad)
+            .await
+            .expect_err("traversal id must be rejected");
+        assert!(
+            matches!(err, SessionError::InvalidId),
+            "expected InvalidId, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    // append with a slash-containing id errors out instead of writing
+    // outside the sessions directory.
+    async fn append_rejects_slash_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let bad = SessionId::from("foo/bar".to_string());
+        let rec = SessionRecord {
+            timestamp: now_iso(),
+            cwd: dir.path().to_path_buf(),
+            session_id: bad.to_string(),
+            payload: SessionPayload::UserPrompt {
+                text: "x".to_string(),
+            },
+        };
+        let err = store
+            .append(&bad, rec)
+            .await
+            .expect_err("slash id must be rejected");
+        assert!(
+            matches!(err, SessionError::InvalidId),
+            "expected InvalidId, got {err:?}"
+        );
+        // Confirm no stray file/directory was created above the sessions dir.
+        let stray = dir.path().join("foo");
+        assert!(
+            !stray.exists(),
+            "append must not create paths outside the sessions dir"
+        );
     }
 
     #[tokio::test]

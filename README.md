@@ -65,6 +65,11 @@ cargo run -p code-agent-cli -- sessions show <SESSION_ID>
 cargo run -p code-agent-cli -- sessions export <SESSION_ID> --format json
 ```
 
+Session ids supplied to `resume`, `fork`, `sessions show`, and
+`sessions export` must match `[A-Za-z0-9_-]+` (UUIDs minted by
+`code-agent` satisfy this). Other inputs are rejected so a crafted id
+cannot escape `<cwd>/.agent/sessions/`.
+
 The CLI prints:
 
 ```
