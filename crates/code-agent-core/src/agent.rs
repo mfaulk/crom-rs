@@ -29,6 +29,13 @@ use crate::todo::{TodoItem, TodoList};
 use crate::tool::{ToolContext, ToolRegistry};
 use crate::usage::TokenUsage;
 
+/// Convert an elapsed duration to milliseconds, saturating at u64::MAX.
+/// Intentional saturation handles the extremely unlikely case of timing
+/// durations exceeding u64::MAX milliseconds (~584 million years).
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
 /// Trait for a session-store sink the agent can write records to without
 /// taking a hard dependency on the session crate.
 #[async_trait]
@@ -501,7 +508,7 @@ pub(crate) async fn run_loop(
                         run_id: cfg.run_id.clone(),
                         turn_index: turns,
                         model: options.model.clone(),
-                        duration_ms: model_started.elapsed().as_millis() as u64,
+                        duration_ms: elapsed_ms(model_started),
                         usage: None,
                         cost_usd: None,
                         outcome: TelemetryOutcome::Error,
@@ -582,7 +589,7 @@ pub(crate) async fn run_loop(
                             run_id: cfg.run_id.clone(),
                             turn_index: turns,
                             model: options.model.clone(),
-                            duration_ms: model_started.elapsed().as_millis() as u64,
+                            duration_ms: elapsed_ms(model_started),
                             usage: Some(total_usage.clone()),
                             cost_usd: pricing.as_ref().map(|p| p.estimate(&total_usage)),
                             outcome: TelemetryOutcome::Error,
@@ -625,7 +632,7 @@ pub(crate) async fn run_loop(
                 run_id: cfg.run_id.clone(),
                 turn_index: turns,
                 model: options.model.clone(),
-                duration_ms: model_started.elapsed().as_millis() as u64,
+                duration_ms: elapsed_ms(model_started),
                 usage: Some(turn_usage.clone()),
                 cost_usd: pricing.as_ref().map(|p| p.estimate(&turn_usage)),
                 outcome: TelemetryOutcome::Ok,
@@ -894,7 +901,7 @@ pub(crate) async fn run_loop(
             )
             .await;
             let exec = tool.execute(effective_input.clone(), ctx).await;
-            let duration_ms = started.elapsed().as_millis() as u64;
+            let duration_ms = elapsed_ms(started);
             let (text, is_error, tool_result_obj) = match &exec {
                 Ok(res) => (res.flatten_text(), res.is_error, Some(res.clone())),
                 Err(ToolError::PermissionDenied(msg)) => {
