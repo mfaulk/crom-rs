@@ -382,7 +382,7 @@ walk through the entire flow.
   `.agent/checkpoints/<session-id>/{checkpoints.jsonl, manifests/, blobs/}`.
 
 ```sh
-export ANTHROPIC_API_KEY=...
+# Either export ANTHROPIC_API_KEY or add ANTHROPIC_API_KEY=... to repo-root .env.
 ./examples/m3-e2e-demo.sh
 ```
 
