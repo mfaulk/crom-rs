@@ -27,7 +27,7 @@
 #
 # Requires:
 #   * cargo / rustc on PATH
-#   * ANTHROPIC_API_KEY exported
+#   * ANTHROPIC_API_KEY exported or set in the repo-root .env
 #   * a clean working tree under examples/checkpoint-demo (the script
 #     restores tracked files from HEAD and wipes generated artifacts on
 #     every run)
@@ -41,14 +41,52 @@ yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
 gray()  { printf '\033[90m%s\033[0m\n' "$*"; }
 section() { printf '\n'; bold "============================================================"; bold "$*"; bold "============================================================"; }
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "error: ANTHROPIC_API_KEY is not set." >&2
-    echo "       export it first: export ANTHROPIC_API_KEY=sk-ant-..." >&2
-    exit 2
-fi
-
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 DEMO_DIR="$REPO_ROOT/examples/checkpoint-demo"
+
+load_anthropic_key_from_dotenv() {
+    local env_file="$REPO_ROOT/.env"
+    local line value first last
+
+    [[ -z "${ANTHROPIC_API_KEY:-}" ]] || return 0
+    [[ -f "$env_file" ]] || return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?ANTHROPIC_API_KEY=(.*)$ ]] || continue
+
+        value="${BASH_REMATCH[2]}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        if [[ "$value" != \"* && "$value" != \'* ]]; then
+            value="${value%%#*}"
+            value="${value%"${value##*[![:space:]]}"}"
+        fi
+
+        if [[ "${#value}" -ge 2 ]]; then
+            first="${value:0:1}"
+            last="${value: -1}"
+            if [[ "$first" == "$last" && ( "$first" == '"' || "$first" == "'" ) ]]; then
+                value="${value:1:${#value}-2}"
+            fi
+        fi
+
+        if [[ -n "$value" ]]; then
+            export ANTHROPIC_API_KEY="$value"
+            gray "Loaded ANTHROPIC_API_KEY from $env_file."
+        fi
+        return 0
+    done < "$env_file"
+}
+
+load_anthropic_key_from_dotenv
+
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "error: ANTHROPIC_API_KEY is not set." >&2
+    echo "       export it first or add ANTHROPIC_API_KEY=sk-ant-... to $REPO_ROOT/.env" >&2
+    exit 2
+fi
 
 if [[ ! -d "$DEMO_DIR" ]]; then
     echo "error: $DEMO_DIR not found" >&2
