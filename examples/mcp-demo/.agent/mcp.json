@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "fake": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "-p", "fake-mcp-server", "--quiet"],
+      "startup_timeout_seconds": 10,
+      "request_timeout_seconds": 60
+    }
+  }
+}

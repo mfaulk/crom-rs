@@ -31,11 +31,11 @@ impl GrepTool {
 
 #[async_trait]
 impl Tool for GrepTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Grep"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Search for a regex pattern across workspace files, optionally filtered by an include glob. Honors .gitignore. Returns up to a configured number of matching lines."
     }
 

@@ -27,11 +27,11 @@ impl WriteTool {
 
 #[async_trait]
 impl Tool for WriteTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Write"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Create or overwrite a UTF-8 text file in the workspace. Paths are resolved relative to the workspace root."
     }
 

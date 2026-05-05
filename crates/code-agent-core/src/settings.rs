@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use code_agent_mcp::McpSettingsConfig;
+
 use crate::permission::PermissionMode;
 use crate::tool_rule::ToolRule;
 
@@ -73,6 +75,8 @@ pub struct SettingsFile {
     pub checkpointing: Option<CheckpointingConfig>,
     #[serde(default)]
     pub validation: Option<ValidationConfig>,
+    #[serde(default)]
+    pub mcp: Option<McpSettingsConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -168,6 +172,7 @@ pub struct Settings {
     pub max_tokens: Option<u32>,
     pub checkpointing: CheckpointingConfig,
     pub validation: ValidationConfig,
+    pub mcp: Option<McpSettingsConfig>,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -406,7 +411,50 @@ fn merge_into(dst: &mut Settings, src: SettingsFile, _is_user: bool) -> Result<(
             dst.validation.rewind_on_failure = Some(r);
         }
     }
+    if let Some(mcp) = src.mcp {
+        match &mut dst.mcp {
+            Some(existing) => merge_mcp_settings(existing, mcp),
+            None => dst.mcp = Some(mcp),
+        }
+    }
     Ok(())
+}
+
+fn merge_mcp_settings(dst: &mut McpSettingsConfig, src: McpSettingsConfig) {
+    if src.enabled.is_some() {
+        dst.enabled = src.enabled;
+    }
+    if src.config_file.is_some() {
+        dst.config_file = src.config_file;
+    }
+    if src.max_servers.is_some() {
+        dst.max_servers = src.max_servers;
+    }
+    if src.max_tools_per_server.is_some() {
+        dst.max_tools_per_server = src.max_tools_per_server;
+    }
+    if src.max_tool_result_bytes.is_some() {
+        dst.max_tool_result_bytes = src.max_tool_result_bytes;
+    }
+    if src.startup_timeout_seconds.is_some() {
+        dst.startup_timeout_seconds = src.startup_timeout_seconds;
+    }
+    if src.request_timeout_seconds.is_some() {
+        dst.request_timeout_seconds = src.request_timeout_seconds;
+    }
+    if src.external_effect_policy.is_some() {
+        dst.external_effect_policy = src.external_effect_policy;
+    }
+    if src.load_resources.is_some() {
+        dst.load_resources = src.load_resources;
+    }
+    if src.load_prompts.is_some() {
+        dst.load_prompts = src.load_prompts;
+    }
+    if src.strict.is_some() {
+        dst.strict = src.strict;
+    }
+    dst.servers.extend(src.servers);
 }
 
 #[cfg(test)]

@@ -27,6 +27,14 @@ pub enum AgentEvent {
     /// `file_snapshot_captured`, `rewind_completed`); structured data is
     /// flattened alongside it.
     CheckpointEvent(CheckpointEventPayload),
+    McpServerConnecting(code_agent_mcp::McpServerConnecting),
+    McpServerConnected(code_agent_mcp::McpServerConnected),
+    McpServerFailed(code_agent_mcp::McpServerFailed),
+    McpToolsDiscovered(code_agent_mcp::McpToolsDiscovered),
+    McpToolCallStarted(code_agent_mcp::McpToolCallStarted),
+    McpToolCallCompleted(code_agent_mcp::McpToolCallCompleted),
+    McpToolCallFailed(code_agent_mcp::McpToolCallFailed),
+    McpServerLog(code_agent_mcp::McpServerLog),
     Result(AgentResult),
 }
 

@@ -8,6 +8,7 @@ pub mod conversation;
 pub mod errors;
 pub mod events;
 pub mod hooks;
+pub mod mcp;
 pub mod options;
 pub mod permission;
 pub mod policy;
@@ -23,12 +24,20 @@ pub mod usage;
 pub use agent::{query, Agent, AgentBuilder, SessionSink, TelemetrySink};
 pub use builtin_hooks::{
     redact_secrets_in_value, AuditEntry, AuditLogHook, BlockDangerousBashHook,
-    BlockEnvFileWritesHook, MaxPatchSizeHook, SecretRedactionHook,
+    BlockEnvFileWritesHook, BlockMcpServerHook, BlockMcpToolNameHook, BlockMcpWriteLikeToolHook,
+    MaxPatchSizeHook, McpAuditLogHook, McpResultSizeLimitHook, McpSecretRedactionHook,
+    SecretRedactionHook,
 };
 pub use checkpoint::{
     CheckpointApi, CheckpointBashAction, CheckpointCaptureResult, CheckpointHandle,
 };
 pub use client::{AgentClient, AgentClientBuilder, AgentEventStream, SessionStart};
+pub use code_agent_mcp::{
+    McpConnectionStatus, McpExternalEffectPolicy, McpLimits, McpOptions, McpServerConfig,
+    McpServerConnected, McpServerConnecting, McpServerFailed, McpServerLog, McpServerStatus,
+    McpSettingsConfig, McpToolCallCompleted, McpToolCallFailed, McpToolCallStarted, McpToolSummary,
+    McpToolsDiscovered, McpTransportKind, StdioMcpServerConfig, StreamableHttpMcpServerConfig,
+};
 pub use conversation::{
     AssistantContent, AssistantMessage, ContentBlock, Conversation, Message, MessageRole,
     SystemInit, ToolCall, ToolResult as ConvToolResult, ToolResultContent,
@@ -43,6 +52,7 @@ pub use hooks::{
     aggregate, Hook, HookAddedContext, HookAggregateDecision, HookCallRecord, HookError,
     HookEventName, HookInput, HookMatcher, HookOutput, Hooks, StopReason, ToolMatcher,
 };
+pub use mcp::{mcp_completion_from_result, mcp_failure_from_error, register_mcp_tools, McpTool};
 pub use options::{is_valid_session_id_str, AgentOptions, SessionId};
 pub use permission::{
     ApprovalMemoryMode, PermissionCallback, PermissionDecision, PermissionKind, PermissionMode,

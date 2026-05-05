@@ -73,6 +73,73 @@ enum Command {
     Checkpoints(CheckpointsCommand),
     /// Rewind workspace files to a checkpoint.
     Rewind(RewindArgs),
+    /// Inspect and call configured MCP servers.
+    #[command(subcommand)]
+    Mcp(McpCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCommand {
+    /// List configured MCP servers.
+    List(McpCommonArgs),
+    /// Connect and show MCP server status.
+    Status(McpCommonArgs),
+    /// List tools exposed by one MCP server.
+    Tools {
+        server: String,
+        #[command(flatten)]
+        common: McpCommonArgs,
+    },
+    /// Call an MCP tool directly.
+    Call {
+        server: String,
+        tool: String,
+        #[arg(long, default_value = "{}")]
+        args_json: String,
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        common: McpCommonArgs,
+    },
+    /// List resources exposed by one MCP server.
+    Resources {
+        server: String,
+        #[command(flatten)]
+        common: McpCommonArgs,
+    },
+    /// Read a resource from one MCP server.
+    #[command(subcommand)]
+    Resource(McpResourceCommand),
+    /// List prompts exposed by one MCP server.
+    Prompts {
+        server: String,
+        #[command(flatten)]
+        common: McpCommonArgs,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpResourceCommand {
+    Read {
+        server: String,
+        uri: String,
+        #[command(flatten)]
+        common: McpCommonArgs,
+    },
+}
+
+#[derive(Parser, Debug, Clone)]
+struct McpCommonArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long)]
+    mcp_config: Option<PathBuf>,
+    #[arg(long)]
+    mcp_timeout: Option<u64>,
+    #[arg(long)]
+    mcp_strict: bool,
+    #[arg(long = "mcp-server")]
+    mcp_servers: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -192,6 +259,21 @@ struct CommonArgs {
     /// Automatically rewind to the run's checkpoint when validation fails.
     #[arg(long)]
     rewind_on_validation_failure: bool,
+    /// Load MCP server configuration from this file.
+    #[arg(long)]
+    mcp_config: Option<PathBuf>,
+    /// Enable or disable MCP: true|false.
+    #[arg(long)]
+    mcp_enabled: Option<String>,
+    /// Fail the run if any configured MCP server fails to connect.
+    #[arg(long)]
+    mcp_strict: bool,
+    /// Override MCP startup and request timeout, in seconds.
+    #[arg(long)]
+    mcp_timeout: Option<u64>,
+    /// Limit MCP loading to this server name (repeatable).
+    #[arg(long = "mcp-server")]
+    mcp_servers: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -287,6 +369,14 @@ fn parse_log_format(s: &str) -> Result<LogFormat> {
         "pretty" => Ok(LogFormat::Pretty),
         "json" => Ok(LogFormat::Json),
         other => Err(anyhow!("invalid --log-format: {other}")),
+    }
+}
+
+fn parse_bool_flag(name: &str, value: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        other => Err(anyhow!("invalid {name}: {other}")),
     }
 }
 
@@ -412,6 +502,7 @@ async fn main() -> ExitCode {
             session,
         }) => cmd_checkpoints_diff(checkpoint_id, cwd, session).await,
         Command::Rewind(args) => cmd_rewind(args).await,
+        Command::Mcp(args) => cmd_mcp(args).await,
     };
 
     match result {
@@ -490,6 +581,9 @@ async fn resolve_common(
         if let Some(m) = file.project_instructions_mode {
             s.project_instructions_mode = m;
         }
+        if let Some(mcp) = file.mcp {
+            s.mcp = Some(mcp);
+        }
         s
     } else {
         code_agent_core::settings::load(&cwd, source).context("load settings")?
@@ -501,6 +595,32 @@ async fn resolve_common(
     }
     for rule_str in &common.deny {
         settings.disallowed_tools.push(parse_cli_rule(rule_str)?);
+    }
+    for tool_name in &common.allowed_tools {
+        if tool_name.starts_with("mcp__") {
+            settings.allowed_tools.push(parse_cli_rule(tool_name)?);
+        }
+    }
+
+    let mcp_enabled_override = common
+        .mcp_enabled
+        .as_deref()
+        .map(|s| parse_bool_flag("--mcp-enabled", s))
+        .transpose()?;
+    let mcp_timeout = common.mcp_timeout.map(Duration::from_secs);
+    let mut mcp_options = code_agent_mcp::load_mcp_options(
+        &cwd,
+        settings.mcp.as_ref(),
+        common.mcp_config.as_deref(),
+        mcp_enabled_override,
+        common.mcp_strict.then_some(true),
+        mcp_timeout,
+    )
+    .context("load MCP config")?;
+    if !common.mcp_servers.is_empty() {
+        mcp_options
+            .servers
+            .retain(|name, _| common.mcp_servers.iter().any(|wanted| wanted == name));
     }
 
     // Build effective tool limits.
@@ -618,6 +738,7 @@ async fn resolve_common(
         project_instructions: instructions,
         max_tokens,
         approval_memory: ApprovalMemoryMode::Session,
+        mcp: mcp_options.clone(),
     };
 
     // Build hooks from settings flags.
@@ -657,7 +778,7 @@ async fn resolve_common(
             .expect("built-in pattern is always valid");
     }
 
-    let settings_summary = build_settings_summary(&settings, &model, mode);
+    let settings_summary = build_settings_summary(&settings, &model, mode, &mcp_options);
     let (checkpointing, validation) = resolve_checkpoint_and_validation(common, &settings)?;
 
     Ok(ResolvedRunConfig {
@@ -769,12 +890,19 @@ fn resolve_checkpoint_and_validation(
     Ok((opts, validation))
 }
 
-fn build_settings_summary(s: &Settings, model: &str, mode: PermissionMode) -> String {
+fn build_settings_summary(
+    s: &Settings,
+    model: &str,
+    mode: PermissionMode,
+    mcp: &code_agent_mcp::McpOptions,
+) -> String {
     serde_json::json!({
         "model": model,
         "permission_mode": format!("{:?}", mode),
         "allowed_tools_count": s.allowed_tools.len(),
         "disallowed_tools_count": s.disallowed_tools.len(),
+        "mcp_settings_present": s.mcp.is_some(),
+        "mcp": mcp.redacted_summary(),
         "settings_source": format!("{:?}", s.source),
         "project_path": s.project_path,
         "user_path": s.user_path,
@@ -1319,6 +1447,182 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
     }
 }
 
+async fn cmd_mcp(args: McpCommand) -> Result<()> {
+    match args {
+        McpCommand::List(common) => {
+            let options = resolve_mcp_cli_options(&common).await?;
+            for (name, server) in &options.servers {
+                println!("{}\t{}", name, code_agent_core::mcp::transport_kind(server));
+            }
+            Ok(())
+        }
+        McpCommand::Status(common) => {
+            let options = resolve_mcp_cli_options(&common).await?;
+            let mut registry = ToolRegistry::new();
+            let report = code_agent_core::register_mcp_tools(&mut registry, &options).await;
+            println!("SERVER\tTRANSPORT\tSTATUS\tTOOLS\tVERSION");
+            for status in report.statuses {
+                println!(
+                    "{}\t{}\t{:?}\t{}\t{}",
+                    status.name,
+                    status.transport,
+                    status.status,
+                    status.tool_count,
+                    status.protocol_version.unwrap_or_else(|| "-".into())
+                );
+                if let Some(error) = status.error {
+                    println!("[mcp] {} failed: {}", status.name, error);
+                }
+            }
+            Ok(())
+        }
+        McpCommand::Tools { server, common } => {
+            let options = resolve_mcp_cli_options(&common).await?;
+            let mut client = connect_single_mcp_server(&options, &server).await?;
+            let tools = client.list_tools().await.map_err(|e| anyhow!("{e}"))?;
+            for tool in tools {
+                println!(
+                    "{}\t{}",
+                    tool.name,
+                    tool.description.unwrap_or_default().replace('\n', " ")
+                );
+            }
+            let _ = client.shutdown().await;
+            Ok(())
+        }
+        McpCommand::Call {
+            server,
+            tool,
+            args_json,
+            yes,
+            common,
+        } => {
+            if !yes {
+                return Err(anyhow!(
+                    "direct MCP calls require --yes because effects are external and not checkpointed"
+                ));
+            }
+            let options = resolve_mcp_cli_options(&common).await?;
+            let args: serde_json::Value = serde_json::from_str(&args_json)
+                .with_context(|| format!("parse --args-json for {server}.{tool}"))?;
+            let mut client = connect_single_mcp_server(&options, &server).await?;
+            println!("[mcp] {}.{}", server, tool);
+            println!(
+                "[warning] MCP tool effects are external and are not covered by workspace checkpointing."
+            );
+            let result = client
+                .call_tool(&tool, args)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            let (text, metadata, _, _) = code_agent_mcp::mcp_result_to_text_and_metadata(
+                &result,
+                options.max_tool_result_bytes,
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            if let Some(structured) = metadata
+                .get("mcp")
+                .and_then(|m| m.get("structured_content"))
+                .filter(|v| !v.is_null())
+            {
+                println!("{}", serde_json::to_string_pretty(structured)?);
+            } else {
+                println!("{text}");
+            }
+            let _ = client.shutdown().await;
+            Ok(())
+        }
+        McpCommand::Resources { server, common } => {
+            let options = resolve_mcp_cli_options(&common).await?;
+            let mut client = connect_single_mcp_server(&options, &server).await?;
+            let resources = client.list_resources().await.map_err(|e| anyhow!("{e}"))?;
+            for resource in resources {
+                println!(
+                    "{}\t{}\t{}",
+                    resource.uri,
+                    resource.name.unwrap_or_default(),
+                    resource.mime_type.unwrap_or_default()
+                );
+            }
+            let _ = client.shutdown().await;
+            Ok(())
+        }
+        McpCommand::Resource(McpResourceCommand::Read {
+            server,
+            uri,
+            common,
+        }) => {
+            let options = resolve_mcp_cli_options(&common).await?;
+            let mut client = connect_single_mcp_server(&options, &server).await?;
+            let contents = client
+                .read_resource(&uri)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            let mut rendered = serde_json::to_string_pretty(&contents)?;
+            if rendered.len() > options.max_tool_result_bytes {
+                rendered.truncate(options.max_tool_result_bytes);
+                rendered.push_str("\n[MCP resource output truncated]");
+            }
+            println!("{rendered}");
+            let _ = client.shutdown().await;
+            Ok(())
+        }
+        McpCommand::Prompts { server, common } => {
+            let options = resolve_mcp_cli_options(&common).await?;
+            let mut client = connect_single_mcp_server(&options, &server).await?;
+            let prompts = client.list_prompts().await.map_err(|e| anyhow!("{e}"))?;
+            for prompt in prompts {
+                println!(
+                    "{}\t{}\targs={}",
+                    prompt.name,
+                    prompt.description.unwrap_or_default().replace('\n', " "),
+                    prompt.arguments.len()
+                );
+            }
+            let _ = client.shutdown().await;
+            Ok(())
+        }
+    }
+}
+
+async fn resolve_mcp_cli_options(common: &McpCommonArgs) -> Result<code_agent_mcp::McpOptions> {
+    let cwd = common.cwd.canonicalize().context("--cwd")?;
+    let mut options = code_agent_mcp::load_mcp_options(
+        &cwd,
+        None,
+        common.mcp_config.as_deref(),
+        Some(true),
+        common.mcp_strict.then_some(true),
+        common.mcp_timeout.map(Duration::from_secs),
+    )
+    .context("load MCP config")?;
+    if !common.mcp_servers.is_empty() {
+        options
+            .servers
+            .retain(|name, _| common.mcp_servers.iter().any(|wanted| wanted == name));
+    }
+    Ok(options)
+}
+
+async fn connect_single_mcp_server(
+    options: &code_agent_mcp::McpOptions,
+    server: &str,
+) -> Result<code_agent_mcp::McpClient> {
+    let config = options
+        .servers
+        .get(server)
+        .ok_or_else(|| anyhow!("unknown MCP server {server}"))?;
+    let mut client = code_agent_mcp::McpClient::connect(
+        server,
+        config,
+        options.limits(),
+        options.secret_values(),
+    )
+    .await
+    .map_err(|e| anyhow!("{e}"))?;
+    client.initialize().await.map_err(|e| anyhow!("{e}"))?;
+    Ok(client)
+}
+
 async fn cmd_sessions_list(cwd: PathBuf) -> Result<()> {
     let cwd = cwd.canonicalize().context("--cwd")?;
     let store = FsSessionStore::new(cwd.clone());
@@ -1750,6 +2054,44 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
                 render_checkpoint_event(p);
             }
         }
+        AgentEvent::McpServerConnecting(e) => {
+            if !quiet {
+                println!("[mcp] connecting {} via {}", e.server_name, e.transport);
+            }
+        }
+        AgentEvent::McpServerConnected(e) => {
+            if !quiet {
+                println!(
+                    "[mcp] {} connected, {} tools discovered",
+                    e.server_name, e.tool_count
+                );
+            }
+        }
+        AgentEvent::McpServerFailed(e) => {
+            println!("[mcp] {} failed: {}", e.server_name, e.error);
+        }
+        AgentEvent::McpToolsDiscovered(_) => {}
+        AgentEvent::McpToolCallStarted(e) => {
+            if !quiet {
+                println!("[mcp-tool] {}.{}", e.server_name, e.remote_tool_name);
+            }
+        }
+        AgentEvent::McpToolCallCompleted(e) => {
+            if !quiet {
+                println!(
+                    "[mcp-result] {} ({} bytes, {}ms)",
+                    e.agent_tool_name, e.result_bytes, e.duration_ms
+                );
+            }
+        }
+        AgentEvent::McpToolCallFailed(e) => {
+            println!("[mcp-error] {}: {}", e.agent_tool_name, e.error);
+        }
+        AgentEvent::McpServerLog(e) => {
+            if !quiet {
+                println!("[mcp-log] {} {:?}: {}", e.server_name, e.stream, e.message);
+            }
+        }
         AgentEvent::Result(r) => {
             println!(
                 "[result] {} (turns={}, subtype={:?})",
@@ -1965,6 +2307,34 @@ impl StdinApprover {
         let mut s = String::new();
         s.push_str(&format!("\n[approval] mode={:?}\n", self.mode));
         s.push_str(&format!("  Tool: {}\n", request.tool_name));
+        if let Some(parts) = code_agent_mcp::parse_agent_tool_name(&request.tool_name) {
+            s.push_str(&format!("  Server: {}\n", parts.server_name));
+            s.push_str(&format!("  Remote tool: {}\n", parts.remote_tool_name));
+            if let Some(transport) = request
+                .metadata
+                .get("mcp")
+                .and_then(|m| m.get("transport"))
+                .and_then(|v| v.as_str())
+            {
+                s.push_str(&format!("  Transport: {}\n", transport));
+            }
+            s.push_str(&format!("  Arguments: {}\n", request.input));
+            s.push_str("  External access: yes\n");
+            s.push_str("  Checkpoint coverage: not applicable\n");
+            if code_agent_mcp::mutating_tool_name(&parts.remote_tool_name) {
+                s.push_str("  Warning: This MCP tool may modify external state. Workspace rewind cannot undo it.\n");
+            } else {
+                s.push_str("  Warning: MCP tool effects are external and are not covered by workspace checkpointing.\n");
+            }
+            s.push_str("    [y] allow once\n");
+            s.push_str("    [s] allow for session\n");
+            s.push_str("    [a] allow for project\n");
+            s.push_str("    [n] deny once\n");
+            s.push_str("    [d] deny for session\n");
+            s.push_str("    [v] view full input\n");
+            s.push_str("  approve> ");
+            return s;
+        }
         match request.tool_name.as_str() {
             "Bash" => {
                 let cmd = request

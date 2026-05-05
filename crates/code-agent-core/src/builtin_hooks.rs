@@ -180,6 +180,185 @@ impl Default for SecretRedactionHook {
     }
 }
 
+pub struct BlockMcpServerHook {
+    servers: Vec<String>,
+}
+
+impl BlockMcpServerHook {
+    pub fn new(servers: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            servers: servers.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl Hook for BlockMcpServerHook {
+    async fn call(&self, input: HookInput) -> Result<HookOutput, HookError> {
+        if input.event != HookEventName::PreToolUse {
+            return Ok(HookOutput::Continue);
+        }
+        let Some(tool_name) = input.tool_name.as_deref() else {
+            return Ok(HookOutput::Continue);
+        };
+        let Some(parts) = code_agent_mcp::parse_agent_tool_name(tool_name) else {
+            return Ok(HookOutput::Continue);
+        };
+        if self.servers.iter().any(|s| s == &parts.server_name) {
+            return Ok(HookOutput::Deny {
+                reason: format!("MCP server {} is blocked by hook", parts.server_name),
+            });
+        }
+        Ok(HookOutput::Continue)
+    }
+}
+
+pub struct BlockMcpToolNameHook {
+    matcher: crate::hooks::ToolMatcher,
+}
+
+impl BlockMcpToolNameHook {
+    pub fn new(pattern: &str) -> Result<Self, HookError> {
+        let matcher = crate::hooks::ToolMatcher::parse(pattern).map_err(|parser_error| {
+            HookError::Pattern {
+                event: HookEventName::PreToolUse,
+                pattern: pattern.to_string(),
+                parser_error,
+            }
+        })?;
+        Ok(Self { matcher })
+    }
+}
+
+#[async_trait]
+impl Hook for BlockMcpToolNameHook {
+    async fn call(&self, input: HookInput) -> Result<HookOutput, HookError> {
+        if input.event != HookEventName::PreToolUse {
+            return Ok(HookOutput::Continue);
+        }
+        let Some(tool_name) = input.tool_name.as_deref() else {
+            return Ok(HookOutput::Continue);
+        };
+        if code_agent_mcp::parse_agent_tool_name(tool_name).is_some()
+            && self.matcher.matches(tool_name)
+        {
+            return Ok(HookOutput::Deny {
+                reason: format!("MCP tool {tool_name} is blocked by hook"),
+            });
+        }
+        Ok(HookOutput::Continue)
+    }
+}
+
+#[derive(Default)]
+pub struct BlockMcpWriteLikeToolHook;
+
+#[async_trait]
+impl Hook for BlockMcpWriteLikeToolHook {
+    async fn call(&self, input: HookInput) -> Result<HookOutput, HookError> {
+        if input.event != HookEventName::PreToolUse {
+            return Ok(HookOutput::Continue);
+        }
+        let Some(tool_name) = input.tool_name.as_deref() else {
+            return Ok(HookOutput::Continue);
+        };
+        let Some(parts) = code_agent_mcp::parse_agent_tool_name(tool_name) else {
+            return Ok(HookOutput::Continue);
+        };
+        if code_agent_mcp::mutating_tool_name(&parts.remote_tool_name) {
+            return Ok(HookOutput::Deny {
+                reason: format!(
+                    "MCP tool {} may modify external state and was blocked",
+                    parts.remote_tool_name
+                ),
+            });
+        }
+        Ok(HookOutput::Continue)
+    }
+}
+
+#[derive(Default)]
+pub struct McpAuditLogHook {
+    entries: Mutex<Vec<AuditEntry>>,
+}
+
+impl McpAuditLogHook {
+    pub fn entries(&self) -> Vec<AuditEntry> {
+        self.entries.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Hook for McpAuditLogHook {
+    async fn call(&self, input: HookInput) -> Result<HookOutput, HookError> {
+        if input
+            .tool_name
+            .as_deref()
+            .and_then(code_agent_mcp::parse_agent_tool_name)
+            .is_none()
+        {
+            return Ok(HookOutput::Continue);
+        }
+        let entry = AuditEntry {
+            event: input.event,
+            tool_name: input.tool_name.clone(),
+            redacted_input: input.tool_input.as_ref().map(redact_secrets_in_value),
+            is_error: matches!(input.event, HookEventName::PostToolUseFailure),
+        };
+        self.entries.lock().unwrap().push(entry);
+        Ok(HookOutput::Continue)
+    }
+}
+
+pub struct McpResultSizeLimitHook {
+    max_bytes: usize,
+}
+
+impl McpResultSizeLimitHook {
+    pub fn new(max_bytes: usize) -> Self {
+        Self { max_bytes }
+    }
+}
+
+#[async_trait]
+impl Hook for McpResultSizeLimitHook {
+    async fn call(&self, input: HookInput) -> Result<HookOutput, HookError> {
+        if !matches!(
+            input.event,
+            HookEventName::PostToolUse | HookEventName::PostToolUseFailure
+        ) {
+            return Ok(HookOutput::Continue);
+        }
+        let Some(tool_name) = input.tool_name.as_deref() else {
+            return Ok(HookOutput::Continue);
+        };
+        if code_agent_mcp::parse_agent_tool_name(tool_name).is_none() {
+            return Ok(HookOutput::Continue);
+        }
+        let bytes = input
+            .tool_result
+            .as_ref()
+            .map(|r| r.flatten_text().len())
+            .unwrap_or(0);
+        if bytes > self.max_bytes {
+            return Ok(HookOutput::Deny {
+                reason: format!("MCP result size {bytes} exceeds {}", self.max_bytes),
+            });
+        }
+        Ok(HookOutput::Continue)
+    }
+}
+
+#[derive(Default)]
+pub struct McpSecretRedactionHook;
+
+#[async_trait]
+impl Hook for McpSecretRedactionHook {
+    async fn call(&self, _input: HookInput) -> Result<HookOutput, HookError> {
+        Ok(HookOutput::Continue)
+    }
+}
+
 #[async_trait]
 impl Hook for SecretRedactionHook {
     async fn call(&self, _input: HookInput) -> Result<HookOutput, HookError> {

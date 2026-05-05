@@ -6,12 +6,14 @@ members = [
     "crates/code-agent-tools",
     "crates/code-agent-session",
     "crates/code-agent-checkpoint",
+    "crates/code-agent-mcp",
     "crates/code-agent-cli",
 ]
 exclude = [
     "examples/bugfix-demo",
     "examples/policy-demo",
     "examples/checkpoint-demo",
+    "examples/mcp-demo",
 ]
 
 [workspace.package]
@@ -52,6 +54,7 @@ code-agent-anthropic = { path = "crates/code-agent-anthropic", version = "0.1.0"
 code-agent-tools = { path = "crates/code-agent-tools", version = "0.1.0" }
 code-agent-session = { path = "crates/code-agent-session", version = "0.1.0" }
 code-agent-checkpoint = { path = "crates/code-agent-checkpoint", version = "0.1.0" }
+code-agent-mcp = { path = "crates/code-agent-mcp", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

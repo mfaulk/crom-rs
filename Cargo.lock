@@ -248,6 +248,7 @@ dependencies = [
  "code-agent-anthropic",
  "code-agent-checkpoint",
  "code-agent-core",
+ "code-agent-mcp",
  "code-agent-session",
  "code-agent-tools",
  "futures",
@@ -268,6 +269,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "camino",
+ "code-agent-mcp",
  "futures",
  "globset",
  "regex",
@@ -280,6 +282,20 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "code-agent-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

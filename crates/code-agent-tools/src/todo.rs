@@ -46,11 +46,11 @@ impl Default for TodoWriteTool {
 
 #[async_trait]
 impl Tool for TodoWriteTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "TodoWrite"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Replace the agent's todo list with a new snapshot. Use to keep the user informed of multi-step progress. Each item has id, content, and status (pending|in_progress|completed|cancelled)."
     }
 

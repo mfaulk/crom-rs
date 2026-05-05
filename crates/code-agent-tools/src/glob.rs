@@ -28,11 +28,11 @@ impl GlobTool {
 
 #[async_trait]
 impl Tool for GlobTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Glob"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Find files in the workspace matching a glob pattern (e.g. \"**/*.rs\"). Honors .gitignore. Returns up to a configured number of paths."
     }
 

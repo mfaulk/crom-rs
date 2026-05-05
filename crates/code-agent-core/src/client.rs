@@ -65,6 +65,8 @@ pub struct AgentClientBuilder {
     source_session_id: Option<SessionId>,
     checkpoint_handle: Option<Arc<dyn CheckpointHandle>>,
     checkpoint_api: Option<Arc<dyn CheckpointApi>>,
+    mcp_options: Option<code_agent_mcp::McpOptions>,
+    mcp_config_file: Option<PathBuf>,
 }
 
 impl AgentClientBuilder {
@@ -171,6 +173,16 @@ impl AgentClientBuilder {
         self
     }
 
+    pub fn mcp_options(mut self, options: code_agent_mcp::McpOptions) -> Self {
+        self.mcp_options = Some(options);
+        self
+    }
+
+    pub fn mcp_config_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.mcp_config_file = Some(path.into());
+        self
+    }
+
     pub async fn build(self) -> Result<AgentClient, AgentError> {
         let provider = self
             .provider
@@ -189,6 +201,20 @@ impl AgentClientBuilder {
         }
         if !self.allowed_tools.is_empty() {
             options.allowed_tools = self.allowed_tools;
+        }
+        if let Some(mcp) = self.mcp_options {
+            options.mcp = mcp;
+        }
+        if let Some(path) = self.mcp_config_file {
+            options.mcp = code_agent_mcp::load_mcp_options(
+                &options.cwd,
+                None,
+                Some(&path),
+                Some(true),
+                None,
+                None,
+            )
+            .map_err(|e| AgentError::InvalidConfig(e.to_string()))?;
         }
 
         let session_id = self
@@ -377,6 +403,83 @@ impl AgentClient {
             .clone()
             .ok_or_else(|| AgentError::other("checkpointing not enabled"))?;
         api.rewind(checkpoint_id.as_ref(), false, false).await
+    }
+
+    pub async fn connect_mcp_servers(&mut self) -> Result<(), AgentError> {
+        let options = self.inner.options.lock().await.clone();
+        let mut tools = ToolRegistry::new();
+        let report = crate::mcp::register_mcp_tools(&mut tools, &options.mcp).await;
+        if options.mcp.strict
+            && report
+                .statuses
+                .iter()
+                .any(|s| matches!(s.status, code_agent_mcp::McpConnectionStatus::Failed))
+        {
+            return Err(AgentError::InvalidConfig(
+                "strict MCP mode: one or more MCP servers failed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn mcp_status(&self) -> Vec<code_agent_mcp::McpServerStatus> {
+        let options = self.inner.options.lock().await.clone();
+        connect_for_mcp_inspection(&options.mcp).await.0.statuses
+    }
+
+    pub async fn list_mcp_tools(
+        &self,
+        server: Option<&str>,
+    ) -> Result<Vec<code_agent_mcp::McpToolSummary>, AgentError> {
+        let options = self.inner.options.lock().await.clone();
+        let (report, _) = connect_for_mcp_inspection(&options.mcp).await;
+        let mut tools = Vec::new();
+        for discovered in report.discovered {
+            if server
+                .map(|wanted| wanted == discovered.server_name)
+                .unwrap_or(true)
+            {
+                tools.extend(discovered.tools);
+            }
+        }
+        Ok(tools)
+    }
+
+    pub async fn call_mcp_tool_direct(
+        &mut self,
+        server: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<crate::ToolResult, AgentError> {
+        let options = self.inner.options.lock().await.clone();
+        let config = options
+            .mcp
+            .servers
+            .get(server)
+            .ok_or_else(|| AgentError::InvalidConfig(format!("unknown MCP server {server}")))?;
+        let secrets = options.mcp.secret_values();
+        let mut client =
+            code_agent_mcp::McpClient::connect(server, config, options.mcp.limits(), secrets)
+                .await
+                .map_err(|e| AgentError::Other(e.to_string()))?;
+        client
+            .initialize()
+            .await
+            .map_err(|e| AgentError::Other(e.to_string()))?;
+        let result = client
+            .call_tool(tool, args)
+            .await
+            .map_err(|e| AgentError::Other(e.to_string()))?;
+        let (text, metadata, _, _) = code_agent_mcp::mcp_result_to_text_and_metadata(
+            &result,
+            options.mcp.max_tool_result_bytes,
+        )
+        .map_err(|e| AgentError::Other(e.to_string()))?;
+        Ok(crate::ToolResult {
+            content: vec![crate::ToolContent::Text(text)],
+            is_error: result.is_error,
+            metadata,
+        })
     }
 
     /// Shut down the runtime. Pending queued messages are dropped.
@@ -738,6 +841,14 @@ impl AgentBuilderExt for AgentBuilder {
             self
         }
     }
+}
+
+async fn connect_for_mcp_inspection(
+    options: &code_agent_mcp::McpOptions,
+) -> (crate::mcp::McpRegistrationReport, ToolRegistry) {
+    let mut tools = ToolRegistry::new();
+    let report = crate::mcp::register_mcp_tools(&mut tools, options).await;
+    (report, tools)
 }
 
 // The private re-export above makes `Agent` reachable from this module.

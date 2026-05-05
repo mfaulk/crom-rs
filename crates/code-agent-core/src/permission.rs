@@ -27,6 +27,7 @@ pub enum PermissionKind {
     ReadOnly,
     Mutating,
     Execution,
+    External,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +36,8 @@ pub struct PermissionRequest {
     pub permission_kind: PermissionKind,
     pub input: serde_json::Value,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
 }
 
 /// Decision returned by a permission callback or memory.

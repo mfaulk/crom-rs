@@ -48,6 +48,7 @@ pub enum PolicyDecisionSource {
     ApprovalCallback,
     DefaultDeny,
     ApprovalMemory,
+    ExternalEffectPolicy,
 }
 
 /// A single policy decision with metadata.
@@ -194,6 +195,7 @@ pub struct PolicyConfig {
     pub callback: Option<Arc<dyn PermissionCallback>>,
     pub memory: ApprovalMemory,
     pub memory_mode: ApprovalMemoryMode,
+    pub mcp_external_effect_policy: code_agent_mcp::McpExternalEffectPolicy,
 }
 
 impl Default for PolicyConfig {
@@ -206,6 +208,8 @@ impl Default for PolicyConfig {
             callback: None,
             memory: ApprovalMemory::new(),
             memory_mode: ApprovalMemoryMode::default(),
+            mcp_external_effect_policy:
+                code_agent_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule,
         }
     }
 }
@@ -220,6 +224,7 @@ pub struct PolicyToolContext<'a> {
     pub permission_kind: PermissionKind,
     pub tool_input: Value,
     pub tool_summary: String,
+    pub metadata: Value,
 }
 
 /// The policy engine itself.
@@ -272,6 +277,7 @@ impl PolicyEngine {
             input.turn_index = ctx.turn_index;
             input.tool_name = Some(ctx.tool_name.to_string());
             input.tool_input = Some(tool_input.clone());
+            input.metadata = ctx.metadata.clone();
             let records = self.hooks.dispatch(&input).await;
             let (agg, _) = aggregate(&records);
             match agg {
@@ -398,9 +404,43 @@ impl PolicyEngine {
 
         // 4. Allow rules. Hook-`Ask` forces a user prompt, so we skip
         // structured allow-rule auto-allow when force_callback is set.
+        let mut matched_allow_rule = false;
         if !force_callback {
             if let Some(d) = self.match_allow(ctx.tool_name, &tool_input, &tool_input) {
                 return d;
+            }
+            matched_allow_rule = self
+                .config
+                .allowed_tools
+                .iter()
+                .any(|r| r.matches(ctx.tool_name, &tool_input));
+        }
+
+        // 4a. MCP external-effect policy. MCP tools are external even when
+        // their remote names look read-only; never let permission modes like
+        // acceptEdits imply access to them.
+        if matches!(ctx.permission_kind, PermissionKind::External) {
+            match self.config.mcp_external_effect_policy {
+                code_agent_mcp::McpExternalEffectPolicy::AllowWithApproval => {}
+                code_agent_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule => {
+                    if !matched_allow_rule {
+                        return PolicyDecision::deny(
+                            PolicyDecisionSource::ExternalEffectPolicy,
+                            "MCP external tools require an explicit allow rule".into(),
+                        );
+                    }
+                }
+                code_agent_mcp::McpExternalEffectPolicy::DenyMutatingNameByDefault => {
+                    if code_agent_mcp::registry::parse_agent_tool_name(ctx.tool_name)
+                        .map(|p| code_agent_mcp::registry::mutating_tool_name(&p.remote_tool_name))
+                        .unwrap_or(false)
+                    {
+                        return PolicyDecision::deny(
+                            PolicyDecisionSource::ExternalEffectPolicy,
+                            "MCP tool may modify external state and is denied by policy".into(),
+                        );
+                    }
+                }
             }
         }
 
@@ -426,6 +466,7 @@ impl PolicyEngine {
                 permission_kind: ctx.permission_kind,
                 input: tool_input.clone(),
                 summary: ctx.tool_summary,
+                metadata: ctx.metadata.clone(),
             };
             let decision = cb.approve(req).await;
             // Record memory if applicable.
@@ -501,6 +542,7 @@ mod tests {
             permission_kind: kind,
             tool_input: input,
             tool_summary: tool.to_string(),
+            metadata: serde_json::Value::Null,
         }
     }
 
@@ -731,6 +773,158 @@ mod tests {
             .await;
         assert_eq!(d.outcome, PolicyOutcome::Deny);
         assert_eq!(*calls.lock().await, 0, "callback must not be invoked");
+    }
+
+    #[tokio::test]
+    // MCP exact allow rules permit external tools under the default MCP policy.
+    async fn mcp_exact_allow_works() {
+        let cfg = PolicyConfig {
+            allowed_tools: vec![ToolRule::ExactTool("mcp__fake__list_issues".into())],
+            permission_mode: PermissionMode::Default,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, Hooks::new());
+        let sid = sid();
+        let rid = rid();
+        let d = engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                std::path::Path::new("."),
+                "mcp__fake__list_issues",
+                PermissionKind::External,
+                serde_json::json!({}),
+            ))
+            .await;
+        assert_eq!(d.outcome, PolicyOutcome::Allow);
+    }
+
+    #[tokio::test]
+    // MCP wildcard allow rules permit matching external tools.
+    async fn mcp_wildcard_allow_works() {
+        let cfg = PolicyConfig {
+            allowed_tools: vec![ToolRule::ToolGlob("mcp__fake__list_*".into())],
+            permission_mode: PermissionMode::Default,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, Hooks::new());
+        let sid = sid();
+        let rid = rid();
+        let d = engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                std::path::Path::new("."),
+                "mcp__fake__list_issues",
+                PermissionKind::External,
+                serde_json::json!({}),
+            ))
+            .await;
+        assert_eq!(d.outcome, PolicyOutcome::Allow);
+    }
+
+    #[tokio::test]
+    // McpServerGlob allow rules match server and remote tool names.
+    async fn mcp_server_glob_allow_works() {
+        let cfg = PolicyConfig {
+            allowed_tools: vec![ToolRule::McpServerGlob {
+                server: "fake".into(),
+                tool_glob: "list_*".into(),
+            }],
+            permission_mode: PermissionMode::Default,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, Hooks::new());
+        let sid = sid();
+        let rid = rid();
+        let d = engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                std::path::Path::new("."),
+                "mcp__fake__list_issues",
+                PermissionKind::External,
+                serde_json::json!({}),
+            ))
+            .await;
+        assert_eq!(d.outcome, PolicyOutcome::Allow);
+    }
+
+    #[tokio::test]
+    // acceptEdits does not approve unresolved MCP external tools.
+    async fn accept_edits_does_not_approve_mcp() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::AcceptEdits,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, Hooks::new());
+        let sid = sid();
+        let rid = rid();
+        let d = engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                std::path::Path::new("."),
+                "mcp__fake__list_issues",
+                PermissionKind::External,
+                serde_json::json!({}),
+            ))
+            .await;
+        assert_eq!(d.outcome, PolicyOutcome::Deny);
+        assert_eq!(d.source, PolicyDecisionSource::ExternalEffectPolicy);
+    }
+
+    #[tokio::test]
+    // AllowWithApproval lets unresolved MCP tools reach the approval callback.
+    async fn mcp_allow_with_approval_reaches_callback() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::Default,
+            callback: Some(Arc::new(crate::permission::AlwaysAllow)),
+            mcp_external_effect_policy: code_agent_mcp::McpExternalEffectPolicy::AllowWithApproval,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, Hooks::new());
+        let sid = sid();
+        let rid = rid();
+        let d = engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                std::path::Path::new("."),
+                "mcp__fake__list_issues",
+                PermissionKind::External,
+                serde_json::json!({}),
+            ))
+            .await;
+        assert_eq!(d.outcome, PolicyOutcome::Allow);
+        assert_eq!(d.source, PolicyDecisionSource::ApprovalCallback);
+    }
+
+    #[tokio::test]
+    // DenyMutatingNameByDefault blocks write-like MCP names without allow rules.
+    async fn mcp_deny_mutating_name_by_default_blocks_write_like() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::Default,
+            callback: Some(Arc::new(crate::permission::AlwaysAllow)),
+            mcp_external_effect_policy:
+                code_agent_mcp::McpExternalEffectPolicy::DenyMutatingNameByDefault,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, Hooks::new());
+        let sid = sid();
+        let rid = rid();
+        let d = engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                std::path::Path::new("."),
+                "mcp__fake__delete_issue",
+                PermissionKind::External,
+                serde_json::json!({}),
+            ))
+            .await;
+        assert_eq!(d.outcome, PolicyOutcome::Deny);
+        assert_eq!(d.source, PolicyDecisionSource::ExternalEffectPolicy);
     }
 
     #[tokio::test]

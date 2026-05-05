@@ -282,10 +282,10 @@ async fn pre_tool_use_hook_denies() {
     }
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "Bash"
         }
-        fn description(&self) -> &'static str {
+        fn description(&self) -> &str {
             ""
         }
         fn input_schema(&self) -> serde_json::Value {
@@ -363,10 +363,10 @@ async fn disallow_path_glob_blocks_env_edit() {
     }
     #[async_trait]
     impl Tool for EditTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "Edit"
         }
-        fn description(&self) -> &'static str {
+        fn description(&self) -> &str {
             ""
         }
         fn input_schema(&self) -> serde_json::Value {
@@ -488,10 +488,10 @@ async fn stop_hook_fires_on_max_turns() {
     struct EchoTool;
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "Echo"
         }
-        fn description(&self) -> &'static str {
+        fn description(&self) -> &str {
             ""
         }
         fn input_schema(&self) -> serde_json::Value {
@@ -548,10 +548,10 @@ async fn client_forwards_user_tool_result_events() {
     struct EchoTool;
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "Echo"
         }
-        fn description(&self) -> &'static str {
+        fn description(&self) -> &str {
             ""
         }
         fn input_schema(&self) -> serde_json::Value {
@@ -652,10 +652,10 @@ async fn pre_tool_use_ask_overrides_accept_edits() {
     }
     #[async_trait]
     impl Tool for EditTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "Edit"
         }
-        fn description(&self) -> &'static str {
+        fn description(&self) -> &str {
             ""
         }
         fn input_schema(&self) -> serde_json::Value {
@@ -743,10 +743,10 @@ async fn dont_ask_honors_allowed_tools_name_list() {
     }
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "Echo"
         }
-        fn description(&self) -> &'static str {
+        fn description(&self) -> &str {
             ""
         }
         fn input_schema(&self) -> serde_json::Value {
