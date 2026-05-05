@@ -1,0 +1,33 @@
+{
+  "model": "claude-sonnet-4-6",
+  "permission_mode": "default",
+  "allowed_tools": [
+    "Read",
+    "Glob",
+    "Grep",
+    "Edit",
+    "Write",
+    "TodoWrite",
+    {"tool": "Bash", "command_regex": "^cargo (test|check|fmt|clippy)( |$)"}
+  ],
+  "disallowed_tools": [
+    {"tool": "Edit", "path_glob": "**/.env*"},
+    {"tool": "Write", "path_glob": "**/.env*"},
+    {"tool": "Read", "path_glob": "**/.env*"},
+    {"tool": "Bash", "command_regex": "rm\\s+-rf|sudo|curl\\s+.*\\|\\s*sh"}
+  ],
+  "tool_limits": {
+    "max_read_bytes": 1048576,
+    "max_output_bytes": 65536,
+    "bash_timeout_seconds": 30,
+    "max_glob_results": 500,
+    "max_grep_results": 500
+  },
+  "hooks": {
+    "block_env_file_writes": true,
+    "block_dangerous_bash": true,
+    "audit_log": true,
+    "secret_redaction": true,
+    "max_patch_size_bytes": 200000
+  }
+}
