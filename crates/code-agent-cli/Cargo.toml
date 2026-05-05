@@ -1,0 +1,27 @@
+[package]
+name = "code-agent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "code-agent command-line interface"
+
+[[bin]]
+name = "code-agent"
+path = "src/main.rs"
+
+[dependencies]
+code-agent-core = { workspace = true }
+code-agent-anthropic = { workspace = true }
+code-agent-tools = { workspace = true }
+code-agent-session = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+time = { workspace = true }

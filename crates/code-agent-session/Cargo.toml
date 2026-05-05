@@ -1,0 +1,21 @@
+[package]
+name = "code-agent-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JSONL session store for code-agent"
+
+[dependencies]
+code-agent-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+futures = { workspace = true }

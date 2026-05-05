@@ -1,0 +1,5 @@
+/target
+**/target
+.agent/
+*.swp
+.DS_Store
