@@ -134,7 +134,7 @@ struct AlwaysAllow;
 #[async_trait]
 impl PermissionCallback for AlwaysAllow {
     async fn approve(&self, _: PermissionRequest) -> PermissionDecision {
-        PermissionDecision::Allow
+        PermissionDecision::AllowOnce
     }
 }
 

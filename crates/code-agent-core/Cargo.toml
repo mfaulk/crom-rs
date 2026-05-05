@@ -17,6 +17,8 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true }
 camino = { workspace = true }
+globset = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

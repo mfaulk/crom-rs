@@ -15,6 +15,7 @@ pub mod grep;
 pub mod limits;
 pub mod path_sandbox;
 pub mod read;
+pub mod todo;
 pub mod write;
 
 pub use bash::BashTool;
@@ -23,6 +24,7 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use limits::ToolLimits;
 pub use read::ReadTool;
+pub use todo::TodoWriteTool;
 pub use write::WriteTool;
 
 /// Build a `ToolRegistry` populated with all six built-in tools using default
@@ -40,6 +42,7 @@ pub fn register_builtin_with_limits(registry: &mut ToolRegistry, limits: ToolLim
     registry.register(Arc::new(GlobTool::new(limits.clone())) as Arc<dyn Tool>);
     registry.register(Arc::new(GrepTool::new(limits.clone())) as Arc<dyn Tool>);
     registry.register(Arc::new(BashTool::new(limits)) as Arc<dyn Tool>);
+    registry.register(Arc::new(TodoWriteTool::new()) as Arc<dyn Tool>);
 }
 
 pub(crate) fn truncate_with_marker(s: &str, max_bytes: usize) -> String {
