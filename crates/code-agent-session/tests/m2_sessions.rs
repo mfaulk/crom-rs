@@ -225,3 +225,58 @@ async fn loading_missing_session_errors() {
     let err = store.load(&id).await.unwrap_err();
     assert!(matches!(err, SessionError::NotFound(_)));
 }
+
+#[tokio::test]
+// Regression (round 4): summarize_session must SUM total_cost_usd across
+// every Result event, not overwrite. Resumed/continued/chat sessions emit
+// one Result per run; the previous behavior reported only the last run's
+// cost.
+async fn session_summary_sums_cost_across_runs() {
+    use code_agent_core::{AgentResult, ResultSubtype, RunId, TokenUsage};
+    use code_agent_session::{now_iso, SessionPayload, SessionRecord};
+
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let store: Arc<dyn SessionStore> = Arc::new(FsSessionStore::new(cwd.clone()));
+    let id = store.create(&cwd).await.unwrap();
+
+    // Two runs at 0.50 USD each → expect 1.00 total.
+    for cost in [0.5, 0.5] {
+        let res = AgentResult {
+            subtype: ResultSubtype::Success,
+            result: Some("ok".into()),
+            session_id: id.clone(),
+            run_id: Some(RunId::new()),
+            num_turns: 1,
+            usage: Some(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            total_cost_usd: Some(cost),
+        };
+        store
+            .append(
+                &id,
+                SessionRecord {
+                    timestamp: now_iso(),
+                    cwd: cwd.clone(),
+                    session_id: id.to_string(),
+                    payload: SessionPayload::Event(AgentEvent::Result(res)),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let summary = summarize_session(store.as_ref(), &id).await.unwrap();
+    let total = summary.total_cost_usd.expect("cost should be reported");
+    assert!(
+        (total - 1.0).abs() < 1e-9,
+        "cost should sum to 1.0, got {total}"
+    );
+    // Tokens should also have summed.
+    assert_eq!(summary.total_input_tokens, 200);
+    assert_eq!(summary.total_output_tokens, 100);
+}

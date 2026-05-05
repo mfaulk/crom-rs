@@ -568,6 +568,7 @@ async fn run_one_shot(
         .as_ref()
         .map(|_| Arc::new(FsSessionStore::new(cfg.cwd.clone())) as Arc<dyn SessionStore>);
 
+    let was_forced = forced_session_id.is_some();
     let (session_id, session_sink, store) = if no_session {
         (forced_session_id.unwrap_or_default(), None, None)
     } else {
@@ -589,7 +590,19 @@ async fn run_one_shot(
     };
 
     let initial_history = if let Some(s) = store.as_ref().or(read_store.as_ref()) {
-        let records = s.load(&session_id).await.unwrap_or_default();
+        // For resume/continue/fork (forced_session_id is Some) the session
+        // was supposed to exist and load. Propagate the error so the user
+        // sees a corrupted log instead of silently losing prior context
+        // and appending new events on top of a broken history. For fresh
+        // `run` (forced_session_id is None) the just-created file is
+        // empty, so an unreadable load is unlikely but still surfaced.
+        let records = if was_forced {
+            s.load(&session_id)
+                .await
+                .with_context(|| format!("failed to load session {}", session_id))?
+        } else {
+            s.load(&session_id).await.unwrap_or_default()
+        };
         let conv = replay_conversation(&records);
         drop_trailing_matching_user_prompt(conv.messages, &prompt)
     } else {

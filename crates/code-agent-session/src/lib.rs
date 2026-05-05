@@ -359,8 +359,13 @@ pub async fn summarize_session(
                         s.total_input_tokens += u.input_tokens;
                         s.total_output_tokens += u.output_tokens;
                     }
+                    // Each Result reports the cumulative cost for its run.
+                    // Summing across runs yields the session-wide total;
+                    // overwriting (the old behavior) under-reported cost
+                    // for any session with more than one run (resumed,
+                    // continued, forked, or chat sessions).
                     if let Some(c) = res.total_cost_usd {
-                        s.total_cost_usd = Some(c);
+                        s.total_cost_usd = Some(s.total_cost_usd.unwrap_or(0.0) + c);
                     }
                 }
                 _ => {}
