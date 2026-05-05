@@ -488,6 +488,8 @@ pub(crate) async fn run_loop(
         options.permission_mode,
         options.allowed_tool_rules.clone(),
         options.disallowed_tool_rules.clone(),
+        options.allowed_tools.clone(),
+        options.mcp.external_effect_policy,
     );
     let search_runtime = if matches!(
         loading_decision.resolved_mode,

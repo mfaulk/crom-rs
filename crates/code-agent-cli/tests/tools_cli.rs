@@ -109,6 +109,65 @@ fn tools_search_works() {
 }
 
 #[test]
+// `tools stats` mirrors the agent registry filter: when settings narrow
+// `allowed_tools` to a single tool, the catalog only reports that tool.
+fn tools_stats_applies_allowed_tools_registry_filter() {
+    let dir = TempDir::new().unwrap();
+    let agent = dir.path().join(".agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("settings.json"),
+        serde_json::json!({
+            "tool_search": {
+                "enabled": true,
+                "mode": "auto",
+            },
+            "allowed_tools": ["Read"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = run(&["tools", "stats", "--cwd", "."], dir.path());
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("total tools:        1"),
+        "expected exactly 1 tool after registry filter, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+// `tools stats` accepts `--permission-mode` and the resolved mode plumbs
+// through; this guards against the prior hardcoded `PermissionMode::Default`.
+fn tools_stats_accepts_permission_mode_flag() {
+    let dir = TempDir::new().unwrap();
+    let agent = dir.path().join(".agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("settings.json"),
+        serde_json::json!({
+            "allowed_tools": ["Read"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = run(
+        &["tools", "stats", "--cwd", ".", "--permission-mode", "plan"],
+        dir.path(),
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 // Disabled tool settings hide matching tools from CLI search results.
 fn tools_search_hides_disabled_tools() {
     let dir = TempDir::new().unwrap();

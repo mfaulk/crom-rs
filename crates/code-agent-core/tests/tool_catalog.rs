@@ -132,6 +132,8 @@ fn disabled_tools_do_not_appear_in_search() {
         PermissionMode::Default,
         vec![ToolRule::try_tool_glob("mcp__github__*").unwrap()],
         vec![],
+        vec![],
+        code_agent_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule,
     );
 
     let result = catalog
@@ -173,6 +175,8 @@ fn hybrid_search_finds_relevant_github_issue_tools() {
         PermissionMode::Default,
         vec![ToolRule::try_tool_glob("mcp__*").unwrap()],
         vec![],
+        vec![],
+        code_agent_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule,
     );
 
     let result = catalog
@@ -205,8 +209,13 @@ fn regex_search_invalid_pattern_errors() {
     let catalog = ToolCatalogBuilder::new(ToolSearchOptions::default())
         .ingest_tool(local_tool("Read", "Read a file"))
         .build();
-    let visibility =
-        ToolSearchOptions::default().visibility_context(PermissionMode::Default, vec![], vec![]);
+    let visibility = ToolSearchOptions::default().visibility_context(
+        PermissionMode::Default,
+        vec![],
+        vec![],
+        vec![],
+        code_agent_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule,
+    );
     let err = catalog
         .search(
             ToolSearchQuery {
@@ -263,6 +272,8 @@ fn dont_ask_visibility_hides_tools_requiring_approval() {
         PermissionMode::DontAsk,
         vec![ToolRule::ExactTool("Read".into())],
         vec![],
+        vec![],
+        code_agent_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule,
     );
 
     let result = catalog
@@ -331,4 +342,91 @@ fn secret_like_values_are_redacted() {
             .and_then(|v| v.as_str()),
         Some("[REDACTED]")
     );
+}
+
+#[test]
+// DontAsk visibility surfaces tools that are only in the simple-name allowlist
+// (`AgentOptions::allowed_tools`) — not just those listed by `ExactTool` rules.
+// Regression test for the case where the search path hid runtime-allowed tools.
+fn dont_ask_visibility_honors_simple_name_allowlist() {
+    let options = ToolSearchOptions::default();
+    let catalog = ToolCatalogBuilder::new(options.clone())
+        .ingest_tool(mcp_tool("mcp__github__list_issues", "List GitHub issues"))
+        .ingest_tool(local_tool("Read", "Read a file"))
+        .build();
+    let visibility = options.visibility_context(
+        PermissionMode::DontAsk,
+        vec![],
+        vec![],
+        vec!["mcp__github__list_issues".into()],
+        code_agent_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule,
+    );
+
+    let result = catalog
+        .search(
+            ToolSearchQuery {
+                query: "github".into(),
+                limit: 10,
+                source_filter: None,
+                include_risky: true,
+            },
+            ToolSearchStrategy::Hybrid,
+            &visibility,
+        )
+        .unwrap();
+
+    let names: Vec<&str> = result
+        .matches
+        .iter()
+        .map(|m| m.tool_name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"mcp__github__list_issues"),
+        "simple-name allowlist should surface {:?} in DontAsk search",
+        names
+    );
+    let m = result
+        .matches
+        .iter()
+        .find(|m| m.tool_name == "mcp__github__list_issues")
+        .unwrap();
+    assert_eq!(m.visibility, ToolVisibility::Callable);
+}
+
+#[test]
+// Visibility honors the runtime MCP external-effect policy — External tools
+// reach `RequiresApproval` under `AllowWithApproval`, not the hardcoded
+// `Denied` that resulted from `RequireExplicitAllowRule` being baked in.
+fn visibility_honors_runtime_mcp_external_effect_policy() {
+    let options = ToolSearchOptions::default();
+    let catalog = ToolCatalogBuilder::new(options.clone())
+        .ingest_tool(mcp_tool("mcp__github__list_issues", "List GitHub issues"))
+        .build();
+    let visibility = options.visibility_context(
+        PermissionMode::Default,
+        vec![],
+        vec![],
+        vec![],
+        code_agent_mcp::McpExternalEffectPolicy::AllowWithApproval,
+    );
+
+    let result = catalog
+        .search(
+            ToolSearchQuery {
+                query: "github".into(),
+                limit: 10,
+                source_filter: None,
+                include_risky: true,
+            },
+            ToolSearchStrategy::Hybrid,
+            &visibility,
+        )
+        .unwrap();
+
+    let m = result
+        .matches
+        .iter()
+        .find(|m| m.tool_name == "mcp__github__list_issues")
+        .expect("AllowWithApproval should surface External MCP tools");
+    assert_eq!(m.visibility, ToolVisibility::RequiresApproval);
 }

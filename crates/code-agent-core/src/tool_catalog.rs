@@ -393,28 +393,41 @@ impl ToolSearchOptions {
         }
     }
 
+    /// Build a `ToolVisibilityContext` for the runtime.
+    ///
+    /// `allowed_tool_names` is the simple-name allowlist (the `Vec<String>`
+    /// equivalent of `AgentOptions::allowed_tools`). It must be passed in
+    /// because `dontAsk` mode treats the simple-name list as an implicit
+    /// allowlist; deriving names only from `ExactTool` rules would hide
+    /// tools that are actually permitted at runtime.
+    ///
+    /// `mcp_external_effect_policy` is the effective runtime policy from
+    /// `McpOptions::external_effect_policy`. Hardcoding a fixed value here
+    /// would make `SearchTools` mislabel external MCP tools when the user
+    /// has selected a non-default policy.
     pub fn visibility_context(
         &self,
         permission_mode: PermissionMode,
         allowed_tools: Vec<ToolRule>,
         disallowed_tools: Vec<ToolRule>,
+        allowed_tool_names: Vec<String>,
+        mcp_external_effect_policy: code_agent_mcp::McpExternalEffectPolicy,
     ) -> ToolVisibilityContext {
-        let allowed_tool_names = allowed_tools
-            .iter()
-            .filter_map(|rule| match rule {
-                ToolRule::ExactTool(name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
+        let mut combined_names = allowed_tool_names;
+        for rule in &allowed_tools {
+            if let ToolRule::ExactTool(name) = rule {
+                if !combined_names.iter().any(|n| n == name) {
+                    combined_names.push(name.clone());
+                }
+            }
+        }
         ToolVisibilityContext {
             permission_mode,
             allowed_tools,
-            allowed_tool_names,
+            allowed_tool_names: combined_names,
             disallowed_tools,
             approval_memory_summary: ApprovalMemorySnapshot::default(),
-            mcp_external_effect_policy: Some(
-                code_agent_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule,
-            ),
+            mcp_external_effect_policy: Some(mcp_external_effect_policy),
             reveal_denied_names: false,
         }
     }

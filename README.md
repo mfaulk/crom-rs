@@ -381,6 +381,11 @@ code-agent tools stats --cwd . --mcp-config .agent/mcp.json
 code-agent tools explain-loading --cwd . --mcp-config .agent/mcp.json
 ```
 
+The `tools` subcommands mirror the agent's runtime semantics: `allowed_tools`
+from settings (or `--allowed-tools`) narrows the registry the same way the
+agent does, and `--permission-mode` (or `permissionMode` in settings) is
+honored when computing search visibility.
+
 M5 emits `ToolCatalogBuilt`, `ToolLoadingModeResolved`,
 `ToolContextBudgetUpdated`, `ToolSearchStarted`, `ToolSearchCompleted`,
 `ToolLoaded`, `ToolDeferred`, `ToolDisabled`, and `ToolSearchFailed` events

@@ -118,6 +118,10 @@ struct ToolsCommonArgs {
     allowed_tools: Vec<String>,
     #[arg(long = "deny")]
     deny: Vec<String>,
+    /// Permission mode override (default | accept-edits | dontAsk | plan).
+    /// Falls back to `permissionMode` from settings, then `default`.
+    #[arg(long)]
+    permission_mode: Option<String>,
     #[arg(long)]
     tool_loading: Option<String>,
     #[arg(long)]
@@ -1864,6 +1868,11 @@ struct ToolsCatalogContext {
     state: code_agent_core::LoadedToolState,
     options: ToolSearchOptions,
     settings: Settings,
+    permission_mode: PermissionMode,
+    /// Effective simple-name allowlist (mirrors `AgentOptions::allowed_tools`).
+    /// Empty means "no simple-name allowlist" — registry was not narrowed.
+    allowed_tool_names: Vec<String>,
+    mcp_external_effect_policy: code_agent_mcp::McpExternalEffectPolicy,
 }
 
 async fn cmd_tools(args: ToolsCommand) -> Result<()> {
@@ -1907,9 +1916,11 @@ async fn cmd_tools(args: ToolsCommand) -> Result<()> {
                 .transpose()
                 .map_err(|e| anyhow!("{e}"))?;
             let visibility = ctx.options.visibility_context(
-                PermissionMode::Default,
+                ctx.permission_mode,
                 ctx.settings.allowed_tools.clone(),
                 ctx.settings.disallowed_tools.clone(),
+                ctx.allowed_tool_names.clone(),
+                ctx.mcp_external_effect_policy,
             );
             let result = ctx.catalog.search(
                 ToolSearchQuery {
@@ -2116,17 +2127,54 @@ async fn build_tools_catalog(common: &ToolsCommonArgs) -> Result<ToolsCatalogCon
     {
         return Err(anyhow!("strict MCP mode: one or more MCP servers failed"));
     }
-    let mut builder = ToolCatalogBuilder::new(options.clone()).ingest_registry(&registry);
+
+    // Resolve permission mode: CLI flag wins over settings, then defaults.
+    let permission_mode = if let Some(pm) = &common.permission_mode {
+        parse_permission_mode(pm)?
+    } else if let Some(pm) = settings.permission_mode {
+        pm
+    } else {
+        PermissionMode::Default
+    };
+
+    // Mirror agent.rs registry filtering so `tools stats` / `explain-loading`
+    // / `search` operate on the same effective tool set as the running
+    // agent. An empty allowlist means "allow all" (matches
+    // `AgentOptions::allowed_tools.is_empty()` semantics in agent.rs).
+    let allowed_tool_names: Vec<String> = if !common.allowed_tools.is_empty() {
+        common.allowed_tools.clone()
+    } else {
+        let mut out: Vec<String> = Vec::new();
+        for r in &settings.allowed_tools {
+            if let Some(pattern) = registry_filter_pattern_for_rule(r) {
+                if !out.contains(&pattern) {
+                    out.push(pattern);
+                }
+            }
+        }
+        out
+    };
+    let filtered_registry = if allowed_tool_names.is_empty() {
+        registry.clone()
+    } else {
+        registry.filter(&allowed_tool_names)
+    };
+
+    let mut builder = ToolCatalogBuilder::new(options.clone()).ingest_registry(&filtered_registry);
     for status in &report.statuses {
         builder = builder.mcp_transport(status.name.clone(), status.transport);
     }
     let catalog = builder.build();
     let state = catalog.initial_loaded_state(&options);
+    let mcp_external_effect_policy = mcp_options.external_effect_policy;
     Ok(ToolsCatalogContext {
         catalog,
         state,
         options,
         settings,
+        permission_mode,
+        allowed_tool_names,
+        mcp_external_effect_policy,
     })
 }
 

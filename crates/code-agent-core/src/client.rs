@@ -515,16 +515,16 @@ impl AgentClient {
         query: ToolSearchQuery,
     ) -> Result<ToolSearchResult, AgentError> {
         let (catalog, mut state, options) = self.build_tool_catalog_snapshot().await?;
-        let visibility = options.visibility_context(
-            self.inner.options.lock().await.permission_mode,
-            self.inner.options.lock().await.allowed_tool_rules.clone(),
-            self.inner
-                .options
-                .lock()
-                .await
-                .disallowed_tool_rules
-                .clone(),
-        );
+        let visibility = {
+            let opts = self.inner.options.lock().await;
+            options.visibility_context(
+                opts.permission_mode,
+                opts.allowed_tool_rules.clone(),
+                opts.disallowed_tool_rules.clone(),
+                opts.allowed_tools.clone(),
+                opts.mcp.external_effect_policy,
+            )
+        };
         let (result, loaded) = catalog
             .search_and_mark_loaded(query, options.strategy, &visibility, &mut state, &options)
             .map_err(|e| AgentError::Other(e.to_string()))?;
