@@ -114,8 +114,15 @@ pub enum HookOutput {
 #[derive(Debug, Error)]
 pub enum HookError {
     /// The tool-name pattern supplied to a hook registration method is invalid.
-    #[error("invalid hook pattern {0:?}: {1}")]
-    Pattern(String, String),
+    #[error("invalid hook pattern {pattern:?} for event {event:?}: {parser_error}")]
+    Pattern {
+        /// The hook event the pattern was registered for.
+        event: HookEventName,
+        /// The pattern string the caller supplied.
+        pattern: String,
+        /// Underlying parser error from `ToolMatcher::parse`.
+        parser_error: String,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -221,8 +228,11 @@ impl Hooks {
         pattern: &str,
         hook: Arc<dyn Hook>,
     ) -> Result<Self, HookError> {
-        let matcher =
-            ToolMatcher::parse(pattern).map_err(|e| HookError::Pattern(pattern.to_owned(), e))?;
+        let matcher = ToolMatcher::parse(pattern).map_err(|e| HookError::Pattern {
+            event,
+            pattern: pattern.to_owned(),
+            parser_error: e,
+        })?;
         self.matchers.push(HookMatcher {
             event,
             matcher,
@@ -493,30 +503,51 @@ mod tests {
     }
 
     #[test]
-    // An invalid glob pattern (unbalanced bracket + wildcard) returns Err(HookError::Pattern)
-    // instead of silently matching all tools.
+    // An invalid glob pattern (unbalanced bracket + wildcard) returns
+    // Err(HookError::Pattern) carrying the event, the bad pattern, and the
+    // underlying parser error — instead of silently matching all tools.
     fn add_with_bad_pattern_returns_err() {
         let h = Arc::new(FixedHook(HookOutput::Continue));
         // "[bad*" triggers the glob path (contains '*') with an unbalanced '['.
         let result = Hooks::new().pre_tool_use("[bad*", h);
-        assert!(
-            matches!(result, Err(HookError::Pattern(ref p, _)) if p == "[bad*"),
-            "expected Err(HookError::Pattern), got {result:?}"
-        );
+        let err = result.expect_err("expected Err(HookError::Pattern)");
+        match &err {
+            HookError::Pattern {
+                event,
+                pattern,
+                parser_error,
+            } => {
+                assert_eq!(*event, HookEventName::PreToolUse);
+                assert_eq!(pattern, "[bad*");
+                assert!(
+                    !parser_error.is_empty(),
+                    "underlying parser error must be preserved"
+                );
+            }
+            other => panic!("expected HookError::Pattern, got {other:?}"),
+        }
+        // The Display form must surface the event and pattern so operators
+        // can locate the bad registration.
+        let msg = format!("{err}");
+        assert!(msg.contains("[bad*"));
+        assert!(msg.contains("PreToolUse"));
     }
 
     #[test]
-    // A bad pattern in a chained call propagates the error and discards the builder.
+    // A bad pattern in a chained call propagates the error (carrying the
+    // event of the failing call) and discards the builder.
     fn chained_bad_pattern_propagates_err() {
         let h1 = Arc::new(FixedHook(HookOutput::Continue));
         let h2 = Arc::new(FixedHook(HookOutput::Continue));
         let result = Hooks::new()
             .pre_tool_use("Bash", h1)
-            .and_then(|hooks| hooks.pre_tool_use("[bad*", h2));
-        assert!(
-            matches!(result, Err(HookError::Pattern(ref p, _)) if p == "[bad*"),
-            "expected Err(HookError::Pattern), got {result:?}"
-        );
+            .and_then(|hooks| hooks.post_tool_use("[bad*", h2));
+        let err = result.expect_err("expected Err(HookError::Pattern)");
+        let HookError::Pattern { event, pattern, .. } = &err else {
+            panic!("expected HookError::Pattern, got {err:?}");
+        };
+        assert_eq!(*event, HookEventName::PostToolUse);
+        assert_eq!(pattern, "[bad*");
     }
 
     #[test]
