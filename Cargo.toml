@@ -7,7 +7,7 @@ members = [
     "crates/code-agent-session",
     "crates/code-agent-cli",
 ]
-exclude = ["examples/bugfix-demo"]
+exclude = ["examples/bugfix-demo", "examples/policy-demo"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,7 +17,7 @@ repository = "https://github.com/mfaulk/code-agent"
 rust-version = "1.80"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "process", "time", "sync", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "io-std", "process", "time", "sync", "signal"] }
 tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"

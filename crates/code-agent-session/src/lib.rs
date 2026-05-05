@@ -40,8 +40,18 @@ pub struct SessionRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionPayload {
-    UserPrompt { text: String },
+    UserPrompt {
+        text: String,
+    },
     Event(AgentEvent),
+    /// Marker recorded once at session creation when forking.
+    ForkMetadata {
+        source_session_id: String,
+    },
+    /// Snapshot of the effective settings used to start the run.
+    SettingsSnapshot {
+        settings_summary: String,
+    },
 }
 
 #[async_trait]
@@ -231,6 +241,178 @@ pub async fn append_user_prompt(
     store.append(session_id, record).await
 }
 
+/// Append a fork-metadata record so the new session knows where it came from.
+pub async fn append_fork_metadata(
+    store: &dyn SessionStore,
+    cwd: &Path,
+    new_session_id: &SessionId,
+    source_session_id: &SessionId,
+) -> Result<(), SessionError> {
+    let record = SessionRecord {
+        timestamp: now_iso(),
+        cwd: cwd.to_path_buf(),
+        session_id: new_session_id.to_string(),
+        payload: SessionPayload::ForkMetadata {
+            source_session_id: source_session_id.to_string(),
+        },
+    };
+    store.append(new_session_id, record).await
+}
+
+/// Append a settings snapshot so audits can reproduce the run.
+pub async fn append_settings_snapshot(
+    store: &dyn SessionStore,
+    cwd: &Path,
+    session_id: &SessionId,
+    settings_summary: &str,
+) -> Result<(), SessionError> {
+    let record = SessionRecord {
+        timestamp: now_iso(),
+        cwd: cwd.to_path_buf(),
+        session_id: session_id.to_string(),
+        payload: SessionPayload::SettingsSnapshot {
+            settings_summary: settings_summary.to_string(),
+        },
+    };
+    store.append(session_id, record).await
+}
+
+/// Fork an existing session into a new one. Copies every record from the
+/// source session into a fresh session id and writes a fork-metadata marker.
+pub async fn fork_session(
+    store: &dyn SessionStore,
+    cwd: &Path,
+    source: &SessionId,
+) -> Result<SessionId, SessionError> {
+    let records = store.load(source).await?;
+    let new_id = store.create(cwd).await?;
+    append_fork_metadata(store, cwd, &new_id, source).await?;
+    for r in records {
+        // Keep the original timestamp but rewrite the session id so the
+        // new file references itself, not the source.
+        let copied = SessionRecord {
+            timestamp: r.timestamp,
+            cwd: cwd.to_path_buf(),
+            session_id: new_id.to_string(),
+            payload: r.payload,
+        };
+        store.append(&new_id, copied).await?;
+    }
+    Ok(new_id)
+}
+
+/// Summary of a session (computed by walking its records).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub cwd: Option<PathBuf>,
+    pub source_session_id: Option<String>,
+    pub user_prompts: u32,
+    pub assistant_messages: u32,
+    pub tool_calls_started: u32,
+    pub tool_calls_completed: u32,
+    pub tool_calls_denied: u32,
+    pub policy_decisions: u32,
+    pub hook_evaluations: u32,
+    pub todo_updates: u32,
+    pub interruptions: u32,
+    pub final_result: Option<String>,
+    pub final_subtype: Option<String>,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cost_usd: Option<f64>,
+}
+
+/// Compute a summary for a session by reading its JSONL.
+pub async fn summarize_session(
+    store: &dyn SessionStore,
+    session_id: &SessionId,
+) -> Result<SessionSummary, SessionError> {
+    let records = store.load(session_id).await?;
+    let mut s = SessionSummary {
+        session_id: session_id.to_string(),
+        ..Default::default()
+    };
+    for r in &records {
+        if s.cwd.is_none() {
+            s.cwd = Some(r.cwd.clone());
+        }
+        match &r.payload {
+            SessionPayload::UserPrompt { .. } => s.user_prompts += 1,
+            SessionPayload::ForkMetadata { source_session_id } => {
+                s.source_session_id = Some(source_session_id.clone());
+            }
+            SessionPayload::SettingsSnapshot { .. } => {}
+            SessionPayload::Event(ev) => match ev {
+                AgentEvent::AssistantMessage(_) => s.assistant_messages += 1,
+                AgentEvent::ToolCallStarted(_) => s.tool_calls_started += 1,
+                AgentEvent::ToolCallCompleted(_) => s.tool_calls_completed += 1,
+                AgentEvent::ToolCallDenied(_) => s.tool_calls_denied += 1,
+                AgentEvent::PolicyDecision(_) => s.policy_decisions += 1,
+                AgentEvent::HookEvaluated(_) => s.hook_evaluations += 1,
+                AgentEvent::TodoUpdate(_) => s.todo_updates += 1,
+                AgentEvent::Interrupted(_) => s.interruptions += 1,
+                AgentEvent::Result(res) => {
+                    s.final_result = res.result.clone();
+                    s.final_subtype = Some(format!("{:?}", res.subtype));
+                    if let Some(u) = &res.usage {
+                        s.total_input_tokens += u.input_tokens;
+                        s.total_output_tokens += u.output_tokens;
+                    }
+                    // Each Result reports the cumulative cost for its run.
+                    // Summing across runs yields the session-wide total;
+                    // overwriting (the old behavior) under-reported cost
+                    // for any session with more than one run (resumed,
+                    // continued, forked, or chat sessions).
+                    if let Some(c) = res.total_cost_usd {
+                        s.total_cost_usd = Some(s.total_cost_usd.unwrap_or(0.0) + c);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    Ok(s)
+}
+
+/// Export format for `sessions export`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Jsonl,
+    Json,
+}
+
+impl ExportFormat {
+    pub fn from_str_lenient(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "jsonl" => Some(Self::Jsonl),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
+/// Export a session as a single string in the requested format.
+pub async fn export_session(
+    store: &dyn SessionStore,
+    session_id: &SessionId,
+    format: ExportFormat,
+) -> Result<String, SessionError> {
+    let records = store.load(session_id).await?;
+    let s = match format {
+        ExportFormat::Jsonl => {
+            let mut out = String::new();
+            for r in records {
+                out.push_str(&serde_json::to_string(&r)?);
+                out.push('\n');
+            }
+            out
+        }
+        ExportFormat::Json => serde_json::to_string_pretty(&records)?,
+    };
+    Ok(s)
+}
+
 /// Reconstruct prior conversation messages from a session log so the agent can
 /// resume with full context.
 ///
@@ -260,6 +442,7 @@ pub fn replay_conversation(records: &[SessionRecord]) -> Conversation {
                 flush_results(&mut conv, &mut pending_tool_results);
                 conv.push(Message::user_text(text.clone()));
             }
+            SessionPayload::ForkMetadata { .. } | SessionPayload::SettingsSnapshot { .. } => {}
             SessionPayload::Event(ev) => match ev {
                 AgentEvent::AssistantMessage(am) => {
                     flush_results(&mut conv, &mut pending_tool_results);

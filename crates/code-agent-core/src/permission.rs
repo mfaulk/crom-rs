@@ -37,10 +37,47 @@ pub struct PermissionRequest {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Decision returned by a permission callback or memory.
+///
+/// `AllowOnce` allows just this call.
+/// `AllowForSession` allows this and any later call that matches the same
+/// approval key for the rest of the session.
+/// `AllowForProject` is like `AllowForSession` but persists across sessions
+/// (when the runtime opts into project-level memory).
+/// `Deny` denies just this call.
+/// `DenyForSession` denies this and any later matching call for the rest of
+/// the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionDecision {
-    Allow,
+    AllowOnce,
+    AllowForSession,
+    AllowForProject,
     Deny { reason: String },
+    DenyForSession { reason: String },
+}
+
+impl PermissionDecision {
+    /// Backwards-compatible alias for `AllowOnce`.
+    pub fn allow() -> Self {
+        Self::AllowOnce
+    }
+
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self::Deny {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn is_allow(&self) -> bool {
+        matches!(
+            self,
+            Self::AllowOnce | Self::AllowForSession | Self::AllowForProject
+        )
+    }
+
+    pub fn is_deny(&self) -> bool {
+        matches!(self, Self::Deny { .. } | Self::DenyForSession { .. })
+    }
 }
 
 #[async_trait]
@@ -61,12 +98,25 @@ impl PermissionCallback for AlwaysDeny {
     }
 }
 
-/// A callback that always allows. Useful in tests.
+/// A callback that always allows once. Useful in tests.
 pub struct AlwaysAllow;
 
 #[async_trait]
 impl PermissionCallback for AlwaysAllow {
     async fn approve(&self, _: PermissionRequest) -> PermissionDecision {
-        PermissionDecision::Allow
+        PermissionDecision::AllowOnce
     }
+}
+
+/// Approval-memory mode: how an approval applies to subsequent calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMemoryMode {
+    /// No memory: every approval prompt is shown again next time.
+    None,
+    /// Memory persists for the duration of the live agent session.
+    #[default]
+    Session,
+    /// Memory persists across sessions for the same cwd (project).
+    Project,
 }
