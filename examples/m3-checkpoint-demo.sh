@@ -46,7 +46,7 @@ if cargo test --quiet 2>/dev/null; then
 fi
 echo "  ok: tokens_are_trimmed fails as expected"
 
-CODE_AGENT="cargo run --quiet -p code-agent-cli --"
+CODE_AGENT=(cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p code-agent-cli --)
 
 # Step 1: create a session manually so checkpoint subcommands have something
 # to attach to.
@@ -57,11 +57,11 @@ echo "[m3-demo] step 1: session ${SESSION_ID}"
 
 # Step 2: take a manual checkpoint of the broken state.
 echo "[m3-demo] step 2: create a manual checkpoint"
-$CODE_AGENT checkpoint "before refactor" --cwd . --session "${SESSION_ID}"
-$CODE_AGENT checkpoints list --cwd . --session "${SESSION_ID}"
+"${CODE_AGENT[@]}" checkpoint "before refactor" --cwd . --session "${SESSION_ID}"
+"${CODE_AGENT[@]}" checkpoints list --cwd . --session "${SESSION_ID}"
 
 # Capture the checkpoint id for the rewind dance below.
-CKPT_ID=$($CODE_AGENT checkpoints list --cwd . --session "${SESSION_ID}" | awk 'NR==1 {print $1}')
+CKPT_ID=$("${CODE_AGENT[@]}" checkpoints list --cwd . --session "${SESSION_ID}" | awk 'NR==1 {print $1}')
 echo "[m3-demo] checkpoint id: ${CKPT_ID}"
 
 # Step 3: simulate an agent edit (it doesn't need the API key — we use
@@ -86,10 +86,10 @@ pub fn parse_tokens(input: &str) -> Vec<String> {
 EOF
 
 echo "[m3-demo] step 4: diff (should report the mutation if a snapshot was captured)"
-$CODE_AGENT checkpoints diff "${CKPT_ID}" --cwd . --session "${SESSION_ID}" || true
+"${CODE_AGENT[@]}" checkpoints diff "${CKPT_ID}" --cwd . --session "${SESSION_ID}" || true
 
 echo "[m3-demo] step 5: dry-run rewind"
-$CODE_AGENT rewind "${CKPT_ID}" --cwd . --dry-run
+"${CODE_AGENT[@]}" rewind "${CKPT_ID}" --cwd . --dry-run
 
 # Restore by hand so the example dir doesn't keep the backup file.
 mv src/lib.rs.bak src/lib.rs
