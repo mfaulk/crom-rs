@@ -99,6 +99,9 @@ impl<'de> Deserialize<'de> for ToolRule {
 
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
                 if value.contains('*') || value.contains('?') {
+                    Glob::new(value).map_err(|e| {
+                        de::Error::custom(format!("invalid tool glob pattern {:?}: {e}", value))
+                    })?;
                     Ok(ToolRule::ToolGlob(value.to_string()))
                 } else {
                     Ok(ToolRule::ExactTool(value.to_string()))
@@ -139,8 +142,14 @@ impl<'de> Deserialize<'de> for ToolRule {
                 let tool =
                     tool.ok_or_else(|| de::Error::custom("tool rule object missing `tool`"))?;
                 if let Some(re) = command_regex {
+                    Regex::new(&re).map_err(|e| {
+                        de::Error::custom(format!("invalid command_regex {:?}: {e}", re))
+                    })?;
                     Ok(ToolRule::BashCommandRegex(re))
                 } else if let Some(p) = path_glob {
+                    Glob::new(&p).map_err(|e| {
+                        de::Error::custom(format!("invalid path_glob {:?}: {e}", p))
+                    })?;
                     Ok(ToolRule::FilePathGlob { tool, pattern: p })
                 } else {
                     Ok(ToolRule::ExactTool(tool))
@@ -224,6 +233,47 @@ mod tests {
         assert!(r.matches("Edit", &serde_json::json!({"file_path": "src/.env.local"})));
         assert!(!r.matches("Edit", &serde_json::json!({"file_path": "src/lib.rs"})));
         assert!(!r.matches("Write", &serde_json::json!({"file_path": ".env"})));
+    }
+}
+
+#[cfg(test)]
+mod issue6_regression {
+    use super::*;
+
+    #[test]
+    // Malformed BashCommandRegex pattern must fail deserialization with an error mentioning the bad pattern.
+    fn rejects_malformed_bash_command_regex() {
+        let r: Result<ToolRule, _> =
+            serde_json::from_str(r#"{"tool": "Bash", "command_regex": "["}"#);
+        assert!(
+            r.is_err(),
+            "expected deserialization error for malformed regex"
+        );
+        let msg = format!("{}", r.unwrap_err());
+        assert!(
+            msg.contains('[') || msg.contains("regex") || msg.contains("invalid"),
+            "error must mention the bad pattern, got: {msg}"
+        );
+    }
+
+    #[test]
+    // Malformed FilePathGlob pattern must fail deserialization.
+    fn rejects_malformed_file_path_glob() {
+        let r: Result<ToolRule, _> = serde_json::from_str(r#"{"tool": "Edit", "path_glob": "["}"#);
+        assert!(
+            r.is_err(),
+            "expected deserialization error for malformed glob"
+        );
+    }
+
+    #[test]
+    // Malformed ToolGlob string (bare `[` which is invalid glob syntax) must fail deserialization.
+    fn rejects_malformed_tool_glob() {
+        let r: Result<ToolRule, _> = serde_json::from_str(r#""[*""#);
+        assert!(
+            r.is_err(),
+            "expected deserialization error for malformed tool glob"
+        );
     }
 }
 
