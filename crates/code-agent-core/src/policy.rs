@@ -282,10 +282,20 @@ impl PolicyEngine {
                     if let Some(v) = updated_input {
                         tool_input = v;
                     }
+                    // Plan mode is an unconditional execution block: a hook
+                    // saying "allow" must not bypass it. Hooks have already
+                    // fired (observability is preserved); the *outcome* in
+                    // Plan mode is always Deny.
+                    if matches!(self.config.permission_mode, PermissionMode::Plan) {
+                        return PolicyDecision::deny(
+                            PolicyDecisionSource::PermissionMode,
+                            "plan mode does not execute tools".into(),
+                        );
+                    }
                     let mut d =
                         PolicyDecision::allow(PolicyDecisionSource::Hook, Some("hook".into()));
                     d.updated_tool_input = Some(tool_input.clone());
-                    // Hook Allow short-circuits ahead of permission mode.
+                    // Hook Allow short-circuits ahead of allow rules / callback.
                     return d;
                 }
                 HookAggregateDecision::Ask { reason: _ } => {
@@ -850,7 +860,8 @@ mod tests {
     }
 
     #[tokio::test]
-    // Plan mode denies even when a hook returns Ask (force_callback=true), not reaching the callback.
+    // Plan mode denies even when a hook returns Ask, and the approval
+    // callback is never invoked (Plan must short-circuit before the prompt).
     async fn plan_mode_denies_when_hook_asks() {
         struct AskHook;
         #[async_trait]
@@ -861,17 +872,60 @@ mod tests {
                 })
             }
         }
-        struct AllowCb;
+        struct CountingCb {
+            calls: Arc<Mutex<u32>>,
+        }
         #[async_trait]
-        impl PermissionCallback for AllowCb {
+        impl PermissionCallback for CountingCb {
             async fn approve(&self, _: PermissionRequest) -> PermissionDecision {
+                *self.calls.lock().await += 1;
                 PermissionDecision::AllowOnce
             }
         }
+        let calls = Arc::new(Mutex::new(0u32));
         let hooks = Hooks::new().pre_tool_use("*", Arc::new(AskHook));
         let cfg = PolicyConfig {
             permission_mode: PermissionMode::Plan,
-            callback: Some(Arc::new(AllowCb)),
+            callback: Some(Arc::new(CountingCb {
+                calls: calls.clone(),
+            })),
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, hooks);
+        let sid = sid();
+        let rid = rid();
+        let cwd = std::path::Path::new(".");
+        let d = engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                cwd,
+                "Bash",
+                PermissionKind::Execution,
+                serde_json::json!({"command": "ls"}),
+            ))
+            .await;
+        assert_eq!(d.outcome, PolicyOutcome::Deny);
+        assert_eq!(d.source, PolicyDecisionSource::PermissionMode);
+        assert_eq!(*calls.lock().await, 0, "callback must not be invoked");
+    }
+
+    #[tokio::test]
+    // Plan mode denies even when a hook returns Allow — Plan is an
+    // unconditional execution block and a hook cannot bypass it.
+    async fn plan_mode_denies_when_hook_allows() {
+        struct AllowHook;
+        #[async_trait]
+        impl Hook for AllowHook {
+            async fn call(&self, _: HookInput) -> Result<HookOutput, HookError> {
+                Ok(HookOutput::Allow {
+                    updated_input: None,
+                })
+            }
+        }
+        let hooks = Hooks::new().pre_tool_use("*", Arc::new(AllowHook));
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::Plan,
             ..PolicyConfig::default()
         };
         let engine = PolicyEngine::new(cfg, hooks);
