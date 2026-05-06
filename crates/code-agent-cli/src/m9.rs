@@ -56,10 +56,11 @@ impl DoctorReport {
     }
 }
 
-/// Run the doctor checks against a workspace + settings snapshot. Stays
-/// fully synchronous and offline so it is safe to call from tests, CI,
-/// and `code-agent doctor --json`.
-pub fn run_doctor(cwd: &Path, settings: &Settings, redact_secrets: bool) -> DoctorReport {
+/// Run the doctor checks against a workspace + settings snapshot. The
+/// async signature lets us call into the recovery detector without
+/// blocking a Tokio worker thread; tests can `await` directly via the
+/// `#[tokio::test]` runtime.
+pub async fn run_doctor(cwd: &Path, settings: &Settings, redact_secrets: bool) -> DoctorReport {
     let mut checks = Vec::new();
     let mut text = Vec::new();
 
@@ -222,10 +223,7 @@ pub fn run_doctor(cwd: &Path, settings: &Settings, redact_secrets: bool) -> Doct
     text.push(String::new());
     text.push("Recovery".to_string());
     if std::path::Path::new(&sessions_dir).exists() {
-        match futures::executor::block_on(detect_state(
-            cwd,
-            settings.recovery.stale_lock_after_seconds,
-        )) {
+        match detect_state(cwd, settings.recovery.stale_lock_after_seconds).await {
             Ok(infos) => {
                 let stale: Vec<&SessionRecoveryInfo> = infos
                     .iter()
@@ -493,7 +491,7 @@ pub fn format_effective_config(settings: &Settings) -> Vec<String> {
 }
 
 /// Format the runtime status line for `/status` and `code-agent status`.
-pub fn format_session_status(
+pub async fn format_session_status(
     cwd: &Path,
     settings: &Settings,
     session_id: Option<&str>,
@@ -511,7 +509,7 @@ pub fn format_session_status(
         out.push("  session:       (none)".to_string());
     }
     let store = FsSessionStore::new(cwd.to_path_buf());
-    let listing = futures::executor::block_on(store.list(cwd)).unwrap_or_default();
+    let listing = store.list(cwd).await.unwrap_or_default();
     out.push(format!("  sessions on disk: {}", listing.len()));
     out
 }
@@ -581,22 +579,28 @@ pub fn write_completions<C: clap::CommandFactory>(
 }
 
 /// Parse the various `--older-than` strings used by `sessions clean`.
+/// Uses checked arithmetic so an absurd input like `99999999999d` produces
+/// a clear error instead of wrapping in release builds (which could mark
+/// recent files as ancient and mass-delete them).
 pub fn parse_age_spec(s: &str) -> Result<std::time::Duration> {
     let s = s.trim();
-    if let Some(rest) = s.strip_suffix('d') {
+    let parse = |rest: &str, mult: u64| -> Result<std::time::Duration> {
         let n: u64 = rest.parse().map_err(|_| anyhow!("invalid age: {s}"))?;
-        return Ok(std::time::Duration::from_secs(n * 86_400));
+        let secs = n
+            .checked_mul(mult)
+            .ok_or_else(|| anyhow!("age overflow: {s}"))?;
+        Ok(std::time::Duration::from_secs(secs))
+    };
+    if let Some(rest) = s.strip_suffix('d') {
+        return parse(rest, 86_400);
     }
     if let Some(rest) = s.strip_suffix('h') {
-        let n: u64 = rest.parse().map_err(|_| anyhow!("invalid age: {s}"))?;
-        return Ok(std::time::Duration::from_secs(n * 3_600));
+        return parse(rest, 3_600);
     }
     if let Some(rest) = s.strip_suffix('m') {
-        let n: u64 = rest.parse().map_err(|_| anyhow!("invalid age: {s}"))?;
-        return Ok(std::time::Duration::from_secs(n * 60));
+        return parse(rest, 60);
     }
-    let n: u64 = s.parse().map_err(|_| anyhow!("invalid age: {s}"))?;
-    Ok(std::time::Duration::from_secs(n))
+    parse(s, 1)
 }
 
 /// Identify session JSONL files older than `age`. Returns the candidate
@@ -619,10 +623,14 @@ pub fn collect_clean_candidates(
         if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
             continue;
         }
-        let modified = ent
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
+        // Skip files whose mtime can't be read instead of treating them as
+        // ancient. The previous behaviour (`unwrap_or(UNIX_EPOCH)`) would
+        // promote any temporarily-unreadable file straight onto the
+        // delete list, which is the wrong default for "clean old sessions".
+        let modified = match ent.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
         if modified <= cutoff {
             out.push((p, modified));
         }
@@ -642,8 +650,12 @@ pub fn send_terminal_bell_for(reason: &str) {
 }
 
 /// Recovery summary used by `code-agent sessions recover`.
-pub fn recoverable_sessions(cwd: &Path, recovery: &RecoveryConfig) -> Vec<SessionRecoveryInfo> {
-    futures::executor::block_on(detect_state(cwd, recovery.stale_lock_after_seconds))
+pub async fn recoverable_sessions(
+    cwd: &Path,
+    recovery: &RecoveryConfig,
+) -> Vec<SessionRecoveryInfo> {
+    detect_state(cwd, recovery.stale_lock_after_seconds)
+        .await
         .unwrap_or_default()
         .into_iter()
         .filter(|i| {
@@ -662,13 +674,13 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
+    #[tokio::test]
     // Doctor reports a fail when ANTHROPIC_API_KEY is missing.
-    fn doctor_fails_without_api_key() {
+    async fn doctor_fails_without_api_key() {
         let dir = TempDir::new().unwrap();
         let _g = EnvGuard::new("ANTHROPIC_API_KEY");
         std::env::remove_var("ANTHROPIC_API_KEY");
-        let report = run_doctor(dir.path(), &Settings::default(), true);
+        let report = run_doctor(dir.path(), &Settings::default(), true).await;
         let api = report
             .checks
             .iter()
@@ -677,13 +689,13 @@ mod tests {
         assert_eq!(api.status, DoctorStatus::Fail);
     }
 
-    #[test]
+    #[tokio::test]
     // Doctor JSON output is valid and doesn't expose the raw key value.
-    fn doctor_json_output_redacts_secret() {
+    async fn doctor_json_output_redacts_secret() {
         let dir = TempDir::new().unwrap();
         let _g = EnvGuard::new("ANTHROPIC_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "sk-XXXXXXXXXXXXXXXXXXXX");
-        let report = run_doctor(dir.path(), &Settings::default(), true);
+        let report = run_doctor(dir.path(), &Settings::default(), true).await;
         let s = serde_json::to_string(&report.checks).unwrap();
         assert!(!s.contains("sk-XXXXXXXX"));
         assert!(s.contains("provider.api_key"));
@@ -748,6 +760,16 @@ mod tests {
         assert_eq!(parse_age_spec("30d").unwrap().as_secs(), 30 * 86_400);
         assert_eq!(parse_age_spec("2h").unwrap().as_secs(), 7_200);
         assert_eq!(parse_age_spec("60").unwrap().as_secs(), 60);
+    }
+
+    #[test]
+    // Absurdly large `--older-than` values produce a clear overflow error
+    // instead of wrapping to a tiny duration that would mass-delete files.
+    fn parse_age_spec_rejects_overflow() {
+        let huge = format!("{}d", u64::MAX);
+        let err = parse_age_spec(&huge).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("overflow"), "got: {msg}");
     }
 
     #[test]

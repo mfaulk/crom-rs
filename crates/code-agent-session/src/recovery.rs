@@ -229,11 +229,12 @@ pub async fn detect_state(
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
-        // Cheap probe: only load enough to know whether the file ends in a
-        // Result event. This avoids the O(records) load that previously
-        // ran for every session on every doctor invocation.
-        let has_result = file_ends_with_result(&path).await.unwrap_or(false);
-        let state = classify_state_lite(has_result, lock.as_ref(), now_unix, stale_after_seconds);
+        // Bounded-I/O probe: read only the last `TAIL_BYTES` of the file
+        // to decide whether this session has any records and whether it
+        // ended in a `Result` event. This caps the scan at ~64KB even for
+        // multi-megabyte session logs.
+        let probe = tail_probe(&path).await.unwrap_or_default();
+        let state = classify_state_lite(probe, lock.as_ref(), now_unix, stale_after_seconds);
         out.push(SessionRecoveryInfo {
             session_id: id,
             state,
@@ -249,16 +250,26 @@ pub async fn detect_state(
     Ok(out)
 }
 
-/// Cheap state classifier that takes a precomputed `has_result` flag rather
-/// than the full record list. Equivalent to `classify_state` for sessions
-/// where we only care about "did this run reach Result?".
+/// Lightweight summary of a session's JSONL file produced by `tail_probe`.
+/// Used by `classify_state_lite` to distinguish "nothing happened yet" from
+/// "session ran but never reached a Result event".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TailProbe {
+    pub has_records: bool,
+    pub has_result: bool,
+}
+
+/// Cheap state classifier that takes a precomputed [`TailProbe`] rather
+/// than the full record list. Sessions with records but no `Result` event
+/// and no held lock are reported as `Interrupted` so recovery flows can
+/// pick them up.
 pub(crate) fn classify_state_lite(
-    has_result: bool,
+    probe: TailProbe,
     lock: Option<&RunLock>,
     now_unix: i64,
     stale_after_seconds: u64,
 ) -> SessionRuntimeState {
-    if has_result {
+    if probe.has_result {
         return if lock.is_none() {
             SessionRuntimeState::Complete
         } else {
@@ -266,7 +277,16 @@ pub(crate) fn classify_state_lite(
         };
     }
     match lock {
-        None => SessionRuntimeState::Idle,
+        None => {
+            // No `Result` event and no lock: either nothing ever happened
+            // (Idle) or the prior process exited without recording a
+            // terminal state (Interrupted).
+            if probe.has_records {
+                SessionRuntimeState::Interrupted
+            } else {
+                SessionRuntimeState::Idle
+            }
+        }
         Some(l) => {
             let started = parse_iso(&l.started_at).unwrap_or(now_unix);
             let elapsed = now_unix.saturating_sub(started);
@@ -279,34 +299,59 @@ pub(crate) fn classify_state_lite(
     }
 }
 
-/// Stream the JSONL file and check whether any line decodes as a `Result`
-/// event. Reads line-by-line so a 100MB session file does not blow up
-/// memory just to answer "did this run finish?".
-async fn file_ends_with_result(path: &Path) -> std::io::Result<bool> {
+/// Read the tail of a session JSONL file (last `TAIL_BYTES`) and report
+/// whether it contains records and whether the most recent terminal record
+/// is a `Result` event. Tail-reading bounds I/O at ~64KB regardless of
+/// session size, so `code-agent doctor` and `sessions-ext recover` stay
+/// fast even on multi-megabyte session logs.
+const TAIL_BYTES: u64 = 64 * 1024;
+
+async fn tail_probe(path: &Path) -> std::io::Result<TailProbe> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
     if !path.exists() {
-        return Ok(false);
+        return Ok(TailProbe::default());
     }
-    let f = tokio::fs::File::open(path).await?;
-    let mut reader = tokio::io::BufReader::new(f).lines();
-    let mut found = false;
-    while let Some(line) = reader.next_line().await? {
-        let trimmed = line.trim_start();
-        // Fast path: only attempt to parse lines that mention `"result"`.
-        // Cuts JSON parsing cost on long sessions to the few candidate
-        // lines per session.
+    let mut f = tokio::fs::File::open(path).await?;
+    let len = f.metadata().await?.len();
+    if len == 0 {
+        return Ok(TailProbe::default());
+    }
+    let start = len.saturating_sub(TAIL_BYTES);
+    f.seek(SeekFrom::Start(start)).await?;
+    let mut buf = Vec::with_capacity(TAIL_BYTES.min(len) as usize);
+    f.read_to_end(&mut buf).await?;
+    let text = String::from_utf8_lossy(&buf);
+    // Parse newline-terminated JSON records from the tail. The first line
+    // may be partial when we did not start from offset zero — drop it then.
+    let lines: Vec<&str> = text.lines().collect();
+    let skip_first = start > 0;
+    let mut has_records = false;
+    let mut has_result = false;
+    for (idx, line) in lines.iter().enumerate() {
+        if skip_first && idx == 0 {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        has_records = true;
         if !trimmed.contains("\"result\"") {
             continue;
         }
-        if let Ok(rec) = serde_json::from_str::<SessionRecord>(&line) {
+        if let Ok(rec) = serde_json::from_str::<SessionRecord>(trimmed) {
             if matches!(
                 &rec.payload,
                 SessionPayload::Event(code_agent_core::AgentEvent::Result(_))
             ) {
-                found = true;
+                has_result = true;
             }
         }
     }
-    Ok(found)
+    Ok(TailProbe {
+        has_records,
+        has_result,
+    })
 }
 
 /// Resilient JSONL load: returns parsed records and the count of skipped
@@ -348,6 +393,35 @@ pub struct RecoveryMarker {
     pub previous_state: SessionRuntimeState,
     pub records_recovered: u32,
     pub records_skipped: u32,
+}
+
+/// Append a `SessionRecovered` event to a session's JSONL file. This is
+/// the audit trail referenced in the recovery flow's documentation:
+/// recovery never mutates existing JSONL beyond appending a marker
+/// record. The append is idempotent in spirit — a repeated recover just
+/// adds another marker.
+pub async fn append_recovery_marker(
+    cwd: &Path,
+    session_id: &SessionId,
+    previous_state: SessionRuntimeState,
+    records_recovered: u32,
+    records_skipped: u32,
+) -> Result<(), SessionError> {
+    use crate::SessionStore;
+    let store = FsSessionStore::new(cwd.to_path_buf());
+    let event = code_agent_core::AgentEvent::SessionRecovered(code_agent_core::SessionRecovered {
+        session_id: session_id.clone(),
+        previous_state,
+        records_recovered,
+        records_skipped,
+    });
+    let record = SessionRecord {
+        timestamp: now_iso(),
+        cwd: cwd.to_path_buf(),
+        session_id: session_id.to_string(),
+        payload: SessionPayload::Event(event),
+    };
+    store.append(session_id, record).await
 }
 
 #[cfg(test)]
@@ -479,6 +553,56 @@ mod tests {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let state = classify_state(&[rec], Some(&lock), now, 60);
         assert_eq!(state, S::Crashed);
+    }
+
+    #[tokio::test]
+    // A session with records but no Result event and no held lock is
+    // classified as Interrupted. Regression test for the classifier
+    // hole where these sessions were previously reported as Idle and
+    // would never surface to recovery flows.
+    async fn classify_interrupted_when_records_no_result_no_lock() {
+        let probe = TailProbe {
+            has_records: true,
+            has_result: false,
+        };
+        let state = classify_state_lite(probe, None, 1_000_000, 60);
+        assert_eq!(state, S::Interrupted);
+    }
+
+    #[tokio::test]
+    // tail_probe correctly reports Result presence even when the file is
+    // larger than the configured tail window.
+    async fn tail_probe_finds_result_in_large_file() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+        // Pad the file with > TAIL_BYTES of unrelated records.
+        for i in 0..2000 {
+            append_user_prompt(&store, dir.path(), &id, &format!("padding line number {i}"))
+                .await
+                .unwrap();
+        }
+        // Then write a Result event at the very end.
+        let rec = SessionRecord {
+            timestamp: now_iso(),
+            cwd: dir.path().to_path_buf(),
+            session_id: id.to_string(),
+            payload: SessionPayload::Event(AgentEvent::Result(AgentResult {
+                subtype: ResultSubtype::Success,
+                result: None,
+                session_id: id.clone(),
+                run_id: None,
+                num_turns: 0,
+                usage: None,
+                total_cost_usd: None,
+            })),
+        };
+        store.append(&id, rec).await.unwrap();
+        let path =
+            FsSessionStore::sessions_dir_for(dir.path()).join(format!("{}.jsonl", id.as_str()));
+        let probe = tail_probe(&path).await.unwrap();
+        assert!(probe.has_records);
+        assert!(probe.has_result);
     }
 
     #[tokio::test]

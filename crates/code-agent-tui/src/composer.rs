@@ -15,6 +15,11 @@ pub enum KeyEvent {
     Enter,
     ShiftEnter,
     AltEnter,
+    /// Ctrl+Enter. Many terminals deliver this indistinguishably from
+    /// `Enter`, so the host translates whatever escape sequence its
+    /// runtime supports into this variant before handing keys to the
+    /// composer.
+    CtrlEnter,
     Backspace,
     Tab,
     Up,
@@ -166,7 +171,28 @@ impl ComposerState {
                     KeyAction::None
                 }
             },
+            KeyEvent::CtrlEnter => match self.config.submit_key {
+                // When the user has chosen Ctrl+Enter as their submit key,
+                // honor it. Otherwise treat as newline (still useful in
+                // multiline mode and harmless in single-line).
+                SubmitKey::CtrlEnter => self.submit(),
+                SubmitKey::Enter => {
+                    if self.config.multiline {
+                        self.buffer.insert(self.cursor, '\n');
+                        self.cursor += 1;
+                    }
+                    KeyAction::None
+                }
+            },
             KeyEvent::ShiftEnter | KeyEvent::AltEnter => {
+                // Submit-as-newline keys: insert in multiline mode, but if
+                // the user has configured `submit_key = ctrl_enter` and the
+                // host can't distinguish Ctrl+Enter from plain Enter, these
+                // alternates are still expected to submit.
+                if matches!(self.config.submit_key, SubmitKey::CtrlEnter) && !self.config.multiline
+                {
+                    return self.submit();
+                }
                 if self.config.multiline {
                     self.buffer.insert(self.cursor, '\n');
                     self.cursor += 1;
@@ -353,6 +379,31 @@ mod tests {
             other => panic!("expected Submit, got {other:?}"),
         }
         assert_eq!(s.history.len(), 1);
+    }
+
+    #[test]
+    // When `submit_key = CtrlEnter` is configured, a CtrlEnter event
+    // submits. Regression test for the trap where users could not
+    // submit at all because no KeyEvent variant produced a Submit
+    // action under the CtrlEnter submit configuration.
+    fn ctrl_enter_submits_when_configured() {
+        let cfg = ComposerConfig {
+            submit_key: SubmitKey::CtrlEnter,
+            multiline: true,
+            ..ComposerConfig::default()
+        };
+        let mut s = ComposerState::new(cfg);
+        for c in "hi".chars() {
+            s.handle_key(KeyEvent::Char(c));
+        }
+        // Plain Enter inserts a newline under CtrlEnter mode.
+        assert_eq!(s.handle_key(KeyEvent::Enter), KeyAction::None);
+        assert_eq!(s.buffer, "hi\n");
+        // CtrlEnter actually submits.
+        match s.handle_key(KeyEvent::CtrlEnter) {
+            KeyAction::Submit(text) => assert_eq!(text, "hi\n"),
+            other => panic!("expected Submit, got {other:?}"),
+        }
     }
 
     #[test]

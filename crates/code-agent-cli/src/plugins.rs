@@ -1315,6 +1315,17 @@ pub fn apply_settings_file_overlay(s: &mut Settings, file: code_agent_core::Sett
     // Skip: allowed_tools/disallowed_tools and per-subsystem block
     // settings already accumulate via the user-and-project loader; we
     // don't touch them here so plugin defaults can never widen them.
+    //
+    // M9: `ui` and `recovery` are also intentionally NOT applied here.
+    // `settings_to_file` projects the effective UiConfig/RecoveryConfig
+    // back into a SettingsFile shape so the JSON merge can't quietly
+    // discard the user's customizations, but we never let plugin
+    // defaults override the user's terminal/UI behaviour — letting a
+    // plugin flip the renderer to "plain" or change submit_key would be
+    // a surprise that's hard to debug. Plugin authors who need UI
+    // behaviour should expose it through their own settings keys.
+    let _ = file.ui;
+    let _ = file.recovery;
 }
 
 /// Compare two version strings using a numeric component split. Falls

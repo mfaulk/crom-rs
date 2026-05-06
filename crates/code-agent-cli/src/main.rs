@@ -2139,7 +2139,9 @@ async fn handle_builtin_slash(
                 &cfg.options.cwd,
                 &cfg.settings,
                 cfg.options.session_id.as_ref().map(|s| s.as_str()),
-            ) {
+            )
+            .await
+            {
                 println!("{line}");
             }
         }
@@ -2151,7 +2153,10 @@ async fn handle_builtin_slash(
             println!("(edit `.agent/settings.json` ui.status_line.template, or run `code-agent statusline set <TEMPLATE>`)");
         }
         B::Doctor => {
-            for line in m9::run_doctor(&cfg.options.cwd, &cfg.settings, true).text {
+            for line in m9::run_doctor(&cfg.options.cwd, &cfg.settings, true)
+                .await
+                .text
+            {
                 println!("{line}");
             }
         }
@@ -5352,7 +5357,7 @@ async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     let source = parse_setting_source(&args.settings)?;
     let settings = code_agent_core::settings::load(&cwd, source)
         .with_context(|| format!("loading settings from {}", cwd.display()))?;
-    let report = m9::run_doctor(&cwd, &settings, true);
+    let report = m9::run_doctor(&cwd, &settings, true).await;
     if args.json {
         let s = serde_json::to_string_pretty(&report.checks)?;
         println!("{s}");
@@ -5439,7 +5444,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
     let source = parse_setting_source(&args.settings)?;
     let settings = code_agent_core::settings::load(&cwd, source)
         .with_context(|| format!("loading settings from {}", cwd.display()))?;
-    for line in m9::format_session_status(&cwd, &settings, args.session.as_deref()) {
+    for line in m9::format_session_status(&cwd, &settings, args.session.as_deref()).await {
         println!("{line}");
     }
     Ok(())
@@ -5560,33 +5565,39 @@ async fn cmd_changes(cmd: ChangesCommand) -> Result<()> {
                 })
                 .await
                 .map_err(|e| anyhow!("summary diff failed: {e}"))?;
-            let entries = diff
-                .file_diffs
-                .iter()
-                .map(|fd| match fd {
-                    FileDiff::Modified { path, .. } => code_agent_tui::DiffEntry::Modified {
-                        path: std::path::PathBuf::from(path.as_str()),
-                        before: String::new(),
-                        after: String::new(),
-                    },
-                    FileDiff::Created { path, .. } => code_agent_tui::DiffEntry::Created {
-                        path: std::path::PathBuf::from(path.as_str()),
-                        after: String::new(),
-                    },
-                    FileDiff::Deleted { path, .. } => code_agent_tui::DiffEntry::Deleted {
-                        path: std::path::PathBuf::from(path.as_str()),
-                        before: String::new(),
-                    },
-                    FileDiff::Binary { path, .. } => code_agent_tui::DiffEntry::Binary {
-                        path: std::path::PathBuf::from(path.as_str()),
-                    },
-                    FileDiff::Redacted { path, .. } => code_agent_tui::DiffEntry::Redacted {
-                        path: std::path::PathBuf::from(path.as_str()),
-                        reason: "secret-like file".into(),
-                    },
-                })
-                .collect::<Vec<_>>();
-            let summary = code_agent_tui::ChangeSummary::from_entries(&entries);
+            // Build the summary directly from the checkpoint diff. The
+            // `+`/`-` line counts come straight out of the unified diff,
+            // which is the only byte-level signal the checkpoint store
+            // surfaces — `DiffEntry::Modified` would otherwise need the
+            // original file bytes (not stored on the diff value), so we
+            // count change lines and report bytes based on those.
+            let mut summary = code_agent_tui::ChangeSummary::default();
+            for fd in &diff.file_diffs {
+                match fd {
+                    FileDiff::Modified { unified_diff, .. } => {
+                        summary.modified += 1;
+                        let (added, removed) = count_unified_diff_bytes(unified_diff);
+                        summary.total_bytes_added += added;
+                        summary.total_bytes_removed += removed;
+                    }
+                    FileDiff::Created {
+                        current_content_preview,
+                        ..
+                    } => {
+                        summary.created += 1;
+                        summary.total_bytes_added += current_content_preview.len() as u64;
+                    }
+                    FileDiff::Deleted {
+                        original_content_preview,
+                        ..
+                    } => {
+                        summary.deleted += 1;
+                        summary.total_bytes_removed += original_content_preview.len() as u64;
+                    }
+                    FileDiff::Binary { .. } => summary.binary += 1,
+                    FileDiff::Redacted { .. } => summary.redacted += 1,
+                }
+            }
             println!(
                 "since {} ({}): {}",
                 last.checkpoint_id,
@@ -5688,6 +5699,38 @@ async fn cmd_changes(cmd: ChangesCommand) -> Result<()> {
     Ok(())
 }
 
+/// Resolve `recovery.stale_lock_after_seconds` from the configured settings
+/// source so `sessions-ext` agrees with `doctor`. Falls back to the
+/// `RecoveryConfig` default when settings can't be loaded.
+fn recovery_stale_seconds(cwd: &Path, settings_arg: &str) -> Result<u64> {
+    let source = parse_setting_source(settings_arg)?;
+    Ok(code_agent_core::settings::load(cwd, source)
+        .map(|s| s.recovery.stale_lock_after_seconds)
+        .unwrap_or_else(|_| code_agent_core::RecoveryConfig::default().stale_lock_after_seconds))
+}
+
+/// Count `+`-line and `-`-line bytes in a unified diff, ignoring the
+/// `+++ b/...` / `--- a/...` header rows. Used by `code-agent changes
+/// summary` to report meaningful byte deltas without re-reading file
+/// snapshots.
+fn count_unified_diff_bytes(unified: &str) -> (u64, u64) {
+    let mut added = 0u64;
+    let mut removed = 0u64;
+    for line in unified.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            // Subtract one for the leading `+` sigil; we want bytes of the
+            // change content itself.
+            added += (line.len() as u64).saturating_sub(1);
+        } else if line.starts_with('-') {
+            removed += (line.len() as u64).saturating_sub(1);
+        }
+    }
+    (added, removed)
+}
+
 async fn pick_session_for_cwd(explicit: Option<&str>, cwd: &Path) -> Result<SessionId> {
     if let Some(s) = explicit {
         return parse_session_id(s);
@@ -5707,7 +5750,8 @@ async fn cmd_sessions_ext(cmd: SessionsExtCommand) -> Result<()> {
                 .cwd
                 .canonicalize()
                 .with_context(|| format!("--cwd {}", args.cwd.display()))?;
-            let infos = code_agent_session::detect_state(&cwd, 3600)
+            let stale = recovery_stale_seconds(&cwd, &args.settings)?;
+            let infos = code_agent_session::detect_state(&cwd, stale)
                 .await
                 .map_err(|e| anyhow!("detect: {e}"))?;
             for i in infos.iter().take(20) {
@@ -5722,7 +5766,8 @@ async fn cmd_sessions_ext(cmd: SessionsExtCommand) -> Result<()> {
                 .cwd
                 .canonicalize()
                 .with_context(|| format!("--cwd {}", args.cwd.display()))?;
-            let infos = code_agent_session::detect_state(&cwd, 3600)
+            let stale = recovery_stale_seconds(&cwd, &args.settings)?;
+            let infos = code_agent_session::detect_state(&cwd, stale)
                 .await
                 .map_err(|e| anyhow!("detect: {e}"))?;
             let mut any = false;
@@ -5745,6 +5790,23 @@ async fn cmd_sessions_ext(cmd: SessionsExtCommand) -> Result<()> {
                         records.len(),
                         skipped
                     );
+                    // Append the audit marker required by the recovery
+                    // doc contract: "Recovery never mutates existing JSONL
+                    // beyond appending a marker record."
+                    if let Err(e) = code_agent_session::append_recovery_marker(
+                        &cwd,
+                        &i.session_id,
+                        i.state,
+                        records.len() as u32,
+                        skipped,
+                    )
+                    .await
+                    {
+                        eprintln!(
+                            "  warning: could not write recovery marker for {}: {}",
+                            i.session_id, e
+                        );
+                    }
                     code_agent_session::release_lock(&cwd, &i.session_id)
                         .await
                         .ok();
