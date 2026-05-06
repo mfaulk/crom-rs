@@ -91,6 +91,13 @@ pub struct SettingsFile {
     /// M7: Manual compaction configuration.
     #[serde(default)]
     pub compaction: Option<CompactionSettingsConfig>,
+    /// M8: Plugin system configuration.
+    #[serde(default)]
+    pub plugins: Option<PluginsSettingsConfig>,
+    /// M8: Per-plugin configuration values, keyed by plugin name.
+    /// These are exposed to plugins via `${user_config.<key>}`.
+    #[serde(default)]
+    pub plugin_config: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
 /// Settings for the M7 Skills subsystem.
@@ -141,6 +148,52 @@ pub struct SlashCommandsSettingsConfig {
     pub max_expanded_prompt_bytes: Option<usize>,
     #[serde(default)]
     pub max_expansion_output_bytes: Option<usize>,
+}
+
+/// One enabled-plugin entry stored in settings (M8).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnabledPluginEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Scope where this enabled-plugin record lives. Optional in JSON;
+    /// defaulted to the file's owning scope on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+/// Plugin-system settings block (M8). Disabled plugins are NOT stored here
+/// — operators flip `enabled` on the [`EnabledPluginEntry`] or move it to
+/// `disabled_plugins`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsSettingsConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub enabled_plugins: Option<Vec<EnabledPluginEntry>>,
+    #[serde(default)]
+    pub disabled_plugins: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_local_plugin_dirs: Option<bool>,
+    #[serde(default)]
+    pub allow_plugin_bin_path: Option<bool>,
+    #[serde(default)]
+    pub allow_plugin_hooks: Option<bool>,
+    #[serde(default)]
+    pub allow_plugin_mcp: Option<bool>,
+    #[serde(default)]
+    pub allow_plugin_settings: Option<bool>,
+    #[serde(default)]
+    pub compat_claude_plugin_manifest: Option<bool>,
+    #[serde(default)]
+    pub max_plugins: Option<usize>,
+    #[serde(default)]
+    pub strict_component_paths: Option<bool>,
+    /// Marketplace files registered with the runtime.
+    #[serde(default)]
+    pub marketplaces: Option<Vec<PathBuf>>,
 }
 
 /// Settings for the M7 manual compaction.
@@ -295,6 +348,8 @@ pub struct Settings {
     pub skills: Option<SkillsSettingsConfig>,
     pub slash_commands: Option<SlashCommandsSettingsConfig>,
     pub compaction: Option<CompactionSettingsConfig>,
+    pub plugins: Option<PluginsSettingsConfig>,
+    pub plugin_config: std::collections::BTreeMap<String, serde_json::Value>,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -560,7 +615,73 @@ fn merge_into(dst: &mut Settings, src: SettingsFile, _is_user: bool) -> Result<(
     if let Some(compact) = src.compaction {
         merge_compaction_settings(&mut dst.compaction, compact);
     }
+    if let Some(plugins) = src.plugins {
+        merge_plugins_settings(&mut dst.plugins, plugins);
+    }
+    if let Some(pc) = src.plugin_config {
+        for (k, v) in pc {
+            dst.plugin_config.insert(k, v);
+        }
+    }
     Ok(())
+}
+
+fn merge_plugins_settings(dst: &mut Option<PluginsSettingsConfig>, src: PluginsSettingsConfig) {
+    let target = dst.get_or_insert_with(PluginsSettingsConfig::default);
+    if src.enabled.is_some() {
+        target.enabled = src.enabled;
+    }
+    if let Some(list) = src.enabled_plugins {
+        let merged = target.enabled_plugins.get_or_insert_with(Vec::new);
+        for entry in list {
+            // Replace any existing entry with the same name; otherwise append.
+            if let Some(existing) = merged.iter_mut().find(|e| e.name == entry.name) {
+                *existing = entry;
+            } else {
+                merged.push(entry);
+            }
+        }
+    }
+    if let Some(list) = src.disabled_plugins {
+        let merged = target.disabled_plugins.get_or_insert_with(Vec::new);
+        for name in list {
+            if !merged.contains(&name) {
+                merged.push(name);
+            }
+        }
+    }
+    if src.allow_local_plugin_dirs.is_some() {
+        target.allow_local_plugin_dirs = src.allow_local_plugin_dirs;
+    }
+    if src.allow_plugin_bin_path.is_some() {
+        target.allow_plugin_bin_path = src.allow_plugin_bin_path;
+    }
+    if src.allow_plugin_hooks.is_some() {
+        target.allow_plugin_hooks = src.allow_plugin_hooks;
+    }
+    if src.allow_plugin_mcp.is_some() {
+        target.allow_plugin_mcp = src.allow_plugin_mcp;
+    }
+    if src.allow_plugin_settings.is_some() {
+        target.allow_plugin_settings = src.allow_plugin_settings;
+    }
+    if src.compat_claude_plugin_manifest.is_some() {
+        target.compat_claude_plugin_manifest = src.compat_claude_plugin_manifest;
+    }
+    if src.max_plugins.is_some() {
+        target.max_plugins = src.max_plugins;
+    }
+    if src.strict_component_paths.is_some() {
+        target.strict_component_paths = src.strict_component_paths;
+    }
+    if let Some(list) = src.marketplaces {
+        let merged = target.marketplaces.get_or_insert_with(Vec::new);
+        for p in list {
+            if !merged.contains(&p) {
+                merged.push(p);
+            }
+        }
+    }
 }
 
 fn merge_skills_settings(dst: &mut Option<SkillsSettingsConfig>, src: SkillsSettingsConfig) {

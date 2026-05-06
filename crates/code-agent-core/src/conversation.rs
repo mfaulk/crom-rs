@@ -118,4 +118,8 @@ pub struct SystemInit {
     /// Compact summaries of registered slash commands (M7).
     #[serde(default)]
     pub slash_commands: Vec<crate::slash::SlashCommandSummary>,
+    /// Compact summaries of installed plugins (M8). Empty when the
+    /// plugin system is disabled.
+    #[serde(default)]
+    pub plugins: Vec<crate::plugins::PluginSummary>,
 }

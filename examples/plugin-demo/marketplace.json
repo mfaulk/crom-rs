@@ -1,0 +1,14 @@
+{
+  "name": "local-devtools",
+  "owner": {
+    "name": "DevTools Team"
+  },
+  "plugins": [
+    {
+      "name": "rust-quality",
+      "source": "./plugins/rust-quality",
+      "description": "Rust review skills and agents",
+      "version": "1.0.0"
+    }
+  ]
+}

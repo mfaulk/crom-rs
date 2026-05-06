@@ -668,6 +668,7 @@ pub(crate) async fn run_loop(
             mcp_servers: mcp_report.statuses.clone(),
             skills: options.skills.list(),
             slash_commands: options.slash_commands.list(),
+            plugins: options.plugins.summaries(),
         };
         emit(
             &tx,

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Optional helper binary. PATH injection is OFF by default; the agent
+# only sees this entry through `plugin show`.
+echo "rust-quality-helper $@"

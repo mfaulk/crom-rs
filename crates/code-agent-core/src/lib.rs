@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod mcp;
 pub mod options;
 pub mod permission;
+pub mod plugins;
 pub mod policy;
 pub mod provider;
 pub mod run_id;
@@ -62,14 +63,17 @@ pub use conversation::{
 pub use errors::{AgentError, ProviderError, ToolError};
 pub use events::{
     AgentEvent, AgentRegistryLoaded, AgentResult, CheckpointEventPayload, CompactBoundary,
-    CompactionTrigger, HookEvaluated, HookOutcomeKind, InterruptedEvent, PolicyDecisionEvent,
-    ResultSubtype, SkillInvocationFailed, SkillLoaded, SkillRegistryLoaded, SkillResourceLoaded,
-    SlashCommandCompleted, SlashCommandExpanded, SlashCommandFailed, SlashCommandRegistryLoaded,
-    SlashCommandStarted, SubagentCancelled, SubagentEvent as SubagentForwardedEvent,
-    SubagentFailed, SubagentStart, SubagentStop, SubagentTimedOut, TodoUpdate, ToolCallCompleted,
-    ToolCallDenied, ToolCallStarted, ToolCatalogBuilt, ToolContextBudgetUpdated, ToolDeferred,
-    ToolDisabled, ToolLoaded, ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed,
-    ToolSearchStarted, UserToolResult,
+    CompactionTrigger, HookEvaluated, HookOutcomeKind, InterruptedEvent, PluginComponentFailed,
+    PluginComponentLoaded, PluginDisabled, PluginEnabled, PluginInstalled, PluginMarketplaceAdded,
+    PluginMarketplaceEntryInstalled, PluginRegistryLoaded, PluginReloaded, PluginUninstalled,
+    PluginValidationFailed, PolicyDecisionEvent, ResultSubtype, SkillInvocationFailed, SkillLoaded,
+    SkillRegistryLoaded, SkillResourceLoaded, SlashCommandCompleted, SlashCommandExpanded,
+    SlashCommandFailed, SlashCommandRegistryLoaded, SlashCommandStarted, SubagentCancelled,
+    SubagentEvent as SubagentForwardedEvent, SubagentFailed, SubagentStart, SubagentStop,
+    SubagentTimedOut, TodoUpdate, ToolCallCompleted, ToolCallDenied, ToolCallStarted,
+    ToolCatalogBuilt, ToolContextBudgetUpdated, ToolDeferred, ToolDisabled, ToolLoaded,
+    ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed, ToolSearchStarted,
+    UserToolResult,
 };
 pub use hooks::{
     aggregate, Hook, HookAddedContext, HookAggregateDecision, HookCallRecord, HookError,
@@ -81,6 +85,21 @@ pub use permission::{
     ApprovalMemoryMode, PermissionCallback, PermissionDecision, PermissionKind, PermissionMode,
     PermissionRequest,
 };
+pub use plugins::{
+    build_plugin_runtime, discover_manifest_path, install_to_cache, is_plugin_name_safe,
+    layout_for_scope, load_plugin_components, make_install, merge_plugin_defaults_into_settings,
+    parse_and_validate_source, plugin_cache_dir, plugin_data_dir, prune_orphans, redacted_display,
+    remove_data_dir, resolve_safe_plugin_path, substitute_str, substitute_value, uninstall_cache,
+    validate_plugin_paths, EffectivePluginConfig, LoadedPluginComponents, LocalMarketplaceError,
+    LocalPluginMarketplace, LocalPluginMarketplaceEntry, PluginAuthor, PluginComponentFailure,
+    PluginComponentKind, PluginComponentSummary, PluginHookCommand, PluginHookMatcherEntry,
+    PluginHooksFile, PluginInstall, PluginInstallError, PluginInstallLayout, PluginLoadContext,
+    PluginLoadOptions, PluginLoadedHook, PluginManifest, PluginManifestError,
+    PluginMarketplaceOwner, PluginRegistry, PluginRuntimeBuild, PluginRuntimePaths, PluginScope,
+    PluginSource, PluginStatus, PluginSubstError, PluginSummary, PluginValidationError,
+    PluginValidationFailure, PluginVarContext, COMPAT_PLUGIN_MANIFEST_PATH, MAX_PLUGIN_NAME_LEN,
+    PLUGIN_MANIFEST_PATH,
+};
 pub use policy::{
     approval_key, ApprovalMemory, ApprovalMemorySnapshot, MemoryDecision, PolicyConfig,
     PolicyDecision, PolicyDecisionSource, PolicyEngine, PolicyOutcome, PolicyToolContext,
@@ -89,8 +108,9 @@ pub use provider::{ModelEvent, ModelProvider, ModelRequest};
 pub use run_id::RunId;
 pub use settings::{
     AgentsSettingsConfig, CheckpointRetentionConfig, CheckpointingConfig, CompactionSettingsConfig,
-    HooksConfig, ProjectInstructionsMode, SettingSource, Settings, SettingsError, SettingsFile,
-    SkillsSettingsConfig, SlashCommandsSettingsConfig, ToolLimitsConfig, ValidationConfig,
+    EnabledPluginEntry, HooksConfig, PluginsSettingsConfig, ProjectInstructionsMode, SettingSource,
+    Settings, SettingsError, SettingsFile, SkillsSettingsConfig, SlashCommandsSettingsConfig,
+    ToolLimitsConfig, ValidationConfig,
 };
 pub use skills::{
     compat_claude_skills_dir, filesystem_skills_dir, is_identifier_safe_skill_name,

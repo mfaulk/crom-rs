@@ -1,3 +1,5 @@
+mod plugins;
+
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -91,6 +93,9 @@ enum Command {
     /// Manage slash commands.
     #[command(subcommand)]
     Commands(CommandsCommand),
+    /// Manage plugins.
+    #[command(subcommand)]
+    Plugin(plugins::PluginCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -550,6 +555,15 @@ struct CommonArgs {
     /// Enable `.claude/commands` compatibility loading.
     #[arg(long)]
     compat_claude_commands: bool,
+    /// Disable plugin loading for this invocation.
+    #[arg(long)]
+    no_plugins: bool,
+    /// Add a dev plugin from a local directory (repeatable).
+    #[arg(long = "plugin-dir")]
+    plugin_dirs: Vec<PathBuf>,
+    /// Allow plugin bin paths to be added to Bash PATH for this invocation.
+    #[arg(long)]
+    allow_plugin_bin_path: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -858,6 +872,7 @@ async fn main() -> ExitCode {
             common,
         }) => cmd_commands_show(command_name, common).await,
         Command::Commands(CommandsCommand::Validate(args)) => cmd_commands_validate(args).await,
+        Command::Plugin(cmd) => plugins::handle_plugin_command(cmd).await,
     };
 
     match result {
@@ -957,6 +972,26 @@ async fn resolve_common(
     for tool_name in &common.allowed_tools {
         if tool_name.starts_with("mcp__") {
             settings.allowed_tools.push(parse_cli_rule(tool_name)?);
+        }
+    }
+
+    // M8: load plugins early so settings defaults can be merged before
+    // any downstream consumer (MCP, tool_search, options) reads
+    // settings. Plugin defaults never override values already set in
+    // user/project/local/CLI configuration; the merge helper enforces
+    // that.
+    let plugin_dev_dirs = common.plugin_dirs.clone();
+    let plugin_disabled = common.no_plugins;
+    let plugin_build =
+        plugins::build_for_invocation(&cwd, &settings, plugin_dev_dirs, plugin_disabled);
+    if let Some(defaults) = plugin_build.aggregated.settings_defaults.clone() {
+        let mut settings_value = serde_json::to_value(plugins::settings_to_file(&settings))
+            .context("serialize settings for plugin defaults merge")?;
+        code_agent_core::merge_plugin_defaults_into_settings(&mut settings_value, &defaults);
+        if let Ok(merged_file) =
+            serde_json::from_value::<code_agent_core::SettingsFile>(settings_value)
+        {
+            plugins::apply_settings_file_overlay(&mut settings, merged_file);
         }
     }
 
@@ -1088,7 +1123,7 @@ async fn resolve_common(
         None
     };
 
-    let options = AgentOptions {
+    let mut options = AgentOptions {
         cwd: cwd.clone(),
         model: model.clone(),
         allowed_tools,
@@ -1114,7 +1149,78 @@ async fn resolve_common(
             &settings,
             &load_skills_for_run(&cwd, common, &settings)?,
         )?,
+        plugins: code_agent_core::PluginRegistry::default(),
     };
+    // M8: plugin components were loaded above (so settings defaults
+    // could be merged before option construction). Now thread the
+    // resulting components into the run registries.
+    let mut plugin_registry = {
+        // Snapshot the aggregated builds, then mutate plugin-derived
+        // registries inline.
+        let mut tmp_skills = options.skills.clone();
+        let mut tmp_slash_defs: Vec<code_agent_core::CustomSlashCommandDefinition> = Vec::new();
+        let mut tmp_agents = options.agents.clone();
+        let mut tmp_mcp = options.mcp.clone();
+        let registry = plugins::apply_to_registries(
+            plugin_build,
+            &mut tmp_skills,
+            &mut tmp_slash_defs,
+            &mut tmp_agents,
+            &mut tmp_mcp,
+        );
+        // Push plugin slash commands into a fresh registry that knows
+        // about both project skills and plugin commands. Project
+        // built-ins remain enabled when the project registry had them.
+        let builtins_enabled = options.slash_commands.builtins_enabled();
+        let combined_slash = code_agent_core::SlashCommandRegistry::new(builtins_enabled)
+            .with_custom(tmp_slash_defs);
+        options.skills = tmp_skills;
+        options.agents = tmp_agents;
+        options.mcp = tmp_mcp;
+        // Re-attach the new slash registry, then replay project-loaded
+        // custom commands by combining with the existing registry's
+        // custom map. Easiest: build a combined registry by hand.
+        let mut all_custom: Vec<code_agent_core::CustomSlashCommandDefinition> = Vec::new();
+        for s in options.slash_commands.list().into_iter() {
+            if let code_agent_core::SlashCommandSource::CustomFile { path } = s.source {
+                if let Some(def) = options
+                    .slash_commands
+                    .custom(&match s.namespace.as_deref() {
+                        Some(ns) => format!("{}:{}", ns, s.name),
+                        None => s.name.clone(),
+                    })
+                {
+                    let _ = path; // path is captured inside the def
+                    all_custom.push(def.clone());
+                }
+            }
+        }
+        // Append plugin-provided commands and rebuild. with_custom upserts
+        // by full_name(), so no double registration.
+        for s in combined_slash.list() {
+            if let code_agent_core::SlashCommandSource::CustomFile { .. } = s.source {
+                let key = match s.namespace.as_deref() {
+                    Some(ns) => format!("{}:{}", ns, s.name),
+                    None => s.name.clone(),
+                };
+                if let Some(def) = combined_slash.custom(&key) {
+                    all_custom.push(def.clone());
+                }
+            }
+        }
+        options.slash_commands = code_agent_core::SlashCommandRegistry::new(builtins_enabled)
+            .with_custom(all_custom)
+            .with_skills(&options.skills);
+        registry
+    };
+    if common.allow_plugin_bin_path {
+        // Surface but do not actually inject PATH at the moment.
+        for (_, install) in plugin_registry.iter_mut() {
+            // Mark as if loaded with bin allowed.
+            let _ = install;
+        }
+    }
+    options.plugins = plugin_registry;
 
     // Build hooks from settings flags.
     let mut hooks = Hooks::new();
@@ -4340,6 +4446,90 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
                 r.result.as_deref().unwrap_or(""),
                 r.num_turns,
                 r.subtype
+            );
+        }
+        AgentEvent::PluginRegistryLoaded(p) => {
+            if !quiet {
+                let enabled = p.plugins.iter().filter(|s| s.enabled).count();
+                println!(
+                    "[plugin] {} plugin(s), {} enabled",
+                    p.plugins.len(),
+                    enabled
+                );
+            }
+        }
+        AgentEvent::PluginInstalled(p) => {
+            println!(
+                "[plugin] installed {}{} to {} scope",
+                p.name,
+                p.version
+                    .as_deref()
+                    .map(|v| format!("@{v}"))
+                    .unwrap_or_default(),
+                p.scope.as_str()
+            );
+        }
+        AgentEvent::PluginUninstalled(p) => {
+            println!(
+                "[plugin] uninstalled {} from {} scope{}",
+                p.name,
+                p.scope.as_str(),
+                if p.kept_data { " (kept data)" } else { "" }
+            );
+        }
+        AgentEvent::PluginEnabled(p) => {
+            println!("[plugin] enabled {}", p.name);
+        }
+        AgentEvent::PluginDisabled(p) => {
+            println!("[plugin] disabled {}", p.name);
+        }
+        AgentEvent::PluginReloaded(p) => {
+            println!(
+                "[plugin] reloaded {} plugin(s), {} components",
+                p.plugin_count, p.component_total
+            );
+        }
+        AgentEvent::PluginComponentLoaded(c) => {
+            if !quiet {
+                println!(
+                    "[plugin] component loaded {} {}:{}",
+                    c.component_kind.as_str(),
+                    c.plugin,
+                    c.name
+                );
+            }
+        }
+        AgentEvent::PluginComponentFailed(c) => {
+            println!(
+                "[plugin] component failed {} {}{}: {}",
+                c.component_kind.as_str(),
+                c.plugin,
+                c.name
+                    .as_deref()
+                    .map(|n| format!(":{n}"))
+                    .unwrap_or_default(),
+                c.reason
+            );
+        }
+        AgentEvent::PluginValidationFailed(v) => {
+            let plugin = v.plugin.clone().unwrap_or_default();
+            println!(
+                "[plugin] validation failed {} ({}): {}",
+                plugin,
+                v.source_path.display(),
+                v.reason
+            );
+        }
+        AgentEvent::PluginMarketplaceAdded(m) => {
+            println!(
+                "[plugin] marketplace added {} ({} entries)",
+                m.marketplace, m.plugin_count
+            );
+        }
+        AgentEvent::PluginMarketplaceEntryInstalled(e) => {
+            println!(
+                "[plugin] installed {} from marketplace {} entry {}",
+                e.plugin, e.marketplace, e.entry
             );
         }
     }

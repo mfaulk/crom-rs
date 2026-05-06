@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::conversation::{AssistantMessage, SystemInit, ToolCall};
 use crate::hooks::HookEventName;
 use crate::options::SessionId;
+use crate::plugins::{PluginComponentKind, PluginScope, PluginSource, PluginStatus, PluginSummary};
 use crate::policy::{PolicyDecisionSource, PolicyOutcome};
 use crate::run_id::RunId;
 use crate::todo::TodoList;
@@ -82,6 +83,28 @@ pub enum AgentEvent {
     SlashCommandFailed(SlashCommandFailed),
     /// Manual conversation compaction completed.
     CompactBoundary(CompactBoundary),
+    /// Plugin registry summary, emitted once during initialization.
+    PluginRegistryLoaded(PluginRegistryLoaded),
+    /// Plugin installed into a scope.
+    PluginInstalled(PluginInstalled),
+    /// Plugin uninstalled from a scope.
+    PluginUninstalled(PluginUninstalled),
+    /// Plugin enabled in its scope.
+    PluginEnabled(PluginEnabled),
+    /// Plugin disabled in its scope.
+    PluginDisabled(PluginDisabled),
+    /// Plugin manifests/components reloaded.
+    PluginReloaded(PluginReloaded),
+    /// One plugin component (skill/command/agent/hook/MCP/setting/bin) loaded.
+    PluginComponentLoaded(PluginComponentLoaded),
+    /// One plugin component failed to load.
+    PluginComponentFailed(PluginComponentFailed),
+    /// Plugin manifest validation failed.
+    PluginValidationFailed(PluginValidationFailed),
+    /// Local marketplace file added to the session/workspace.
+    PluginMarketplaceAdded(PluginMarketplaceAdded),
+    /// A plugin was installed via a local marketplace entry.
+    PluginMarketplaceEntryInstalled(PluginMarketplaceEntryInstalled),
     Result(AgentResult),
 }
 
@@ -388,6 +411,99 @@ pub struct SlashCommandFailed {
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTrigger {
     ManualSlashCommand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginRegistryLoaded {
+    pub plugins: Vec<PluginSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginInstalled {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub scope: PluginScope,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginUninstalled {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub scope: PluginScope,
+    pub kept_data: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginEnabled {
+    pub name: String,
+    pub scope: PluginScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDisabled {
+    pub name: String,
+    pub scope: PluginScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginReloaded {
+    pub plugin_count: usize,
+    pub component_total: usize,
+    pub plugins: Vec<PluginSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginComponentLoaded {
+    pub plugin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub component_kind: PluginComponentKind,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PluginSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginComponentFailed {
+    pub plugin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub component_kind: PluginComponentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginValidationFailed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    pub source_path: std::path::PathBuf,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<PluginStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginMarketplaceAdded {
+    pub marketplace: String,
+    pub source_path: std::path::PathBuf,
+    pub plugin_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginMarketplaceEntryInstalled {
+    pub marketplace: String,
+    pub entry: String,
+    pub plugin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub scope: PluginScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

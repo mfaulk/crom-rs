@@ -1,0 +1,6 @@
+{
+  "max_tokens": 4096,
+  "validation": {
+    "commands": ["cargo check"]
+  }
+}

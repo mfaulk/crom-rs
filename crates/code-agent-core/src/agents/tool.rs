@@ -1069,6 +1069,10 @@ fn build_child_options(
         skills: parent.skills.clone(),
         skill_options: parent.skill_options.clone(),
         slash_commands: crate::slash::SlashCommandRegistry::new(false),
+        // Subagents inherit the parent's plugin summaries (they can see
+        // plugin-derived skills/agents/MCP servers through the registries
+        // above) but do not own a separate plugin registry.
+        plugins: parent.plugins.clone(),
     };
 
     // Build the system prompt.
