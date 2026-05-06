@@ -1,0 +1,19 @@
+{
+  "name": "rust-quality",
+  "version": "1.0.0",
+  "description": "Rust code review skills, agents, hooks, and MCP tools.",
+  "author": {
+    "name": "Example Team",
+    "email": "devtools@example.com"
+  },
+  "homepage": "https://example.com/rust-quality",
+  "license": "MIT",
+  "keywords": ["rust", "review", "quality"],
+  "skills": "./skills/",
+  "commands": "./commands/",
+  "agents": "./agents/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json",
+  "settings": "./settings.json",
+  "bin": "./bin/"
+}

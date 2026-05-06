@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agents::{AgentRegistry, AgentRuntimeOptions};
 use crate::permission::{ApprovalMemoryMode, PermissionCallback, PermissionMode};
+use crate::plugins::PluginRegistry;
 use crate::skills::{SkillDiscoveryOptions, SkillRegistry};
 use crate::slash::SlashCommandRegistry;
 use crate::tool_catalog::ToolSearchOptions;
@@ -110,6 +111,10 @@ pub struct AgentOptions {
     /// Slash-command registry (M7). Built-ins are enabled by default;
     /// custom command files are loaded via the SDK builder or CLI flags.
     pub slash_commands: SlashCommandRegistry,
+    /// Plugin registry (M8). Empty by default. When non-empty, plugin
+    /// summaries appear in `SystemInit` and plugin-derived components
+    /// appear in their respective registries above.
+    pub plugins: PluginRegistry,
 }
 
 impl Default for AgentOptions {
@@ -144,6 +149,7 @@ impl Default for AgentOptions {
             skills: SkillRegistry::default(),
             skill_options: SkillDiscoveryOptions::default(),
             slash_commands: SlashCommandRegistry::new(true),
+            plugins: PluginRegistry::default(),
         }
     }
 }

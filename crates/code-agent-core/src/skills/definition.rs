@@ -123,6 +123,10 @@ pub struct SkillSummary {
 
 /// Returns true iff `name` is safe to use as a CLI argument, filesystem
 /// component, and policy key. Allowlist is intentionally tight.
+///
+/// A single `:` is allowed *between* two identifier-safe segments to
+/// support plugin-namespaced names like `rust-quality:rust-api-review`.
+/// Both halves must be identifier-safe and non-empty.
 pub fn is_identifier_safe_skill_name(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_SKILL_NAME_LEN {
         return false;
@@ -130,8 +134,23 @@ pub fn is_identifier_safe_skill_name(name: &str) -> bool {
     if name == "." || name == ".." {
         return false;
     }
-    name.chars()
-        .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_'))
+    if let Some((ns, base)) = name.split_once(':') {
+        if ns.is_empty() || base.is_empty() {
+            return false;
+        }
+        if base.contains(':') {
+            return false;
+        }
+        return is_plain_skill_segment(ns) && is_plain_skill_segment(base);
+    }
+    is_plain_skill_segment(name)
+}
+
+fn is_plain_skill_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_'))
 }
 
 /// Classify a resource by extension. Heuristic-only — the loader still does

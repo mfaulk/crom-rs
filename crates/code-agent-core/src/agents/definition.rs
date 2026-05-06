@@ -174,6 +174,10 @@ pub struct AgentDefinitionSummary {
 /// Returns true iff `name` is safe to use as a CLI argument, filesystem
 /// component, and policy key. The allowlist is intentionally tight: lower-
 /// case ASCII letters, digits, hyphen, and underscore. Length is bounded.
+///
+/// A single `:` is permitted between two identifier-safe segments to
+/// support plugin-namespaced names like `rust-quality:security-reviewer`.
+/// Both segments must be non-empty and identifier-safe.
 pub fn is_identifier_safe_agent_name(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_AGENT_NAME_LEN {
         return false;
@@ -181,8 +185,20 @@ pub fn is_identifier_safe_agent_name(name: &str) -> bool {
     if name == "." || name == ".." {
         return false;
     }
-    name.chars()
-        .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_'))
+    if let Some((ns, base)) = name.split_once(':') {
+        if ns.is_empty() || base.is_empty() || base.contains(':') {
+            return false;
+        }
+        return is_plain_agent_segment(ns) && is_plain_agent_segment(base);
+    }
+    is_plain_agent_segment(name)
+}
+
+fn is_plain_agent_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_'))
 }
 
 /// Look at a list of tool-rules and decide whether any of them would grant

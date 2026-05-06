@@ -25,7 +25,10 @@ pub use definition::{
     AgentConcurrencyHint, AgentDefinition, AgentDefinitionSummary, AgentOutputMode,
 };
 pub use errors::AgentDefinitionError;
-pub use loader::{filesystem_agents_dir, load_filesystem_agents, load_filesystem_agents_strict};
+pub use loader::{
+    filesystem_agents_dir, load_filesystem_agents, load_filesystem_agents_strict,
+    parse_definition_file, MAX_AGENT_FILE_BYTES,
+};
 pub use registry::AgentRegistry;
 pub use runtime::{
     AgentRuntimeOptions, SubagentCheckpointPolicy, SubagentContextPolicy, SubagentEventVisibility,
