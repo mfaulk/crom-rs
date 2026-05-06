@@ -308,11 +308,45 @@ fn open_cached_install(
     entry: &EnabledPluginEntry,
     scope: PluginScope,
 ) -> Result<PluginInstall, PluginInstallError> {
+    // Defense-in-depth: settings.json is operator-supplied data and could
+    // be hand-edited or imported from a foreign source. Re-validate the
+    // entry's name and version here so a crafted `enabled_plugins` entry
+    // can't make the runtime open a cache directory outside the layout
+    // root.
+    if !super::manifest::is_plugin_name_safe(&entry.name) {
+        return Err(PluginInstallError::Manifest(
+            super::manifest::PluginManifestError::UnsafeName {
+                path: layout.cache_root.clone(),
+                name: entry.name.clone(),
+            },
+        ));
+    }
+    if let Some(v) = entry.version.as_deref() {
+        if !super::manifest::is_plugin_version_safe(v) {
+            return Err(PluginInstallError::Manifest(
+                super::manifest::PluginManifestError::InvalidField {
+                    path: layout.cache_root.clone(),
+                    field: "version",
+                    message: format!("unsafe version {v:?} in enabled_plugins"),
+                },
+            ));
+        }
+    }
     let cache_root = super::registry::plugin_cache_dir(
         &layout.cache_root,
         &entry.name,
         entry.version.as_deref(),
     );
+    // Lexical containment: even with the validators above this is a
+    // belt-and-braces check before any filesystem read.
+    if !cache_root.starts_with(&layout.cache_root) {
+        return Err(PluginInstallError::Manifest(
+            super::manifest::PluginManifestError::UnsafeName {
+                path: cache_root,
+                name: entry.name.clone(),
+            },
+        ));
+    }
     if !cache_root.exists() {
         return Err(PluginInstallError::NotInstalled {
             name: entry.name.clone(),
@@ -429,8 +463,14 @@ pub fn merge_plugin_defaults_into_settings(
 ) {
     if let (Value::Object(dst), Value::Object(src)) = (project_settings_value, plugin_defaults) {
         for (k, v) in src {
-            if !dst.contains_key(k) {
-                dst.insert(k.clone(), v.clone());
+            // Treat both "absent key" and "explicit null" as unset, so
+            // a settings JSON serialized with Option::None fields (which
+            // serialize to `null`) doesn't block the plugin default.
+            let entry_is_unset = matches!(dst.get(k), None | Some(Value::Null));
+            if entry_is_unset {
+                if !matches!(v, Value::Null) {
+                    dst.insert(k.clone(), v.clone());
+                }
             } else if let (Some(Value::Object(existing)), Value::Object(deep)) = (dst.get_mut(k), v)
             {
                 merge_plugin_defaults_into_settings_object(existing, deep);
@@ -444,8 +484,11 @@ fn merge_plugin_defaults_into_settings_object(
     src: &serde_json::Map<String, Value>,
 ) {
     for (k, v) in src {
-        if !dst.contains_key(k) {
-            dst.insert(k.clone(), v.clone());
+        let entry_is_unset = matches!(dst.get(k), None | Some(Value::Null));
+        if entry_is_unset {
+            if !matches!(v, Value::Null) {
+                dst.insert(k.clone(), v.clone());
+            }
         } else if let (Some(Value::Object(existing)), Value::Object(deep)) = (dst.get_mut(k), v) {
             merge_plugin_defaults_into_settings_object(existing, deep);
         }
@@ -513,6 +556,18 @@ mod tests {
     }
 
     #[test]
+    // An explicit `null` in existing settings is treated as "unset" so
+    // plugin defaults are still applied. Without this, a Settings struct
+    // serialized without `skip_serializing_if` would silently drop every
+    // plugin default — Codex pass-3 found this regression.
+    fn defaults_apply_through_null_round_trip() {
+        let mut existing = serde_json::json!({"max_turns": null});
+        let defaults = serde_json::json!({"max_turns": 12});
+        merge_plugin_defaults_into_settings(&mut existing, &defaults);
+        assert_eq!(existing["max_turns"], 12);
+    }
+
+    #[test]
     // The disabled-plugin list keeps an enabled entry from being loaded.
     fn disabled_list_skips_dev_plugin() {
         let work = TempDir::new().unwrap();
@@ -562,6 +617,52 @@ mod tests {
         };
         let build = build_plugin_runtime(&settings, &ctx);
         assert_eq!(build.registry.len(), 2);
+        assert_eq!(build.validation_failures.len(), 1);
+    }
+
+    #[test]
+    // Defense-in-depth: a settings.json with a malicious enabled_plugins
+    // entry whose `name` or `version` contains a path-traversal sequence
+    // is rejected at runtime — the plugin is reported as a validation
+    // failure rather than loaded from outside the cache root.
+    fn enabled_plugins_traversal_is_rejected_at_runtime() {
+        let work = TempDir::new().unwrap();
+        let settings = Settings {
+            plugins: Some(PluginsSettingsConfig {
+                enabled: Some(true),
+                enabled_plugins: Some(vec![EnabledPluginEntry {
+                    name: "../../etc".into(),
+                    version: Some("1.0.0".into()),
+                    scope: Some("project".into()),
+                }]),
+                ..Default::default()
+            }),
+            ..Settings::default()
+        };
+        let ctx = PluginLoadContext {
+            cwd: work.path().to_path_buf(),
+            user_config_home: None,
+            dev_plugin_dirs: Vec::new(),
+            force_disabled: false,
+        };
+        let build = build_plugin_runtime(&settings, &ctx);
+        assert!(build.registry.is_empty());
+        assert_eq!(build.validation_failures.len(), 1);
+        // Same check for an unsafe version field.
+        let settings = Settings {
+            plugins: Some(PluginsSettingsConfig {
+                enabled: Some(true),
+                enabled_plugins: Some(vec![EnabledPluginEntry {
+                    name: "ok".into(),
+                    version: Some("../../../etc".into()),
+                    scope: Some("project".into()),
+                }]),
+                ..Default::default()
+            }),
+            ..Settings::default()
+        };
+        let build = build_plugin_runtime(&settings, &ctx);
+        assert!(build.registry.is_empty());
         assert_eq!(build.validation_failures.len(), 1);
     }
 }
