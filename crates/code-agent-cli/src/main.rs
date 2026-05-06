@@ -82,6 +82,46 @@ enum Command {
     /// Inspect, search, and explain the tool catalog.
     #[command(subcommand)]
     Tools(ToolsCommand),
+    /// Manage and run subagents.
+    #[command(subcommand)]
+    Agents(AgentsCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentsCommand {
+    /// List registered subagents.
+    List(AgentsCommonArgs),
+    /// Show a subagent definition (parsed frontmatter + prompt preview).
+    Show {
+        agent_name: String,
+        #[command(flatten)]
+        common: AgentsCommonArgs,
+    },
+    /// Validate filesystem and built-in subagent definitions.
+    Validate(AgentsCommonArgs),
+    /// Run a subagent directly (debugging).
+    Run {
+        agent_name: String,
+        task: String,
+        #[command(flatten)]
+        common: AgentsCommonArgs,
+        #[arg(long)]
+        max_turns: Option<u32>,
+        #[arg(long)]
+        show_events: bool,
+    },
+}
+
+#[derive(Parser, Debug, Clone)]
+struct AgentsCommonArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    /// Path to subagent definitions directory (default `.agent/agents`).
+    #[arg(long)]
+    agents: Option<PathBuf>,
+    /// Settings sources to load: none|project|user|user-and-project.
+    #[arg(long, default_value = "user-and-project")]
+    settings: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -404,6 +444,21 @@ struct CommonArgs {
     /// Comma-separated tool names or globs to disable.
     #[arg(long, value_delimiter = ',')]
     disable_tools: Vec<String>,
+    /// Path to subagent definitions directory (default `.agent/agents`).
+    #[arg(long)]
+    agents: Option<PathBuf>,
+    /// Disable filesystem subagent loading entirely.
+    #[arg(long)]
+    no_agents: bool,
+    /// Cap on concurrent in-flight subagents (default 3).
+    #[arg(long)]
+    max_concurrent_subagents: Option<usize>,
+    /// Per-subagent timeout in seconds (default 300).
+    #[arg(long)]
+    subagent_timeout: Option<u64>,
+    /// When set, child events are interleaved into the parent stream.
+    #[arg(long)]
+    show_subagent_events: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -466,6 +521,26 @@ enum SessionsCommand {
     /// Export a session as JSONL or JSON.
     Export {
         session_id: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+    },
+    /// List child (subagent) sessions for a parent session.
+    Children {
+        session_id: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+    },
+    /// Show a child (subagent) session's records.
+    ShowChild {
+        subagent_session_id: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+    },
+    /// Export a child (subagent) session as JSONL or JSON.
+    ExportChild {
+        subagent_session_id: String,
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
         #[arg(long, default_value = "jsonl")]
@@ -636,6 +711,30 @@ async fn main() -> ExitCode {
             cwd,
             format,
         }) => cmd_sessions_export(session_id, cwd, format).await,
+        Command::Sessions(SessionsCommand::Children { session_id, cwd }) => {
+            cmd_sessions_children(session_id, cwd).await
+        }
+        Command::Sessions(SessionsCommand::ShowChild {
+            subagent_session_id,
+            cwd,
+        }) => cmd_sessions_show_child(subagent_session_id, cwd).await,
+        Command::Sessions(SessionsCommand::ExportChild {
+            subagent_session_id,
+            cwd,
+            format,
+        }) => cmd_sessions_export_child(subagent_session_id, cwd, format).await,
+        Command::Agents(AgentsCommand::List(args)) => cmd_agents_list(args).await,
+        Command::Agents(AgentsCommand::Show { agent_name, common }) => {
+            cmd_agents_show(agent_name, common).await
+        }
+        Command::Agents(AgentsCommand::Validate(args)) => cmd_agents_validate(args).await,
+        Command::Agents(AgentsCommand::Run {
+            agent_name,
+            task,
+            common,
+            max_turns,
+            show_events,
+        }) => cmd_agents_run(agent_name, task, common, max_turns, show_events).await,
         Command::Checkpoint(args) => cmd_checkpoint_create(args).await,
         Command::Checkpoints(CheckpointsCommand::List { cwd, session }) => {
             cmd_checkpoints_list(cwd, session).await
@@ -869,6 +968,10 @@ async fn resolve_common(
     let max_tokens = settings.max_tokens.unwrap_or(4096);
     let tool_search = tool_search_options_from_common(&settings, common)?;
 
+    // M6: load subagent registry and runtime options.
+    let (agent_registry, agent_runtime_options) =
+        load_agent_registry_and_runtime(&cwd, &settings, common)?;
+
     let permission_callback: Option<Arc<dyn PermissionCallback>> = if prompt_for_callback {
         Some(Arc::new(StdinApprover::new(
             mode,
@@ -895,6 +998,8 @@ async fn resolve_common(
         approval_memory: ApprovalMemoryMode::Session,
         mcp: mcp_options.clone(),
         tool_search,
+        agents: agent_registry.clone(),
+        agent_runtime: agent_runtime_options.clone(),
     };
 
     // Build hooks from settings flags.
@@ -1054,7 +1159,134 @@ fn registry_filter_pattern_for_rule(rule: &ToolRule) -> Option<String> {
             Some(format!("mcp__{}__{}", server, tool_glob))
         }
         ToolRule::BashCommandRegex(_) | ToolRule::FilePathGlob { .. } => None,
+        // M6: an Agent rule grants/denies the built-in `Agent` tool. The
+        // registry filter just needs to keep the tool name available; the
+        // policy engine matches `agent` field against the glob.
+        ToolRule::AgentNameGlob { .. } => Some("Agent".into()),
     }
+}
+
+fn load_agent_registry_and_runtime(
+    cwd: &Path,
+    settings: &Settings,
+    common: &CommonArgs,
+) -> Result<(
+    code_agent_core::AgentRegistry,
+    code_agent_core::AgentRuntimeOptions,
+)> {
+    let mut registry = code_agent_core::AgentRegistry::new();
+    let mut runtime = code_agent_core::AgentRuntimeOptions::default();
+
+    // Apply settings (project + user) first.
+    if let Some(s) = &settings.agents {
+        if let Some(v) = s.enabled {
+            runtime.enabled = v;
+        }
+        if let Some(v) = s.max_concurrent_subagents {
+            runtime.max_concurrent_subagents = v.max(1);
+        }
+        if let Some(v) = s.subagent_timeout_seconds {
+            runtime.subagent_timeout = std::time::Duration::from_secs(v);
+        }
+        if let Some(v) = s.persist_subagent_transcripts {
+            runtime.persist_subagent_transcripts = v;
+        }
+        if let Some(v) = s.event_visibility.as_deref() {
+            runtime.event_visibility =
+                code_agent_core::SubagentEventVisibility::from_str_lenient(v)
+                    .ok_or_else(|| anyhow!("invalid agents.event_visibility: {v:?}"))?;
+        }
+        if let Some(v) = s.checkpoint_policy.as_deref() {
+            runtime.checkpoint_policy =
+                code_agent_core::SubagentCheckpointPolicy::from_str_lenient(v)
+                    .ok_or_else(|| anyhow!("invalid agents.checkpoint_policy: {v:?}"))?;
+        }
+        let mut policy = runtime.context_policy.clone();
+        if let Some(v) = s.inherit_project_instructions {
+            policy.inherit_project_instructions = v;
+        }
+        if let Some(v) = s.inherit_settings {
+            policy.inherit_settings = v;
+        }
+        if let Some(v) = s.inherit_hooks {
+            policy.inherit_hooks = v;
+        }
+        if let Some(v) = s.inherit_permissions {
+            policy.inherit_permissions = v;
+        }
+        if let Some(v) = s.inherit_mcp_servers {
+            policy.inherit_mcp_servers = v;
+        }
+        if let Some(v) = s.inherit_tool_search_state {
+            policy.inherit_tool_search_state = v;
+        }
+        if let Some(v) = s.inherit_approval_memory {
+            policy.inherit_approval_memory = v;
+        }
+        runtime.context_policy = policy;
+    }
+
+    // CLI overrides.
+    if let Some(v) = common.max_concurrent_subagents {
+        runtime.max_concurrent_subagents = v.max(1);
+    }
+    if let Some(v) = common.subagent_timeout {
+        runtime.subagent_timeout = std::time::Duration::from_secs(v);
+    }
+    if common.show_subagent_events {
+        runtime.event_visibility = code_agent_core::SubagentEventVisibility::StreamChildEvents;
+    }
+
+    if common.no_agents {
+        runtime.enabled = false;
+        return Ok((registry, runtime));
+    }
+
+    // Optional built-in starter set, if requested in settings.
+    let allow_filesystem = settings
+        .agents
+        .as_ref()
+        .and_then(|s| s.allow_filesystem_agents)
+        .unwrap_or(true);
+
+    if let Some(builtin_names) = settings.agents.as_ref().and_then(|s| s.builtins.as_ref()) {
+        let starters = code_agent_core::builtin_starter_definitions();
+        for name in builtin_names {
+            if let Some(d) = starters.iter().find(|d| &d.name == name) {
+                registry.register_builtin(d.clone()).ok();
+            }
+        }
+    }
+
+    // Filesystem definitions.
+    if allow_filesystem {
+        let dir = if let Some(p) = &common.agents {
+            p.clone()
+        } else if let Some(p) = settings.agents.as_ref().and_then(|s| s.path.clone()) {
+            cwd.join(p)
+        } else {
+            code_agent_core::filesystem_agents_dir(cwd)
+        };
+        let (defs, errors) = code_agent_core::load_filesystem_agents(&dir);
+        for d in defs {
+            if let Err(e) = registry.register_filesystem(d) {
+                eprintln!("[agents] {e}");
+            }
+        }
+        for e in errors {
+            eprintln!("[agents] {e}");
+        }
+    }
+
+    // If the operator hasn't pinned `agents.enabled` either way and the
+    // registry has at least one agent, default to enabled. We MUST NOT
+    // overwrite an explicit `false` from settings — that's how the
+    // operator turns subagents off without deleting their definitions.
+    let explicit_enabled = settings.agents.as_ref().and_then(|s| s.enabled).is_some();
+    if !registry.is_empty() && !runtime.enabled && !explicit_enabled {
+        runtime.enabled = true;
+    }
+    Ok((registry, runtime))
 }
 
 fn tool_search_options_from_common(
@@ -1365,6 +1597,14 @@ async fn run_one_shot(
             let _ = &store;
             initial_history
         });
+    if !no_session {
+        let fs_store = Arc::new(FsSessionStore::new(cfg.cwd.clone()));
+        let factory = Arc::new(code_agent_session::FsChildSessionSinkFactory::new(
+            fs_store,
+            cfg.cwd.clone(),
+        ));
+        builder = builder.child_session_sink_factory(factory);
+    }
     if let Some(sink) = session_sink {
         builder = builder.session_sink(sink);
     }
@@ -1628,6 +1868,17 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
         .session_start(SessionStart::New);
     if let Some(s) = session_sink {
         client_builder = client_builder.session_sink(s);
+    }
+    // Honor --no-session: when the user explicitly opts out of session
+    // persistence, also opt out of child-session persistence so the child
+    // transcripts don't show up on disk surprisingly.
+    if !args.common.no_session {
+        let fs_store = Arc::new(FsSessionStore::new(cfg.cwd.clone()));
+        let factory = Arc::new(code_agent_session::FsChildSessionSinkFactory::new(
+            fs_store,
+            cfg.cwd.clone(),
+        ));
+        client_builder = client_builder.child_session_sink_factory(factory);
     }
     if let Some(t) = telemetry_sink {
         client_builder = client_builder.telemetry_sink(t);
@@ -2251,6 +2502,235 @@ async fn cmd_sessions_export(session_id: String, cwd: PathBuf, format: String) -
     Ok(())
 }
 
+async fn cmd_sessions_children(session_id: String, cwd: PathBuf) -> Result<()> {
+    let cwd = cwd.canonicalize().context("--cwd")?;
+    let store = FsSessionStore::new(cwd.clone());
+    let id = parse_session_id(&session_id)?;
+    let children = store.list_children(&id).await?;
+    if children.is_empty() {
+        println!("(no child sessions for {})", id);
+    } else {
+        for c in children {
+            println!("{c}");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_sessions_show_child(child_id: String, cwd: PathBuf) -> Result<()> {
+    let cwd = cwd.canonicalize().context("--cwd")?;
+    let store = FsSessionStore::new(cwd.clone());
+    let child = parse_session_id(&child_id)?;
+    let parent = store
+        .find_parent_for_child(&child)
+        .await?
+        .ok_or_else(|| anyhow!("no parent session found for {child_id}"))?;
+    let records = store.load_child(&parent, &child).await?;
+    println!(
+        "(parent={parent}, child={child}, records={})",
+        records.len()
+    );
+    for r in &records {
+        println!("{}", serde_json::to_string(r)?);
+    }
+    Ok(())
+}
+
+async fn cmd_sessions_export_child(child_id: String, cwd: PathBuf, format: String) -> Result<()> {
+    let cwd = cwd.canonicalize().context("--cwd")?;
+    let store = FsSessionStore::new(cwd.clone());
+    let child = parse_session_id(&child_id)?;
+    let parent = store
+        .find_parent_for_child(&child)
+        .await?
+        .ok_or_else(|| anyhow!("no parent session found for {child_id}"))?;
+    let records = store.load_child(&parent, &child).await?;
+    let fmt = ExportFormat::from_str_lenient(&format)
+        .ok_or_else(|| anyhow!("invalid --format: {format}"))?;
+    match fmt {
+        ExportFormat::Jsonl => {
+            for r in records {
+                println!("{}", serde_json::to_string(&r)?);
+            }
+        }
+        ExportFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&records)?);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_agents_list(common: AgentsCommonArgs) -> Result<()> {
+    let registry = load_agent_registry_for_cli(&common)?;
+    if registry.is_empty() {
+        println!("(no subagents registered)");
+        return Ok(());
+    }
+    println!("{:<24} {:<8} {:<10} DESCRIPTION", "NAME", "TURNS", "TOOLS");
+    for s in registry.list() {
+        let tools = s
+            .tool_count
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        let turns = s
+            .max_turns
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<24} {:<8} {:<10} {}",
+            s.name,
+            turns,
+            tools,
+            truncate(&s.description, 80)
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_agents_show(agent_name: String, common: AgentsCommonArgs) -> Result<()> {
+    let registry = load_agent_registry_for_cli(&common)?;
+    let def = registry
+        .get(&agent_name)
+        .ok_or_else(|| anyhow!("unknown agent {agent_name:?}"))?;
+    println!("name:              {}", def.name);
+    println!("description:       {}", def.description);
+    if let Some(model) = &def.model {
+        println!("model:             {model}");
+    }
+    println!("max_turns:         {}", def.effective_max_turns());
+    if let Some(mode) = def.permission_mode {
+        println!("permission_mode:   {:?}", mode);
+    }
+    if let Some(tools) = &def.tools {
+        println!("tools:             {} rule(s)", tools.len());
+        for r in tools {
+            println!(
+                "  - {}",
+                serde_json::to_string(r).unwrap_or_else(|_| "?".into())
+            );
+        }
+    } else {
+        println!("tools:             (inherit parent allow set)");
+    }
+    if !def.disallowed_tools.is_empty() {
+        println!("disallowed_tools:  {} rule(s)", def.disallowed_tools.len());
+        for r in &def.disallowed_tools {
+            println!(
+                "  - {}",
+                serde_json::to_string(r).unwrap_or_else(|_| "?".into())
+            );
+        }
+    }
+    if let Some(servers) = &def.mcp_servers {
+        println!("mcp_servers:       {}", servers.join(", "));
+    }
+    println!();
+    println!("--- prompt ---");
+    let preview: String = def.prompt.chars().take(2048).collect();
+    println!("{preview}");
+    if def.prompt.len() > preview.len() {
+        println!("…[truncated]");
+    }
+    Ok(())
+}
+
+async fn cmd_agents_validate(common: AgentsCommonArgs) -> Result<()> {
+    let registry = load_agent_registry_for_cli(&common)?;
+    if registry.is_empty() {
+        println!("(no subagents registered — nothing to validate)");
+        return Ok(());
+    }
+    // Build a tool registry the same way the runtime does so the
+    // available-tool set tracks the real binary instead of a hardcoded
+    // list. We cannot enumerate MCP tools without connecting to servers,
+    // but glob rules and MCP rules are not flagged as "unknown" in the
+    // registry validator (only `ExactTool` references are checked).
+    let mut tools = code_agent_core::ToolRegistry::new();
+    code_agent_tools::register_builtin_with_limits(
+        &mut tools,
+        code_agent_tools::ToolLimits::default(),
+    );
+    let mut available: std::collections::BTreeSet<String> = tools.names().into_iter().collect();
+    available.insert("SearchTools".into());
+    registry
+        .validate_against_tools(&available)
+        .map_err(|e| anyhow!("{e}"))?;
+    println!("ok ({} agents)", registry.len());
+    for s in registry.list() {
+        println!("  {} - {}", s.name, truncate(&s.description, 80));
+    }
+    Ok(())
+}
+
+async fn cmd_agents_run(
+    agent_name: String,
+    task: String,
+    common: AgentsCommonArgs,
+    max_turns: Option<u32>,
+    show_events: bool,
+) -> Result<()> {
+    let registry = load_agent_registry_for_cli(&common)?;
+    let def = registry
+        .get(&agent_name)
+        .ok_or_else(|| anyhow!("unknown agent {agent_name:?}"))?;
+    println!(
+        "[agent] {} (model={}, tools={})",
+        def.name,
+        def.model.as_deref().unwrap_or("(inherit)"),
+        def.tools
+            .as_ref()
+            .map(|t| t.len().to_string())
+            .unwrap_or_else(|| "(inherit)".into())
+    );
+    println!("[agent] task: {}", truncate(&task, 200));
+    if max_turns.is_some() || show_events {
+        println!(
+            "[agent] (max_turns={:?}, show_events={})",
+            max_turns, show_events
+        );
+    }
+    println!(
+        "[agent] direct subagent execution requires a configured ModelProvider; \
+         use `code-agent run` with `--allowed-tools Agent,...` and the parent agent will \
+         delegate to this subagent through the Agent tool."
+    );
+    Ok(())
+}
+
+fn load_agent_registry_for_cli(
+    common: &AgentsCommonArgs,
+) -> Result<code_agent_core::AgentRegistry> {
+    let cwd = common
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", common.cwd.display()))?;
+    let mut registry = code_agent_core::AgentRegistry::new();
+    let dir = if let Some(p) = &common.agents {
+        p.clone()
+    } else {
+        code_agent_core::filesystem_agents_dir(&cwd)
+    };
+    let (defs, errors) = code_agent_core::load_filesystem_agents(&dir);
+    for d in defs {
+        if let Err(e) = registry.register_filesystem(d) {
+            eprintln!("[agents] {e}");
+        }
+    }
+    for e in errors {
+        eprintln!("[agents] {e}");
+    }
+    let _ = common.settings;
+    Ok(registry)
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    let mut out: String = s.chars().take(n).collect();
+    if s.chars().count() > n {
+        out.push('…');
+    }
+    out
+}
+
 async fn rotate_checkpoint(
     handle: Option<&Arc<code_agent_checkpoint::RotatingCheckpointHandle>>,
     cwd: &Path,
@@ -2744,6 +3224,53 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
             println!("[tool-search-error] {}: {}", e.query, e.error);
         }
         AgentEvent::ToolLoaded(_) | AgentEvent::ToolDeferred(_) | AgentEvent::ToolDisabled(_) => {}
+        AgentEvent::AgentRegistryLoaded(e) => {
+            if !quiet {
+                let names: Vec<String> = e.agents.iter().map(|a| a.name.clone()).collect();
+                println!(
+                    "[agents] loaded {} subagents: {}",
+                    e.agents.len(),
+                    names.join(", ")
+                );
+            }
+        }
+        AgentEvent::SubagentStart(e) => {
+            if !quiet {
+                println!("[agent] starting {}", e.agent_name);
+            }
+        }
+        AgentEvent::SubagentEvent(e) => {
+            if !quiet {
+                println!("[agent:{}] {:?}", e.agent_name, e.event.as_ref());
+            }
+        }
+        AgentEvent::SubagentStop(e) => {
+            if !quiet {
+                let preview: String = e
+                    .result_preview
+                    .lines()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!(
+                    "[agent-result] {} ({:?}, {}ms): {}",
+                    e.agent_name, e.status, e.duration_ms, preview
+                );
+            }
+        }
+        AgentEvent::SubagentFailed(e) => {
+            println!("[agent-error] {} failed: {}", e.agent_name, e.error);
+        }
+        AgentEvent::SubagentCancelled(e) => {
+            println!("[agent-cancelled] {}: {}", e.agent_name, e.reason);
+        }
+        AgentEvent::SubagentTimedOut(e) => {
+            println!(
+                "[agent-error] {} timed out after {}s",
+                e.agent_name,
+                e.timeout_ms / 1000
+            );
+        }
         AgentEvent::Result(r) => {
             println!(
                 "[result] {} (turns={}, subtype={:?})",

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agents::{AgentRegistry, AgentRuntimeOptions};
 use crate::permission::{ApprovalMemoryMode, PermissionCallback, PermissionMode};
 use crate::tool_catalog::ToolSearchOptions;
 use crate::tool_rule::ToolRule;
@@ -91,6 +92,13 @@ pub struct AgentOptions {
     pub approval_memory: ApprovalMemoryMode,
     pub mcp: McpOptions,
     pub tool_search: ToolSearchOptions,
+    /// Subagent registry (M6). Empty by default; the `Agent` tool is only
+    /// surfaced when this contains at least one definition AND
+    /// `agent_runtime.enabled` is true AND `Agent` is in `allowed_tools`
+    /// or an explicit allow rule.
+    pub agents: AgentRegistry,
+    /// Subagent runtime knobs (M6).
+    pub agent_runtime: AgentRuntimeOptions,
 }
 
 impl Default for AgentOptions {
@@ -120,6 +128,8 @@ impl Default for AgentOptions {
             approval_memory: ApprovalMemoryMode::Session,
             mcp: McpOptions::default(),
             tool_search: ToolSearchOptions::default(),
+            agents: AgentRegistry::default(),
+            agent_runtime: AgentRuntimeOptions::default(),
         }
     }
 }
@@ -139,6 +149,8 @@ impl std::fmt::Debug for AgentOptions {
             .field("approval_memory", &self.approval_memory)
             .field("mcp_enabled", &self.mcp.enabled)
             .field("tool_search", &self.tool_search)
+            .field("agents_count", &self.agents.len())
+            .field("agent_runtime_enabled", &self.agent_runtime.enabled)
             .finish()
     }
 }

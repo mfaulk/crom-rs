@@ -16,6 +16,7 @@ use futures::stream::Stream;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::agent::{run_loop, Agent, AgentBuilder, RunConfig, SessionSink, TelemetrySink};
+use crate::agents::{AgentDefinition, AgentRegistry, AgentRuntimeOptions};
 use crate::checkpoint::{CheckpointApi, CheckpointHandle};
 use crate::conversation::{Message, MessageRole};
 use crate::errors::AgentError;
@@ -74,6 +75,7 @@ pub struct AgentClientBuilder {
     mcp_config_file: Option<PathBuf>,
     tool_search_options: Option<ToolSearchOptions>,
     tool_loading_mode: Option<ToolLoadingMode>,
+    child_session_sink_factory: Option<Arc<dyn crate::agents::ChildSessionSinkFactory>>,
 }
 
 impl AgentClientBuilder {
@@ -200,6 +202,40 @@ impl AgentClientBuilder {
         self
     }
 
+    /// Register a single subagent definition. Returns an error if validation
+    /// fails or a same-origin definition with that name already exists.
+    pub fn agent(mut self, definition: AgentDefinition) -> Result<Self, AgentError> {
+        let opts = self.options.get_or_insert_with(AgentOptions::default);
+        opts.agents
+            .register(definition)
+            .map_err(|e| AgentError::InvalidConfig(e.to_string()))?;
+        Ok(self)
+    }
+
+    /// Replace the entire agent registry. Convenient for callers that
+    /// already have one (e.g. from `load_filesystem_agents`).
+    pub fn agents(mut self, registry: AgentRegistry) -> Self {
+        let opts = self.options.get_or_insert_with(AgentOptions::default);
+        opts.agents = registry;
+        self
+    }
+
+    /// Override the subagent runtime knobs.
+    pub fn agent_runtime(mut self, options: AgentRuntimeOptions) -> Self {
+        let opts = self.options.get_or_insert_with(AgentOptions::default);
+        opts.agent_runtime = options;
+        self
+    }
+
+    /// Attach a factory that mints session sinks for child subagent runs.
+    pub fn child_session_sink_factory(
+        mut self,
+        factory: Arc<dyn crate::agents::ChildSessionSinkFactory>,
+    ) -> Self {
+        self.child_session_sink_factory = Some(factory);
+        self
+    }
+
     pub async fn build(self) -> Result<AgentClient, AgentError> {
         let provider = self
             .provider
@@ -263,6 +299,7 @@ impl AgentClientBuilder {
             session_id: session_id.clone(),
             checkpoint_handle: self.checkpoint_handle,
             checkpoint_api: self.checkpoint_api,
+            child_session_sink_factory: self.child_session_sink_factory,
         };
 
         let inner = Arc::new(inner);
@@ -660,6 +697,7 @@ struct ClientInner {
     session_id: SessionId,
     checkpoint_handle: Option<Arc<dyn CheckpointHandle>>,
     checkpoint_api: Option<Arc<dyn CheckpointApi>>,
+    child_session_sink_factory: Option<Arc<dyn crate::agents::ChildSessionSinkFactory>>,
 }
 
 #[derive(Clone)]
@@ -784,6 +822,9 @@ impl ClientRuntime {
             .pricing_opt(self.inner.pricing);
         if let Some(h) = self.inner.checkpoint_handle.clone() {
             builder = builder.checkpoint_handle(h);
+        }
+        if let Some(f) = self.inner.child_session_sink_factory.clone() {
+            builder = builder.child_session_sink_factory(f);
         }
         let agent_result = builder.build();
         let agent = match agent_result {

@@ -27,6 +27,13 @@ pub enum HookEventName {
     PostToolUseFailure,
     PostToolBatch,
     Stop,
+    /// Fired before a subagent run starts. Hook output can deny, modify the
+    /// task prompt via `Allow { updated_input }`, or add context.
+    SubagentStart,
+    /// Fired after a subagent run finishes (success, failure, timeout, or
+    /// cancellation). Hook output can `Allow { updated_input }` to rewrite
+    /// the result preview returned to the parent.
+    SubagentStop,
 }
 
 impl HookEventName {
@@ -38,6 +45,8 @@ impl HookEventName {
             HookEventName::PostToolUseFailure => "PostToolUseFailure",
             HookEventName::PostToolBatch => "PostToolBatch",
             HookEventName::Stop => "Stop",
+            HookEventName::SubagentStart => "SubagentStart",
+            HookEventName::SubagentStop => "SubagentStop",
         }
     }
 }
@@ -279,6 +288,20 @@ impl Hooks {
     pub fn stop(self, hook: Arc<dyn Hook>) -> Self {
         self.add(HookEventName::Stop, "*", hook)
             .expect("\"*\" is always a valid pattern")
+    }
+
+    /// Register a hook for the `SubagentStart` event matching `pattern`
+    /// against the subagent's *name* (e.g. `"security-reviewer"` or
+    /// `"*-reviewer"`). The pattern follows the same shape as tool-name
+    /// patterns (`*` for glob, `|` for alternation, exact otherwise).
+    pub fn subagent_start(self, pattern: &str, hook: Arc<dyn Hook>) -> Result<Self, HookError> {
+        self.add(HookEventName::SubagentStart, pattern, hook)
+    }
+
+    /// Register a hook for the `SubagentStop` event matching `pattern`
+    /// against the subagent's name.
+    pub fn subagent_stop(self, pattern: &str, hook: Arc<dyn Hook>) -> Result<Self, HookError> {
+        self.add(HookEventName::SubagentStop, pattern, hook)
     }
 
     pub fn matchers(&self) -> &[HookMatcher] {

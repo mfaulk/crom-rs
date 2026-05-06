@@ -28,6 +28,12 @@ pub enum PermissionKind {
     Mutating,
     Execution,
     External,
+    /// Subagent orchestration — invoking the built-in `Agent` tool. Treated
+    /// like `Execution` by the policy pipeline (no auto-approval under
+    /// `Default` or `AcceptEdits`), but classified separately so callbacks
+    /// and audit records can show "this allows the parent to delegate work
+    /// to a child agent" with appropriate context.
+    Orchestration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

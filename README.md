@@ -392,6 +392,119 @@ M5 emits `ToolCatalogBuilt`, `ToolLoadingModeResolved`,
 to the normal event stream and session JSONL. JSON log mode serializes these
 as valid JSON lines.
 
+## Subagents (M6)
+
+The parent agent can delegate focused subtasks to *subagents* through a new
+built-in `Agent` tool. Subagents run in fresh, isolated conversations with
+their own scoped tools, permission policy, MCP scope, and child session
+JSONL — they do not pollute the parent's conversation. Subagents cannot
+recursively invoke `Agent`.
+
+Define subagents either programmatically:
+
+```rust
+use code_agent_core::{AgentClient, AgentDefinition, PermissionMode, ToolRule};
+
+let security = AgentDefinition {
+    name: "security-reviewer".into(),
+    description: "Reviews code for input validation and secret handling.".into(),
+    prompt: "You are a security-focused Rust code reviewer.".into(),
+    tools: Some(vec![
+        ToolRule::ExactTool("Read".into()),
+        ToolRule::ExactTool("Grep".into()),
+        ToolRule::ExactTool("Glob".into()),
+    ]),
+    disallowed_tools: vec![
+        ToolRule::ExactTool("Edit".into()),
+        ToolRule::ExactTool("Write".into()),
+        ToolRule::ExactTool("Bash".into()),
+    ],
+    permission_mode: Some(PermissionMode::DontAsk),
+    ..Default::default()
+};
+
+let client = AgentClient::builder()
+    .agent(security)?
+    .allowed_tools(["Read", "Grep", "Glob", "Agent"])
+    .build()
+    .await?;
+```
+
+Or as project-local files in `.agent/agents/<name>.md`:
+
+```yaml
+---
+name: security-reviewer
+description: Reviews Rust code for security vulnerabilities.
+tools:
+  - Read
+  - Grep
+  - Glob
+disallowed_tools:
+  - Edit
+  - Write
+  - Bash
+model: claude-sonnet-4-6
+max_turns: 8
+permission_mode: dontAsk
+---
+
+You are a security-focused Rust code reviewer.
+...
+```
+
+Subagent settings live in `.agent/settings.json`:
+
+```json
+{
+  "agents": {
+    "enabled": true,
+    "path": ".agent/agents",
+    "allow_filesystem_agents": true,
+    "max_concurrent_subagents": 3,
+    "subagent_timeout_seconds": 300,
+    "persist_subagent_transcripts": true,
+    "event_visibility": "summary_only",
+    "checkpoint_policy": "required_for_mutating_tools",
+    "inherit_mcp_servers": false,
+    "inherit_approval_memory": false
+  }
+}
+```
+
+The `Agent` tool itself is not surfaced unless explicitly allowed. Even
+under `acceptEdits`, the parent must allow `Agent` (or be allowed once
+through the approval callback) before any subagent runs. Subagents always
+run with `Agent` stripped from their own tool registry, so M6 forbids
+recursive subagent spawning.
+
+CLI commands:
+
+```sh
+code-agent agents list --cwd .
+code-agent agents show security-reviewer --cwd .
+code-agent agents validate --cwd .
+code-agent agents run security-reviewer "Review src/auth.rs" --cwd .
+
+code-agent run "Review this crate for security, tests, and API design." \
+    --allowed-tools "Read,Grep,Glob,Bash,Agent" \
+    --agents .agent/agents \
+    --show-subagent-events
+
+code-agent sessions children <PARENT_SESSION_ID> --cwd .
+code-agent sessions show-child <SUBAGENT_SESSION_ID> --cwd .
+code-agent sessions export-child <SUBAGENT_SESSION_ID> --format json --cwd .
+```
+
+Subagent transcripts are persisted under
+`.agent/sessions/children/<parent>/<child>.jsonl`. The parent only sees
+`SubagentStart`, `SubagentStop`, `SubagentFailed`, `SubagentCancelled`,
+and `SubagentTimedOut` events by default — child intermediate events stay
+in the child JSONL unless `--show-subagent-events` is set.
+
+The full demo is at `examples/subagent-demo/` and is exercised offline by
+`examples/m6-subagent-demo.sh`.
+
 ## Session persistence
 
 Sessions are stored as JSONL at `<cwd>/.agent/sessions/<id>.jsonl`. Each line

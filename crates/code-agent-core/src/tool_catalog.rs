@@ -1213,13 +1213,17 @@ impl ToolCatalog {
                         }
                     }
                 },
-                PermissionKind::Mutating | PermissionKind::Execution => {
-                    ToolVisibility::RequiresApproval
-                }
+                // Orchestration is treated like Execution: never auto-allowed.
+                PermissionKind::Mutating
+                | PermissionKind::Execution
+                | PermissionKind::Orchestration => ToolVisibility::RequiresApproval,
             },
             PermissionMode::AcceptEdits => match descriptor.permission_kind {
                 PermissionKind::ReadOnly | PermissionKind::Mutating => ToolVisibility::Callable,
-                PermissionKind::Execution => ToolVisibility::RequiresApproval,
+                // Orchestration is NOT auto-allowed by AcceptEdits.
+                PermissionKind::Execution | PermissionKind::Orchestration => {
+                    ToolVisibility::RequiresApproval
+                }
                 PermissionKind::External => match context
                     .mcp_external_effect_policy
                     .unwrap_or(code_agent_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule)
@@ -1742,7 +1746,9 @@ fn infer_risk_profile(name: &str, permission_kind: PermissionKind) -> ToolRiskPr
     match permission_kind {
         PermissionKind::ReadOnly => ToolRiskProfile::Low,
         PermissionKind::Mutating => ToolRiskProfile::Medium,
-        PermissionKind::Execution => ToolRiskProfile::High,
+        // Orchestration spawns child runs that may themselves do high-risk
+        // work; classify it as `High` to surface the autonomy implications.
+        PermissionKind::Execution | PermissionKind::Orchestration => ToolRiskProfile::High,
         PermissionKind::External => {
             if mutating_external(name) {
                 ToolRiskProfile::MutatingExternal

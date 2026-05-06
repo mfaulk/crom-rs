@@ -1,0 +1,25 @@
+{
+  "agents": {
+    "enabled": true,
+    "path": ".agent/agents",
+    "allow_filesystem_agents": true,
+    "max_concurrent_subagents": 3,
+    "subagent_timeout_seconds": 300,
+    "persist_subagent_transcripts": true,
+    "event_visibility": "summary_only",
+    "inherit_project_instructions": true,
+    "inherit_hooks": true,
+    "inherit_permissions": true,
+    "inherit_mcp_servers": false,
+    "inherit_tool_search_state": false,
+    "inherit_approval_memory": false,
+    "checkpoint_policy": "required_for_mutating_tools"
+  },
+  "allowed_tools": [
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash",
+    "Agent"
+  ]
+}

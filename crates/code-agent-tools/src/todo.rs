@@ -139,10 +139,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx() -> ToolContext {
-        ToolContext {
-            cwd: PathBuf::from("."),
-            session_id: SessionId::from("s".to_string()),
-        }
+        ToolContext::new_minimal(PathBuf::from("."), SessionId::from("s".to_string()))
     }
 
     #[tokio::test]

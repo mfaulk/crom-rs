@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::errors::ToolError;
 use crate::options::SessionId;
 use crate::permission::PermissionKind;
+use crate::run_id::RunId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -62,6 +63,31 @@ pub enum ToolContent {
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub session_id: SessionId,
+    /// Run id of the parent agent loop. `None` for ad-hoc tool invocations
+    /// outside the loop (CLI-direct calls). M6 uses this to link subagent
+    /// runs back to the parent run.
+    pub run_id: Option<RunId>,
+    /// Zero-indexed turn within the parent run (0 if unknown). M6 uses
+    /// this for subagent telemetry; existing tools may ignore it.
+    pub turn_index: u32,
+    /// Identifier of the tool call this `ToolContext` was constructed for.
+    /// `None` for tool invocations outside a turn loop. M6 uses this to
+    /// link a subagent run to a specific Agent-tool call in the parent.
+    pub tool_call_id: Option<String>,
+}
+
+impl ToolContext {
+    /// Convenience constructor used by call sites that do not have a parent
+    /// run id or tool call id (e.g. tests, ad-hoc invocations).
+    pub fn new_minimal(cwd: PathBuf, session_id: SessionId) -> Self {
+        Self {
+            cwd,
+            session_id,
+            run_id: None,
+            turn_index: 0,
+            tool_call_id: None,
+        }
+    }
 }
 
 #[async_trait]

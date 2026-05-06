@@ -76,6 +76,7 @@ pub struct Agent {
     pricing: Option<ModelPricing>,
     approval_memory: ApprovalMemory,
     checkpoint_handle: Option<Arc<dyn CheckpointHandle>>,
+    child_session_sink_factory: Option<Arc<dyn crate::agents::ChildSessionSinkFactory>>,
 }
 
 #[derive(Default)]
@@ -90,6 +91,7 @@ pub struct AgentBuilder {
     pricing: Option<ModelPricing>,
     approval_memory: Option<ApprovalMemory>,
     checkpoint_handle: Option<Arc<dyn CheckpointHandle>>,
+    child_session_sink_factory: Option<Arc<dyn crate::agents::ChildSessionSinkFactory>>,
 }
 
 impl AgentBuilder {
@@ -147,6 +149,17 @@ impl AgentBuilder {
         self
     }
 
+    /// Attach a factory that mints session sinks for child subagent runs.
+    /// Optional; when omitted, child events go to the parent's sink under
+    /// the parent's session id (still safe, but not separated by file).
+    pub fn child_session_sink_factory(
+        mut self,
+        factory: Arc<dyn crate::agents::ChildSessionSinkFactory>,
+    ) -> Self {
+        self.child_session_sink_factory = Some(factory);
+        self
+    }
+
     pub fn build(self) -> Result<Agent, AgentError> {
         let options = self
             .options
@@ -166,6 +179,7 @@ impl AgentBuilder {
             pricing: self.pricing,
             approval_memory: self.approval_memory.unwrap_or_default(),
             checkpoint_handle: self.checkpoint_handle,
+            child_session_sink_factory: self.child_session_sink_factory,
         })
     }
 }
@@ -275,6 +289,7 @@ pub(crate) async fn run_loop(
         pricing,
         approval_memory,
         checkpoint_handle,
+        child_session_sink_factory,
     } = agent;
 
     let session_id = options
@@ -430,6 +445,70 @@ pub(crate) async fn run_loop(
         .await;
         return Ok(());
     }
+
+    // M6: Register the built-in `Agent` tool when subagents are configured
+    // and the parent has been granted access to it. The SubagentRuntime
+    // holds shared state (provider, base tool registry, hooks, sinks) used
+    // to spawn isolated child runs.
+    let agent_tool_allowed = options.allowed_tools.iter().any(|n| n == "Agent")
+        || options.allowed_tool_rules.iter().any(|r| {
+            matches!(r,
+                crate::tool_rule::ToolRule::ExactTool(n) if n == "Agent"
+            )
+        })
+        || options
+            .allowed_tool_rules
+            .iter()
+            .any(|r| matches!(r, crate::tool_rule::ToolRule::AgentNameGlob { .. }));
+    let subagent_runtime = if options.agent_runtime.enabled
+        && !options.agents.is_empty()
+        && agent_tool_allowed
+    {
+        let runtime = crate::agents::SubagentRuntime::new(
+            Arc::new(options.agents.clone()),
+            provider.clone(),
+            tools.clone(),
+            options.clone(),
+            hooks.clone(),
+            options.agent_runtime.clone(),
+        );
+        let mut runtime = runtime.with_sinks(session_sink.clone(), telemetry_sink.clone(), pricing);
+        if let Some(factory) = child_session_sink_factory.clone() {
+            runtime = runtime.with_child_sink_factory(factory);
+        }
+        if let Some(handle) = checkpoint_handle.clone() {
+            runtime = runtime.with_checkpoint_handle(handle);
+        }
+        runtime.set_parent_event_tx(Some(tx.clone())).await;
+        let agent_tool = Arc::new(crate::agents::AgentTool::new(runtime.clone())) as Arc<dyn Tool>;
+        tools.register(agent_tool);
+
+        // Emit a one-shot AgentRegistryLoaded event so the CLI/UI can
+        // show which subagents were registered.
+        let summaries = options.agents.list();
+        emit_telemetry(
+            &telemetry_sink,
+            AgentTelemetryEvent::AgentRegistryLoaded {
+                session_id: session_id.clone(),
+                run_id: cfg.run_id.clone(),
+                agent_count: summaries.len(),
+            },
+        )
+        .await;
+        emit(
+            &tx,
+            &session_sink,
+            &session_id,
+            AgentEvent::AgentRegistryLoaded(crate::events::AgentRegistryLoaded {
+                agents: summaries,
+            }),
+        )
+        .await;
+        Some(runtime)
+    } else {
+        None
+    };
+    let _ = subagent_runtime;
 
     // Build the catalog before the first model request so tool loading can
     // resolve deterministically from the complete local + MCP tool set.
@@ -1302,6 +1381,9 @@ pub(crate) async fn run_loop(
             let ctx = ToolContext {
                 cwd: options.cwd.clone(),
                 session_id: session_id.clone(),
+                run_id: Some(cfg.run_id.clone()),
+                turn_index: turns,
+                tool_call_id: Some(call.id.clone()),
             };
             let started = Instant::now();
             emit_telemetry(
