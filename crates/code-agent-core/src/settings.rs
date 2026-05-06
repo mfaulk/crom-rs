@@ -16,6 +16,10 @@ use code_agent_mcp::McpSettingsConfig;
 use crate::permission::PermissionMode;
 use crate::tool_catalog::ToolSearchSettingsConfig;
 use crate::tool_rule::ToolRule;
+use crate::ui::{
+    merge_recovery_into, merge_ui_into, RecoveryConfig, RecoverySettingsConfig, UiConfig,
+    UiSettingsConfig, UiSettingsError,
+};
 
 /// Which settings sources should be loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -98,6 +102,12 @@ pub struct SettingsFile {
     /// These are exposed to plugins via `${user_config.<key>}`.
     #[serde(default)]
     pub plugin_config: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// M9: terminal UI configuration.
+    #[serde(default)]
+    pub ui: Option<UiSettingsConfig>,
+    /// M9: session recovery configuration.
+    #[serde(default)]
+    pub recovery: Option<RecoverySettingsConfig>,
 }
 
 /// Settings for the M7 Skills subsystem.
@@ -350,6 +360,10 @@ pub struct Settings {
     pub compaction: Option<CompactionSettingsConfig>,
     pub plugins: Option<PluginsSettingsConfig>,
     pub plugin_config: std::collections::BTreeMap<String, serde_json::Value>,
+    /// M9: effective UI configuration.
+    pub ui: UiConfig,
+    /// M9: effective recovery configuration.
+    pub recovery: RecoveryConfig,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -377,6 +391,8 @@ pub enum SettingsError {
     BadBashCheckpointPolicy(String),
     #[error("{0}")]
     BadToolSearch(String),
+    #[error("{0}")]
+    BadUi(#[from] UiSettingsError),
 }
 
 /// Load project settings from `<cwd>/.agent/settings.json` if present.
@@ -622,6 +638,12 @@ fn merge_into(dst: &mut Settings, src: SettingsFile, _is_user: bool) -> Result<(
         for (k, v) in pc {
             dst.plugin_config.insert(k, v);
         }
+    }
+    if let Some(ui) = src.ui {
+        merge_ui_into(&mut dst.ui, ui)?;
+    }
+    if let Some(rec) = src.recovery {
+        merge_recovery_into(&mut dst.recovery, rec);
     }
     Ok(())
 }

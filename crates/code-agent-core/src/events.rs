@@ -105,7 +105,185 @@ pub enum AgentEvent {
     PluginMarketplaceAdded(PluginMarketplaceAdded),
     /// A plugin was installed via a local marketplace entry.
     PluginMarketplaceEntryInstalled(PluginMarketplaceEntryInstalled),
+    /// M9: terminal UI started for a session.
+    UiStarted(UiStarted),
+    /// M9: renderer changed (e.g. fullscreen → plain fallback).
+    UiRendererChanged(UiRendererChanged),
+    /// M9: status line template configured/updated at runtime.
+    StatusLineConfigured(StatusLineConfigured),
+    /// M9: an approval prompt was presented to the user.
+    ApprovalPromptShown(ApprovalPromptShown),
+    /// M9: an approval prompt was resolved (allow/deny/revision).
+    ApprovalPromptResolved(ApprovalPromptResolved),
+    /// M9: user requested a revision instead of approving or denying.
+    ApprovalRevisionRequested(ApprovalRevisionRequested),
+    /// M9: user inspected a checkpoint or workspace diff.
+    DiffViewed(DiffViewed),
+    /// M9: user listed session changes.
+    ChangesViewed(ChangesViewed),
+    /// M9: doctor diagnostic check started.
+    DoctorCheckStarted(DoctorCheckStarted),
+    /// M9: doctor diagnostic check completed.
+    DoctorCheckCompleted(DoctorCheckCompleted),
+    /// M9: a recoverable session was restored.
+    SessionRecovered(SessionRecovered),
+    /// M9: session recovery failed (corrupted JSONL, missing data, ...).
+    SessionRecoveryFailed(SessionRecoveryFailed),
+    /// M9: `code-agent init` started writing files.
+    InitStarted(InitStarted),
+    /// M9: `code-agent init` finished.
+    InitCompleted(InitCompleted),
+    /// M9: a local notification was sent.
+    NotificationSent(NotificationSent),
+    /// M9: a local notification failed to send.
+    NotificationFailed(NotificationFailed),
     Result(AgentResult),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiStarted {
+    pub renderer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    pub width: u16,
+    pub height: u16,
+    pub is_tty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiRendererChanged {
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusLineConfigured {
+    pub template: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalPromptShown {
+    pub tool_name: String,
+    pub permission_kind: crate::permission::PermissionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalPromptResolved {
+    pub tool_name: String,
+    pub decision: crate::permission::PermissionDecision,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRevisionRequested {
+    pub tool_name: String,
+    pub message_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffViewed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    pub files_changed: u32,
+    pub bytes: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangesViewed {
+    pub session_id: SessionId,
+    pub files_changed: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorStatus {
+    Ok,
+    Warn,
+    Fail,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorCheckStarted {
+    pub check_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorCheckCompleted {
+    pub check_id: String,
+    pub status: DoctorStatus,
+    pub severity: DoctorSeverity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRuntimeState {
+    Idle,
+    Running,
+    Interrupted,
+    Crashed,
+    Complete,
+    NeedsRecovery,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecovered {
+    pub session_id: SessionId,
+    pub previous_state: SessionRuntimeState,
+    pub records_recovered: u32,
+    pub records_skipped: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecoveryFailed {
+    pub session_id: SessionId,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitStarted {
+    pub mode: String,
+    pub cwd: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitCompleted {
+    pub mode: String,
+    pub cwd: std::path::PathBuf,
+    pub created_settings: bool,
+    pub created_agents_md: bool,
+    pub created_agent_dir: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSent {
+    pub channel: String,
+    pub event: String,
+    pub message_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationFailed {
+    pub channel: String,
+    pub event: String,
+    pub reason: String,
 }
 
 /// Loosely-typed checkpoint event delivered through `AgentEvent`. The

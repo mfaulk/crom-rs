@@ -61,8 +61,17 @@ pub enum PermissionDecision {
     AllowOnce,
     AllowForSession,
     AllowForProject,
-    Deny { reason: String },
-    DenyForSession { reason: String },
+    Deny {
+        reason: String,
+    },
+    DenyForSession {
+        reason: String,
+    },
+    /// M9: deny once and inject a follow-up instruction so the agent retries
+    /// with the user's revised guidance instead of re-asking.
+    RequestRevision {
+        message: String,
+    },
 }
 
 impl PermissionDecision {
@@ -85,7 +94,23 @@ impl PermissionDecision {
     }
 
     pub fn is_deny(&self) -> bool {
-        matches!(self, Self::Deny { .. } | Self::DenyForSession { .. })
+        matches!(
+            self,
+            Self::Deny { .. } | Self::DenyForSession { .. } | Self::RequestRevision { .. }
+        )
+    }
+
+    /// True when this decision asks the runtime to inject a follow-up message
+    /// rather than just denying.
+    pub fn is_revision(&self) -> bool {
+        matches!(self, Self::RequestRevision { .. })
+    }
+
+    /// Convenience constructor for the M9 revision-request decision.
+    pub fn request_revision(message: impl Into<String>) -> Self {
+        Self::RequestRevision {
+            message: message.into(),
+        }
     }
 }
 

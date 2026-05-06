@@ -1,0 +1,25 @@
+{
+  "permission_mode": "default",
+  "checkpointing": {
+    "enabled": true
+  },
+  "ui": {
+    "renderer": "fullscreen",
+    "fallback_renderer": "plain",
+    "status_line": {
+      "enabled": true,
+      "template": "{project} · {git_branch}{git_dirty} · {model} · ctx {context_percent}% · {estimated_cost}"
+    },
+    "composer": {
+      "multiline": true,
+      "history_limit": 50
+    },
+    "notifications": {
+      "enabled": false
+    }
+  },
+  "recovery": {
+    "enabled": true,
+    "stale_lock_after_seconds": 1800
+  }
+}

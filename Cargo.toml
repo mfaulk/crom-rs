@@ -7,6 +7,7 @@ members = [
     "crates/code-agent-session",
     "crates/code-agent-checkpoint",
     "crates/code-agent-mcp",
+    "crates/code-agent-tui",
     "crates/code-agent-cli",
 ]
 exclude = [
@@ -16,6 +17,7 @@ exclude = [
     "examples/mcp-demo",
     "examples/subagent-demo",
     "examples/skills-demo",
+    "examples/beta-demo",
 ]
 
 [workspace.package]

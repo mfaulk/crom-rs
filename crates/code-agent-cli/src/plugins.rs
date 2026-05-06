@@ -1200,6 +1200,55 @@ pub fn settings_to_file(s: &Settings) -> code_agent_core::SettingsFile {
         } else {
             Some(s.plugin_config.clone())
         },
+        // Round-trip the effective UI/recovery shape so plugin defaults can
+        // merge into them without erasing user customizations. The merge
+        // helper only fills *unset* fields, so emitting the current values
+        // here means user-set keys win over plugin defaults.
+        ui: Some(ui_to_settings(&s.ui)),
+        recovery: Some(recovery_to_settings(&s.recovery)),
+    }
+}
+
+fn ui_to_settings(ui: &code_agent_core::UiConfig) -> code_agent_core::UiSettingsConfig {
+    code_agent_core::UiSettingsConfig {
+        renderer: Some(ui.renderer.as_str().to_string()),
+        fallback_renderer: Some(ui.fallback_renderer.as_str().to_string()),
+        confirm_exit_while_running: Some(ui.confirm_exit_while_running),
+        show_subagent_events: Some(ui.show_subagent_events),
+        show_tool_json: Some(ui.show_tool_json),
+        status_line: Some(code_agent_core::StatusLineSettingsConfig {
+            enabled: Some(ui.status_line.enabled),
+            template: Some(ui.status_line.template.clone()),
+            refresh_interval_ms: Some(ui.status_line.refresh_interval_ms),
+        }),
+        composer: Some(code_agent_core::ComposerSettingsConfig {
+            multiline: Some(ui.composer.multiline),
+            submit_key: Some(match ui.composer.submit_key {
+                code_agent_core::SubmitKey::Enter => "enter".to_string(),
+                code_agent_core::SubmitKey::CtrlEnter => "ctrl_enter".to_string(),
+            }),
+            history_limit: Some(ui.composer.history_limit),
+            bracketed_paste: Some(ui.composer.bracketed_paste),
+        }),
+        notifications: Some(code_agent_core::NotificationSettingsConfig {
+            enabled: Some(ui.notifications.enabled),
+            on_approval_required: Some(ui.notifications.on_approval_required),
+            on_run_complete: Some(ui.notifications.on_run_complete),
+            on_run_failed: Some(ui.notifications.on_run_failed),
+            on_validation_failed: Some(ui.notifications.on_validation_failed),
+            on_long_command_complete: Some(ui.notifications.on_long_command_complete),
+            on_subagent_complete: Some(ui.notifications.on_subagent_complete),
+        }),
+    }
+}
+
+fn recovery_to_settings(
+    r: &code_agent_core::RecoveryConfig,
+) -> code_agent_core::RecoverySettingsConfig {
+    code_agent_core::RecoverySettingsConfig {
+        enabled: Some(r.enabled),
+        stale_lock_after_seconds: Some(r.stale_lock_after_seconds),
+        auto_mark_interrupted: Some(r.auto_mark_interrupted),
     }
 }
 

@@ -1,3 +1,4 @@
+mod m9;
 mod plugins;
 
 use std::io::{IsTerminal, Write};
@@ -50,11 +51,26 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 
 #[derive(Parser, Debug)]
-#[command(name = "code-agent", version, about = "Headless coding agent (M2)")]
+#[command(
+    name = "code-agent",
+    version,
+    long_version = LONG_VERSION,
+    about = "Coding agent CLI with optional terminal UI"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nbuild_profile: ",
+    env!("PROFILE_INFO"),
+    "\ntarget:        ",
+    env!("TARGET_INFO"),
+    "\nfeatures:      default",
+    "\nuse `code-agent paths` for resolved config/session/checkpoint/plugin paths"
+);
 
 #[derive(Subcommand, Debug)]
 enum Command {
@@ -96,6 +112,206 @@ enum Command {
     /// Manage plugins.
     #[command(subcommand)]
     Plugin(plugins::PluginCommand),
+    /// First-run setup: create `.agent/`, settings.json, AGENTS.md.
+    Init(InitArgs),
+    /// Run diagnostics against the current workspace.
+    Doctor(DoctorArgs),
+    /// Show effective configuration paths and values.
+    Config(ConfigArgs),
+    /// Show current session/runtime status.
+    Status(StatusArgs),
+    /// Configure or print the status line template.
+    #[command(subcommand)]
+    Statusline(StatuslineCommand),
+    /// View, diff, or revert workspace changes.
+    #[command(subcommand)]
+    Changes(ChangesCommand),
+    /// Browse and recover sessions (extra `sessions` subcommands beyond M2).
+    #[command(subcommand)]
+    SessionsExt(SessionsExtCommand),
+    /// Print the resolved paths used by code-agent.
+    Paths(PathsArgs),
+    /// Generate shell completions.
+    Completions(CompletionsArgs),
+    /// Open the interactive fullscreen TUI.
+    Tui(TuiArgs),
+}
+
+#[derive(Parser, Debug)]
+struct InitArgs {
+    /// Workspace directory.
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    /// Minimal starter config (default).
+    #[arg(long, conflicts_with_all = ["interactive", "ci"])]
+    minimal: bool,
+    /// Interactive prompts.
+    #[arg(long, conflicts_with_all = ["minimal", "ci"])]
+    interactive: bool,
+    /// Non-interactive CI mode.
+    #[arg(long, conflicts_with_all = ["minimal", "interactive"])]
+    ci: bool,
+    /// Overwrite existing files instead of skipping.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Parser, Debug)]
+struct DoctorArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    /// Emit JSON instead of human-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Apply safe fixes (currently: create missing `.agent/` directories).
+    /// Pass `--yes` to skip confirmation in interactive sessions.
+    #[arg(long)]
+    fix: bool,
+    /// Skip the interactive confirmation prompt for `--fix`.
+    #[arg(long)]
+    yes: bool,
+    /// Settings sources to load.
+    #[arg(long, default_value = "user-and-project")]
+    settings: String,
+}
+
+#[derive(Parser, Debug)]
+struct ConfigArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long, default_value = "user-and-project")]
+    settings: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser, Debug)]
+struct StatusArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long, default_value = "user-and-project")]
+    settings: String,
+    #[arg(long)]
+    session: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum StatuslineCommand {
+    /// Show the configured template.
+    Show {
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long, default_value = "user-and-project")]
+        settings: String,
+    },
+    /// Set the template in `.agent/settings.json`.
+    Set {
+        template: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ChangesCommand {
+    /// List file changes since the most recent checkpoint.
+    List(ChangesListArgs),
+    /// Show a diff between a checkpoint and the workspace.
+    Diff(ChangesDiffArgs),
+    /// One-line summary of recent changes.
+    Summary(ChangesListArgs),
+    /// Revert to a checkpoint id.
+    Revert(ChangesRevertArgs),
+}
+
+#[derive(Parser, Debug)]
+struct ChangesListArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long)]
+    session: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct ChangesDiffArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long)]
+    checkpoint: Option<String>,
+    #[arg(long)]
+    session: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct ChangesRevertArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long)]
+    checkpoint: String,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionsExtCommand {
+    /// List the most recent sessions.
+    Recent(SessionsExtArgs),
+    /// Detect and report recoverable (interrupted/crashed) sessions.
+    Recover(SessionsExtArgs),
+    /// Open a session for inspection (prints replayed conversation).
+    Open {
+        session_id: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+    },
+    /// Delete sessions older than the given age (e.g. `30d`, `2h`).
+    Clean {
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(long, default_value = "30d")]
+        older_than: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Parser, Debug)]
+struct SessionsExtArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long, default_value = "user-and-project")]
+    settings: String,
+}
+
+#[derive(Parser, Debug)]
+struct PathsArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser, Debug)]
+struct CompletionsArgs {
+    /// Shell to generate completions for.
+    shell: String,
+}
+
+#[derive(Parser, Debug)]
+struct TuiArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    /// Force a renderer (overrides settings).
+    #[arg(long)]
+    renderer: Option<String>,
+    /// Resume an existing session id.
+    #[arg(long)]
+    session: Option<String>,
+    /// Print one frame and exit (used in tests / non-interactive demos).
+    #[arg(long)]
+    snapshot: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -873,6 +1089,16 @@ async fn main() -> ExitCode {
         }) => cmd_commands_show(command_name, common).await,
         Command::Commands(CommandsCommand::Validate(args)) => cmd_commands_validate(args).await,
         Command::Plugin(cmd) => plugins::handle_plugin_command(cmd).await,
+        Command::Init(args) => cmd_init(args).await,
+        Command::Doctor(args) => cmd_doctor(args).await,
+        Command::Config(args) => cmd_config(args).await,
+        Command::Status(args) => cmd_status(args).await,
+        Command::Statusline(cmd) => cmd_statusline(cmd).await,
+        Command::Changes(cmd) => cmd_changes(cmd).await,
+        Command::SessionsExt(cmd) => cmd_sessions_ext(cmd).await,
+        Command::Paths(args) => cmd_paths(args).await,
+        Command::Completions(args) => cmd_completions(args).await,
+        Command::Tui(args) => cmd_tui(args).await,
     };
 
     match result {
@@ -1901,6 +2127,63 @@ async fn handle_builtin_slash(
             println!(
                 "(in one-shot mode there's no live conversation to compact; \
                  use `/compact` from `code-agent chat`)"
+            );
+        }
+        B::Config => {
+            for line in m9::format_effective_config(&cfg.settings) {
+                println!("{line}");
+            }
+        }
+        B::Status => {
+            for line in m9::format_session_status(
+                &cfg.options.cwd,
+                &cfg.settings,
+                cfg.options.session_id.as_ref().map(|s| s.as_str()),
+            ) {
+                println!("{line}");
+            }
+        }
+        B::StatusLine => {
+            println!(
+                "status_line.template: {}",
+                cfg.settings.ui.status_line.template
+            );
+            println!("(edit `.agent/settings.json` ui.status_line.template, or run `code-agent statusline set <TEMPLATE>`)");
+        }
+        B::Doctor => {
+            for line in m9::run_doctor(&cfg.options.cwd, &cfg.settings, true).text {
+                println!("{line}");
+            }
+        }
+        B::Changes => {
+            println!(
+                "(use `code-agent changes list --cwd {}` or `code-agent changes summary --cwd {}`)",
+                cfg.options.cwd.display(),
+                cfg.options.cwd.display()
+            );
+        }
+        B::Diff => {
+            println!(
+                "(use `code-agent changes diff --cwd {}` to view checkpoint diff)",
+                cfg.options.cwd.display()
+            );
+        }
+        B::Revert => {
+            println!(
+                "(use `code-agent rewind <CHECKPOINT>` to revert; `code-agent checkpoints list --cwd {}` lists ids)",
+                cfg.options.cwd.display()
+            );
+        }
+        B::Sessions => {
+            println!(
+                "(use `code-agent sessions list --cwd {}`)",
+                cfg.options.cwd.display()
+            );
+        }
+        B::Recover => {
+            println!(
+                "(use `code-agent sessions recover --cwd {}`)",
+                cfg.options.cwd.display()
             );
         }
     }
@@ -4532,6 +4815,86 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
                 e.plugin, e.marketplace, e.entry
             );
         }
+        AgentEvent::UiStarted(u) => {
+            if !quiet {
+                println!(
+                    "[ui] started {} ({}x{}, tty={})",
+                    u.renderer, u.width, u.height, u.is_tty
+                );
+            }
+        }
+        AgentEvent::UiRendererChanged(u) => {
+            println!("[ui] renderer {} -> {}: {}", u.from, u.to, u.reason);
+        }
+        AgentEvent::StatusLineConfigured(s) => {
+            if !quiet {
+                println!("[ui] status line: {}", s.template);
+            }
+        }
+        AgentEvent::ApprovalPromptShown(a) => {
+            if !quiet {
+                println!(
+                    "[approval] prompt {} ({:?}) source={:?}",
+                    a.tool_name, a.permission_kind, a.source
+                );
+            }
+        }
+        AgentEvent::ApprovalPromptResolved(a) => {
+            if !quiet {
+                println!(
+                    "[approval] resolved {} -> {:?} ({}ms)",
+                    a.tool_name, a.decision, a.duration_ms
+                );
+            }
+        }
+        AgentEvent::ApprovalRevisionRequested(a) => {
+            println!(
+                "[approval] revision-requested {}: {}",
+                a.tool_name, a.message_preview
+            );
+        }
+        AgentEvent::DiffViewed(d) => {
+            if !quiet {
+                println!(
+                    "[diff] {} files, {} bytes{}",
+                    d.files_changed,
+                    d.bytes,
+                    if d.truncated { " (truncated)" } else { "" }
+                );
+            }
+        }
+        AgentEvent::ChangesViewed(c) => {
+            if !quiet {
+                println!("[changes] {} files in {}", c.files_changed, c.session_id);
+            }
+        }
+        AgentEvent::DoctorCheckStarted(_) => {}
+        AgentEvent::DoctorCheckCompleted(d) => {
+            if !quiet {
+                println!("[doctor] {} {:?}: {}", d.check_id, d.status, d.message);
+            }
+        }
+        AgentEvent::SessionRecovered(s) => {
+            println!(
+                "[recover] {} (state {:?}; {} records, {} skipped)",
+                s.session_id, s.previous_state, s.records_recovered, s.records_skipped
+            );
+        }
+        AgentEvent::SessionRecoveryFailed(s) => {
+            println!("[recover-error] {}: {}", s.session_id, s.reason);
+        }
+        AgentEvent::InitStarted(_) => {}
+        AgentEvent::InitCompleted(i) => {
+            println!("[init] {} done ({})", i.mode, i.cwd.display());
+        }
+        AgentEvent::NotificationSent(n) => {
+            if !quiet {
+                println!("[notify] {} {}: {}", n.channel, n.event, n.message_preview);
+            }
+        }
+        AgentEvent::NotificationFailed(n) => {
+            println!("[notify-error] {} {}: {}", n.channel, n.event, n.reason);
+        }
     }
 }
 
@@ -4937,4 +5300,616 @@ impl TelemetrySink for StderrTelemetrySink {
             eprintln!("[telemetry] {:?}", event);
         }
     }
+}
+
+// =====================================================================
+// M9 command implementations.
+// =====================================================================
+
+async fn cmd_init(args: InitArgs) -> Result<()> {
+    let cwd = args
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+    let mode = if args.ci {
+        m9::InitMode::Ci
+    } else if args.interactive {
+        m9::InitMode::Interactive
+    } else {
+        m9::InitMode::Minimal
+    };
+    let outcome = m9::run_init(&cwd, mode, args.force)?;
+    println!("Welcome to code-agent.");
+    println!();
+    if outcome.created_agent_dir {
+        println!("✓ created .agent/ in {}", cwd.display());
+    } else {
+        println!("· .agent/ already present");
+    }
+    if outcome.created_settings {
+        println!("✓ created .agent/settings.json");
+    } else {
+        println!("· .agent/settings.json kept");
+    }
+    if outcome.created_agents_md {
+        println!("✓ created AGENTS.md");
+    } else {
+        println!("· AGENTS.md kept");
+    }
+    if !outcome.api_key_present {
+        println!();
+        println!("! ANTHROPIC_API_KEY missing");
+        println!("  → export ANTHROPIC_API_KEY=...");
+    }
+    Ok(())
+}
+
+async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
+    let cwd = args
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+    let source = parse_setting_source(&args.settings)?;
+    let settings = code_agent_core::settings::load(&cwd, source)
+        .with_context(|| format!("loading settings from {}", cwd.display()))?;
+    let report = m9::run_doctor(&cwd, &settings, true);
+    if args.json {
+        let s = serde_json::to_string_pretty(&report.checks)?;
+        println!("{s}");
+    } else {
+        for line in &report.text {
+            println!("{line}");
+        }
+    }
+    if args.fix {
+        // Safe-fix path: only ever creates missing `.agent/` directories.
+        // Anything riskier should require an explicit follow-up command.
+        let agent_dir = cwd.join(".agent");
+        if !agent_dir.exists() {
+            let stdin_is_tty = std::io::stdin().is_terminal();
+            let confirmed = if args.yes || !stdin_is_tty {
+                args.yes // non-interactive shells must pass --yes
+            } else {
+                println!(
+                    "About to create {} (and sessions/, checkpoints/, logs/ subdirs).",
+                    agent_dir.display()
+                );
+                print!("Proceed? [y/N] ");
+                let _ = std::io::stdout().flush();
+                let mut buf = String::new();
+                std::io::stdin().read_line(&mut buf).ok();
+                matches!(buf.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+            };
+            if confirmed {
+                std::fs::create_dir_all(agent_dir.join("sessions"))?;
+                std::fs::create_dir_all(agent_dir.join("checkpoints"))?;
+                std::fs::create_dir_all(agent_dir.join("logs"))?;
+                println!("→ created missing .agent/ directories");
+            } else {
+                println!("→ skipped: pass --yes to apply non-interactively");
+            }
+        }
+    }
+    if report.has_failures() && !args.fix {
+        return Err(anyhow!("doctor reported errors"));
+    }
+    Ok(())
+}
+
+async fn cmd_config(args: ConfigArgs) -> Result<()> {
+    let cwd = args
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+    let source = parse_setting_source(&args.settings)?;
+    let settings = code_agent_core::settings::load(&cwd, source)
+        .with_context(|| format!("loading settings from {}", cwd.display()))?;
+    if args.json {
+        // Print a redacted JSON summary. Settings struct is not directly
+        // Serializable, but the path/source/UI/recovery fields are.
+        let v = serde_json::json!({
+            "source": format!("{:?}", settings.source),
+            "model": settings.model,
+            "permission_mode": settings.permission_mode.map(|p| format!("{p:?}")),
+            "ui": {
+                "renderer": settings.ui.renderer.as_str(),
+                "fallback_renderer": settings.ui.fallback_renderer.as_str(),
+                "status_line": settings.ui.status_line,
+                "composer": settings.ui.composer,
+                "notifications": settings.ui.notifications,
+            },
+            "recovery": settings.recovery,
+            "project_path": settings.project_path,
+            "user_path": settings.user_path,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        for line in m9::format_effective_config(&settings) {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_status(args: StatusArgs) -> Result<()> {
+    let cwd = args
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+    let source = parse_setting_source(&args.settings)?;
+    let settings = code_agent_core::settings::load(&cwd, source)
+        .with_context(|| format!("loading settings from {}", cwd.display()))?;
+    for line in m9::format_session_status(&cwd, &settings, args.session.as_deref()) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+async fn cmd_statusline(cmd: StatuslineCommand) -> Result<()> {
+    match cmd {
+        StatuslineCommand::Show { cwd, settings } => {
+            let cwd = cwd
+                .canonicalize()
+                .with_context(|| format!("--cwd {}", cwd.display()))?;
+            let source = parse_setting_source(&settings)?;
+            let s = code_agent_core::settings::load(&cwd, source).unwrap_or_default();
+            println!("{}", s.ui.status_line.template);
+        }
+        StatuslineCommand::Set { template, cwd } => {
+            let cwd = cwd
+                .canonicalize()
+                .with_context(|| format!("--cwd {}", cwd.display()))?;
+            let unknown = code_agent_core::ui::unknown_status_line_variables(&template);
+            if !unknown.is_empty() {
+                return Err(anyhow!(
+                    "template references unknown variables: {:?}",
+                    unknown
+                ));
+            }
+            let path = cwd.join(".agent").join("settings.json");
+            let mut current = if path.exists() {
+                let body = std::fs::read_to_string(&path)?;
+                serde_json::from_str::<serde_json::Value>(&body).map_err(|e| {
+                    anyhow!(
+                        "settings.json at {} is not valid JSON: {} \n\
+                         (refusing to overwrite — fix or remove the file first)",
+                        path.display(),
+                        e
+                    )
+                })?
+            } else {
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                serde_json::json!({})
+            };
+            let ui = current
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("settings.json must be a JSON object"))?
+                .entry("ui".to_string())
+                .or_insert(serde_json::json!({}));
+            let sl = ui
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("ui must be a JSON object"))?
+                .entry("status_line".to_string())
+                .or_insert(serde_json::json!({}));
+            sl.as_object_mut()
+                .ok_or_else(|| anyhow!("status_line must be a JSON object"))?
+                .insert(
+                    "template".into(),
+                    serde_json::Value::String(template.clone()),
+                );
+            std::fs::write(&path, serde_json::to_string_pretty(&current)?)?;
+            println!("✓ status line set to: {template}");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_changes(cmd: ChangesCommand) -> Result<()> {
+    use code_agent_checkpoint::{CheckpointId, DiffCheckpointRequest as DiffReq};
+    match cmd {
+        ChangesCommand::List(args) => {
+            let cwd = args
+                .cwd
+                .canonicalize()
+                .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+            let store = LocalCheckpointStore::new(cwd.clone());
+            let session_id = pick_session_for_cwd(args.session.as_deref(), &cwd).await?;
+            let recent = store
+                .list_checkpoints(&session_id)
+                .await
+                .unwrap_or_default();
+            if recent.is_empty() {
+                println!("(no checkpoints recorded for session {})", session_id);
+                return Ok(());
+            }
+            println!("Recent checkpoints for {}:", session_id);
+            for c in recent.iter().take(20) {
+                println!(
+                    "  {}  {}  {}",
+                    c.checkpoint_id,
+                    c.created_at,
+                    c.description.as_deref().unwrap_or("")
+                );
+            }
+        }
+        ChangesCommand::Summary(args) => {
+            let cwd = args
+                .cwd
+                .canonicalize()
+                .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+            let store = LocalCheckpointStore::new(cwd.clone());
+            let session_id = pick_session_for_cwd(args.session.as_deref(), &cwd).await?;
+            let recent = store
+                .list_checkpoints(&session_id)
+                .await
+                .unwrap_or_default();
+            let last = match recent.last() {
+                Some(c) => c,
+                None => {
+                    println!("(no checkpoints recorded for session {})", session_id);
+                    return Ok(());
+                }
+            };
+            // Diff the most recent checkpoint against the live workspace.
+            let diff = store
+                .diff_checkpoint(code_agent_checkpoint::DiffCheckpointRequest {
+                    checkpoint_id: last.checkpoint_id.clone(),
+                    cwd: cwd.clone(),
+                    session_id: session_id.clone(),
+                    max_bytes: None,
+                })
+                .await
+                .map_err(|e| anyhow!("summary diff failed: {e}"))?;
+            let entries = diff
+                .file_diffs
+                .iter()
+                .map(|fd| match fd {
+                    FileDiff::Modified { path, .. } => code_agent_tui::DiffEntry::Modified {
+                        path: std::path::PathBuf::from(path.as_str()),
+                        before: String::new(),
+                        after: String::new(),
+                    },
+                    FileDiff::Created { path, .. } => code_agent_tui::DiffEntry::Created {
+                        path: std::path::PathBuf::from(path.as_str()),
+                        after: String::new(),
+                    },
+                    FileDiff::Deleted { path, .. } => code_agent_tui::DiffEntry::Deleted {
+                        path: std::path::PathBuf::from(path.as_str()),
+                        before: String::new(),
+                    },
+                    FileDiff::Binary { path, .. } => code_agent_tui::DiffEntry::Binary {
+                        path: std::path::PathBuf::from(path.as_str()),
+                    },
+                    FileDiff::Redacted { path, .. } => code_agent_tui::DiffEntry::Redacted {
+                        path: std::path::PathBuf::from(path.as_str()),
+                        reason: "secret-like file".into(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let summary = code_agent_tui::ChangeSummary::from_entries(&entries);
+            println!(
+                "since {} ({}): {}",
+                last.checkpoint_id,
+                last.created_at,
+                code_agent_tui::render_change_summary(&summary)
+            );
+        }
+        ChangesCommand::Diff(args) => {
+            let cwd = args
+                .cwd
+                .canonicalize()
+                .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+            let store = LocalCheckpointStore::new(cwd.clone());
+            let session_id = pick_session_for_cwd(args.session.as_deref(), &cwd).await?;
+            let checkpoint = match args.checkpoint {
+                Some(c) => CheckpointId::from(c),
+                None => {
+                    let cps = store
+                        .list_checkpoints(&session_id)
+                        .await
+                        .unwrap_or_default();
+                    cps.last()
+                        .ok_or_else(|| anyhow!("no checkpoints to diff"))?
+                        .checkpoint_id
+                        .clone()
+                }
+            };
+            let diff = store
+                .diff_checkpoint(DiffReq {
+                    checkpoint_id: checkpoint.clone(),
+                    cwd: cwd.clone(),
+                    session_id: session_id.clone(),
+                    max_bytes: None,
+                })
+                .await
+                .map_err(|e| anyhow!("diff failed: {e}"))?;
+            for fd in &diff.file_diffs {
+                match fd {
+                    FileDiff::Modified {
+                        path, unified_diff, ..
+                    } => {
+                        println!("=== {} ===", path);
+                        println!("{unified_diff}");
+                    }
+                    FileDiff::Created {
+                        path,
+                        current_content_preview,
+                        ..
+                    } => {
+                        println!("=== created: {} ===", path);
+                        println!("{current_content_preview}");
+                    }
+                    FileDiff::Deleted {
+                        path,
+                        original_content_preview,
+                        ..
+                    } => {
+                        println!("=== deleted: {} ===", path);
+                        println!("{original_content_preview}");
+                    }
+                    FileDiff::Binary { path, change_kind } => {
+                        println!("=== binary {:?}: {} ===", change_kind, path);
+                    }
+                    FileDiff::Redacted { path, change_kind } => {
+                        println!("=== redacted {:?}: {} ===", change_kind, path);
+                    }
+                }
+            }
+            if diff.file_diffs.is_empty() {
+                println!("(no differences)");
+            }
+        }
+        ChangesCommand::Revert(args) => {
+            let cwd = args
+                .cwd
+                .canonicalize()
+                .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+            if !args.yes {
+                return Err(anyhow!("pass --yes to confirm revert"));
+            }
+            let store = LocalCheckpointStore::new(cwd.clone());
+            let report = store
+                .rewind(RewindRequest {
+                    checkpoint_id: CheckpointId::from(args.checkpoint.clone()),
+                    cwd: cwd.clone(),
+                    dry_run: false,
+                    force_cwd: false,
+                })
+                .await
+                .map_err(|e| anyhow!("rewind failed: {e}"))?;
+            println!(
+                "✓ reverted to {} ({} restored, {} skipped)",
+                args.checkpoint,
+                report.restored_files.len(),
+                report.skipped_files.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn pick_session_for_cwd(explicit: Option<&str>, cwd: &Path) -> Result<SessionId> {
+    if let Some(s) = explicit {
+        return parse_session_id(s);
+    }
+    let session_store = FsSessionStore::new(cwd.to_path_buf());
+    let latest = session_store
+        .latest_for_cwd(cwd)
+        .await
+        .map_err(|e| anyhow!("could not list sessions: {e}"))?;
+    latest.ok_or_else(|| anyhow!("no sessions found for {}", cwd.display()))
+}
+
+async fn cmd_sessions_ext(cmd: SessionsExtCommand) -> Result<()> {
+    match cmd {
+        SessionsExtCommand::Recent(args) => {
+            let cwd = args
+                .cwd
+                .canonicalize()
+                .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+            let infos = code_agent_session::detect_state(&cwd, 3600)
+                .await
+                .map_err(|e| anyhow!("detect: {e}"))?;
+            for i in infos.iter().take(20) {
+                println!("  {}  {:?}", i.session_id, i.state);
+            }
+            if infos.is_empty() {
+                println!("(no sessions found)");
+            }
+        }
+        SessionsExtCommand::Recover(args) => {
+            let cwd = args
+                .cwd
+                .canonicalize()
+                .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+            let infos = code_agent_session::detect_state(&cwd, 3600)
+                .await
+                .map_err(|e| anyhow!("detect: {e}"))?;
+            let mut any = false;
+            for i in &infos {
+                if matches!(
+                    i.state,
+                    code_agent_core::SessionRuntimeState::Crashed
+                        | code_agent_core::SessionRuntimeState::Interrupted
+                        | code_agent_core::SessionRuntimeState::NeedsRecovery
+                ) {
+                    any = true;
+                    println!("Recoverable: {}  state={:?}", i.session_id, i.state);
+                    if let Some(lock) = &i.lock {
+                        println!("  lock: pid={} started_at={}", lock.pid, lock.started_at);
+                    }
+                    let (records, skipped) =
+                        code_agent_session::load_records_resilient(&cwd, &i.session_id).await?;
+                    println!(
+                        "  records recovered: {} (skipped {})",
+                        records.len(),
+                        skipped
+                    );
+                    code_agent_session::release_lock(&cwd, &i.session_id)
+                        .await
+                        .ok();
+                }
+            }
+            if !any {
+                println!("(no recoverable sessions detected)");
+            }
+        }
+        SessionsExtCommand::Open { session_id, cwd } => {
+            let cwd = cwd
+                .canonicalize()
+                .with_context(|| format!("--cwd {}", cwd.display()))?;
+            let id = parse_session_id(&session_id)?;
+            let (records, skipped) = code_agent_session::load_records_resilient(&cwd, &id).await?;
+            println!(
+                "Session {}: {} records ({} skipped)",
+                id,
+                records.len(),
+                skipped
+            );
+            for r in records.iter().take(50) {
+                match &r.payload {
+                    code_agent_session::SessionPayload::UserPrompt { text } => {
+                        println!("  user: {}", truncate(text, 120));
+                    }
+                    code_agent_session::SessionPayload::Event(_) => {
+                        println!("  event @ {}", r.timestamp);
+                    }
+                    other => {
+                        println!("  meta: {:?}", other);
+                    }
+                }
+            }
+        }
+        SessionsExtCommand::Clean {
+            cwd,
+            older_than,
+            dry_run,
+            yes,
+        } => {
+            let cwd = cwd
+                .canonicalize()
+                .with_context(|| format!("--cwd {}", cwd.display()))?;
+            let age = m9::parse_age_spec(&older_than)?;
+            let candidates = m9::collect_clean_candidates(&cwd, age);
+            if candidates.is_empty() {
+                println!("(no sessions older than {})", older_than);
+                return Ok(());
+            }
+            for (p, _) in &candidates {
+                println!("would remove: {}", p.display());
+            }
+            if dry_run {
+                return Ok(());
+            }
+            if !yes {
+                return Err(anyhow!("pass --yes to actually remove these files"));
+            }
+            let mut removed = 0u32;
+            let mut failed: Vec<(PathBuf, std::io::Error)> = Vec::new();
+            for (p, _) in &candidates {
+                if let Err(e) = std::fs::remove_file(p) {
+                    failed.push((p.clone(), e));
+                    continue;
+                }
+                removed += 1;
+                // Also remove the orphan run-lock that lives next to the
+                // JSONL. Missing lock files are not an error — sessions
+                // that exited cleanly never had one.
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    let lock = p.with_file_name(format!("{stem}.lock"));
+                    if lock.exists() {
+                        let _ = std::fs::remove_file(&lock);
+                    }
+                }
+            }
+            println!("✓ removed {removed} session file(s)");
+            if !failed.is_empty() {
+                eprintln!("! {} file(s) could not be removed:", failed.len());
+                for (p, e) in &failed {
+                    eprintln!("  {}: {}", p.display(), e);
+                }
+                return Err(anyhow!("partial cleanup: {} file(s) failed", failed.len()));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_paths(args: PathsArgs) -> Result<()> {
+    let cwd = args
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+    let p = m9::resolve_paths(&cwd);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&p)?);
+    } else {
+        println!("project_settings:        {:?}", p.project_settings);
+        println!("user_settings:           {:?}", p.user_settings);
+        println!("project_local_settings:  {:?}", p.project_local_settings);
+        println!("agent_dir:               {}", p.agent_dir.display());
+        println!("sessions_dir:            {}", p.sessions_dir.display());
+        println!("checkpoints_dir:         {}", p.checkpoints_dir.display());
+        println!("plugin_cache_dir:        {}", p.plugin_cache_dir.display());
+        println!("plugin_data_dir:         {}", p.plugin_data_dir.display());
+        println!("logs_dir:                {}", p.logs_dir.display());
+        println!("cache_dir:               {}", p.cache_dir.display());
+    }
+    Ok(())
+}
+
+async fn cmd_completions(args: CompletionsArgs) -> Result<()> {
+    let shell = match args.shell.to_ascii_lowercase().as_str() {
+        "bash" => clap_complete::Shell::Bash,
+        "zsh" => clap_complete::Shell::Zsh,
+        "fish" => clap_complete::Shell::Fish,
+        "powershell" | "pwsh" => clap_complete::Shell::PowerShell,
+        "elvish" => clap_complete::Shell::Elvish,
+        other => return Err(anyhow!("unsupported shell: {other}")),
+    };
+    let mut out = std::io::stdout();
+    m9::write_completions::<Cli>(shell, "code-agent", &mut out)?;
+    Ok(())
+}
+
+async fn cmd_tui(args: TuiArgs) -> Result<()> {
+    let cwd = args
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", args.cwd.display()))?;
+    let settings =
+        code_agent_core::settings::load(&cwd, SettingSource::UserAndProject).unwrap_or_default();
+    let caps = code_agent_tui::detect_capabilities_from_env();
+    let cli_override = args
+        .renderer
+        .as_deref()
+        .and_then(code_agent_core::TerminalRenderer::from_str_lenient);
+    let chosen = m9::choose_renderer(&settings.ui, &caps, cli_override);
+    println!(
+        "[tui] renderer={} (caps {}x{} tty={}) session={:?}",
+        chosen.as_str(),
+        caps.width,
+        caps.height,
+        caps.is_tty,
+        args.session
+    );
+    if args.snapshot || matches!(chosen, code_agent_core::TerminalRenderer::Plain) {
+        // Headless preview: print one snapshot frame using the deterministic
+        // status-line and transcript renderers, then exit.
+        let ctx =
+            m9::build_default_status_ctx(&cwd, &settings, args.session.as_deref(), None, false);
+        let line = code_agent_tui::format_status_line(
+            &settings.ui.status_line.template,
+            &ctx,
+            caps.width.max(40) as usize,
+        );
+        println!("{line}");
+        println!("(plain TUI fallback — use a TTY for the fullscreen UI)");
+        return Ok(());
+    }
+    println!(
+        "[tui] interactive UI is not yet implemented in this milestone alpha; \
+         use --snapshot for a preview frame or `--renderer plain`"
+    );
+    Ok(())
 }
