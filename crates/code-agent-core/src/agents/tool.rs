@@ -1062,6 +1062,13 @@ fn build_child_options(
             enabled: false,
             ..AgentRuntimeOptions::default()
         },
+        // Subagents inherit the parent's Skill registry so a subagent
+        // working on a release-pr task can still load the same Skill if
+        // it has been granted the Skill tool. The slash-command registry
+        // is parent-only — subagents do not parse slash commands.
+        skills: parent.skills.clone(),
+        skill_options: parent.skill_options.clone(),
+        slash_commands: crate::slash::SlashCommandRegistry::new(false),
     };
 
     // Build the system prompt.

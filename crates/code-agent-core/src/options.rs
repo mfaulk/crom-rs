@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::agents::{AgentRegistry, AgentRuntimeOptions};
 use crate::permission::{ApprovalMemoryMode, PermissionCallback, PermissionMode};
+use crate::skills::{SkillDiscoveryOptions, SkillRegistry};
+use crate::slash::SlashCommandRegistry;
 use crate::tool_catalog::ToolSearchOptions;
 use crate::tool_rule::ToolRule;
 use code_agent_mcp::McpOptions;
@@ -99,6 +101,15 @@ pub struct AgentOptions {
     pub agents: AgentRegistry,
     /// Subagent runtime knobs (M6).
     pub agent_runtime: AgentRuntimeOptions,
+    /// Skill registry (M7). Empty by default; the `Skill` tool is only
+    /// surfaced when this contains at least one definition AND `Skill` is
+    /// in `allowed_tools` (or an explicit allow rule).
+    pub skills: SkillRegistry,
+    /// Skill discovery / safety knobs (M7).
+    pub skill_options: SkillDiscoveryOptions,
+    /// Slash-command registry (M7). Built-ins are enabled by default;
+    /// custom command files are loaded via the SDK builder or CLI flags.
+    pub slash_commands: SlashCommandRegistry,
 }
 
 impl Default for AgentOptions {
@@ -130,6 +141,9 @@ impl Default for AgentOptions {
             tool_search: ToolSearchOptions::default(),
             agents: AgentRegistry::default(),
             agent_runtime: AgentRuntimeOptions::default(),
+            skills: SkillRegistry::default(),
+            skill_options: SkillDiscoveryOptions::default(),
+            slash_commands: SlashCommandRegistry::new(true),
         }
     }
 }

@@ -82,6 +82,77 @@ pub struct SettingsFile {
     pub tool_search: Option<ToolSearchSettingsConfig>,
     #[serde(default)]
     pub agents: Option<AgentsSettingsConfig>,
+    /// M7: Skills configuration.
+    #[serde(default)]
+    pub skills: Option<SkillsSettingsConfig>,
+    /// M7: Slash-commands configuration.
+    #[serde(default)]
+    pub slash_commands: Option<SlashCommandsSettingsConfig>,
+    /// M7: Manual compaction configuration.
+    #[serde(default)]
+    pub compaction: Option<CompactionSettingsConfig>,
+}
+
+/// Settings for the M7 Skills subsystem.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsSettingsConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub project_path: Option<PathBuf>,
+    #[serde(default)]
+    pub user_path: Option<PathBuf>,
+    #[serde(default)]
+    pub allow_filesystem_skills: Option<bool>,
+    #[serde(default)]
+    pub compat_claude_skills: Option<bool>,
+    #[serde(default)]
+    pub max_skill_md_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_resource_bytes_per_skill: Option<usize>,
+    #[serde(default)]
+    pub max_loaded_skills_per_run: Option<usize>,
+    #[serde(default)]
+    pub load_resources_on_demand: Option<bool>,
+    #[serde(default)]
+    pub enforce_skill_allowed_tools: Option<bool>,
+}
+
+/// Settings for the M7 slash-command subsystem.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlashCommandsSettingsConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub project_path: Option<PathBuf>,
+    #[serde(default)]
+    pub user_path: Option<PathBuf>,
+    #[serde(default)]
+    pub compat_claude_commands: Option<bool>,
+    #[serde(default)]
+    pub enable_builtin_commands: Option<bool>,
+    #[serde(default)]
+    pub allow_bash_expansion: Option<bool>,
+    #[serde(default)]
+    pub allow_file_references: Option<bool>,
+    #[serde(default)]
+    pub max_expanded_prompt_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_expansion_output_bytes: Option<usize>,
+}
+
+/// Settings for the M7 manual compaction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionSettingsConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub preserve_recent_turns: Option<usize>,
+    #[serde(default)]
+    pub max_summary_tokens: Option<usize>,
 }
 
 /// Settings for the M6 subagent orchestrator. All fields optional; merged
@@ -221,6 +292,9 @@ pub struct Settings {
     pub mcp: Option<McpSettingsConfig>,
     pub tool_search: ToolSearchSettingsConfig,
     pub agents: Option<AgentsSettingsConfig>,
+    pub skills: Option<SkillsSettingsConfig>,
+    pub slash_commands: Option<SlashCommandsSettingsConfig>,
+    pub compaction: Option<CompactionSettingsConfig>,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -477,7 +551,100 @@ fn merge_into(dst: &mut Settings, src: SettingsFile, _is_user: bool) -> Result<(
     if let Some(agents) = src.agents {
         merge_agents_settings(&mut dst.agents, agents);
     }
+    if let Some(skills) = src.skills {
+        merge_skills_settings(&mut dst.skills, skills);
+    }
+    if let Some(slash) = src.slash_commands {
+        merge_slash_settings(&mut dst.slash_commands, slash);
+    }
+    if let Some(compact) = src.compaction {
+        merge_compaction_settings(&mut dst.compaction, compact);
+    }
     Ok(())
+}
+
+fn merge_skills_settings(dst: &mut Option<SkillsSettingsConfig>, src: SkillsSettingsConfig) {
+    let target = dst.get_or_insert_with(SkillsSettingsConfig::default);
+    if src.enabled.is_some() {
+        target.enabled = src.enabled;
+    }
+    if src.project_path.is_some() {
+        target.project_path = src.project_path;
+    }
+    if src.user_path.is_some() {
+        target.user_path = src.user_path;
+    }
+    if src.allow_filesystem_skills.is_some() {
+        target.allow_filesystem_skills = src.allow_filesystem_skills;
+    }
+    if src.compat_claude_skills.is_some() {
+        target.compat_claude_skills = src.compat_claude_skills;
+    }
+    if src.max_skill_md_bytes.is_some() {
+        target.max_skill_md_bytes = src.max_skill_md_bytes;
+    }
+    if src.max_resource_bytes_per_skill.is_some() {
+        target.max_resource_bytes_per_skill = src.max_resource_bytes_per_skill;
+    }
+    if src.max_loaded_skills_per_run.is_some() {
+        target.max_loaded_skills_per_run = src.max_loaded_skills_per_run;
+    }
+    if src.load_resources_on_demand.is_some() {
+        target.load_resources_on_demand = src.load_resources_on_demand;
+    }
+    if src.enforce_skill_allowed_tools.is_some() {
+        target.enforce_skill_allowed_tools = src.enforce_skill_allowed_tools;
+    }
+}
+
+fn merge_slash_settings(
+    dst: &mut Option<SlashCommandsSettingsConfig>,
+    src: SlashCommandsSettingsConfig,
+) {
+    let target = dst.get_or_insert_with(SlashCommandsSettingsConfig::default);
+    if src.enabled.is_some() {
+        target.enabled = src.enabled;
+    }
+    if src.project_path.is_some() {
+        target.project_path = src.project_path;
+    }
+    if src.user_path.is_some() {
+        target.user_path = src.user_path;
+    }
+    if src.compat_claude_commands.is_some() {
+        target.compat_claude_commands = src.compat_claude_commands;
+    }
+    if src.enable_builtin_commands.is_some() {
+        target.enable_builtin_commands = src.enable_builtin_commands;
+    }
+    if src.allow_bash_expansion.is_some() {
+        target.allow_bash_expansion = src.allow_bash_expansion;
+    }
+    if src.allow_file_references.is_some() {
+        target.allow_file_references = src.allow_file_references;
+    }
+    if src.max_expanded_prompt_bytes.is_some() {
+        target.max_expanded_prompt_bytes = src.max_expanded_prompt_bytes;
+    }
+    if src.max_expansion_output_bytes.is_some() {
+        target.max_expansion_output_bytes = src.max_expansion_output_bytes;
+    }
+}
+
+fn merge_compaction_settings(
+    dst: &mut Option<CompactionSettingsConfig>,
+    src: CompactionSettingsConfig,
+) {
+    let target = dst.get_or_insert_with(CompactionSettingsConfig::default);
+    if src.enabled.is_some() {
+        target.enabled = src.enabled;
+    }
+    if src.preserve_recent_turns.is_some() {
+        target.preserve_recent_turns = src.preserve_recent_turns;
+    }
+    if src.max_summary_tokens.is_some() {
+        target.max_summary_tokens = src.max_summary_tokens;
+    }
 }
 
 fn merge_agents_settings(dst: &mut Option<AgentsSettingsConfig>, src: AgentsSettingsConfig) {

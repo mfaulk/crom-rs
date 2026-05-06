@@ -510,6 +510,62 @@ pub(crate) async fn run_loop(
     };
     let _ = subagent_runtime;
 
+    // M7: Register the built-in `Skill` tool when Skills are configured
+    // and the parent has been granted access to it. Skills are
+    // never auto-approved by `acceptEdits`; the tool's permission kind is
+    // `Orchestration`.
+    let loaded_skills_state = crate::skills::LoadedSkillsState::new();
+    let skill_tool_allowed = options
+        .allowed_tools
+        .iter()
+        .any(|n| n == crate::skills::SKILL_TOOL_NAME)
+        || options.allowed_tool_rules.iter().any(|r| {
+            matches!(r,
+                crate::tool_rule::ToolRule::ExactTool(n) if n == crate::skills::SKILL_TOOL_NAME
+            )
+        });
+    if !options.skills.is_empty() && skill_tool_allowed {
+        let registry_arc = Arc::new(options.skills.clone());
+        let skill_tool = Arc::new(crate::skills::SkillTool::new(
+            registry_arc.clone(),
+            options.skill_options.clone(),
+            loaded_skills_state.clone(),
+        )) as Arc<dyn Tool>;
+        tools.register(skill_tool);
+        let summaries = registry_arc.list();
+        emit(
+            &tx,
+            &session_sink,
+            &session_id,
+            AgentEvent::SkillRegistryLoaded(crate::events::SkillRegistryLoaded {
+                skills: summaries,
+            }),
+        )
+        .await;
+        emit_telemetry(
+            &telemetry_sink,
+            AgentTelemetryEvent::SkillRegistryLoaded {
+                session_id: session_id.clone(),
+                run_id: cfg.run_id.clone(),
+                skill_count: registry_arc.len(),
+            },
+        )
+        .await;
+    }
+
+    if !options.slash_commands.list().is_empty() {
+        emit(
+            &tx,
+            &session_sink,
+            &session_id,
+            AgentEvent::SlashCommandRegistryLoaded(crate::events::SlashCommandRegistryLoaded {
+                commands: options.slash_commands.list(),
+            }),
+        )
+        .await;
+    }
+    let _ = loaded_skills_state;
+
     // Build the catalog before the first model request so tool loading can
     // resolve deterministically from the complete local + MCP tool set.
     let provisional_allowed_tools = if options.allowed_tools.is_empty() {
@@ -610,6 +666,8 @@ pub(crate) async fn run_loop(
             tools: init_tool_names.into_iter().collect(),
             permission_mode: options.permission_mode,
             mcp_servers: mcp_report.statuses.clone(),
+            skills: options.skills.list(),
+            slash_commands: options.slash_commands.list(),
         };
         emit(
             &tx,

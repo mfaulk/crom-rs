@@ -5,6 +5,7 @@ pub mod agents;
 pub mod builtin_hooks;
 pub mod checkpoint;
 pub mod client;
+pub mod compaction;
 pub mod conversation;
 pub mod errors;
 pub mod events;
@@ -16,6 +17,8 @@ pub mod policy;
 pub mod provider;
 pub mod run_id;
 pub mod settings;
+pub mod skills;
+pub mod slash;
 pub mod telemetry;
 pub mod todo;
 pub mod tool;
@@ -48,19 +51,25 @@ pub use code_agent_mcp::{
     McpSettingsConfig, McpToolCallCompleted, McpToolCallFailed, McpToolCallStarted, McpToolSummary,
     McpToolsDiscovered, McpTransportKind, StdioMcpServerConfig, StreamableHttpMcpServerConfig,
 };
+pub use compaction::{
+    compact_conversation, compact_conversation_with_summarizer, deterministic_summary,
+    CompactionOptions, CompactionPreservePolicy, CompactionResult,
+};
 pub use conversation::{
     AssistantContent, AssistantMessage, ContentBlock, Conversation, Message, MessageRole,
     SystemInit, ToolCall, ToolResult as ConvToolResult, ToolResultContent,
 };
 pub use errors::{AgentError, ProviderError, ToolError};
 pub use events::{
-    AgentEvent, AgentRegistryLoaded, AgentResult, CheckpointEventPayload, HookEvaluated,
-    HookOutcomeKind, InterruptedEvent, PolicyDecisionEvent, ResultSubtype, SubagentCancelled,
-    SubagentEvent as SubagentForwardedEvent, SubagentFailed, SubagentStart, SubagentStop,
-    SubagentTimedOut, TodoUpdate, ToolCallCompleted, ToolCallDenied, ToolCallStarted,
-    ToolCatalogBuilt, ToolContextBudgetUpdated, ToolDeferred, ToolDisabled, ToolLoaded,
-    ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed, ToolSearchStarted,
-    UserToolResult,
+    AgentEvent, AgentRegistryLoaded, AgentResult, CheckpointEventPayload, CompactBoundary,
+    CompactionTrigger, HookEvaluated, HookOutcomeKind, InterruptedEvent, PolicyDecisionEvent,
+    ResultSubtype, SkillInvocationFailed, SkillLoaded, SkillRegistryLoaded, SkillResourceLoaded,
+    SlashCommandCompleted, SlashCommandExpanded, SlashCommandFailed, SlashCommandRegistryLoaded,
+    SlashCommandStarted, SubagentCancelled, SubagentEvent as SubagentForwardedEvent,
+    SubagentFailed, SubagentStart, SubagentStop, SubagentTimedOut, TodoUpdate, ToolCallCompleted,
+    ToolCallDenied, ToolCallStarted, ToolCatalogBuilt, ToolContextBudgetUpdated, ToolDeferred,
+    ToolDisabled, ToolLoaded, ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed,
+    ToolSearchStarted, UserToolResult,
 };
 pub use hooks::{
     aggregate, Hook, HookAddedContext, HookAggregateDecision, HookCallRecord, HookError,
@@ -79,9 +88,25 @@ pub use policy::{
 pub use provider::{ModelEvent, ModelProvider, ModelRequest};
 pub use run_id::RunId;
 pub use settings::{
-    AgentsSettingsConfig, CheckpointRetentionConfig, CheckpointingConfig, HooksConfig,
-    ProjectInstructionsMode, SettingSource, Settings, SettingsError, SettingsFile,
-    ToolLimitsConfig, ValidationConfig,
+    AgentsSettingsConfig, CheckpointRetentionConfig, CheckpointingConfig, CompactionSettingsConfig,
+    HooksConfig, ProjectInstructionsMode, SettingSource, Settings, SettingsError, SettingsFile,
+    SkillsSettingsConfig, SlashCommandsSettingsConfig, ToolLimitsConfig, ValidationConfig,
+};
+pub use skills::{
+    compat_claude_skills_dir, filesystem_skills_dir, is_identifier_safe_skill_name,
+    load_filesystem_skills, parse_skill_md, resource_kind_for, LoadedSkillsSnapshot,
+    LoadedSkillsState, SkillDefinition, SkillDiscoveryOptions, SkillDiscoveryPath, SkillError,
+    SkillRegistry, SkillResourceKind, SkillResourceSummary, SkillSource, SkillSummary, SkillTool,
+    SkillToolInput, SkillToolResult, DEFAULT_MAX_SKILL_MD_BYTES, SKILL_TOOL_NAME,
+};
+pub use slash::{
+    builtin_command_summary, custom_commands_dir, expand_custom_command,
+    is_identifier_safe_command_name, load_custom_commands, parse_custom_command,
+    parse_slash_command, render_synthetic_skill_prompt, BuiltInSlashCommand,
+    CustomSlashCommandDefinition, CustomSlashCommandError, ExpandedToolCallSummary,
+    ParsedSlashCommand, SlashBuiltinResult, SlashCommandDispatch, SlashCommandError,
+    SlashCommandHandler, SlashCommandRegistry, SlashCommandSource, SlashCommandSummary,
+    SlashExpansionOptions, SlashExpansionResult,
 };
 pub use telemetry::{AgentTelemetryEvent, ModelPricing, SessionLoadKind, TelemetryOutcome};
 pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};
