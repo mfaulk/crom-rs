@@ -110,4 +110,12 @@ pub struct SystemInit {
     pub permission_mode: crate::permission::PermissionMode,
     #[serde(default)]
     pub mcp_servers: Vec<code_agent_mcp::McpServerStatus>,
+    /// Compact summaries of registered Skills (M7). Full Skill bodies are
+    /// loaded on demand through the `Skill` tool — the initial context only
+    /// sees these summaries.
+    #[serde(default)]
+    pub skills: Vec<crate::skills::SkillSummary>,
+    /// Compact summaries of registered slash commands (M7).
+    #[serde(default)]
+    pub slash_commands: Vec<crate::slash::SlashCommandSummary>,
 }

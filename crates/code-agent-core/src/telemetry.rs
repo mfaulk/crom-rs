@@ -290,6 +290,84 @@ pub enum AgentTelemetryEvent {
         subagent_session_id: SessionId,
         timeout_ms: u64,
     },
+    // ----- M7 skills + slash commands -----
+    SkillRegistryLoaded {
+        session_id: SessionId,
+        run_id: RunId,
+        skill_count: usize,
+    },
+    SkillLoaded {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        skill_name: String,
+        loaded_resource_count: usize,
+        bytes_loaded: usize,
+    },
+    SkillResourceLoaded {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        skill_name: String,
+        path: String,
+        size_bytes: u64,
+        truncated: bool,
+    },
+    SkillInvocationFailed {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        skill_name: String,
+        error_category: String,
+    },
+    SlashCommandRegistryLoaded {
+        session_id: SessionId,
+        run_id: RunId,
+        command_count: usize,
+    },
+    SlashCommandStarted {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        command: String,
+        source: String,
+    },
+    SlashCommandExpanded {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        command: String,
+        file_ref_count: usize,
+        bash_expansion_count: usize,
+        expanded_bytes: usize,
+        truncated: bool,
+    },
+    SlashCommandCompleted {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        command: String,
+        duration_ms: u64,
+        outcome: TelemetryOutcome,
+    },
+    SlashCommandFailed {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        command: String,
+        error_category: String,
+    },
+    CompactStarted {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        pre_messages: usize,
+    },
+    CompactCompleted {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        pre_messages: usize,
+        post_messages: usize,
+        preserved_recent_turns: usize,
+        duration_ms: u64,
+    },
+    CompactFailed {
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        error_category: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

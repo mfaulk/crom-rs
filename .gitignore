@@ -7,6 +7,11 @@
 # M6 demos also commit their subagent definitions.
 !examples/*/.agent/agents/
 !examples/*/.agent/agents/*.md
+# M7 demos also commit their Skill and slash-command definitions.
+!examples/*/.agent/skills/
+!examples/*/.agent/skills/**
+!examples/*/.agent/commands/
+!examples/*/.agent/commands/**
 *.swp
 .DS_Store
 .env

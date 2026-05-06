@@ -15,6 +15,7 @@ exclude = [
     "examples/checkpoint-demo",
     "examples/mcp-demo",
     "examples/subagent-demo",
+    "examples/skills-demo",
 ]
 
 [workspace.package]

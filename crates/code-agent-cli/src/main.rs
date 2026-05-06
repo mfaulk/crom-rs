@@ -85,6 +85,79 @@ enum Command {
     /// Manage and run subagents.
     #[command(subcommand)]
     Agents(AgentsCommand),
+    /// Manage Skills.
+    #[command(subcommand)]
+    Skills(SkillsCommand),
+    /// Manage slash commands.
+    #[command(subcommand)]
+    Commands(CommandsCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillsCommand {
+    /// List discovered Skills.
+    List(SkillsCommonArgs),
+    /// Show a Skill (frontmatter + body preview).
+    Show {
+        skill_name: String,
+        #[command(flatten)]
+        common: SkillsCommonArgs,
+    },
+    /// Validate every discovered Skill.
+    Validate(SkillsCommonArgs),
+    /// Inspect a Skill's resources, sizes, and tool rules.
+    Inspect {
+        skill_name: String,
+        #[command(flatten)]
+        common: SkillsCommonArgs,
+    },
+    /// Create a skeleton Skill directory.
+    Init {
+        name: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+    },
+}
+
+#[derive(Parser, Debug, Clone)]
+struct SkillsCommonArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    /// Path to the Skills directory (default `.agent/skills`).
+    #[arg(long)]
+    skills: Option<PathBuf>,
+    /// Enable `.claude/skills` compatibility loading.
+    #[arg(long)]
+    compat_claude_skills: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum CommandsCommand {
+    /// List slash commands.
+    List(CommandsCommonArgs),
+    /// Show a slash command (source + body preview).
+    Show {
+        command_name: String,
+        #[command(flatten)]
+        common: CommandsCommonArgs,
+    },
+    /// Validate every custom command file.
+    Validate(CommandsCommonArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+struct CommandsCommonArgs {
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    /// Path to the custom commands directory (default `.agent/commands`).
+    #[arg(long)]
+    commands: Option<PathBuf>,
+    /// Path to the Skills directory (so Skill-backed commands appear).
+    #[arg(long)]
+    skills: Option<PathBuf>,
+    /// Disable built-in commands in the listing.
+    #[arg(long)]
+    no_builtins: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -459,6 +532,24 @@ struct CommonArgs {
     /// When set, child events are interleaved into the parent stream.
     #[arg(long)]
     show_subagent_events: bool,
+    /// Path to Skills directory (default `.agent/skills`).
+    #[arg(long)]
+    skills: Option<PathBuf>,
+    /// Disable Skills entirely.
+    #[arg(long)]
+    no_skills: bool,
+    /// Path to custom commands directory (default `.agent/commands`).
+    #[arg(long)]
+    commands: Option<PathBuf>,
+    /// Disable slash command dispatch.
+    #[arg(long)]
+    no_slash_commands: bool,
+    /// Enable `.claude/skills` compatibility loading.
+    #[arg(long)]
+    compat_claude_skills: bool,
+    /// Enable `.claude/commands` compatibility loading.
+    #[arg(long)]
+    compat_claude_commands: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -752,6 +843,21 @@ async fn main() -> ExitCode {
         Command::Rewind(args) => cmd_rewind(args).await,
         Command::Mcp(args) => cmd_mcp(args).await,
         Command::Tools(args) => cmd_tools(args).await,
+        Command::Skills(SkillsCommand::List(args)) => cmd_skills_list(args).await,
+        Command::Skills(SkillsCommand::Show { skill_name, common }) => {
+            cmd_skills_show(skill_name, common).await
+        }
+        Command::Skills(SkillsCommand::Validate(args)) => cmd_skills_validate(args).await,
+        Command::Skills(SkillsCommand::Inspect { skill_name, common }) => {
+            cmd_skills_inspect(skill_name, common).await
+        }
+        Command::Skills(SkillsCommand::Init { name, cwd }) => cmd_skills_init(name, cwd).await,
+        Command::Commands(CommandsCommand::List(args)) => cmd_commands_list(args).await,
+        Command::Commands(CommandsCommand::Show {
+            command_name,
+            common,
+        }) => cmd_commands_show(command_name, common).await,
+        Command::Commands(CommandsCommand::Validate(args)) => cmd_commands_validate(args).await,
     };
 
     match result {
@@ -1000,6 +1106,14 @@ async fn resolve_common(
         tool_search,
         agents: agent_registry.clone(),
         agent_runtime: agent_runtime_options.clone(),
+        skills: load_skills_for_run(&cwd, common, &settings)?,
+        skill_options: skill_options_for_run(common, &settings),
+        slash_commands: load_slash_registry_for_run(
+            &cwd,
+            common,
+            &settings,
+            &load_skills_for_run(&cwd, common, &settings)?,
+        )?,
     };
 
     // Build hooks from settings flags.
@@ -1396,7 +1510,435 @@ fn build_settings_summary(
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     let cfg = resolve_common(&args.common, true).await?;
-    run_one_shot(cfg, args.common.no_session, args.prompt, None, None).await
+    let prompt = match maybe_handle_slash_command(&cfg, &args.prompt).await? {
+        SlashOutcome::HandledLocally => return Ok(()),
+        SlashOutcome::Rewrite(p) => p,
+        SlashOutcome::Passthrough => args.prompt.clone(),
+    };
+    run_one_shot(cfg, args.common.no_session, prompt, None, None).await
+}
+
+/// Result of attempting to dispatch a slash command from a CLI prompt.
+enum SlashOutcome {
+    /// The slash command was handled entirely locally (e.g. `/help`,
+    /// `/skills`); no model turn is required.
+    HandledLocally,
+    /// The slash command was resolved to a Skill or custom command and
+    /// the synthetic prompt should replace the original.
+    Rewrite(String),
+    /// Not a slash command — keep the prompt as-is for the model.
+    Passthrough,
+}
+
+async fn maybe_handle_slash_command(cfg: &ResolvedRunConfig, raw: &str) -> Result<SlashOutcome> {
+    let parsed = match code_agent_core::parse_slash_command(raw) {
+        Ok(p) => p,
+        Err(code_agent_core::SlashCommandError::NotASlashCommand) => {
+            return Ok(SlashOutcome::Passthrough)
+        }
+        Err(e) => return Err(anyhow!("slash parse: {e}")),
+    };
+    let dispatch = match cfg.options.slash_commands.dispatch(parsed.clone()) {
+        Ok(d) => d,
+        Err(e) => return Err(anyhow!("slash dispatch: {e}")),
+    };
+    use code_agent_core::SlashCommandHandler;
+    match dispatch.handler {
+        SlashCommandHandler::BuiltIn(b) => {
+            handle_builtin_slash(b, cfg).await?;
+            Ok(SlashOutcome::HandledLocally)
+        }
+        SlashCommandHandler::Skill(name) => {
+            // Refuse skill-backed dispatch when the parent has not been
+            // granted the `Skill` tool. The model-facing `Skill` tool is
+            // gated on `allowed_tools`, and the slash path must respect
+            // the same gate so the CLI can't silently load instructions
+            // that the agent loop would refuse to expose.
+            if !skill_tool_is_allowed(&cfg.options) {
+                return Err(anyhow!(
+                    "skill `/{name}` requires the `Skill` tool to be in --allowed-tools \
+                     (or matched by an allow rule)"
+                ));
+            }
+            let state = code_agent_core::LoadedSkillsState::new();
+            let result = code_agent_core::SkillTool::load(
+                &cfg.options.skills,
+                &cfg.options.skill_options,
+                &state,
+                &name,
+            )
+            .map_err(|e| anyhow!("skill {name}: {e}"))?;
+            let def = cfg
+                .options
+                .skills
+                .get(&name)
+                .ok_or_else(|| anyhow!("skill {name} not registered"))?;
+            let synthetic = code_agent_core::render_synthetic_skill_prompt(&parsed, def, &result);
+            Ok(SlashOutcome::Rewrite(synthetic))
+        }
+        SlashCommandHandler::CustomFile(path) => {
+            let def = cfg
+                .options
+                .slash_commands
+                .custom(&parsed.full_name())
+                .cloned()
+                .ok_or_else(|| anyhow!("custom command not found at {}", path.display()))?;
+            let executor = make_cli_expansion_executor(cfg)?;
+            let opts = slash_expansion_options_from_settings(&cfg.settings);
+            let result =
+                code_agent_core::expand_custom_command(&parsed, &def, &opts, executor.as_ref())
+                    .await
+                    .map_err(|e| anyhow!("expansion failed: {e}"))?;
+            Ok(SlashOutcome::Rewrite(result.expanded_prompt))
+        }
+    }
+}
+
+/// Result of dispatching a slash command in `chat`. The chat loop owns an
+/// AgentClient instance, so built-in commands like `/compact` can act on
+/// the live conversation directly instead of just emitting an info line
+/// like the one-shot `run` path does.
+enum ChatSlashOutcome {
+    HandledLocally,
+    Rewrite(String),
+    Passthrough,
+}
+
+async fn maybe_handle_slash_command_for_chat(
+    cfg: &ResolvedRunConfig,
+    client: &mut AgentClient,
+    raw: &str,
+) -> Result<ChatSlashOutcome> {
+    let parsed = match code_agent_core::parse_slash_command(raw) {
+        Ok(p) => p,
+        Err(code_agent_core::SlashCommandError::NotASlashCommand) => {
+            return Ok(ChatSlashOutcome::Passthrough)
+        }
+        Err(e) => return Err(anyhow!("slash parse: {e}")),
+    };
+    let dispatch = match cfg.options.slash_commands.dispatch(parsed.clone()) {
+        Ok(d) => d,
+        Err(e) => return Err(anyhow!("slash dispatch: {e}")),
+    };
+    use code_agent_core::SlashCommandHandler;
+    match dispatch.handler {
+        SlashCommandHandler::BuiltIn(b) => {
+            handle_builtin_slash_for_chat(b, cfg, client).await?;
+            Ok(ChatSlashOutcome::HandledLocally)
+        }
+        SlashCommandHandler::Skill(name) => {
+            if !skill_tool_is_allowed(&cfg.options) {
+                return Err(anyhow!(
+                    "skill `/{name}` requires the `Skill` tool to be in --allowed-tools"
+                ));
+            }
+            let state = code_agent_core::LoadedSkillsState::new();
+            let result = code_agent_core::SkillTool::load(
+                &cfg.options.skills,
+                &cfg.options.skill_options,
+                &state,
+                &name,
+            )
+            .map_err(|e| anyhow!("skill {name}: {e}"))?;
+            let def = cfg
+                .options
+                .skills
+                .get(&name)
+                .ok_or_else(|| anyhow!("skill {name} not registered"))?;
+            let synthetic = code_agent_core::render_synthetic_skill_prompt(&parsed, def, &result);
+            Ok(ChatSlashOutcome::Rewrite(synthetic))
+        }
+        SlashCommandHandler::CustomFile(path) => {
+            let def = cfg
+                .options
+                .slash_commands
+                .custom(&parsed.full_name())
+                .cloned()
+                .ok_or_else(|| anyhow!("custom command not found at {}", path.display()))?;
+            let executor = make_cli_expansion_executor(cfg)?;
+            let opts = slash_expansion_options_from_settings(&cfg.settings);
+            let result =
+                code_agent_core::expand_custom_command(&parsed, &def, &opts, executor.as_ref())
+                    .await
+                    .map_err(|e| anyhow!("expansion failed: {e}"))?;
+            Ok(ChatSlashOutcome::Rewrite(result.expanded_prompt))
+        }
+    }
+}
+
+async fn handle_builtin_slash_for_chat(
+    b: code_agent_core::BuiltInSlashCommand,
+    cfg: &ResolvedRunConfig,
+    client: &mut AgentClient,
+) -> Result<()> {
+    use code_agent_core::BuiltInSlashCommand as B;
+    match b {
+        B::Compact => {
+            let compact_cfg = compaction_options_from_settings(&cfg.settings);
+            if !compact_cfg.enabled {
+                println!("[compact] disabled by configuration");
+                return Ok(());
+            }
+            match client.compact(compact_cfg).await {
+                Ok(b) => {
+                    println!(
+                        "[compact] {} -> {} messages ({} preserved)",
+                        b.pre_messages, b.post_messages, b.preserved_recent_turns
+                    );
+                }
+                Err(e) => println!("[compact-error] {e}"),
+            }
+        }
+        other => handle_builtin_slash(other, cfg).await?,
+    }
+    Ok(())
+}
+
+fn compaction_options_from_settings(settings: &Settings) -> code_agent_core::CompactionOptions {
+    let cfg = settings.compaction.clone().unwrap_or_default();
+    let mut opts = code_agent_core::CompactionOptions::default();
+    if let Some(v) = cfg.enabled {
+        opts.enabled = v;
+    }
+    if let Some(v) = cfg.preserve_recent_turns {
+        opts.preserve_recent_turns = v;
+    }
+    if let Some(v) = cfg.max_summary_tokens {
+        opts.max_summary_tokens = v;
+    }
+    opts
+}
+
+/// True iff the parent has been granted the `Skill` tool, either by name
+/// in `--allowed-tools` or by a structured allow rule.
+fn skill_tool_is_allowed(options: &AgentOptions) -> bool {
+    options
+        .allowed_tools
+        .iter()
+        .any(|n| n == code_agent_core::SKILL_TOOL_NAME)
+        || options.allowed_tool_rules.iter().any(|r| {
+            matches!(
+                r,
+                code_agent_core::ToolRule::ExactTool(n) if n == code_agent_core::SKILL_TOOL_NAME
+            )
+        })
+}
+
+/// Build [`SlashExpansionOptions`] from the merged settings. CLI overrides
+/// land via `--no-slash-commands` (handled earlier) and the
+/// `slash_commands.allow_*` / `max_*` knobs in `.agent/settings.json`.
+fn slash_expansion_options_from_settings(
+    settings: &Settings,
+) -> code_agent_core::SlashExpansionOptions {
+    let cfg = settings.slash_commands.clone().unwrap_or_default();
+    let mut opts = code_agent_core::SlashExpansionOptions::default();
+    if let Some(v) = cfg.allow_bash_expansion {
+        opts.allow_bash_expansion = v;
+    }
+    if let Some(v) = cfg.allow_file_references {
+        opts.allow_file_references = v;
+    }
+    if let Some(v) = cfg.max_expanded_prompt_bytes {
+        opts.max_expanded_prompt_bytes = v;
+    }
+    if let Some(v) = cfg.max_expansion_output_bytes {
+        opts.max_expansion_output_bytes = v;
+    }
+    opts
+}
+
+async fn handle_builtin_slash(
+    b: code_agent_core::BuiltInSlashCommand,
+    cfg: &ResolvedRunConfig,
+) -> Result<()> {
+    use code_agent_core::BuiltInSlashCommand as B;
+    match b {
+        B::Help => {
+            println!("Available slash commands:");
+            for s in cfg.options.slash_commands.list() {
+                let n = match &s.namespace {
+                    Some(ns) => format!("/{ns}:{}", s.name),
+                    None => format!("/{}", s.name),
+                };
+                println!("  {:<20} {}", n, s.description);
+            }
+        }
+        B::Context => {
+            println!("cwd:          {}", cfg.options.cwd.display());
+            println!("model:        {}", cfg.options.model);
+            println!("permission:   {:?}", cfg.options.permission_mode);
+            println!("max_turns:    {}", cfg.options.max_turns.unwrap_or(8));
+        }
+        B::Usage => {
+            println!("(usage stats are emitted at the end of each run)");
+        }
+        B::Tools => {
+            println!("Allowed tools: {:?}", cfg.options.allowed_tools);
+        }
+        B::Skills => {
+            for s in cfg.options.skills.list() {
+                println!("  {} — {}", s.name, s.description);
+            }
+        }
+        B::Agents => {
+            for s in cfg.options.agents.list() {
+                println!("  {} — {}", s.name, s.description);
+            }
+        }
+        B::Checkpoints => {
+            println!(
+                "(use `code-agent checkpoints list --cwd {}` to inspect checkpoints)",
+                cfg.options.cwd.display()
+            );
+        }
+        B::Compact => {
+            println!(
+                "(in one-shot mode there's no live conversation to compact; \
+                 use `/compact` from `code-agent chat`)"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn make_cli_expansion_executor(
+    cfg: &ResolvedRunConfig,
+) -> Result<Arc<dyn code_agent_core::slash::expansion::SlashExpansionExecutor>> {
+    // Build the ReadTool and BashTool with the same limits the agent loop
+    // uses. Routing expansion through these tools means slash `@file` and
+    // `!`bash`` reuse the existing path sandbox, output cap, timeout, and
+    // secret-redaction logic — there is no shadow code path for the
+    // riskiest expansion surface to bypass.
+    let limits = std::sync::Arc::new(tool_limits_from_settings(&cfg.settings));
+    Ok(Arc::new(CliExpansionExecutor {
+        cwd: cfg.options.cwd.clone(),
+        session_id: cfg.options.session_id.clone().unwrap_or_default(),
+        read: std::sync::Arc::new(code_agent_tools::ReadTool::new(limits.clone())),
+        bash: std::sync::Arc::new(code_agent_tools::BashTool::new(limits)),
+        hooks: cfg.hooks.clone(),
+        secret_redaction: cfg.settings.hooks.secret_redaction.unwrap_or(true),
+    }))
+}
+
+fn tool_limits_from_settings(settings: &Settings) -> ToolLimits {
+    let mut limits = ToolLimits::default();
+    if let Some(v) = settings.tool_limits.max_read_bytes {
+        limits.max_read_bytes = v;
+    }
+    if let Some(v) = settings.tool_limits.max_output_bytes {
+        limits.max_output_bytes = v;
+    }
+    if let Some(v) = settings.tool_limits.bash_timeout_seconds {
+        limits.bash_timeout = std::time::Duration::from_secs(v);
+    }
+    if let Some(v) = settings.tool_limits.max_glob_results {
+        limits.max_glob_results = v;
+    }
+    if let Some(v) = settings.tool_limits.max_grep_results {
+        limits.max_grep_results = v;
+    }
+    limits
+}
+
+struct CliExpansionExecutor {
+    cwd: PathBuf,
+    session_id: SessionId,
+    read: std::sync::Arc<code_agent_tools::ReadTool>,
+    bash: std::sync::Arc<code_agent_tools::BashTool>,
+    hooks: Hooks,
+    secret_redaction: bool,
+}
+
+impl CliExpansionExecutor {
+    /// Run the configured PreToolUse hooks. Returns an error if any hook
+    /// denies, so denials surface through the same `SlashCommandFailed`
+    /// path as other expansion failures.
+    async fn check_pre_tool_use(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> std::result::Result<(), code_agent_core::SlashCommandError> {
+        use code_agent_core::HookEventName;
+        let hook_input = code_agent_core::HookInput {
+            event: HookEventName::PreToolUse,
+            session_id: self.session_id.clone(),
+            cwd: self.cwd.clone(),
+            run_id: code_agent_core::RunId::new(),
+            turn_index: 0,
+            tool_name: Some(tool_name.to_string()),
+            tool_input: Some(input),
+            tool_result: None,
+            prompt: None,
+            stop_reason: None,
+            metadata: serde_json::Value::Null,
+        };
+        let records = self.hooks.dispatch(&hook_input).await;
+        let (decision, _) = code_agent_core::aggregate(&records);
+        if let code_agent_core::HookAggregateDecision::Deny { reason } = decision {
+            return Err(code_agent_core::SlashCommandError::ExpansionFailed(
+                format!("pre-tool-use hook denied: {reason}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl code_agent_core::slash::expansion::SlashExpansionExecutor for CliExpansionExecutor {
+    async fn read_file(
+        &self,
+        path: &str,
+    ) -> std::result::Result<String, code_agent_core::SlashCommandError> {
+        let input = serde_json::json!({"file_path": path});
+        self.check_pre_tool_use("Read", input.clone()).await?;
+        let ctx =
+            code_agent_core::ToolContext::new_minimal(self.cwd.clone(), self.session_id.clone());
+        use code_agent_core::Tool;
+        let result = self
+            .read
+            .execute(input, ctx)
+            .await
+            .map_err(|e| code_agent_core::SlashCommandError::ExpansionFailed(e.to_string()))?;
+        if result.is_error {
+            return Err(code_agent_core::SlashCommandError::ExpansionFailed(
+                result.flatten_text(),
+            ));
+        }
+        Ok(maybe_redact(result.flatten_text(), self.secret_redaction))
+    }
+
+    async fn run_bash(
+        &self,
+        command: &str,
+    ) -> std::result::Result<String, code_agent_core::SlashCommandError> {
+        let input = serde_json::json!({"command": command});
+        self.check_pre_tool_use("Bash", input.clone()).await?;
+        let ctx =
+            code_agent_core::ToolContext::new_minimal(self.cwd.clone(), self.session_id.clone());
+        use code_agent_core::Tool;
+        let result = self
+            .bash
+            .execute(input, ctx)
+            .await
+            .map_err(|e| code_agent_core::SlashCommandError::ExpansionFailed(e.to_string()))?;
+        if result.is_error {
+            return Err(code_agent_core::SlashCommandError::ExpansionFailed(
+                result.flatten_text(),
+            ));
+        }
+        Ok(maybe_redact(result.flatten_text(), self.secret_redaction))
+    }
+}
+
+/// Apply the project's secret-redaction pass to a captured string,
+/// matching the hook applied to live tool results.
+fn maybe_redact(text: String, enabled: bool) -> String {
+    if !enabled {
+        return text;
+    }
+    let v = serde_json::Value::String(text);
+    let redacted = code_agent_core::redact_secrets_in_value(&v);
+    redacted.as_str().map(str::to_string).unwrap_or_default()
 }
 
 async fn cmd_resume(args: ResumeArgs) -> Result<()> {
@@ -1900,11 +2442,23 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
     }
 
     if let Some(initial) = args.prompt.clone() {
-        if let Some(s) = &store {
-            let _ = append_user_prompt(s.as_ref(), &cfg.cwd, &session_id, &initial).await;
+        match maybe_handle_slash_command_for_chat(&cfg, &mut client, &initial).await? {
+            ChatSlashOutcome::HandledLocally => {}
+            ChatSlashOutcome::Rewrite(prompt) => {
+                if let Some(s) = &store {
+                    let _ = append_user_prompt(s.as_ref(), &cfg.cwd, &session_id, &prompt).await;
+                }
+                rotate_checkpoint(rotating_handle.as_ref(), &cfg.cwd, &session_id, cfg.quiet).await;
+                client.send_user_message(prompt).await?;
+            }
+            ChatSlashOutcome::Passthrough => {
+                if let Some(s) = &store {
+                    let _ = append_user_prompt(s.as_ref(), &cfg.cwd, &session_id, &initial).await;
+                }
+                rotate_checkpoint(rotating_handle.as_ref(), &cfg.cwd, &session_id, cfg.quiet).await;
+                client.send_user_message(initial).await?;
+            }
         }
-        rotate_checkpoint(rotating_handle.as_ref(), &cfg.cwd, &session_id, cfg.quiet).await;
-        client.send_user_message(initial).await?;
     }
 
     // Spawn a stdin reader.
@@ -1956,11 +2510,32 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
                         if trimmed.is_empty() {
                             continue;
                         }
-                        if let Some(s) = &store {
-                            let _ = append_user_prompt(s.as_ref(), &cfg.cwd, &session_id, trimmed).await;
+                        // Dispatch slash commands at the prompt boundary so
+                        // built-ins like `/help` and `/compact` work in chat
+                        // and Skill / custom-command rewrites flow through
+                        // the same path as one-shot `run`.
+                        match maybe_handle_slash_command_for_chat(&cfg, &mut client, trimmed)
+                            .await
+                        {
+                            Ok(ChatSlashOutcome::HandledLocally) => continue,
+                            Ok(ChatSlashOutcome::Rewrite(prompt)) => {
+                                if let Some(s) = &store {
+                                    let _ = append_user_prompt(s.as_ref(), &cfg.cwd, &session_id, &prompt).await;
+                                }
+                                rotate_checkpoint(rotating_handle.as_ref(), &cfg.cwd, &session_id, cfg.quiet).await;
+                                client.send_user_message(prompt).await?;
+                            }
+                            Ok(ChatSlashOutcome::Passthrough) => {
+                                if let Some(s) = &store {
+                                    let _ = append_user_prompt(s.as_ref(), &cfg.cwd, &session_id, trimmed).await;
+                                }
+                                rotate_checkpoint(rotating_handle.as_ref(), &cfg.cwd, &session_id, cfg.quiet).await;
+                                client.send_user_message(trimmed.to_string()).await?;
+                            }
+                            Err(e) => {
+                                eprintln!("[slash-error] {e}");
+                            }
                         }
-                        rotate_checkpoint(rotating_handle.as_ref(), &cfg.cwd, &session_id, cfg.quiet).await;
-                        client.send_user_message(trimmed.to_string()).await?;
                     }
                     None => break,
                 }
@@ -2697,6 +3272,429 @@ async fn cmd_agents_run(
     Ok(())
 }
 
+/// Resolve and load the Skills registry for a `run`/`chat` session.
+fn load_skills_for_run(
+    cwd: &Path,
+    common: &CommonArgs,
+    settings: &Settings,
+) -> Result<code_agent_core::SkillRegistry> {
+    if common.no_skills {
+        return Ok(code_agent_core::SkillRegistry::new());
+    }
+    let cfg = settings.skills.clone().unwrap_or_default();
+    if matches!(cfg.enabled, Some(false)) {
+        return Ok(code_agent_core::SkillRegistry::new());
+    }
+    let project_dir = if let Some(p) = &common.skills {
+        resolve_against_cwd(cwd, p)
+    } else if let Some(p) = &cfg.project_path {
+        resolve_against_cwd(cwd, p)
+    } else {
+        code_agent_core::filesystem_skills_dir(cwd)
+    };
+    let mut paths = vec![code_agent_core::SkillDiscoveryPath {
+        source: code_agent_core::SkillSource::Project,
+        path: project_dir,
+    }];
+    if let Some(user) = cfg.user_path.clone() {
+        // User paths can be absolute or `~`-prefixed; treat relative as
+        // relative to cwd to match project paths.
+        paths.push(code_agent_core::SkillDiscoveryPath {
+            source: code_agent_core::SkillSource::User,
+            path: resolve_against_cwd(cwd, &user),
+        });
+    }
+    let compat = common.compat_claude_skills || cfg.compat_claude_skills.unwrap_or(false);
+    if compat {
+        paths.push(code_agent_core::SkillDiscoveryPath {
+            source: code_agent_core::SkillSource::CompatibilityClaude,
+            path: code_agent_core::compat_claude_skills_dir(cwd),
+        });
+    }
+    let opts = skill_options_for_run(common, settings);
+    code_agent_core::SkillRegistry::discover(&paths, &opts)
+        .map_err(|e| anyhow!("skills discover: {e}"))
+}
+
+fn skill_options_for_run(
+    common: &CommonArgs,
+    settings: &Settings,
+) -> code_agent_core::SkillDiscoveryOptions {
+    let mut opts = code_agent_core::SkillDiscoveryOptions::default();
+    let cfg = settings.skills.clone().unwrap_or_default();
+    if let Some(v) = cfg.allow_filesystem_skills {
+        opts.allow_filesystem_skills = v;
+    }
+    opts.compat_claude_skills =
+        common.compat_claude_skills || cfg.compat_claude_skills.unwrap_or(false);
+    if let Some(v) = cfg.max_skill_md_bytes {
+        opts.max_skill_md_bytes = v;
+    }
+    if let Some(v) = cfg.max_resource_bytes_per_skill {
+        opts.max_resource_bytes_per_skill = v;
+    }
+    if let Some(v) = cfg.max_loaded_skills_per_run {
+        opts.max_loaded_skills_per_run = v;
+    }
+    if let Some(v) = cfg.load_resources_on_demand {
+        opts.load_resources_on_demand = v;
+    }
+    if let Some(v) = cfg.enforce_skill_allowed_tools {
+        opts.enforce_skill_allowed_tools = v;
+    }
+    opts
+}
+
+fn load_slash_registry_for_run(
+    cwd: &Path,
+    common: &CommonArgs,
+    settings: &Settings,
+    skills: &code_agent_core::SkillRegistry,
+) -> Result<code_agent_core::SlashCommandRegistry> {
+    if common.no_slash_commands {
+        return Ok(code_agent_core::SlashCommandRegistry::new(false));
+    }
+    let cfg = settings.slash_commands.clone().unwrap_or_default();
+    if matches!(cfg.enabled, Some(false)) {
+        return Ok(code_agent_core::SlashCommandRegistry::new(false));
+    }
+    let builtins = cfg.enable_builtin_commands.unwrap_or(true);
+    let dir = if let Some(p) = &common.commands {
+        resolve_against_cwd(cwd, p)
+    } else if let Some(p) = &cfg.project_path {
+        resolve_against_cwd(cwd, p)
+    } else {
+        code_agent_core::custom_commands_dir(cwd)
+    };
+    let (mut defs, errors) = code_agent_core::load_custom_commands(&dir);
+    for e in errors {
+        eprintln!("[commands] {e}");
+    }
+    // M7: optionally also load user-level and `.claude/commands/`
+    // compatibility command files.
+    if let Some(user) = cfg.user_path.clone() {
+        let resolved = resolve_against_cwd(cwd, &user);
+        let (mut user_defs, user_errs) = code_agent_core::load_custom_commands(&resolved);
+        for e in user_errs {
+            eprintln!("[commands:user] {e}");
+        }
+        defs.append(&mut user_defs);
+    }
+    let compat_commands =
+        common.compat_claude_commands || cfg.compat_claude_commands.unwrap_or(false);
+    if compat_commands {
+        let claude = cwd.join(".claude").join("commands");
+        let (mut compat_defs, compat_errs) = code_agent_core::load_custom_commands(&claude);
+        for e in compat_errs {
+            eprintln!("[commands:compat] {e}");
+        }
+        defs.append(&mut compat_defs);
+    }
+    let reg = code_agent_core::SlashCommandRegistry::new(builtins)
+        .with_custom(defs)
+        .with_skills(skills);
+    Ok(reg)
+}
+
+/// Resolve a configured path against `cwd`. If `p` is absolute, return it
+/// unchanged; if relative, join onto `cwd`. Mirrors the agents-path
+/// handling so `--cwd examples/skills-demo` works regardless of where the
+/// CLI was invoked from.
+fn resolve_against_cwd(cwd: &Path, p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
+/// Resolve the Skills directory and load the registry.
+fn load_skills_for_cli(common: &SkillsCommonArgs) -> Result<code_agent_core::SkillRegistry> {
+    let cwd = common
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", common.cwd.display()))?;
+    let dir = if let Some(p) = &common.skills {
+        resolve_against_cwd(&cwd, p)
+    } else {
+        code_agent_core::filesystem_skills_dir(&cwd)
+    };
+    let mut paths = vec![code_agent_core::SkillDiscoveryPath {
+        source: code_agent_core::SkillSource::Project,
+        path: dir,
+    }];
+    if common.compat_claude_skills {
+        paths.push(code_agent_core::SkillDiscoveryPath {
+            source: code_agent_core::SkillSource::CompatibilityClaude,
+            path: code_agent_core::compat_claude_skills_dir(&cwd),
+        });
+    }
+    let opts = code_agent_core::SkillDiscoveryOptions {
+        compat_claude_skills: common.compat_claude_skills,
+        ..code_agent_core::SkillDiscoveryOptions::default()
+    };
+    code_agent_core::SkillRegistry::discover(&paths, &opts)
+        .map_err(|e| anyhow!("skills discover: {e}"))
+}
+
+async fn cmd_skills_list(common: SkillsCommonArgs) -> Result<()> {
+    let reg = load_skills_for_cli(&common)?;
+    if reg.is_empty() {
+        println!("(no skills registered)");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<8} {:<10} DESCRIPTION",
+        "NAME", "SOURCE", "RESOURCES"
+    );
+    for s in reg.list() {
+        println!(
+            "{:<24} {:<8} {:<10} {}",
+            s.name,
+            s.source.as_str(),
+            s.resource_count,
+            truncate(&s.description, 80)
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_skills_show(name: String, common: SkillsCommonArgs) -> Result<()> {
+    let reg = load_skills_for_cli(&common)?;
+    let def = reg
+        .get(&name)
+        .ok_or_else(|| anyhow!("unknown skill {name:?}"))?;
+    println!("name:              {}", def.name);
+    println!("description:       {}", def.description);
+    println!("source:            {}", def.source.as_str());
+    if let Some(hint) = &def.argument_hint {
+        println!("argument-hint:     {hint}");
+    }
+    if !def.allowed_tools.is_empty() {
+        println!("allowed-tools:     {} rule(s)", def.allowed_tools.len());
+    }
+    if !def.disallowed_tools.is_empty() {
+        println!("disallowed-tools:  {} rule(s)", def.disallowed_tools.len());
+    }
+    if !def.resources.is_empty() {
+        println!("resources:");
+        for r in &def.resources {
+            println!("  - {r}");
+        }
+    }
+    println!();
+    println!("--- instructions ---");
+    let preview: String = def.instructions.chars().take(2048).collect();
+    println!("{preview}");
+    if def.instructions.len() > preview.len() {
+        println!("…[truncated]");
+    }
+    Ok(())
+}
+
+async fn cmd_skills_validate(common: SkillsCommonArgs) -> Result<()> {
+    let reg = load_skills_for_cli(&common)?;
+    if reg.is_empty() {
+        println!("(no skills to validate)");
+        return Ok(());
+    }
+    let mut bad = 0usize;
+    for (name, def) in reg.iter() {
+        match def.validate_structural() {
+            Ok(()) => println!("ok    {name}"),
+            Err(e) => {
+                println!("error {name}: {e}");
+                bad += 1;
+            }
+        }
+    }
+    if bad > 0 {
+        Err(anyhow!("{bad} skill(s) failed validation"))
+    } else {
+        Ok(())
+    }
+}
+
+async fn cmd_skills_inspect(name: String, common: SkillsCommonArgs) -> Result<()> {
+    let reg = load_skills_for_cli(&common)?;
+    let def = reg
+        .get(&name)
+        .ok_or_else(|| anyhow!("unknown skill {name:?}"))?;
+    println!("name:        {}", def.name);
+    println!("source:      {}", def.source.as_str());
+    println!("root:        {}", def.root_dir.display());
+    let opts = code_agent_core::SkillDiscoveryOptions::default();
+    let state = code_agent_core::LoadedSkillsState::new();
+    let result = code_agent_core::SkillTool::load(&reg, &opts, &state, &name)
+        .map_err(|e| anyhow!("inspect {name}: {e}"))?;
+    println!("instructions bytes: {}", result.instructions.len());
+    println!("declared resources: {}", def.resources.len());
+    let mut total: u64 = 0;
+    for r in &result.resources {
+        let truncated = if r.truncated { " (truncated)" } else { "" };
+        println!(
+            "  {:<48} {:>10}  loaded={}{}",
+            r.path, r.size_bytes, r.loaded, truncated
+        );
+        total += r.size_bytes;
+    }
+    println!("total resource bytes: {total}");
+    if !def.allowed_tools.is_empty() {
+        println!("allowed-tools: {} rule(s)", def.allowed_tools.len());
+    }
+    if !def.disallowed_tools.is_empty() {
+        println!("disallowed-tools: {} rule(s)", def.disallowed_tools.len());
+    }
+    Ok(())
+}
+
+async fn cmd_skills_init(name: String, cwd: PathBuf) -> Result<()> {
+    if !code_agent_core::is_identifier_safe_skill_name(&name) {
+        return Err(anyhow!("skill name {name:?} must match [a-z0-9_-]{{1,64}}"));
+    }
+    let cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", cwd.display()))?;
+    let dir = code_agent_core::filesystem_skills_dir(&cwd).join(&name);
+    if dir.exists() {
+        return Err(anyhow!("{} already exists", dir.display()));
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let body = format!(
+        "---\nname: {name}\ndescription: TODO — describe this skill\nallowed-tools:\n  - Read\n  - Grep\n  - Glob\n---\n\n# {name}\n\nReplace this body with the procedure the model should follow when this\nSkill is loaded.\n"
+    );
+    let path = dir.join("SKILL.md");
+    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    println!("created {}", path.display());
+    Ok(())
+}
+
+fn load_commands_for_cli(
+    common: &CommandsCommonArgs,
+) -> Result<code_agent_core::SlashCommandRegistry> {
+    let cwd = common
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", common.cwd.display()))?;
+    let dir = if let Some(p) = &common.commands {
+        resolve_against_cwd(&cwd, p)
+    } else {
+        code_agent_core::custom_commands_dir(&cwd)
+    };
+    let (defs, errors) = code_agent_core::load_custom_commands(&dir);
+    for e in errors {
+        eprintln!("[commands] {e}");
+    }
+    let mut reg = code_agent_core::SlashCommandRegistry::new(!common.no_builtins).with_custom(defs);
+    let skills_dir = if let Some(p) = &common.skills {
+        resolve_against_cwd(&cwd, p)
+    } else {
+        code_agent_core::filesystem_skills_dir(&cwd)
+    };
+    let (skill_defs, _skill_errors) = code_agent_core::load_filesystem_skills(
+        &skills_dir,
+        code_agent_core::SkillSource::Project,
+        code_agent_core::DEFAULT_MAX_SKILL_MD_BYTES,
+    );
+    let mut sk = code_agent_core::SkillRegistry::new();
+    for d in skill_defs {
+        let _ = sk.register(d);
+    }
+    reg = reg.with_skills(&sk);
+    Ok(reg)
+}
+
+async fn cmd_commands_list(common: CommandsCommonArgs) -> Result<()> {
+    let reg = load_commands_for_cli(&common)?;
+    let cmds = reg.list();
+    if cmds.is_empty() {
+        println!("(no commands)");
+        return Ok(());
+    }
+    println!("{:<24} {:<8} {:<8} DESCRIPTION", "NAME", "SOURCE", "ARGS");
+    for s in cmds {
+        let full = match &s.namespace {
+            Some(ns) => format!("{}:{}", ns, s.name),
+            None => s.name.clone(),
+        };
+        println!(
+            "{:<24} {:<8} {:<8} {}",
+            full,
+            s.source.label(),
+            s.argument_hint.clone().unwrap_or_default(),
+            truncate(&s.description, 80)
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_commands_show(name: String, common: CommandsCommonArgs) -> Result<()> {
+    let reg = load_commands_for_cli(&common)?;
+    if let Some(def) = reg.custom(&name) {
+        println!("name:          {}", def.full_name());
+        println!("source:        custom file");
+        println!("path:          {}", def.source_path.display());
+        println!("description:   {}", def.description);
+        if let Some(h) = &def.argument_hint {
+            println!("argument-hint: {h}");
+        }
+        if let Some(m) = &def.model {
+            println!("model:         {m}");
+        }
+        if !def.allowed_tools.is_empty() {
+            println!("allowed-tools: {} rule(s)", def.allowed_tools.len());
+        }
+        if !def.disallowed_tools.is_empty() {
+            println!("disallowed:    {} rule(s)", def.disallowed_tools.len());
+        }
+        println!();
+        println!("--- body ---");
+        let preview: String = def.body.chars().take(2048).collect();
+        println!("{preview}");
+        if def.body.len() > preview.len() {
+            println!("…[truncated]");
+        }
+        return Ok(());
+    }
+    if let Some(b) = code_agent_core::BuiltInSlashCommand::from_name(&name) {
+        println!("name:        /{}", b.name());
+        println!("source:      builtin");
+        println!("description: {}", b.description());
+        return Ok(());
+    }
+    if reg.list().iter().any(|s| s.name == name) {
+        println!("name:        /{name}");
+        println!("source:      skill-backed");
+        return Ok(());
+    }
+    Err(anyhow!("unknown command {name:?}"))
+}
+
+async fn cmd_commands_validate(common: CommandsCommonArgs) -> Result<()> {
+    let cwd = common
+        .cwd
+        .canonicalize()
+        .with_context(|| format!("--cwd {}", common.cwd.display()))?;
+    let dir = if let Some(p) = &common.commands {
+        p.clone()
+    } else {
+        code_agent_core::custom_commands_dir(&cwd)
+    };
+    let (defs, errors) = code_agent_core::load_custom_commands(&dir);
+    let bad = errors.len();
+    for e in &errors {
+        eprintln!("error: {e}");
+    }
+    for def in &defs {
+        println!("ok    {}", def.full_name());
+    }
+    if bad > 0 {
+        Err(anyhow!("{bad} command file(s) failed validation"))
+    } else {
+        Ok(())
+    }
+}
+
 fn load_agent_registry_for_cli(
     common: &AgentsCommonArgs,
 ) -> Result<code_agent_core::AgentRegistry> {
@@ -3269,6 +4267,71 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
                 "[agent-error] {} timed out after {}s",
                 e.agent_name,
                 e.timeout_ms / 1000
+            );
+        }
+        AgentEvent::SkillRegistryLoaded(s) => {
+            if !quiet {
+                let names: Vec<&str> = s.skills.iter().map(|x| x.name.as_str()).collect();
+                println!(
+                    "[skills] discovered {} skills: {}",
+                    s.skills.len(),
+                    names.join(", ")
+                );
+            }
+        }
+        AgentEvent::SkillLoaded(s) => {
+            if !quiet {
+                println!(
+                    "[skill] loaded {} ({} resources)",
+                    s.name, s.loaded_resource_count
+                );
+            }
+        }
+        AgentEvent::SkillResourceLoaded(r) => {
+            if !quiet {
+                println!(
+                    "[skill] resource {}/{} ({} bytes{})",
+                    r.skill_name,
+                    r.path,
+                    r.size_bytes,
+                    if r.truncated { ", truncated" } else { "" }
+                );
+            }
+        }
+        AgentEvent::SkillInvocationFailed(e) => {
+            println!("[skill-error] {}: {}", e.name, e.reason);
+        }
+        AgentEvent::SlashCommandRegistryLoaded(s) => {
+            if !quiet {
+                println!("[slash] {} commands loaded", s.commands.len());
+            }
+        }
+        AgentEvent::SlashCommandStarted(s) => {
+            if !quiet {
+                println!("[slash] /{} ({})", s.command, s.source.label());
+            }
+        }
+        AgentEvent::SlashCommandExpanded(e) => {
+            if !quiet {
+                println!(
+                    "[slash] expanded {} file ref(s) and {} bash command(s)",
+                    e.file_refs.len(),
+                    e.bash_commands.len()
+                );
+            }
+        }
+        AgentEvent::SlashCommandCompleted(c) => {
+            if !quiet {
+                println!("[slash] /{} done ({}ms)", c.command, c.duration_ms);
+            }
+        }
+        AgentEvent::SlashCommandFailed(f) => {
+            println!("[slash-error] /{}: {}", f.command, f.reason);
+        }
+        AgentEvent::CompactBoundary(b) => {
+            println!(
+                "[compact] {} -> {} messages ({} preserved)",
+                b.pre_messages, b.post_messages, b.preserved_recent_turns
             );
         }
         AgentEvent::Result(r) => {

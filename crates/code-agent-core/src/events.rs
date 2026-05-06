@@ -62,6 +62,26 @@ pub enum AgentEvent {
     SubagentCancelled(SubagentCancelled),
     /// Subagent exceeded its per-run timeout.
     SubagentTimedOut(SubagentTimedOut),
+    /// Skill registry summary, emitted once after Skills are registered.
+    SkillRegistryLoaded(SkillRegistryLoaded),
+    /// Skill loaded into the current run.
+    SkillLoaded(SkillLoaded),
+    /// Skill resource loaded with safe summary.
+    SkillResourceLoaded(SkillResourceLoaded),
+    /// Skill invocation attempted but failed.
+    SkillInvocationFailed(SkillInvocationFailed),
+    /// Slash-command registry summary, emitted once after commands load.
+    SlashCommandRegistryLoaded(SlashCommandRegistryLoaded),
+    /// Slash command begun (just after parsing).
+    SlashCommandStarted(SlashCommandStarted),
+    /// Slash command body successfully expanded into a final prompt.
+    SlashCommandExpanded(SlashCommandExpanded),
+    /// Slash command finished dispatching (handler returned).
+    SlashCommandCompleted(SlashCommandCompleted),
+    /// Slash command failed (parsing, expansion, or handler).
+    SlashCommandFailed(SlashCommandFailed),
+    /// Manual conversation compaction completed.
+    CompactBoundary(CompactBoundary),
     Result(AgentResult),
 }
 
@@ -301,4 +321,84 @@ pub struct SubagentTimedOut {
     pub agent_name: String,
     pub subagent_session_id: SessionId,
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRegistryLoaded {
+    pub skills: Vec<crate::skills::SkillSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillLoaded {
+    pub name: String,
+    pub source: crate::skills::SkillSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub loaded_resource_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillResourceLoaded {
+    pub skill_name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillInvocationFailed {
+    pub name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashCommandRegistryLoaded {
+    pub commands: Vec<crate::slash::SlashCommandSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashCommandStarted {
+    pub command: String,
+    pub arguments: Vec<String>,
+    pub source: crate::slash::SlashCommandSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashCommandExpanded {
+    pub command: String,
+    pub expanded_prompt_preview: String,
+    pub file_refs: Vec<String>,
+    pub bash_commands: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashCommandCompleted {
+    pub command: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashCommandFailed {
+    pub command: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    ManualSlashCommand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactBoundary {
+    pub session_id: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+    pub pre_messages: usize,
+    pub post_messages: usize,
+    pub preserved_recent_turns: usize,
+    pub trigger: CompactionTrigger,
+    /// One-line summary of the older context (the body persisted to history).
+    pub summary_preview: String,
 }

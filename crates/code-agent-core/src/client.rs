@@ -236,6 +236,36 @@ impl AgentClientBuilder {
         self
     }
 
+    /// Register a single Skill definition.
+    pub fn skill(mut self, definition: crate::skills::SkillDefinition) -> Result<Self, AgentError> {
+        let opts = self.options.get_or_insert_with(AgentOptions::default);
+        opts.skills
+            .register(definition)
+            .map_err(|e| AgentError::InvalidConfig(e.to_string()))?;
+        Ok(self)
+    }
+
+    /// Replace the entire Skill registry.
+    pub fn skills(mut self, registry: crate::skills::SkillRegistry) -> Self {
+        let opts = self.options.get_or_insert_with(AgentOptions::default);
+        opts.skills = registry;
+        self
+    }
+
+    /// Override Skill discovery / safety options.
+    pub fn skill_options(mut self, options: crate::skills::SkillDiscoveryOptions) -> Self {
+        let opts = self.options.get_or_insert_with(AgentOptions::default);
+        opts.skill_options = options;
+        self
+    }
+
+    /// Replace the slash-command registry.
+    pub fn slash_commands(mut self, registry: crate::slash::SlashCommandRegistry) -> Self {
+        let opts = self.options.get_or_insert_with(AgentOptions::default);
+        opts.slash_commands = registry;
+        self
+    }
+
     pub async fn build(self) -> Result<AgentClient, AgentError> {
         let provider = self
             .provider
@@ -602,6 +632,88 @@ impl AgentClient {
     pub async fn tool_context_budget(&self) -> Result<ToolContextBudget, AgentError> {
         let (catalog, state, options) = self.build_tool_catalog_snapshot().await?;
         Ok(catalog.context_budget(&state, &options))
+    }
+
+    /// List the Skills currently registered with the client.
+    pub async fn list_skills(&self) -> Result<Vec<crate::skills::SkillSummary>, AgentError> {
+        let opts = self.inner.options.lock().await;
+        Ok(opts.skills.list())
+    }
+
+    /// Load a Skill by name and return its instructions and resource summaries.
+    /// This bypasses the `Skill` tool's permission gate; callers are
+    /// responsible for prompting the user if interactivity is required.
+    pub async fn load_skill(
+        &mut self,
+        name: &str,
+        _arguments: Option<serde_json::Value>,
+    ) -> Result<crate::skills::SkillToolResult, AgentError> {
+        let opts = self.inner.options.lock().await.clone();
+        let state = crate::skills::LoadedSkillsState::new();
+        crate::skills::SkillTool::load(&opts.skills, &opts.skill_options, &state, name)
+            .map_err(|e| AgentError::Other(e.to_string()))
+    }
+
+    /// List the slash commands currently known to the client.
+    pub async fn list_slash_commands(
+        &self,
+    ) -> Result<Vec<crate::slash::SlashCommandSummary>, AgentError> {
+        let opts = self.inner.options.lock().await;
+        Ok(opts.slash_commands.list())
+    }
+
+    /// Run the manual compactor over the live conversation history.
+    /// Emits a `CompactBoundary` event onto the session sink so the
+    /// boundary is auditable from session JSONL.
+    pub async fn compact(
+        &mut self,
+        options: crate::compaction::CompactionOptions,
+    ) -> Result<crate::events::CompactBoundary, AgentError> {
+        if !options.enabled {
+            return Err(AgentError::InvalidConfig(
+                "compaction is disabled".to_string(),
+            ));
+        }
+        let mut hist = self.inner.initial_history.lock().await;
+        let mut convo = crate::conversation::Conversation::new();
+        for m in hist.iter() {
+            convo.push(m.clone());
+        }
+        let result = crate::compaction::compact_conversation(&convo, &options);
+        if !result.compacted {
+            return Ok(crate::events::CompactBoundary {
+                session_id: self.session_id.clone(),
+                run_id: None,
+                pre_messages: result.pre_messages,
+                post_messages: result.post_messages,
+                preserved_recent_turns: result.preserved_recent_turns,
+                trigger: crate::events::CompactionTrigger::ManualSlashCommand,
+                summary_preview: result.summary_preview,
+            });
+        }
+        // Replace in-memory history with the compacted version.
+        hist.clear();
+        for m in &result.conversation.messages {
+            hist.push(m.clone());
+        }
+        let boundary = crate::events::CompactBoundary {
+            session_id: self.session_id.clone(),
+            run_id: None,
+            pre_messages: result.pre_messages,
+            post_messages: result.post_messages,
+            preserved_recent_turns: result.preserved_recent_turns,
+            trigger: crate::events::CompactionTrigger::ManualSlashCommand,
+            summary_preview: result.summary_preview,
+        };
+        if let Some(sink) = &self.inner.session_sink {
+            let _ = sink
+                .record(
+                    &self.session_id,
+                    &crate::events::AgentEvent::CompactBoundary(boundary.clone()),
+                )
+                .await;
+        }
+        Ok(boundary)
     }
 
     /// Shut down the runtime. Pending queued messages are dropped.
