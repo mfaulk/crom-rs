@@ -43,6 +43,24 @@ pub enum BuiltInSlashCommand {
     Agents,
     Checkpoints,
     Compact,
+    /// M9: show effective configuration.
+    Config,
+    /// M9: show current run/session status.
+    Status,
+    /// M9: configure the status line template.
+    StatusLine,
+    /// M9: run diagnostics.
+    Doctor,
+    /// M9: list session changes.
+    Changes,
+    /// M9: show patch diff for the session/checkpoint.
+    Diff,
+    /// M9: revert to a checkpoint.
+    Revert,
+    /// M9: list known sessions.
+    Sessions,
+    /// M9: detect and recover an interrupted session.
+    Recover,
 }
 
 impl BuiltInSlashCommand {
@@ -56,6 +74,15 @@ impl BuiltInSlashCommand {
             Self::Agents => "agents",
             Self::Checkpoints => "checkpoints",
             Self::Compact => "compact",
+            Self::Config => "config",
+            Self::Status => "status",
+            Self::StatusLine => "statusline",
+            Self::Doctor => "doctor",
+            Self::Changes => "changes",
+            Self::Diff => "diff",
+            Self::Revert => "revert",
+            Self::Sessions => "sessions",
+            Self::Recover => "recover",
         }
     }
 
@@ -69,6 +96,15 @@ impl BuiltInSlashCommand {
             Self::Agents => "List available subagents.",
             Self::Checkpoints => "List recent workspace checkpoints.",
             Self::Compact => "Manually compact older conversation history.",
+            Self::Config => "Show effective configuration and source locations.",
+            Self::Status => "Show current run/session status.",
+            Self::StatusLine => "View or change the status line template.",
+            Self::Doctor => "Run diagnostic checks.",
+            Self::Changes => "List file changes made during this session.",
+            Self::Diff => "Show patch diff for current changes or a checkpoint.",
+            Self::Revert => "Revert workspace files to a checkpoint.",
+            Self::Sessions => "List known sessions for this workspace.",
+            Self::Recover => "Detect and recover an interrupted session.",
         }
     }
 
@@ -82,6 +118,15 @@ impl BuiltInSlashCommand {
             "agents" => Self::Agents,
             "checkpoints" => Self::Checkpoints,
             "compact" => Self::Compact,
+            "config" => Self::Config,
+            "status" => Self::Status,
+            "statusline" => Self::StatusLine,
+            "doctor" => Self::Doctor,
+            "changes" => Self::Changes,
+            "diff" => Self::Diff,
+            "revert" => Self::Revert,
+            "sessions" => Self::Sessions,
+            "recover" => Self::Recover,
             _ => return None,
         })
     }
@@ -96,6 +141,15 @@ impl BuiltInSlashCommand {
             Self::Agents,
             Self::Checkpoints,
             Self::Compact,
+            Self::Config,
+            Self::Status,
+            Self::StatusLine,
+            Self::Doctor,
+            Self::Changes,
+            Self::Diff,
+            Self::Revert,
+            Self::Sessions,
+            Self::Recover,
         ]
     }
 }

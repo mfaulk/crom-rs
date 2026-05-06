@@ -15,6 +15,13 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+pub mod recovery;
+pub use recovery::{
+    acquire_lock, append_recovery_marker, classify_state, detect_state, load_records_resilient,
+    lock_path_for, read_lock, release_lock, write_lock, RecoveryMarker, RunLock,
+    SessionRecoveryInfo,
+};
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("I/O error: {0}")]

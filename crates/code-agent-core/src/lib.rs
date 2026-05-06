@@ -25,6 +25,7 @@ pub mod todo;
 pub mod tool;
 pub mod tool_catalog;
 pub mod tool_rule;
+pub mod ui;
 pub mod usage;
 
 pub use agent::{query, Agent, AgentBuilder, SessionSink, TelemetrySink};
@@ -62,18 +63,22 @@ pub use conversation::{
 };
 pub use errors::{AgentError, ProviderError, ToolError};
 pub use events::{
-    AgentEvent, AgentRegistryLoaded, AgentResult, CheckpointEventPayload, CompactBoundary,
-    CompactionTrigger, HookEvaluated, HookOutcomeKind, InterruptedEvent, PluginComponentFailed,
-    PluginComponentLoaded, PluginDisabled, PluginEnabled, PluginInstalled, PluginMarketplaceAdded,
+    AgentEvent, AgentRegistryLoaded, AgentResult, ApprovalPromptResolved, ApprovalPromptShown,
+    ApprovalRevisionRequested, ChangesViewed, CheckpointEventPayload, CompactBoundary,
+    CompactionTrigger, DiffViewed, DoctorCheckCompleted, DoctorCheckStarted, DoctorSeverity,
+    DoctorStatus, HookEvaluated, HookOutcomeKind, InitCompleted, InitStarted, InterruptedEvent,
+    NotificationFailed, NotificationSent, PluginComponentFailed, PluginComponentLoaded,
+    PluginDisabled, PluginEnabled, PluginInstalled, PluginMarketplaceAdded,
     PluginMarketplaceEntryInstalled, PluginRegistryLoaded, PluginReloaded, PluginUninstalled,
-    PluginValidationFailed, PolicyDecisionEvent, ResultSubtype, SkillInvocationFailed, SkillLoaded,
+    PluginValidationFailed, PolicyDecisionEvent, ResultSubtype, SessionRecovered,
+    SessionRecoveryFailed, SessionRuntimeState, SkillInvocationFailed, SkillLoaded,
     SkillRegistryLoaded, SkillResourceLoaded, SlashCommandCompleted, SlashCommandExpanded,
-    SlashCommandFailed, SlashCommandRegistryLoaded, SlashCommandStarted, SubagentCancelled,
-    SubagentEvent as SubagentForwardedEvent, SubagentFailed, SubagentStart, SubagentStop,
-    SubagentTimedOut, TodoUpdate, ToolCallCompleted, ToolCallDenied, ToolCallStarted,
+    SlashCommandFailed, SlashCommandRegistryLoaded, SlashCommandStarted, StatusLineConfigured,
+    SubagentCancelled, SubagentEvent as SubagentForwardedEvent, SubagentFailed, SubagentStart,
+    SubagentStop, SubagentTimedOut, TodoUpdate, ToolCallCompleted, ToolCallDenied, ToolCallStarted,
     ToolCatalogBuilt, ToolContextBudgetUpdated, ToolDeferred, ToolDisabled, ToolLoaded,
     ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed, ToolSearchStarted,
-    UserToolResult,
+    UiRendererChanged, UiStarted, UserToolResult,
 };
 pub use hooks::{
     aggregate, Hook, HookAddedContext, HookAggregateDecision, HookCallRecord, HookError,
@@ -142,4 +147,11 @@ pub use tool_catalog::{
     SEARCH_TOOLS_NAME,
 };
 pub use tool_rule::ToolRule;
+pub use ui::{
+    merge_recovery_into, merge_ui_into, render_status_line, supported_status_line_variables,
+    unknown_status_line_variables, ColorCapability, ComposerConfig, ComposerSettingsConfig,
+    NotificationConfig, NotificationSettingsConfig, RecoveryConfig, RecoverySettingsConfig,
+    StatusLineConfig, StatusLineContext, StatusLineSettingsConfig, SubmitKey, TerminalCapabilities,
+    TerminalRenderer, UiConfig, UiSettingsConfig, UiSettingsError, DEFAULT_STATUSLINE_TEMPLATE,
+};
 pub use usage::TokenUsage;

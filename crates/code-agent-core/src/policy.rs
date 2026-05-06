@@ -489,6 +489,10 @@ impl PolicyEngine {
                 | PermissionDecision::DenyForSession { reason } => {
                     PolicyDecision::deny(PolicyDecisionSource::ApprovalCallback, reason)
                 }
+                PermissionDecision::RequestRevision { message } => PolicyDecision::deny(
+                    PolicyDecisionSource::ApprovalCallback,
+                    format!("user requested revision: {message}"),
+                ),
             };
         }
 
