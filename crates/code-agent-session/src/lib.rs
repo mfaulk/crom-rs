@@ -52,6 +52,14 @@ pub enum SessionPayload {
     SettingsSnapshot {
         settings_summary: String,
     },
+    /// M6: marker recorded once at the head of a child-session JSONL file
+    /// so audits can recover the parent linkage from the child alone.
+    SubagentMetadata {
+        parent_session_id: String,
+        parent_run_id: String,
+        parent_tool_call_id: String,
+        agent_name: String,
+    },
 }
 
 #[async_trait]
@@ -80,11 +88,138 @@ impl FsSessionStore {
         cwd.join(".agent").join("sessions")
     }
 
+    /// Directory used for subagent (child) session JSONL files for a given
+    /// parent session.
+    pub fn child_sessions_dir_for(cwd: &Path, parent: &SessionId) -> Result<PathBuf, SessionError> {
+        if !parent.is_valid_format() {
+            return Err(SessionError::InvalidId);
+        }
+        Ok(Self::sessions_dir_for(cwd)
+            .join("children")
+            .join(parent.as_str()))
+    }
+
     fn file_path(&self, session_id: &SessionId) -> Result<PathBuf, SessionError> {
         if !session_id.is_valid_format() {
             return Err(SessionError::InvalidId);
         }
         Ok(Self::sessions_dir_for(&self.cwd).join(format!("{}.jsonl", session_id.as_str())))
+    }
+
+    /// Resolve the path to a child session's JSONL file given its parent.
+    fn child_file_path(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+    ) -> Result<PathBuf, SessionError> {
+        if !child.is_valid_format() {
+            return Err(SessionError::InvalidId);
+        }
+        Ok(Self::child_sessions_dir_for(&self.cwd, parent)?
+            .join(format!("{}.jsonl", child.as_str())))
+    }
+
+    /// Append a single record to a child session, creating the parent
+    /// directory if needed.
+    pub async fn append_child(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+        event: SessionRecord,
+    ) -> Result<(), SessionError> {
+        let path = self.child_file_path(parent, child)?;
+        if let Some(dir) = path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        let mut line = serde_json::to_string(&event)?;
+        line.push('\n');
+        file.write_all(line.as_bytes()).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    /// List child session ids for a given parent.
+    pub async fn list_children(&self, parent: &SessionId) -> Result<Vec<SessionId>, SessionError> {
+        let dir = match Self::child_sessions_dir_for(&self.cwd, parent) {
+            Ok(p) => p,
+            Err(e) => return Err(e),
+        };
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut rd = tokio::fs::read_dir(&dir).await?;
+        while let Some(ent) = rd.next_entry().await? {
+            let p = ent.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                out.push(SessionId::from(stem.to_string()));
+            }
+        }
+        out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(out)
+    }
+
+    /// Load records for a child session.
+    pub async fn load_child(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+    ) -> Result<Vec<SessionRecord>, SessionError> {
+        let path = self.child_file_path(parent, child)?;
+        if !path.exists() {
+            return Err(SessionError::NotFound(child.to_string()));
+        }
+        let f = tokio::fs::File::open(&path).await?;
+        let mut reader = BufReader::new(f).lines();
+        let mut out = Vec::new();
+        while let Some(line) = reader.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rec: SessionRecord = serde_json::from_str(&line)?;
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// Find the parent session id for a child by scanning the children/
+    /// directory tree. Returns `None` if the child is unknown.
+    pub async fn find_parent_for_child(
+        &self,
+        child: &SessionId,
+    ) -> Result<Option<SessionId>, SessionError> {
+        let root = Self::sessions_dir_for(&self.cwd).join("children");
+        if !root.exists() {
+            return Ok(None);
+        }
+        let mut rd = tokio::fs::read_dir(&root).await?;
+        while let Some(ent) = rd.next_entry().await? {
+            let parent_dir = ent.path();
+            if !parent_dir.is_dir() {
+                continue;
+            }
+            let parent_name = match parent_dir.file_name().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let parent_id = SessionId::from(parent_name);
+            if !parent_id.is_valid_format() {
+                continue;
+            }
+            let candidate = parent_dir.join(format!("{}.jsonl", child.as_str()));
+            if candidate.exists() {
+                return Ok(Some(parent_id));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -222,6 +357,102 @@ impl SessionSink for SessionSinkAdapter {
     }
 }
 
+/// SessionSink that persists subagent records under a child-session path
+/// rooted at the parent's session id. Used as the inner sink when M6
+/// orchestration runs.
+pub struct ChildSessionSinkAdapter {
+    store: Arc<FsSessionStore>,
+    cwd: PathBuf,
+    parent_session_id: SessionId,
+}
+
+impl ChildSessionSinkAdapter {
+    pub fn new(store: Arc<FsSessionStore>, cwd: PathBuf, parent_session_id: SessionId) -> Self {
+        Self {
+            store,
+            cwd,
+            parent_session_id,
+        }
+    }
+}
+
+#[async_trait]
+impl SessionSink for ChildSessionSinkAdapter {
+    async fn record(&self, session_id: &SessionId, event: &AgentEvent) -> Result<(), AgentError> {
+        let record = SessionRecord {
+            timestamp: now_iso(),
+            cwd: self.cwd.clone(),
+            session_id: session_id.to_string(),
+            payload: SessionPayload::Event(event.clone()),
+        };
+        self.store
+            .append_child(&self.parent_session_id, session_id, record)
+            .await
+            .map_err(|e| AgentError::Session(format!("{e}")))
+    }
+}
+
+/// Factory that hands out a fresh `ChildSessionSinkAdapter` per child run,
+/// satisfying [`code_agent_core::ChildSessionSinkFactory`]. The factory
+/// owns one `FsSessionStore` instance and the cwd, so the parent can
+/// configure it once and the orchestrator can mint sinks per child.
+pub struct FsChildSessionSinkFactory {
+    store: Arc<FsSessionStore>,
+    cwd: PathBuf,
+}
+
+impl FsChildSessionSinkFactory {
+    pub fn new(store: Arc<FsSessionStore>, cwd: PathBuf) -> Self {
+        Self { store, cwd }
+    }
+}
+
+impl code_agent_core::ChildSessionSinkFactory for FsChildSessionSinkFactory {
+    fn child_sink(
+        &self,
+        parent_session_id: &SessionId,
+        _child_session_id: &SessionId,
+    ) -> Arc<dyn SessionSink> {
+        Arc::new(ChildSessionSinkAdapter::new(
+            self.store.clone(),
+            self.cwd.clone(),
+            parent_session_id.clone(),
+        ))
+    }
+
+    fn write_metadata(
+        &self,
+        parent_session_id: &SessionId,
+        child_session_id: &SessionId,
+        metadata: &code_agent_core::ChildSessionMetadata,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), code_agent_core::AgentError>> + Send + '_>,
+    > {
+        let parent = parent_session_id.clone();
+        let child = child_session_id.clone();
+        let cwd = self.cwd.clone();
+        let store = self.store.clone();
+        let payload = SessionPayload::SubagentMetadata {
+            parent_session_id: metadata.parent_session_id.to_string(),
+            parent_run_id: metadata.parent_run_id.to_string(),
+            parent_tool_call_id: metadata.parent_tool_call_id.clone(),
+            agent_name: metadata.agent_name.clone(),
+        };
+        Box::pin(async move {
+            let record = SessionRecord {
+                timestamp: now_iso(),
+                cwd,
+                session_id: child.to_string(),
+                payload,
+            };
+            store
+                .append_child(&parent, &child, record)
+                .await
+                .map_err(|e| code_agent_core::AgentError::Session(format!("{e}")))
+        })
+    }
+}
+
 pub fn now_iso() -> String {
     OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -348,6 +579,7 @@ pub async fn summarize_session(
                 s.source_session_id = Some(source_session_id.clone());
             }
             SessionPayload::SettingsSnapshot { .. } => {}
+            SessionPayload::SubagentMetadata { .. } => {}
             SessionPayload::Event(ev) => match ev {
                 AgentEvent::AssistantMessage(_) => s.assistant_messages += 1,
                 AgentEvent::ToolCallStarted(_) => s.tool_calls_started += 1,
@@ -447,7 +679,9 @@ pub fn replay_conversation(records: &[SessionRecord]) -> Conversation {
                 flush_results(&mut conv, &mut pending_tool_results);
                 conv.push(Message::user_text(text.clone()));
             }
-            SessionPayload::ForkMetadata { .. } | SessionPayload::SettingsSnapshot { .. } => {}
+            SessionPayload::ForkMetadata { .. }
+            | SessionPayload::SettingsSnapshot { .. }
+            | SessionPayload::SubagentMetadata { .. } => {}
             SessionPayload::Event(ev) => match ev {
                 AgentEvent::AssistantMessage(am) => {
                     flush_results(&mut conv, &mut pending_tool_results);

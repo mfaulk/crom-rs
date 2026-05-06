@@ -1,6 +1,7 @@
 //! Core types, traits, and the agent runtime for code-agent.
 
 pub mod agent;
+pub mod agents;
 pub mod builtin_hooks;
 pub mod checkpoint;
 pub mod client;
@@ -23,6 +24,14 @@ pub mod tool_rule;
 pub mod usage;
 
 pub use agent::{query, Agent, AgentBuilder, SessionSink, TelemetrySink};
+pub use agents::{
+    builtin_starter_definitions, filesystem_agents_dir, load_filesystem_agents,
+    load_filesystem_agents_strict, AgentConcurrencyHint, AgentDefinition, AgentDefinitionError,
+    AgentDefinitionSummary, AgentOutputMode, AgentRegistry, AgentRuntimeOptions, AgentTool,
+    AgentToolInput, AgentToolResult, ChildSessionMetadata, ChildSessionSinkFactory,
+    SubagentCheckpointPolicy, SubagentContextPolicy, SubagentEventVisibility, SubagentRunHandle,
+    SubagentRuntime, SubagentStatus, SUBAGENT_TOOL_NAME,
+};
 pub use builtin_hooks::{
     redact_secrets_in_value, AuditEntry, AuditLogHook, BlockDangerousBashHook,
     BlockEnvFileWritesHook, BlockMcpServerHook, BlockMcpToolNameHook, BlockMcpWriteLikeToolHook,
@@ -45,11 +54,13 @@ pub use conversation::{
 };
 pub use errors::{AgentError, ProviderError, ToolError};
 pub use events::{
-    AgentEvent, AgentResult, CheckpointEventPayload, HookEvaluated, HookOutcomeKind,
-    InterruptedEvent, PolicyDecisionEvent, ResultSubtype, TodoUpdate, ToolCallCompleted,
-    ToolCallDenied, ToolCallStarted, ToolCatalogBuilt, ToolContextBudgetUpdated, ToolDeferred,
-    ToolDisabled, ToolLoaded, ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed,
-    ToolSearchStarted, UserToolResult,
+    AgentEvent, AgentRegistryLoaded, AgentResult, CheckpointEventPayload, HookEvaluated,
+    HookOutcomeKind, InterruptedEvent, PolicyDecisionEvent, ResultSubtype, SubagentCancelled,
+    SubagentEvent as SubagentForwardedEvent, SubagentFailed, SubagentStart, SubagentStop,
+    SubagentTimedOut, TodoUpdate, ToolCallCompleted, ToolCallDenied, ToolCallStarted,
+    ToolCatalogBuilt, ToolContextBudgetUpdated, ToolDeferred, ToolDisabled, ToolLoaded,
+    ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed, ToolSearchStarted,
+    UserToolResult,
 };
 pub use hooks::{
     aggregate, Hook, HookAddedContext, HookAggregateDecision, HookCallRecord, HookError,
@@ -68,8 +79,9 @@ pub use policy::{
 pub use provider::{ModelEvent, ModelProvider, ModelRequest};
 pub use run_id::RunId;
 pub use settings::{
-    CheckpointRetentionConfig, CheckpointingConfig, HooksConfig, ProjectInstructionsMode,
-    SettingSource, Settings, SettingsError, SettingsFile, ToolLimitsConfig, ValidationConfig,
+    AgentsSettingsConfig, CheckpointRetentionConfig, CheckpointingConfig, HooksConfig,
+    ProjectInstructionsMode, SettingSource, Settings, SettingsError, SettingsFile,
+    ToolLimitsConfig, ValidationConfig,
 };
 pub use telemetry::{AgentTelemetryEvent, ModelPricing, SessionLoadKind, TelemetryOutcome};
 pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};

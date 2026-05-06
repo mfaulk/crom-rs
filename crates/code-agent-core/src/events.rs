@@ -48,6 +48,20 @@ pub enum AgentEvent {
     ToolSearchFailed(ToolSearchFailed),
     ToolContextBudgetUpdated(ToolContextBudgetUpdated),
     ToolLoadingModeResolved(ToolLoadingModeResolved),
+    /// Subagent registry summary, emitted once after agents are registered.
+    AgentRegistryLoaded(AgentRegistryLoaded),
+    /// Subagent run started.
+    SubagentStart(SubagentStart),
+    /// Forwarded child event (only when `event_visibility = StreamChildEvents`).
+    SubagentEvent(SubagentEvent),
+    /// Subagent run completed (with any terminal status).
+    SubagentStop(SubagentStop),
+    /// Subagent failed (provider, hook, or tool error).
+    SubagentFailed(SubagentFailed),
+    /// Subagent was cancelled by parent or operator.
+    SubagentCancelled(SubagentCancelled),
+    /// Subagent exceeded its per-run timeout.
+    SubagentTimedOut(SubagentTimedOut),
     Result(AgentResult),
 }
 
@@ -230,4 +244,61 @@ impl From<ToolContextBudget> for ToolContextBudgetUpdated {
             deferred_tool_count: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRegistryLoaded {
+    pub agents: Vec<crate::agents::AgentDefinitionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentStart {
+    pub agent_name: String,
+    pub parent_session_id: SessionId,
+    pub parent_run_id: RunId,
+    pub parent_tool_call_id: String,
+    pub subagent_session_id: SessionId,
+    pub task_preview: String,
+    pub tools: Vec<String>,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentEvent {
+    pub agent_name: String,
+    pub subagent_session_id: SessionId,
+    pub event: Box<AgentEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentStop {
+    pub agent_name: String,
+    pub subagent_session_id: SessionId,
+    pub status: crate::agents::SubagentStatus,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+    pub result_preview: String,
+    pub tool_calls: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentFailed {
+    pub agent_name: String,
+    pub subagent_session_id: SessionId,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentCancelled {
+    pub agent_name: String,
+    pub subagent_session_id: SessionId,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentTimedOut {
+    pub agent_name: String,
+    pub subagent_session_id: SessionId,
+    pub timeout_ms: u64,
 }

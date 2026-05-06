@@ -227,6 +227,69 @@ pub enum AgentTelemetryEvent {
         mode: String,
         error_category: String,
     },
+    // ----- M6 subagent orchestration -----
+    AgentRegistryLoaded {
+        session_id: SessionId,
+        run_id: RunId,
+        agent_count: usize,
+    },
+    AgentToolInvoked {
+        session_id: SessionId,
+        run_id: RunId,
+        turn_index: u32,
+        agent_name: String,
+        parent_tool_call_id: String,
+    },
+    SubagentQueued {
+        session_id: SessionId,
+        run_id: RunId,
+        agent_name: String,
+        subagent_session_id: SessionId,
+        queue_duration_ms: u64,
+    },
+    SubagentStart {
+        session_id: SessionId,
+        run_id: RunId,
+        agent_name: String,
+        subagent_session_id: SessionId,
+        subagent_run_id: RunId,
+        model: String,
+    },
+    SubagentStop {
+        session_id: SessionId,
+        run_id: RunId,
+        agent_name: String,
+        subagent_session_id: SessionId,
+        subagent_run_id: RunId,
+        outcome: TelemetryOutcome,
+        duration_ms: u64,
+        tool_calls: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+    },
+    SubagentFailed {
+        session_id: SessionId,
+        run_id: RunId,
+        agent_name: String,
+        subagent_session_id: SessionId,
+        error_category: String,
+    },
+    SubagentCancelled {
+        session_id: SessionId,
+        run_id: RunId,
+        agent_name: String,
+        subagent_session_id: SessionId,
+        reason: String,
+    },
+    SubagentTimedOut {
+        session_id: SessionId,
+        run_id: RunId,
+        agent_name: String,
+        subagent_session_id: SessionId,
+        timeout_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

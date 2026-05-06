@@ -270,6 +270,7 @@ dependencies = [
  "async-trait",
  "camino",
  "code-agent-mcp",
+ "code-agent-session",
  "futures",
  "globset",
  "regex",

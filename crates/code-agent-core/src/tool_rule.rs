@@ -18,6 +18,10 @@ pub enum ToolRule {
     FilePathGlob { tool: String, pattern: String },
     /// Match MCP tools from a server by remote tool-name glob.
     McpServerGlob { server: String, tool_glob: String },
+    /// Match invocations of the built-in `Agent` tool whose `agent` field
+    /// matches a glob (e.g. `security-reviewer` or `*-reviewer`). Only
+    /// matches the built-in `Agent` tool — never any other tool.
+    AgentNameGlob { pattern: String },
 }
 
 impl ToolRule {
@@ -62,6 +66,13 @@ impl ToolRule {
         Ok(ToolRule::McpServerGlob { server, tool_glob })
     }
 
+    /// Construct an `AgentNameGlob` rule, validating the glob pattern.
+    pub fn try_agent_name_glob(pattern: impl Into<String>) -> Result<Self, String> {
+        let p = pattern.into();
+        Glob::new(&p).map_err(|e| format!("invalid agent name glob {:?}: {e}", p))?;
+        Ok(ToolRule::AgentNameGlob { pattern: p })
+    }
+
     /// Returns true if this rule matches the requested tool name and input.
     pub fn matches(&self, tool_name: &str, input: &Value) -> bool {
         match self {
@@ -92,6 +103,16 @@ impl ToolRule {
                     return false;
                 };
                 server == &parts.server_name && glob_match(tool_glob, &parts.remote_tool_name)
+            }
+            ToolRule::AgentNameGlob { pattern } => {
+                if tool_name != "Agent" {
+                    return false;
+                }
+                let agent = input
+                    .get("agent")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                glob_match(pattern, agent)
             }
         }
     }
@@ -134,6 +155,12 @@ impl Serialize for ToolRule {
                 m.serialize_entry("tool_glob", tool_glob)?;
                 m.end()
             }
+            ToolRule::AgentNameGlob { pattern } => {
+                let mut m = serializer.serialize_map(Some(2))?;
+                m.serialize_entry("tool", "Agent")?;
+                m.serialize_entry("agent", pattern)?;
+                m.end()
+            }
         }
     }
 }
@@ -170,6 +197,7 @@ impl<'de> Deserialize<'de> for ToolRule {
                 let mut path_glob: Option<String> = None;
                 let mut server: Option<String> = None;
                 let mut tool_glob: Option<String> = None;
+                let mut agent: Option<String> = None;
 
                 // Track unknown keys so a typo like `commandRegex` fails fast
                 // instead of silently degrading to an unconditional
@@ -183,6 +211,7 @@ impl<'de> Deserialize<'de> for ToolRule {
                         "path_glob" => path_glob = Some(map.next_value::<String>()?),
                         "server" => server = Some(map.next_value::<String>()?),
                         "tool_glob" => tool_glob = Some(map.next_value::<String>()?),
+                        "agent" => agent = Some(map.next_value::<String>()?),
                         other => {
                             unknown_keys.push(other.to_string());
                             let _: serde_json::Value = map.next_value()?;
@@ -191,7 +220,7 @@ impl<'de> Deserialize<'de> for ToolRule {
                 }
                 if !unknown_keys.is_empty() {
                     return Err(de::Error::custom(format!(
-                        "tool rule object has unknown key(s): {} (allowed: tool, command_regex, path_glob, server, tool_glob)",
+                        "tool rule object has unknown key(s): {} (allowed: tool, command_regex, path_glob, server, tool_glob, agent)",
                         unknown_keys.join(", ")
                     )));
                 }
@@ -210,6 +239,20 @@ impl<'de> Deserialize<'de> for ToolRule {
                 }
                 let tool =
                     tool.ok_or_else(|| de::Error::custom("tool rule object missing `tool`"))?;
+                if let Some(agent_pat) = agent {
+                    if tool != "Agent" {
+                        return Err(de::Error::custom(format!(
+                            "agent is only valid with tool=\"Agent\", got tool={:?}",
+                            tool
+                        )));
+                    }
+                    if command_regex.is_some() || path_glob.is_some() {
+                        return Err(de::Error::custom(
+                            "Agent tool rule cannot be combined with command_regex or path_glob",
+                        ));
+                    }
+                    return ToolRule::try_agent_name_glob(agent_pat).map_err(de::Error::custom);
+                }
                 // Reject ambiguous rule objects up front: if both `command_regex`
                 // and `path_glob` are present we'd silently pick one and discard
                 // the other (potentially hiding a malformed pattern in the

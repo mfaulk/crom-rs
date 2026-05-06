@@ -80,6 +80,49 @@ pub struct SettingsFile {
     pub mcp: Option<McpSettingsConfig>,
     #[serde(default)]
     pub tool_search: Option<ToolSearchSettingsConfig>,
+    #[serde(default)]
+    pub agents: Option<AgentsSettingsConfig>,
+}
+
+/// Settings for the M6 subagent orchestrator. All fields optional; merged
+/// at load time from user + project settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsSettingsConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub allow_filesystem_agents: Option<bool>,
+    #[serde(default)]
+    pub compat_claude_agents: Option<bool>,
+    #[serde(default)]
+    pub max_concurrent_subagents: Option<usize>,
+    #[serde(default)]
+    pub subagent_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub persist_subagent_transcripts: Option<bool>,
+    #[serde(default)]
+    pub event_visibility: Option<String>,
+    #[serde(default)]
+    pub checkpoint_policy: Option<String>,
+    #[serde(default)]
+    pub inherit_project_instructions: Option<bool>,
+    #[serde(default)]
+    pub inherit_settings: Option<bool>,
+    #[serde(default)]
+    pub inherit_hooks: Option<bool>,
+    #[serde(default)]
+    pub inherit_permissions: Option<bool>,
+    #[serde(default)]
+    pub inherit_mcp_servers: Option<bool>,
+    #[serde(default)]
+    pub inherit_tool_search_state: Option<bool>,
+    #[serde(default)]
+    pub inherit_approval_memory: Option<bool>,
+    #[serde(default)]
+    pub builtins: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -177,6 +220,7 @@ pub struct Settings {
     pub validation: ValidationConfig,
     pub mcp: Option<McpSettingsConfig>,
     pub tool_search: ToolSearchSettingsConfig,
+    pub agents: Option<AgentsSettingsConfig>,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -430,7 +474,65 @@ fn merge_into(dst: &mut Settings, src: SettingsFile, _is_user: bool) -> Result<(
             .apply_settings(&dst.tool_search)
             .map_err(SettingsError::BadToolSearch)?;
     }
+    if let Some(agents) = src.agents {
+        merge_agents_settings(&mut dst.agents, agents);
+    }
     Ok(())
+}
+
+fn merge_agents_settings(dst: &mut Option<AgentsSettingsConfig>, src: AgentsSettingsConfig) {
+    let target = dst.get_or_insert_with(AgentsSettingsConfig::default);
+    if src.enabled.is_some() {
+        target.enabled = src.enabled;
+    }
+    if src.path.is_some() {
+        target.path = src.path;
+    }
+    if src.allow_filesystem_agents.is_some() {
+        target.allow_filesystem_agents = src.allow_filesystem_agents;
+    }
+    if src.compat_claude_agents.is_some() {
+        target.compat_claude_agents = src.compat_claude_agents;
+    }
+    if src.max_concurrent_subagents.is_some() {
+        target.max_concurrent_subagents = src.max_concurrent_subagents;
+    }
+    if src.subagent_timeout_seconds.is_some() {
+        target.subagent_timeout_seconds = src.subagent_timeout_seconds;
+    }
+    if src.persist_subagent_transcripts.is_some() {
+        target.persist_subagent_transcripts = src.persist_subagent_transcripts;
+    }
+    if src.event_visibility.is_some() {
+        target.event_visibility = src.event_visibility;
+    }
+    if src.checkpoint_policy.is_some() {
+        target.checkpoint_policy = src.checkpoint_policy;
+    }
+    if src.inherit_project_instructions.is_some() {
+        target.inherit_project_instructions = src.inherit_project_instructions;
+    }
+    if src.inherit_settings.is_some() {
+        target.inherit_settings = src.inherit_settings;
+    }
+    if src.inherit_hooks.is_some() {
+        target.inherit_hooks = src.inherit_hooks;
+    }
+    if src.inherit_permissions.is_some() {
+        target.inherit_permissions = src.inherit_permissions;
+    }
+    if src.inherit_mcp_servers.is_some() {
+        target.inherit_mcp_servers = src.inherit_mcp_servers;
+    }
+    if src.inherit_tool_search_state.is_some() {
+        target.inherit_tool_search_state = src.inherit_tool_search_state;
+    }
+    if src.inherit_approval_memory.is_some() {
+        target.inherit_approval_memory = src.inherit_approval_memory;
+    }
+    if src.builtins.is_some() {
+        target.builtins = src.builtins;
+    }
 }
 
 fn merge_tool_search_settings(dst: &mut ToolSearchSettingsConfig, src: ToolSearchSettingsConfig) {

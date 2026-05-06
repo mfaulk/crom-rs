@@ -7,10 +7,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 fn ctx_for(dir: &TempDir) -> ToolContext {
-    ToolContext {
-        cwd: dir.path().to_path_buf(),
-        session_id: SessionId::new(),
-    }
+    ToolContext::new_minimal(dir.path().to_path_buf(), SessionId::new())
 }
 
 #[tokio::test]
