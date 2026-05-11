@@ -1208,6 +1208,7 @@ pub fn settings_to_file(s: &Settings) -> code_agent_core::SettingsFile {
         recovery: Some(recovery_to_settings(&s.recovery)),
         auth: Some(s.auth.clone()),
         model_config: Some(s.model_config.clone()),
+        planning: s.planning.clone(),
     }
 }
 

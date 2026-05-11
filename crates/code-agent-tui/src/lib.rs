@@ -11,6 +11,7 @@ pub mod composer;
 pub mod diff_view;
 pub mod fullscreen;
 pub mod plain;
+pub mod plan_view;
 pub mod renderer;
 pub mod statusline;
 pub mod transcript;
@@ -22,6 +23,9 @@ pub use composer::{
 };
 pub use diff_view::{render_change_summary, render_diff_card, ChangeSummary, DiffEntry};
 pub use plain::PlainRenderer;
+pub use plan_view::{
+    format_deviation_modal, format_plan_approval_modal, format_plan_diff, format_plan_panel,
+};
 pub use renderer::{detect_capabilities_from_env, fallback_renderer_for, RenderError};
 pub use statusline::format_status_line;
 pub use transcript::{render_event_card, EventCard};

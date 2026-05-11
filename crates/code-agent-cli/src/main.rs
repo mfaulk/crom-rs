@@ -1,5 +1,6 @@
 mod auth_cmd;
 mod m9;
+mod plan_cmd;
 mod plugins;
 
 use std::io::{IsTerminal, Write};
@@ -149,6 +150,15 @@ enum Command {
     Model(auth_cmd::ModelCommand),
     /// Logout (alias for `auth logout`).
     Logout(auth_cmd::AuthCommonArgs),
+    /// M11: draft a structured plan from a prompt.
+    Plan(plan_cmd::PlanArgs),
+    /// M11: execute an approved plan.
+    Act(plan_cmd::ActArgs),
+    /// M11: re-plan after deviation or failure.
+    Replan(plan_cmd::ReplanArgs),
+    /// M11: manage plans (list/show/approve/reject/revise/diff/archive/export).
+    #[command(subcommand)]
+    Plans(plan_cmd::PlansCommand),
 }
 
 #[derive(Parser, Debug)]
@@ -800,6 +810,10 @@ struct CommonArgs {
     /// Allow plugin bin paths to be added to Bash PATH for this invocation.
     #[arg(long)]
     allow_plugin_bin_path: bool,
+    /// M11: refuse to run the agent unless an approved plan exists for the
+    /// session. Used by automation that wants planning to be mandatory.
+    #[arg(long)]
+    require_plan: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -1124,6 +1138,16 @@ async fn main() -> ExitCode {
         Command::Provider(cmd) => auth_cmd::cmd_provider(cmd).await,
         Command::Model(cmd) => auth_cmd::cmd_model(cmd).await,
         Command::Logout(args) => auth_cmd::cmd_auth_logout(None, args).await,
+        Command::Plan(args) => cmd_plan_top(args).await,
+        Command::Act(args) => cmd_act_top(args).await,
+        Command::Replan(args) => cmd_replan_top(args).await,
+        Command::Plans(cmd) => {
+            let settings_path = cmd.cwd().to_path_buf();
+            let settings =
+                code_agent_core::settings::load(&settings_path, SettingSource::UserAndProject)
+                    .unwrap_or_default();
+            plan_cmd::cmd_plans(&settings, cmd).await
+        }
     };
 
     match result {
@@ -1870,6 +1894,54 @@ fn build_settings_summary(
 }
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
+    if args.common.require_plan {
+        let planning = plan_cmd::planning_options_from_settings(
+            &code_agent_core::settings::load(&args.common.cwd, SettingSource::UserAndProject)
+                .unwrap_or_default(),
+        );
+        let store: Arc<dyn code_agent_core::PlanStore> = Arc::new(
+            code_agent_core::FsPlanStore::new(args.common.cwd.clone(), planning),
+        );
+        // The --require-plan gate must reject *any* run that wouldn't be
+        // executing under fresh approval. We enforce that the candidate
+        // plan:
+        //   1. Has status = Approved (not Completed/Failed/NeedsReplan/...).
+        //   2. Has no recorded `execution` — it has never been acted on.
+        //      Without this check, a plan that already ran (and therefore
+        //      transitioned through Executing into Completed/Failed) would
+        //      not count, but a plan that ran successfully and was reset
+        //      back to Approved by a manual edit *would* — we close that
+        //      hole by requiring the absence of any prior execution.
+        // This intentionally treats every `code-agent run` invocation as a
+        // brand-new session that demands its own fresh approval.
+        let candidates = store
+            .list(code_agent_core::PlanListFilter {
+                status: Some(code_agent_core::PlanStatus::Approved),
+                session_id: None,
+                limit: None,
+            })
+            .await
+            .context("--require-plan: list plans")?;
+        let mut usable = false;
+        for c in &candidates {
+            let plan = match store.load(&c.id).await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if plan.execution.is_none() {
+                usable = true;
+                break;
+            }
+        }
+        if !usable {
+            return Err(anyhow!(
+                "--require-plan was set but no fresh approved plan exists \
+                 in {}/.agent/plans (need status=approved AND no prior \
+                 execution); draft and approve one with `code-agent plan ...`",
+                args.common.cwd.display()
+            ));
+        }
+    }
     let cfg = resolve_common(&args.common, true).await?;
     let prompt = match maybe_handle_slash_command(&cfg, &args.prompt).await? {
         SlashOutcome::HandledLocally => return Ok(()),
@@ -1877,6 +1949,217 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         SlashOutcome::Passthrough => args.prompt.clone(),
     };
     run_one_shot(cfg, args.common.no_session, prompt, None, None).await
+}
+
+/// Build a minimal CommonArgs shim from a cwd + optional provider/model
+/// overrides. Used by `code-agent plan/act/replan` to reach back through
+/// `resolve_common` (and pick up settings, provider, tool registry) without
+/// the user having to repeat every CLI flag.
+fn make_plan_common(
+    cwd: std::path::PathBuf,
+    provider: Option<String>,
+    model: Option<String>,
+    permission_mode: Option<String>,
+) -> CommonArgs {
+    CommonArgs {
+        cwd,
+        model,
+        provider,
+        allowed_tools: Vec::new(),
+        permission_mode,
+        max_turns: None,
+        settings: "user-and-project".to_string(),
+        config: None,
+        no_session: false,
+        log_format: "pretty".to_string(),
+        show_usage: false,
+        quiet: false,
+        verbose: false,
+        yes_to: Vec::new(),
+        deny: Vec::new(),
+        checkpointing: None,
+        validate: Vec::new(),
+        validation_timeout: None,
+        rewind_on_validation_failure: false,
+        mcp_config: None,
+        mcp_enabled: None,
+        mcp_strict: false,
+        mcp_timeout: None,
+        mcp_servers: Vec::new(),
+        tool_loading: None,
+        tool_search_strategy: None,
+        native_tool_search: None,
+        tool_search_threshold: None,
+        max_tool_search_results: None,
+        max_loaded_tools: None,
+        max_loaded_tool_tokens: None,
+        always_load: Vec::new(),
+        defer_tools: Vec::new(),
+        disable_tools: Vec::new(),
+        agents: None,
+        no_agents: false,
+        max_concurrent_subagents: None,
+        subagent_timeout: None,
+        show_subagent_events: false,
+        skills: None,
+        no_skills: false,
+        commands: None,
+        no_slash_commands: false,
+        compat_claude_skills: false,
+        compat_claude_commands: false,
+        no_plugins: false,
+        plugin_dirs: Vec::new(),
+        allow_plugin_bin_path: false,
+        require_plan: false,
+    }
+}
+
+async fn cmd_plan_top(args: plan_cmd::PlanArgs) -> Result<()> {
+    let common = make_plan_common(
+        args.cwd.clone(),
+        args.provider.clone(),
+        args.model.clone(),
+        Some("plan".to_string()),
+    );
+    let cfg = resolve_common(&common, false).await?;
+
+    let mut planning = plan_cmd::planning_options_from_settings(&cfg.settings);
+    plan_cmd::apply_plan_args_to_options(&args, &mut planning)?;
+
+    let provider = build_provider(&cfg)?;
+    let plan_store: Arc<dyn code_agent_core::PlanStore> = Arc::new(
+        code_agent_core::FsPlanStore::new(cfg.cwd.clone(), planning.clone()),
+    );
+
+    let outcome = code_agent_core::generate_plan(code_agent_core::PlanRequest {
+        prompt: args.prompt.clone(),
+        options: cfg.options.clone(),
+        planning,
+        provider,
+        tools: cfg.tools.clone(),
+        plan_store: Some(plan_store),
+        parent_plan_id: None,
+        created_by: code_agent_core::PlanCreatedBy::Agent,
+    })
+    .await
+    .with_context(|| "plan generation failed")?;
+
+    println!(
+        "[plan] created {} v{} ({} steps)",
+        outcome.plan.id,
+        outcome.plan.version,
+        outcome.plan.steps.len()
+    );
+    if outcome.fallback_used {
+        println!("[plan] warning: model returned prose; structured plan inferred");
+    }
+    print!("{}", code_agent_core::render_plan_pretty(&outcome.plan));
+    println!("Approve with: code-agent plans approve {}", outcome.plan.id);
+    Ok(())
+}
+
+async fn cmd_act_top(args: plan_cmd::ActArgs) -> Result<()> {
+    let common = make_plan_common(args.cwd.clone(), None, None, args.permission_mode.clone());
+    let cfg = resolve_common(&common, true).await?;
+
+    let mut planning = plan_cmd::planning_options_from_settings(&cfg.settings);
+    if args.strict_plan {
+        planning.enforce_plan_scope = true;
+        planning.deviation_policy = code_agent_core::PlanDeviationPolicy::Deny;
+    }
+    if args.no_enforce_plan_scope {
+        planning.enforce_plan_scope = false;
+    }
+
+    let provider = build_provider(&cfg)?;
+    let plan_store: Arc<dyn code_agent_core::PlanStore> = Arc::new(
+        code_agent_core::FsPlanStore::new(cfg.cwd.clone(), planning.clone()),
+    );
+    let plan_id = plan_cmd::resolve_plan_id(&plan_store, &args.plan_id).await?;
+
+    let outcome = code_agent_core::act_plan(code_agent_core::ActRequest {
+        plan_id: plan_id.clone(),
+        options: cfg.options.clone(),
+        planning,
+        provider,
+        tools: cfg.tools.clone(),
+        plan_store,
+        user_callback: None,
+        deviation_callback: Some(Arc::new(code_agent_core::DenyAllDeviations)),
+        prompt: None,
+    })
+    .await
+    .with_context(|| format!("act failed for {plan_id}"))?;
+
+    println!(
+        "[plan] {:?}: {} step(s) completed, {} failed, {} deviation(s)",
+        outcome.summary.status,
+        outcome.summary.completed_steps.len(),
+        outcome.summary.failed_steps.len(),
+        outcome.deviations.len(),
+    );
+    Ok(())
+}
+
+async fn cmd_replan_top(args: plan_cmd::ReplanArgs) -> Result<()> {
+    let common = make_plan_common(args.cwd.clone(), None, None, Some("plan".to_string()));
+    let cfg = resolve_common(&common, false).await?;
+    let planning = plan_cmd::planning_options_from_settings(&cfg.settings);
+    let plan_store: Arc<dyn code_agent_core::PlanStore> = Arc::new(
+        code_agent_core::FsPlanStore::new(cfg.cwd.clone(), planning.clone()),
+    );
+    let target = args.plan_id.clone().unwrap_or_else(|| "latest".to_string());
+    let id = plan_cmd::resolve_plan_id(&plan_store, &target).await?;
+    let original = plan_store.load(&id).await?;
+
+    let instructions = args
+        .instructions
+        .clone()
+        .unwrap_or_else(|| format!("Revise the plan {}; previous attempt did not complete", id));
+    let provider = build_provider(&cfg)?;
+
+    // Generate the replacement plan FIRST. We only mark the previous
+    // plan as Superseded after generation succeeds — otherwise a
+    // provider error or validation failure during plan generation
+    // would leave the workspace with a freshly-demoted previous plan
+    // and no replacement, which is worse than the pre-replan state.
+    let outcome = code_agent_core::generate_plan(code_agent_core::PlanRequest {
+        prompt: format!(
+            "Revise the previous plan.\n\nORIGINAL USER REQUEST: {}\n\nREVISION INSTRUCTIONS: {}",
+            original.user_request, instructions
+        ),
+        options: cfg.options.clone(),
+        planning,
+        provider,
+        tools: cfg.tools.clone(),
+        plan_store: Some(plan_store.clone()),
+        parent_plan_id: Some(id.clone()),
+        created_by: code_agent_core::PlanCreatedBy::RevisedByAgent,
+    })
+    .await
+    .context("replan failed")?;
+
+    // Now demote the previous plan. If this save_revision fails (e.g.
+    // disk full) we still emit a clear error AFTER the new plan has
+    // been persisted, so the user is never left with no usable plan
+    // at all.
+    let mut superseded = original.clone();
+    superseded.status = code_agent_core::PlanStatus::Superseded;
+    if let Err(e) = plan_store.save_revision(superseded).await {
+        eprintln!(
+            "[plan] warning: replanned to {} v{} but failed to mark previous plan {} \
+             as superseded: {}",
+            outcome.plan.id, outcome.plan.version, id, e
+        );
+    }
+
+    println!(
+        "[plan] replanned -> {} v{} ({} steps)",
+        outcome.plan.id,
+        outcome.plan.version,
+        outcome.plan.steps.len()
+    );
+    Ok(())
 }
 
 /// Result of attempting to dispatch a slash command from a CLI prompt.
@@ -2296,6 +2579,137 @@ async fn handle_builtin_slash(
                     );
                 }
             }
+        }
+        B::Plan => {
+            // `/plan <prompt>` draft via the planning driver.
+            let prompt = raw_args.trim();
+            if prompt.is_empty() {
+                println!("[plan] usage: /plan <prompt>");
+                return Ok(());
+            }
+            cmd_plan_top(plan_cmd::PlanArgs {
+                prompt: prompt.to_string(),
+                mode: None,
+                max_steps: None,
+                provider: None,
+                model: None,
+                cwd: cfg.options.cwd.clone(),
+            })
+            .await?;
+        }
+        B::Plans => {
+            for line in plan_cmd::latest_plan_summary(&cfg.options.cwd, &cfg.settings).await? {
+                println!("{line}");
+            }
+        }
+        B::ApprovePlan => {
+            let target = raw_args
+                .split_whitespace()
+                .next()
+                .unwrap_or("latest")
+                .to_string();
+            plan_cmd::cmd_plans(
+                &cfg.settings,
+                plan_cmd::PlansCommand::Approve(plan_cmd::ApproveArgs {
+                    plan_id: target,
+                    common: plan_cmd::CommonArgs {
+                        cwd: cfg.options.cwd.clone(),
+                    },
+                    notes: None,
+                }),
+            )
+            .await?;
+        }
+        B::RejectPlan => {
+            let target = raw_args
+                .split_whitespace()
+                .next()
+                .unwrap_or("latest")
+                .to_string();
+            plan_cmd::cmd_plans(
+                &cfg.settings,
+                plan_cmd::PlansCommand::Reject(plan_cmd::RejectArgs {
+                    plan_id: target,
+                    common: plan_cmd::CommonArgs {
+                        cwd: cfg.options.cwd.clone(),
+                    },
+                    reason: None,
+                }),
+            )
+            .await?;
+        }
+        B::RevisePlan => {
+            let instructions = raw_args.trim().to_string();
+            if instructions.is_empty() {
+                println!("[plan] usage: /revise-plan <instructions>");
+                return Ok(());
+            }
+            plan_cmd::cmd_plans(
+                &cfg.settings,
+                plan_cmd::PlansCommand::Revise(plan_cmd::ReviseArgs {
+                    plan_id: "latest".to_string(),
+                    instructions,
+                    common: plan_cmd::CommonArgs {
+                        cwd: cfg.options.cwd.clone(),
+                    },
+                }),
+            )
+            .await?;
+        }
+        B::EditPlan => {
+            plan_cmd::cmd_plans(
+                &cfg.settings,
+                plan_cmd::PlansCommand::Edit(plan_cmd::EditArgs {
+                    plan_id: "latest".to_string(),
+                    common: plan_cmd::CommonArgs {
+                        cwd: cfg.options.cwd.clone(),
+                    },
+                    print_path: true,
+                }),
+            )
+            .await?;
+        }
+        B::PlanDiff => {
+            plan_cmd::cmd_plans(
+                &cfg.settings,
+                plan_cmd::PlansCommand::Diff(plan_cmd::DiffArgs {
+                    plan_id: "latest".to_string(),
+                    common: plan_cmd::CommonArgs {
+                        cwd: cfg.options.cwd.clone(),
+                    },
+                    from_version: None,
+                    to_version: None,
+                }),
+            )
+            .await?;
+        }
+        B::Act => {
+            let target = raw_args
+                .split_whitespace()
+                .next()
+                .unwrap_or("latest")
+                .to_string();
+            cmd_act_top(plan_cmd::ActArgs {
+                plan_id: target,
+                permission_mode: None,
+                strict_plan: false,
+                no_enforce_plan_scope: false,
+                cwd: cfg.options.cwd.clone(),
+            })
+            .await?;
+        }
+        B::Replan => {
+            let instructions = raw_args.trim();
+            cmd_replan_top(plan_cmd::ReplanArgs {
+                plan_id: Some("latest".to_string()),
+                instructions: if instructions.is_empty() {
+                    None
+                } else {
+                    Some(instructions.to_string())
+                },
+                cwd: cfg.options.cwd.clone(),
+            })
+            .await?;
         }
     }
     Ok(())
@@ -5385,6 +5799,114 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
                 println!(
                     "[auth] status checked provider={} healthy={}",
                     p.provider, p.healthy
+                );
+            }
+        }
+        AgentEvent::PlanCreated(p) => {
+            if !quiet {
+                println!(
+                    "[plan] created {} v{} ({} steps): {}",
+                    p.plan_id, p.version, p.step_count, p.title
+                );
+                if let Some(w) = &p.fallback {
+                    println!("[plan] warning: {w}");
+                }
+            }
+        }
+        AgentEvent::PlanRevisionCreated(p) => {
+            if !quiet {
+                println!(
+                    "[plan] revision {} v{} (was v{})",
+                    p.plan_id, p.version, p.previous_version
+                );
+            }
+        }
+        AgentEvent::PlanApprovalRequested(p) => {
+            if !quiet {
+                println!("[plan] approval requested for {} v{}", p.plan_id, p.version);
+            }
+        }
+        AgentEvent::PlanApproved(p) => {
+            if !quiet {
+                println!("[plan] approved {} v{}", p.plan_id, p.version);
+            }
+        }
+        AgentEvent::PlanRejected(p) => {
+            if !quiet {
+                let r = p.reason.as_deref().unwrap_or("");
+                println!("[plan] rejected {} v{} {r}", p.plan_id, p.version);
+            }
+        }
+        AgentEvent::PlanActStarted(p) => {
+            if !quiet {
+                println!(
+                    "[act] starting plan {} v{} ({} steps)",
+                    p.plan_id, p.version, p.step_count
+                );
+            }
+        }
+        AgentEvent::PlanStepStarted(p) => {
+            if !quiet {
+                println!("[plan-step] start {} {}", p.step_id, p.title);
+            }
+        }
+        AgentEvent::PlanStepUpdated(p) => {
+            if !quiet {
+                let m = p
+                    .message
+                    .as_deref()
+                    .map(|m| format!(": {m}"))
+                    .unwrap_or_default();
+                println!("[plan-step] {} -> {:?}{}", p.step_id, p.status, m);
+            }
+        }
+        AgentEvent::PlanStepCompleted(p) => {
+            if !quiet {
+                println!("[plan-step] done {} ({:?})", p.step_id, p.final_status);
+            }
+        }
+        AgentEvent::PlanDeviationDetected(p) => {
+            println!(
+                "[deviation] {} requested {} (severity={:?}): {}",
+                p.deviation.plan_id,
+                p.deviation.tool_name,
+                p.deviation.severity,
+                p.deviation.reason
+            );
+        }
+        AgentEvent::PlanDeviationResolved(p) => {
+            if !quiet {
+                println!(
+                    "[deviation] resolved {} {} -> {}",
+                    p.plan_id, p.tool_name, p.outcome
+                );
+            }
+        }
+        AgentEvent::PlanCompleted(p) => {
+            if !quiet {
+                println!(
+                    "[plan] completed {} v{} ({:?}, {} steps)",
+                    p.plan_id, p.version, p.status, p.completed_steps
+                );
+            }
+        }
+        AgentEvent::PlanFailed(p) => {
+            println!(
+                "[plan] failed {} v{} ({} failed): {}",
+                p.plan_id, p.version, p.failed_steps, p.reason
+            );
+        }
+        AgentEvent::PlanNeedsReplan(p) => {
+            println!(
+                "[plan] needs replan {} v{}: {}",
+                p.plan_id, p.version, p.reason
+            );
+        }
+        AgentEvent::PlanArchived(p) => {
+            if !quiet {
+                println!(
+                    "[plan] archived {} v{} ({:?})",
+                    p.plan_id, p.version, p.status
                 );
             }
         }

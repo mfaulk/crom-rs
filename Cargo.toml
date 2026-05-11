@@ -21,6 +21,7 @@ exclude = [
     "examples/subagent-demo",
     "examples/skills-demo",
     "examples/beta-demo",
+    "examples/planning-demo",
 ]
 
 [workspace.package]
