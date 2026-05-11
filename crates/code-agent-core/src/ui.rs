@@ -412,6 +412,12 @@ pub fn supported_status_line_variables() -> &'static [&'static str] {
         "plugins",
         "loaded_tools",
         "deferred_tools",
+        // M10 auth/provider variables.
+        "provider",
+        "account",
+        "auth_method",
+        "plan",
+        "quota",
     ]
 }
 

@@ -108,6 +108,67 @@ pub struct SettingsFile {
     /// M9: session recovery configuration.
     #[serde(default)]
     pub recovery: Option<RecoverySettingsConfig>,
+    /// M10: provider auth configuration. Tokens are NEVER stored here —
+    /// only the metadata that controls how they're discovered/resolved.
+    #[serde(default)]
+    pub auth: Option<AuthSettingsConfig>,
+    /// M10: active model + provider, plus optional fallback list.
+    #[serde(default)]
+    pub model_config: Option<ModelSettingsConfig>,
+}
+
+/// Auth subsystem settings (M10).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthSettingsConfig {
+    /// `auto`, `keychain`, or `file`.
+    #[serde(default)]
+    pub credential_store: Option<String>,
+    #[serde(default)]
+    pub active_provider: Option<String>,
+    #[serde(default)]
+    pub active_account: Option<String>,
+    /// `explicit_first` (default), `env_first`, `stored_first`.
+    #[serde(default)]
+    pub auth_precedence: Option<String>,
+    #[serde(default)]
+    pub allow_file_credential_store: Option<bool>,
+    #[serde(default)]
+    pub refresh_before_expiry_seconds: Option<u64>,
+    #[serde(default)]
+    pub allow_subscription_auth_in_ci: Option<bool>,
+    #[serde(default)]
+    pub providers: Option<std::collections::BTreeMap<String, AuthProviderEntry>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthProviderEntry {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub allowed_methods: Option<Vec<String>>,
+    #[serde(default)]
+    pub prefer_device_flow: Option<bool>,
+}
+
+/// Model subsystem settings (M10).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSettingsConfig {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub fallbacks: Option<Vec<ModelFallbackEntry>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelFallbackEntry {
+    pub provider: String,
+    pub model: String,
 }
 
 /// Settings for the M7 Skills subsystem.
@@ -364,6 +425,10 @@ pub struct Settings {
     pub ui: UiConfig,
     /// M9: effective recovery configuration.
     pub recovery: RecoveryConfig,
+    /// M10: auth subsystem settings.
+    pub auth: AuthSettingsConfig,
+    /// M10: active model + provider.
+    pub model_config: ModelSettingsConfig,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -645,7 +710,55 @@ fn merge_into(dst: &mut Settings, src: SettingsFile, _is_user: bool) -> Result<(
     if let Some(rec) = src.recovery {
         merge_recovery_into(&mut dst.recovery, rec);
     }
+    if let Some(auth) = src.auth {
+        merge_auth_settings(&mut dst.auth, auth);
+    }
+    if let Some(model_cfg) = src.model_config {
+        merge_model_settings(&mut dst.model_config, model_cfg);
+    }
     Ok(())
+}
+
+fn merge_auth_settings(dst: &mut AuthSettingsConfig, src: AuthSettingsConfig) {
+    if src.credential_store.is_some() {
+        dst.credential_store = src.credential_store;
+    }
+    if src.active_provider.is_some() {
+        dst.active_provider = src.active_provider;
+    }
+    if src.active_account.is_some() {
+        dst.active_account = src.active_account;
+    }
+    if src.auth_precedence.is_some() {
+        dst.auth_precedence = src.auth_precedence;
+    }
+    if src.allow_file_credential_store.is_some() {
+        dst.allow_file_credential_store = src.allow_file_credential_store;
+    }
+    if src.refresh_before_expiry_seconds.is_some() {
+        dst.refresh_before_expiry_seconds = src.refresh_before_expiry_seconds;
+    }
+    if src.allow_subscription_auth_in_ci.is_some() {
+        dst.allow_subscription_auth_in_ci = src.allow_subscription_auth_in_ci;
+    }
+    if let Some(providers) = src.providers {
+        let dst_providers = dst.providers.get_or_insert_with(Default::default);
+        for (k, v) in providers {
+            dst_providers.insert(k, v);
+        }
+    }
+}
+
+fn merge_model_settings(dst: &mut ModelSettingsConfig, src: ModelSettingsConfig) {
+    if src.provider.is_some() {
+        dst.provider = src.provider;
+    }
+    if src.model.is_some() {
+        dst.model = src.model;
+    }
+    if src.fallbacks.is_some() {
+        dst.fallbacks = src.fallbacks;
+    }
 }
 
 fn merge_plugins_settings(dst: &mut Option<PluginsSettingsConfig>, src: PluginsSettingsConfig) {

@@ -270,6 +270,136 @@ pub async fn run_doctor(cwd: &Path, settings: &Settings, redact_secrets: bool) -
         }
     }
 
+    // M10: auth diagnostics. Best-effort; failures here never abort doctor.
+    text.push(String::new());
+    text.push("Auth".to_string());
+    let env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    // Doctor reads-only — never opt in to the file backend here, since
+    // building it would side-effect-create `.agent/secrets/`. We still
+    // load the index from `.agent/auth.json` if it exists.
+    let auth_index_path = cwd.join(".agent").join("auth.json");
+    let index_exists = auth_index_path.exists();
+    let store = code_agent_auth::CredentialStore::build(
+        code_agent_auth::CredentialStoreMode::Auto,
+        false,
+        if index_exists {
+            Some(auth_index_path)
+        } else {
+            None
+        },
+    );
+    let backend_name = match &store {
+        Ok(s) => s.backend.name(),
+        Err(_) => "unavailable",
+    };
+    checks.push(DoctorCheck {
+        id: "auth.credential_store".into(),
+        status: if store.is_ok() {
+            DoctorStatus::Ok
+        } else {
+            DoctorStatus::Warn
+        },
+        severity: DoctorSeverity::Info,
+        message: format!("credential store backend: {}", backend_name),
+        remediation: None,
+    });
+    text.push(format!("  ✓ credential store: {}", backend_name));
+
+    // CI detection
+    if let Some(marker) = code_agent_auth::ci::detect_ci(&env) {
+        checks.push(DoctorCheck {
+            id: "auth.ci_detected".into(),
+            status: DoctorStatus::Warn,
+            severity: DoctorSeverity::Warning,
+            message: format!(
+                "CI detected via {marker}; subscription auth blocked unless explicitly allowed"
+            ),
+            remediation: Some(
+                "set auth.allow_subscription_auth_in_ci to true in trusted private CI".into(),
+            ),
+        });
+        text.push(format!(
+            "  ! CI detected via {marker}; subscription auth blocked by default"
+        ));
+    }
+
+    if let Ok(store) = store.as_ref() {
+        let idx = store.snapshot_index();
+        for provider_id in [
+            code_agent_auth::ProviderId::Anthropic,
+            code_agent_auth::ProviderId::OpenAi,
+            code_agent_auth::ProviderId::Codex,
+            code_agent_auth::ProviderId::Gemini,
+            code_agent_auth::ProviderId::Fake,
+        ] {
+            let active = idx.active_for(&provider_id).cloned();
+            let resolved =
+                code_agent_auth::resolve_credential(code_agent_auth::AuthResolverInputs {
+                    provider: Some(provider_id.clone()),
+                    mode: code_agent_auth::AuthPrecedenceMode::ExplicitFirst,
+                    explicit_api_key: None,
+                    explicit_account: None,
+                    active_account: active.as_ref(),
+                    env: env.clone(),
+                    store: Some(store),
+                });
+            match resolved {
+                Ok(r) => {
+                    let summary = format!(
+                        "{}: {} ({})",
+                        provider_id,
+                        match &r.credential {
+                            code_agent_auth::ResolvedCredential::ApiKey { .. } => "api-key",
+                            code_agent_auth::ResolvedCredential::OAuthBearer { .. } => "oauth",
+                            code_agent_auth::ResolvedCredential::ExternalManaged { .. } =>
+                                "external",
+                            code_agent_auth::ResolvedCredential::None => "none",
+                        },
+                        r.credential.source_label()
+                    );
+                    checks.push(DoctorCheck {
+                        id: format!("auth.{}", provider_id),
+                        status: DoctorStatus::Ok,
+                        severity: DoctorSeverity::Info,
+                        message: summary.clone(),
+                        remediation: None,
+                    });
+                    text.push(format!("  ✓ {}", summary));
+                    for w in &r.warnings {
+                        checks.push(DoctorCheck {
+                            id: format!("auth.{}.precedence", provider_id),
+                            status: DoctorStatus::Warn,
+                            severity: DoctorSeverity::Warning,
+                            message: w.clone(),
+                            remediation: None,
+                        });
+                        text.push(format!("    ! {}", w));
+                    }
+                }
+                Err(e) if e.kind == code_agent_auth::AuthErrorKind::NotLoggedIn => {
+                    checks.push(DoctorCheck {
+                        id: format!("auth.{}", provider_id),
+                        status: DoctorStatus::Skipped,
+                        severity: DoctorSeverity::Info,
+                        message: format!("{}: not logged in", provider_id),
+                        remediation: Some(format!("/login {} --api-key", provider_id)),
+                    });
+                    text.push(format!("  - {}: not logged in", provider_id));
+                }
+                Err(e) => {
+                    checks.push(DoctorCheck {
+                        id: format!("auth.{}", provider_id),
+                        status: DoctorStatus::Fail,
+                        severity: DoctorSeverity::Error,
+                        message: format!("{}: {}", provider_id, e),
+                        remediation: None,
+                    });
+                    text.push(format!("  ✗ {}: {}", provider_id, e));
+                }
+            }
+        }
+    }
+
     DoctorReport { checks, text }
 }
 
@@ -553,7 +683,70 @@ pub fn build_default_status_ctx(
     }
     ctx.set("context_percent", "0");
     ctx.set("estimated_cost", "$0.00");
+    // M10: best-effort auth status. We read the .agent/auth.json index
+    // directly so the status line works even when the auth subsystem
+    // hasn't been touched this session. Missing fields render as "".
+    populate_auth_statusline_vars(&mut ctx, cwd);
     ctx
+}
+
+/// Populate provider/account/auth_method/plan/quota status-line variables
+/// from `cwd/.agent/auth.json`. Failures are silent — partial info is
+/// fine for the status line.
+pub fn populate_auth_statusline_vars(ctx: &mut StatusLineContext, cwd: &Path) {
+    let path = cwd.join(".agent").join("auth.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(idx): Result<serde_json::Value, _> = serde_json::from_slice(&bytes) else {
+        return;
+    };
+    // Pick the first active provider entry.
+    let active = idx
+        .get("active")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.iter().next());
+    if let Some((provider, account_id)) = active {
+        ctx.set("provider", provider.clone());
+        if let Some(s) = account_id.as_str() {
+            // Use the same redaction rule as StoredAccount::display_label(true).
+            let redacted = if let Some((local, domain)) = s.split_once('@') {
+                let prefix: String = local.chars().take(2).collect();
+                format!("{}***@{}", prefix, domain)
+            } else if s.len() > 4 {
+                format!("{}…", &s[..4])
+            } else {
+                s.to_string()
+            };
+            ctx.set("account", redacted);
+        }
+        // Find login_method + plan_type from the accounts array, scoped
+        // to the active *(provider, account_id)* pair. If we matched on
+        // provider only we'd surface metadata for whichever account
+        // happened to be first in the file when multiple accounts exist
+        // under the same provider.
+        let active_account_id_str = account_id.as_str();
+        if let Some(accounts) = idx.get("accounts").and_then(|v| v.as_array()) {
+            for acct in accounts {
+                let provider_matches =
+                    acct.get("provider").and_then(|v| v.as_str()) == Some(provider.as_str());
+                let account_matches = match active_account_id_str {
+                    Some(s) => acct.get("account_id").and_then(|v| v.as_str()) == Some(s),
+                    None => true,
+                };
+                if provider_matches && account_matches {
+                    if let Some(m) = acct.get("login_method").and_then(|v| v.as_str()) {
+                        ctx.set("auth_method", m);
+                    }
+                    if let Some(p) = acct.get("plan_type").and_then(|v| v.as_str()) {
+                        ctx.set("plan", p);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    // No quota source yet; leave empty rather than fabricate a value.
 }
 
 /// Choose a renderer using the configured preferences and detected caps.
@@ -780,16 +973,24 @@ mod tests {
     }
 
     /// Restores an env var on drop so tests don't leak global state.
+    /// Holds a process-global mutex while alive so two tests touching
+    /// the same env var (e.g. ANTHROPIC_API_KEY) cannot interleave under
+    /// `cargo test` parallel execution.
     struct EnvGuard {
         key: String,
         prior: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl EnvGuard {
         fn new(key: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             Self {
                 key: key.to_string(),
                 prior: std::env::var(key).ok(),
+                _lock: lock,
             }
         }
     }

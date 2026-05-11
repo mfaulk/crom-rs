@@ -61,6 +61,16 @@ pub enum BuiltInSlashCommand {
     Sessions,
     /// M9: detect and recover an interrupted session.
     Recover,
+    /// M10: open the provider login flow.
+    Login,
+    /// M10: log out of the active provider.
+    Logout,
+    /// M10: show stored auth credentials.
+    Auth,
+    /// M10: list or set the active model provider.
+    Provider,
+    /// M10: list or pick a model from the registry.
+    Model,
 }
 
 impl BuiltInSlashCommand {
@@ -83,6 +93,11 @@ impl BuiltInSlashCommand {
             Self::Revert => "revert",
             Self::Sessions => "sessions",
             Self::Recover => "recover",
+            Self::Login => "login",
+            Self::Logout => "logout",
+            Self::Auth => "auth",
+            Self::Provider => "provider",
+            Self::Model => "model",
         }
     }
 
@@ -105,6 +120,11 @@ impl BuiltInSlashCommand {
             Self::Revert => "Revert workspace files to a checkpoint.",
             Self::Sessions => "List known sessions for this workspace.",
             Self::Recover => "Detect and recover an interrupted session.",
+            Self::Login => "Login to a model-access provider.",
+            Self::Logout => "Logout (delete stored credentials).",
+            Self::Auth => "Show or manage stored auth credentials.",
+            Self::Provider => "List or set the active model provider.",
+            Self::Model => "List or pick a model from the registry.",
         }
     }
 
@@ -127,6 +147,11 @@ impl BuiltInSlashCommand {
             "revert" => Self::Revert,
             "sessions" => Self::Sessions,
             "recover" => Self::Recover,
+            "login" => Self::Login,
+            "logout" => Self::Logout,
+            "auth" => Self::Auth,
+            "provider" => Self::Provider,
+            "model" => Self::Model,
             _ => return None,
         })
     }
@@ -150,6 +175,11 @@ impl BuiltInSlashCommand {
             Self::Revert,
             Self::Sessions,
             Self::Recover,
+            Self::Login,
+            Self::Logout,
+            Self::Auth,
+            Self::Provider,
+            Self::Model,
         ]
     }
 }

@@ -1,0 +1,28 @@
+[package]
+name = "code-agent-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Provider login, credential storage, and OAuth (PKCE + device-code) framework for code-agent (M10)."
+
+[features]
+default = []
+# Surfaces a deterministic in-memory fake OAuth server for tests/demos.
+# Built unconditionally because it has no extra deps and the demo uses it.
+testing = []
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+time = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

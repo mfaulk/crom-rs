@@ -1,0 +1,5 @@
+# Runtime artifacts written by the demo runner.
+.agent/auth.json
+.agent/active-model.json
+.agent/active-provider.json
+.agent/secrets/
