@@ -137,7 +137,119 @@ pub enum AgentEvent {
     NotificationSent(NotificationSent),
     /// M9: a local notification failed to send.
     NotificationFailed(NotificationFailed),
+    /// M10: provider auth registry summarized at startup.
+    AuthProviderRegistryLoaded(AuthProviderRegistryLoaded),
+    /// M10: a login flow began.
+    LoginStarted(LoginStarted),
+    /// M10: a login flow completed successfully.
+    LoginCompleted(LoginCompleted),
+    /// M10: a login flow failed.
+    LoginFailed(LoginFailed),
+    /// M10: logout completed.
+    LogoutCompleted(LogoutCompleted),
+    /// M10: a credential was stored.
+    CredentialStored(CredentialStored),
+    /// M10: a credential was refreshed.
+    CredentialRefreshed(CredentialRefreshed),
+    /// M10: a credential refresh attempt failed.
+    CredentialRefreshFailed(CredentialRefreshFailed),
+    /// M10: an auth provider was selected as active.
+    AuthProviderSelected(AuthProviderSelected),
+    /// M10: a model was selected.
+    ModelSelected(ModelSelected),
+    /// M10: a model list was loaded.
+    ModelListLoaded(ModelListLoaded),
+    /// M10: an auth status check was performed.
+    AuthStatusChecked(AuthStatusChecked),
     Result(AgentResult),
+}
+
+/// M10 auth events. We define them here (rather than re-using the auth
+/// crate's records via `#[serde(transparent)]`) so the central
+/// `AgentEvent` enum stays the canonical wire format. The CLI/TUI
+/// converts auth-crate records into these wrappers before publishing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthProviderRegistryLoaded {
+    pub providers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginStarted {
+    pub provider: String,
+    pub method: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginCompleted {
+    pub provider: String,
+    pub method: String,
+    pub account_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_account: Option<String>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginFailed {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    pub kind: String,
+    pub message: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogoutCompleted {
+    pub provider: String,
+    pub account_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialStored {
+    pub provider: String,
+    pub account_hash: String,
+    pub store: String,
+    pub secret_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialRefreshed {
+    pub provider: String,
+    pub account_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialRefreshFailed {
+    pub provider: String,
+    pub account_hash: String,
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthProviderSelected {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSelected {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelListLoaded {
+    pub provider: String,
+    pub model_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthStatusChecked {
+    pub provider: String,
+    pub healthy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

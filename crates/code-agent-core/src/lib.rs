@@ -64,9 +64,16 @@ pub use conversation::{
 pub use errors::{AgentError, ProviderError, ToolError};
 pub use events::{
     AgentEvent, AgentRegistryLoaded, AgentResult, ApprovalPromptResolved, ApprovalPromptShown,
-    ApprovalRevisionRequested, ChangesViewed, CheckpointEventPayload, CompactBoundary,
-    CompactionTrigger, DiffViewed, DoctorCheckCompleted, DoctorCheckStarted, DoctorSeverity,
-    DoctorStatus, HookEvaluated, HookOutcomeKind, InitCompleted, InitStarted, InterruptedEvent,
+    ApprovalRevisionRequested, AuthProviderRegistryLoaded as AuthProviderRegistryLoadedEvent,
+    AuthProviderSelected as AuthProviderSelectedEvent, AuthStatusChecked as AuthStatusCheckedEvent,
+    ChangesViewed, CheckpointEventPayload, CompactBoundary, CompactionTrigger,
+    CredentialRefreshFailed as CredentialRefreshFailedEvent,
+    CredentialRefreshed as CredentialRefreshedEvent, CredentialStored as CredentialStoredEvent,
+    DiffViewed, DoctorCheckCompleted, DoctorCheckStarted, DoctorSeverity, DoctorStatus,
+    HookEvaluated, HookOutcomeKind, InitCompleted, InitStarted, InterruptedEvent,
+    LoginCompleted as LoginCompletedEvent, LoginFailed as LoginFailedEvent,
+    LoginStarted as LoginStartedEvent, LogoutCompleted as LogoutCompletedEvent,
+    ModelListLoaded as ModelListLoadedEvent, ModelSelected as ModelSelectedEvent,
     NotificationFailed, NotificationSent, PluginComponentFailed, PluginComponentLoaded,
     PluginDisabled, PluginEnabled, PluginInstalled, PluginMarketplaceAdded,
     PluginMarketplaceEntryInstalled, PluginRegistryLoaded, PluginReloaded, PluginUninstalled,
@@ -112,10 +119,11 @@ pub use policy::{
 pub use provider::{ModelEvent, ModelProvider, ModelRequest};
 pub use run_id::RunId;
 pub use settings::{
-    AgentsSettingsConfig, CheckpointRetentionConfig, CheckpointingConfig, CompactionSettingsConfig,
-    EnabledPluginEntry, HooksConfig, PluginsSettingsConfig, ProjectInstructionsMode, SettingSource,
-    Settings, SettingsError, SettingsFile, SkillsSettingsConfig, SlashCommandsSettingsConfig,
-    ToolLimitsConfig, ValidationConfig,
+    AgentsSettingsConfig, AuthProviderEntry, AuthSettingsConfig, CheckpointRetentionConfig,
+    CheckpointingConfig, CompactionSettingsConfig, EnabledPluginEntry, HooksConfig,
+    ModelFallbackEntry, ModelSettingsConfig, PluginsSettingsConfig, ProjectInstructionsMode,
+    SettingSource, Settings, SettingsError, SettingsFile, SkillsSettingsConfig,
+    SlashCommandsSettingsConfig, ToolLimitsConfig, ValidationConfig,
 };
 pub use skills::{
     compat_claude_skills_dir, filesystem_skills_dir, is_identifier_safe_skill_name,

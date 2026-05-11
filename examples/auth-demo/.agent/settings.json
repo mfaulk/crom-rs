@@ -1,0 +1,20 @@
+{
+  "auth": {
+    "credential_store": "auto",
+    "active_provider": "fake",
+    "auth_precedence": "explicit_first",
+    "allow_file_credential_store": true,
+    "allow_subscription_auth_in_ci": false,
+    "providers": {
+      "anthropic": { "enabled": true, "allowed_methods": ["api_key"] },
+      "openai":    { "enabled": true, "allowed_methods": ["api_key"] },
+      "codex":     { "enabled": true, "allowed_methods": ["api_key"] },
+      "gemini":    { "enabled": true, "allowed_methods": ["api_key"] },
+      "fake":      { "enabled": true, "allowed_methods": ["api_key", "oauth_browser", "oauth_device_code"] }
+    }
+  },
+  "model_config": {
+    "provider": "fake",
+    "model": "fake-coding-model"
+  }
+}

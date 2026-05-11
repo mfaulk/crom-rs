@@ -1206,6 +1206,8 @@ pub fn settings_to_file(s: &Settings) -> code_agent_core::SettingsFile {
         // here means user-set keys win over plugin defaults.
         ui: Some(ui_to_settings(&s.ui)),
         recovery: Some(recovery_to_settings(&s.recovery)),
+        auth: Some(s.auth.clone()),
+        model_config: Some(s.model_config.clone()),
     }
 }
 

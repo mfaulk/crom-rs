@@ -1,3 +1,4 @@
+mod auth_cmd;
 mod m9;
 mod plugins;
 
@@ -135,6 +136,19 @@ enum Command {
     Completions(CompletionsArgs),
     /// Open the interactive fullscreen TUI.
     Tui(TuiArgs),
+    /// Login to a model-access provider (M10).
+    Login(auth_cmd::LoginArgs),
+    /// Inspect or manage stored credentials (M10).
+    #[command(subcommand)]
+    Auth(auth_cmd::AuthCommand),
+    /// List or set the active model provider (M10).
+    #[command(subcommand)]
+    Provider(auth_cmd::ProviderCommand),
+    /// List or pick a model from the unified registry (M10).
+    #[command(subcommand)]
+    Model(auth_cmd::ModelCommand),
+    /// Logout (alias for `auth logout`).
+    Logout(auth_cmd::AuthCommonArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -642,6 +656,12 @@ struct CommonArgs {
     /// falls back to the built-in default `claude-sonnet-4-6`.
     #[arg(long)]
     model: Option<String>,
+    /// Model-access provider to use for this run: anthropic | openai |
+    /// gemini | fake. When omitted, falls back to .agent/active-provider.json
+    /// (set by `code-agent provider use`), then to the built-in default
+    /// `anthropic`.
+    #[arg(long)]
+    provider: Option<String>,
     /// Comma-separated list of tools to expose by name.
     #[arg(long, value_delimiter = ',')]
     allowed_tools: Vec<String>,
@@ -1099,6 +1119,11 @@ async fn main() -> ExitCode {
         Command::Paths(args) => cmd_paths(args).await,
         Command::Completions(args) => cmd_completions(args).await,
         Command::Tui(args) => cmd_tui(args).await,
+        Command::Login(args) => auth_cmd::cmd_login(args).await,
+        Command::Auth(cmd) => auth_cmd::cmd_auth(cmd).await,
+        Command::Provider(cmd) => auth_cmd::cmd_provider(cmd).await,
+        Command::Model(cmd) => auth_cmd::cmd_model(cmd).await,
+        Command::Logout(args) => auth_cmd::cmd_auth_logout(None, args).await,
     };
 
     match result {
@@ -1123,6 +1148,9 @@ struct ResolvedRunConfig {
     settings_summary: String,
     checkpointing: CheckpointOptions,
     validation: ValidationOptions,
+    /// CLI `--provider` override, if any. When `None`, `build_provider`
+    /// falls back to `.agent/active-provider.json`, then to the default.
+    provider_override: Option<String>,
 }
 
 async fn resolve_common(
@@ -1501,6 +1529,7 @@ async fn resolve_common(
         settings_summary,
         checkpointing,
         validation,
+        provider_override: common.provider.clone(),
     })
 }
 
@@ -1877,7 +1906,7 @@ async fn maybe_handle_slash_command(cfg: &ResolvedRunConfig, raw: &str) -> Resul
     use code_agent_core::SlashCommandHandler;
     match dispatch.handler {
         SlashCommandHandler::BuiltIn(b) => {
-            handle_builtin_slash(b, cfg).await?;
+            handle_builtin_slash(b, cfg, &parsed.raw_arguments).await?;
             Ok(SlashOutcome::HandledLocally)
         }
         SlashCommandHandler::Skill(name) => {
@@ -1955,7 +1984,7 @@ async fn maybe_handle_slash_command_for_chat(
     use code_agent_core::SlashCommandHandler;
     match dispatch.handler {
         SlashCommandHandler::BuiltIn(b) => {
-            handle_builtin_slash_for_chat(b, cfg, client).await?;
+            handle_builtin_slash_for_chat(b, cfg, client, &parsed.raw_arguments).await?;
             Ok(ChatSlashOutcome::HandledLocally)
         }
         SlashCommandHandler::Skill(name) => {
@@ -2002,6 +2031,7 @@ async fn handle_builtin_slash_for_chat(
     b: code_agent_core::BuiltInSlashCommand,
     cfg: &ResolvedRunConfig,
     client: &mut AgentClient,
+    raw_args: &str,
 ) -> Result<()> {
     use code_agent_core::BuiltInSlashCommand as B;
     match b {
@@ -2021,7 +2051,7 @@ async fn handle_builtin_slash_for_chat(
                 Err(e) => println!("[compact-error] {e}"),
             }
         }
-        other => handle_builtin_slash(other, cfg).await?,
+        other => handle_builtin_slash(other, cfg, raw_args).await?,
     }
     Ok(())
 }
@@ -2082,6 +2112,7 @@ fn slash_expansion_options_from_settings(
 async fn handle_builtin_slash(
     b: code_agent_core::BuiltInSlashCommand,
     cfg: &ResolvedRunConfig,
+    raw_args: &str,
 ) -> Result<()> {
     use code_agent_core::BuiltInSlashCommand as B;
     match b {
@@ -2190,6 +2221,81 @@ async fn handle_builtin_slash(
                 "(use `code-agent sessions recover --cwd {}`)",
                 cfg.options.cwd.display()
             );
+        }
+        B::Login => {
+            let allow_file = cfg
+                .settings
+                .auth
+                .allow_file_credential_store
+                .unwrap_or(false);
+            let out = auth_cmd::handle_login_slash(raw_args, &cfg.options.cwd, allow_file).await?;
+            print!("{out}");
+        }
+        B::Logout => {
+            let allow_file = cfg
+                .settings
+                .auth
+                .allow_file_credential_store
+                .unwrap_or(false);
+            let out = auth_cmd::format_logout(&cfg.options.cwd, true, allow_file).await?;
+            print!("{out}");
+        }
+        B::Auth => {
+            let allow_file = cfg
+                .settings
+                .auth
+                .allow_file_credential_store
+                .unwrap_or(false);
+            let out = auth_cmd::format_login_status(&cfg.options.cwd, true, allow_file).await?;
+            print!("{out}");
+        }
+        B::Provider => {
+            // /provider <name> persists the active provider; bare /provider lists.
+            let arg = raw_args.split_whitespace().next();
+            if let Some(name) = arg {
+                let allow_file = cfg
+                    .settings
+                    .auth
+                    .allow_file_credential_store
+                    .unwrap_or(false);
+                let common = auth_cmd::AuthCommonArgs {
+                    cwd: cfg.options.cwd.clone(),
+                    json: false,
+                    allow_file_store: allow_file,
+                };
+                auth_cmd::cmd_provider_use(name.to_string(), common).await?;
+            } else {
+                let (registry, _) = auth_cmd::build_registry();
+                for (_, p) in registry.iter() {
+                    println!("- {} ({})", p.display_name(), p.id());
+                }
+            }
+        }
+        B::Model => {
+            // /model <provider>/<model> persists; bare /model lists.
+            let arg = raw_args.split_whitespace().next();
+            if let Some(spec) = arg {
+                let common = auth_cmd::AuthCommonArgs {
+                    cwd: cfg.options.cwd.clone(),
+                    json: false,
+                    allow_file_store: cfg
+                        .settings
+                        .auth
+                        .allow_file_credential_store
+                        .unwrap_or(false),
+                };
+                auth_cmd::cmd_model_use(spec.to_string(), common).await?;
+            } else {
+                for m in code_agent_auth::starter_registry().models {
+                    println!(
+                        "{}/{}  {}  ({})",
+                        m.provider,
+                        m.model_id,
+                        m.display_name,
+                        m.availability.label()
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -2400,7 +2506,7 @@ async fn run_one_shot(
 ) -> Result<()> {
     let validation = cfg.validation.clone();
     let checkpointing = cfg.checkpointing.clone();
-    let provider: Arc<dyn ModelProvider> = build_provider(&cfg.options.model)?;
+    let provider: Arc<dyn ModelProvider> = build_provider(&cfg)?;
 
     // `--no-session` disables session WRITES, but resume/continue/fork still
     // need to READ prior history to honor their semantics. When the caller
@@ -2668,7 +2774,7 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
     // Unresolved tool requests are denied with a helpful message.
     let mut cfg = resolve_common(&args.common, false).await?;
     cfg.options.permission_callback = Some(Arc::new(ChatNoninteractiveApprover));
-    let provider: Arc<dyn ModelProvider> = build_provider(&cfg.options.model)?;
+    let provider: Arc<dyn ModelProvider> = build_provider(&cfg)?;
 
     let store: Option<Arc<dyn SessionStore>> = if args.common.no_session {
         None
@@ -4393,11 +4499,314 @@ async fn cmd_rewind(args: RewindArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_provider(_model: &str) -> Result<Arc<dyn ModelProvider>> {
-    let cfg =
-        AnthropicConfig::from_env().context("ANTHROPIC_API_KEY must be set to call the model")?;
-    let provider = AnthropicProvider::new(cfg)?;
-    Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
+fn build_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
+    let provider_id = resolve_active_provider(cfg);
+    match provider_id.as_str() {
+        "openai" => build_openai_provider(cfg),
+        "gemini" => build_gemini_provider(cfg),
+        "fake" => Ok(Arc::new(build_fake_provider())),
+        // Anthropic is the default. Bedrock/Vertex/Foundry are
+        // intentionally not wired in this milestone — `auth status` and
+        // doctor explain the support matrix.
+        _ => {
+            let acfg = AnthropicConfig::from_env()
+                .context("ANTHROPIC_API_KEY must be set to call the Anthropic API")?;
+            let provider = AnthropicProvider::new(acfg)?;
+            Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
+        }
+    }
+}
+
+/// Pick the provider name to use this run, in order of precedence:
+/// 1. `--provider` CLI flag,
+/// 2. `.agent/active-provider.json` written by `code-agent provider use`,
+/// 3. `auth.active_provider` from settings,
+/// 4. the built-in default `"anthropic"`.
+fn resolve_active_provider(cfg: &ResolvedRunConfig) -> String {
+    if let Some(p) = cfg.provider_override.as_deref() {
+        return p.to_string();
+    }
+    let marker = cfg.cwd.join(".agent").join("active-provider.json");
+    if let Ok(bytes) = std::fs::read(&marker) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(s) = v.get("provider").and_then(|v| v.as_str()) {
+                return s.to_string();
+            }
+        }
+    }
+    if let Some(s) = cfg.settings.auth.active_provider.as_deref() {
+        return s.to_string();
+    }
+    "anthropic".to_string()
+}
+
+fn build_openai_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
+    let cred = resolve_runtime_credential(cfg, code_agent_auth::ProviderId::OpenAi)?;
+    let transport: Arc<dyn code_agent_provider_openai::OpenAiTransport> =
+        Arc::new(ReqwestOpenAiTransport::new()?);
+    let cred_arc = std::sync::Arc::new(parking_lot_compat::Mutex::new(Some(cred)));
+    let factory = move || {
+        cred_arc
+            .lock()
+            .as_ref()
+            .cloned()
+            .unwrap_or(code_agent_auth::ResolvedCredential::None)
+    };
+    Ok(Arc::new(code_agent_provider_openai::OpenAiProvider::new(
+        code_agent_provider_openai::OpenAiConfig::default(),
+        transport,
+        Arc::new(factory),
+    )) as Arc<dyn ModelProvider>)
+}
+
+fn build_gemini_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
+    let cred = resolve_runtime_credential(cfg, code_agent_auth::ProviderId::Gemini)?;
+    let transport: Arc<dyn code_agent_provider_gemini::GeminiTransport> =
+        Arc::new(ReqwestGeminiTransport::new()?);
+    let cred_arc = std::sync::Arc::new(parking_lot_compat::Mutex::new(Some(cred)));
+    let factory = move || {
+        cred_arc
+            .lock()
+            .as_ref()
+            .cloned()
+            .unwrap_or(code_agent_auth::ResolvedCredential::None)
+    };
+    Ok(Arc::new(code_agent_provider_gemini::GeminiProvider::new(
+        code_agent_provider_gemini::GeminiConfig::default(),
+        transport,
+        Arc::new(factory),
+    )) as Arc<dyn ModelProvider>)
+}
+
+/// Tiny, fully-offline ModelProvider that streams a one-line acknowledgement
+/// and stops. Used by `--provider fake` so the runtime path is exercisable
+/// in CI / examples without a real model.
+fn build_fake_provider() -> impl ModelProvider {
+    use code_agent_core::{ModelEvent, TokenUsage};
+    struct FakeRuntime;
+    #[async_trait::async_trait]
+    impl ModelProvider for FakeRuntime {
+        async fn stream_turn(
+            &self,
+            req: code_agent_core::ModelRequest,
+        ) -> std::result::Result<
+            futures::stream::BoxStream<
+                'static,
+                std::result::Result<ModelEvent, code_agent_core::ProviderError>,
+            >,
+            code_agent_core::ProviderError,
+        > {
+            let preview: String = req
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter_map(|c| match c {
+                    code_agent_core::ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let truncated: String = preview.chars().take(80).collect();
+            let response = format!("[fake] received: {truncated}");
+            let events = vec![
+                ModelEvent::MessageStart,
+                ModelEvent::TextDelta { text: response },
+                ModelEvent::MessageStop {
+                    stop_reason: Some("end_turn".into()),
+                    usage: Some(TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 1,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                    }),
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+    FakeRuntime
+}
+
+/// Resolve a credential at runtime, mirroring `code-agent auth status` so
+/// `--provider <p>` honors the same precedence ladder as the auth surface.
+fn resolve_runtime_credential(
+    cfg: &ResolvedRunConfig,
+    provider: code_agent_auth::ProviderId,
+) -> Result<code_agent_auth::ResolvedCredential> {
+    let allow_file = cfg
+        .settings
+        .auth
+        .allow_file_credential_store
+        .unwrap_or(false);
+    let store = code_agent_auth::CredentialStore::build(
+        code_agent_auth::CredentialStoreMode::Auto,
+        allow_file,
+        Some(cfg.cwd.join(".agent").join("auth.json")),
+    )
+    .map_err(|e| anyhow!("credential store: {e}"))?;
+    let env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let idx = store.snapshot_index();
+    let active = idx.active_for(&provider).cloned();
+    let res = code_agent_auth::resolve_credential(code_agent_auth::AuthResolverInputs {
+        provider: Some(provider.clone()),
+        mode: code_agent_auth::AuthPrecedenceMode::ExplicitFirst,
+        explicit_api_key: None,
+        explicit_account: None,
+        active_account: active.as_ref(),
+        env,
+        store: Some(&store),
+    })
+    .map_err(|e| anyhow!("resolve {} credential: {}", provider, e))?;
+    Ok(res.credential)
+}
+
+/// Drop-in `Mutex` shim so the closure above doesn't pull in `parking_lot`.
+/// Wraps `std::sync::Mutex` with `lock()` returning the guard directly so
+/// it composes with the `move` closure.
+mod parking_lot_compat {
+    pub struct Mutex<T>(std::sync::Mutex<T>);
+    impl<T> Mutex<T> {
+        pub fn new(t: T) -> Self {
+            Self(std::sync::Mutex::new(t))
+        }
+        pub fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+}
+
+/// Minimal `reqwest`-backed OpenAI transport. Streaming is left for a
+/// follow-up — the chat endpoint returns a complete payload that we
+/// then chunk into `ModelEvent`s.
+struct ReqwestOpenAiTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestOpenAiTransport {
+    fn new() -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(StdDuration::from_secs(30))
+            .build()
+            .context("openai client build")?;
+        Ok(Self { client })
+    }
+}
+
+#[async_trait::async_trait]
+impl code_agent_provider_openai::OpenAiTransport for ReqwestOpenAiTransport {
+    async fn post_chat(
+        &self,
+        url: &str,
+        api_key: &code_agent_auth::SecretString,
+        body: &str,
+    ) -> std::result::Result<
+        code_agent_provider_openai::TransportResponse,
+        code_agent_core::ProviderError,
+    > {
+        let resp = self
+            .client
+            .post(url)
+            .bearer_auth(api_key.expose())
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| code_agent_core::ProviderError::Http(format!("openai post: {e}")))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| code_agent_core::ProviderError::Http(format!("openai body: {e}")))?;
+        Ok(code_agent_provider_openai::TransportResponse { status, body: text })
+    }
+
+    async fn list_models(
+        &self,
+        url: &str,
+        api_key: &code_agent_auth::SecretString,
+    ) -> std::result::Result<
+        code_agent_provider_openai::TransportResponse,
+        code_agent_core::ProviderError,
+    > {
+        let resp = self
+            .client
+            .get(url)
+            .bearer_auth(api_key.expose())
+            .send()
+            .await
+            .map_err(|e| code_agent_core::ProviderError::Http(format!("openai models: {e}")))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| code_agent_core::ProviderError::Http(format!("openai body: {e}")))?;
+        Ok(code_agent_provider_openai::TransportResponse { status, body: text })
+    }
+}
+
+/// Minimal `reqwest`-backed Gemini transport. Same trade-off as the
+/// OpenAI variant — the request payload includes `?key=<API_KEY>` so
+/// no Authorization header is needed.
+struct ReqwestGeminiTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestGeminiTransport {
+    fn new() -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(StdDuration::from_secs(30))
+            .build()
+            .context("gemini client build")?;
+        Ok(Self { client })
+    }
+}
+
+#[async_trait::async_trait]
+impl code_agent_provider_gemini::GeminiTransport for ReqwestGeminiTransport {
+    async fn post_generate(
+        &self,
+        url: &str,
+        body: &str,
+    ) -> std::result::Result<
+        code_agent_provider_gemini::TransportResponse,
+        code_agent_core::ProviderError,
+    > {
+        let resp = self
+            .client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| code_agent_core::ProviderError::Http(format!("gemini post: {e}")))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| code_agent_core::ProviderError::Http(format!("gemini body: {e}")))?;
+        Ok(code_agent_provider_gemini::TransportResponse { status, body: text })
+    }
+
+    async fn list_models(
+        &self,
+        url: &str,
+    ) -> std::result::Result<
+        code_agent_provider_gemini::TransportResponse,
+        code_agent_core::ProviderError,
+    > {
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| code_agent_core::ProviderError::Http(format!("gemini models: {e}")))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| code_agent_core::ProviderError::Http(format!("gemini body: {e}")))?;
+        Ok(code_agent_provider_gemini::TransportResponse { status, body: text })
+    }
 }
 
 async fn load_agents_md(cwd: &Path) -> Option<String> {
@@ -4899,6 +5308,85 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
         }
         AgentEvent::NotificationFailed(n) => {
             println!("[notify-error] {} {}: {}", n.channel, n.event, n.reason);
+        }
+        AgentEvent::AuthProviderRegistryLoaded(p) => {
+            if !quiet {
+                println!("[auth] providers: {}", p.providers.join(", "));
+            }
+        }
+        AgentEvent::LoginStarted(p) => {
+            if !quiet {
+                println!(
+                    "[auth] login start provider={} method={}",
+                    p.provider, p.method
+                );
+            }
+        }
+        AgentEvent::LoginCompleted(p) => {
+            println!(
+                "[auth] login completed provider={} method={} account={}",
+                p.provider, p.method, p.account_hash
+            );
+        }
+        AgentEvent::LoginFailed(p) => {
+            println!(
+                "[auth-error] login failed provider={} kind={} message={}",
+                p.provider, p.kind, p.message
+            );
+        }
+        AgentEvent::LogoutCompleted(p) => {
+            println!(
+                "[auth] logout provider={} account={}",
+                p.provider, p.account_hash
+            );
+        }
+        AgentEvent::CredentialStored(p) => {
+            if !quiet {
+                println!(
+                    "[auth] credential stored provider={} kind={} store={}",
+                    p.provider, p.secret_kind, p.store
+                );
+            }
+        }
+        AgentEvent::CredentialRefreshed(p) => {
+            if !quiet {
+                println!(
+                    "[auth] credential refreshed provider={} account={}",
+                    p.provider, p.account_hash
+                );
+            }
+        }
+        AgentEvent::CredentialRefreshFailed(p) => {
+            println!(
+                "[auth-error] refresh failed provider={} kind={} message={}",
+                p.provider, p.kind, p.message
+            );
+        }
+        AgentEvent::AuthProviderSelected(p) => {
+            if !quiet {
+                println!("[auth] provider selected: {}", p.provider);
+            }
+        }
+        AgentEvent::ModelSelected(p) => {
+            if !quiet {
+                println!("[model] {}/{}", p.provider, p.model);
+            }
+        }
+        AgentEvent::ModelListLoaded(p) => {
+            if !quiet {
+                println!(
+                    "[model] list loaded provider={} count={}",
+                    p.provider, p.model_count
+                );
+            }
+        }
+        AgentEvent::AuthStatusChecked(p) => {
+            if !quiet {
+                println!(
+                    "[auth] status checked provider={} healthy={}",
+                    p.provider, p.healthy
+                );
+            }
         }
     }
 }

@@ -16,20 +16,31 @@ bypasses hooks, policy, approvals, sessions, telemetry, or checkpointing.
 
 ```
 crates/
-  code-agent-core/        types, agent loop, AgentClient, hooks, policy, settings, telemetry
-  code-agent-anthropic/   Messages API streaming provider
-  code-agent-tools/       Read, Write, Edit, Glob, Grep, Bash, TodoWrite
-  code-agent-session/     JSONL store + continue/fork/show/export helpers
-  code-agent-checkpoint/  M3: LocalCheckpointStore, CheckpointHandle, validation
-  code-agent-mcp/         M4: MCP client config, protocol, stdio/http transports
-  code-agent-cli/         `code-agent` binary (run, resume, continue, fork, chat,
-                          sessions, checkpoint, checkpoints, rewind, mcp, tools)
+  code-agent-core/             types, agent loop, AgentClient, hooks, policy, settings, telemetry
+  code-agent-anthropic/        Messages API streaming provider
+  code-agent-tools/            Read, Write, Edit, Glob, Grep, Bash, TodoWrite
+  code-agent-session/          JSONL store + continue/fork/show/export helpers
+  code-agent-checkpoint/       M3: LocalCheckpointStore, CheckpointHandle, validation
+  code-agent-mcp/              M4: MCP client config, protocol, stdio/http transports
+  code-agent-tui/              M9: terminal UI (fullscreen ratatui + plain renderer)
+  code-agent-auth/             M10: provider login, OAuth (PKCE + device-code),
+                               credential store, model registry, CI policy
+  code-agent-provider-openai/  M10: OpenAI Chat Completions adapter
+  code-agent-provider-gemini/  M10: Google AI Studio (Gemini) adapter
+  code-agent-cli/              `code-agent` binary (run, resume, continue, fork, chat,
+                               sessions, checkpoint, mcp, tools, tui, login, auth,
+                               provider, model)
 examples/
-  bugfix-demo/            tiny crate with a deliberately failing test (M1 demo)
-  policy-demo/            tiny crate plus .agent/settings.json policy + hooks (M2 demo)
-  checkpoint-demo/        tiny crate exercising checkpoint + rewind + validation (M3 demo)
-  mcp-demo/               offline fake MCP server and demo project (M4 demo)
-  tool-search-demo/       large fake MCP catalog for deferred loading (M5 demo)
+  bugfix-demo/                 tiny crate with a deliberately failing test (M1 demo)
+  policy-demo/                 tiny crate plus .agent/settings.json policy + hooks (M2 demo)
+  checkpoint-demo/             tiny crate exercising checkpoint + rewind + validation (M3 demo)
+  mcp-demo/                    offline fake MCP server and demo project (M4 demo)
+  tool-search-demo/            large fake MCP catalog for deferred loading (M5 demo)
+  subagent-demo/               subagent orchestration demo (M6)
+  skills-demo/                 Skills + slash commands demo (M7)
+  plugin-demo/                 plugin system demo (M8)
+  beta-demo/                   terminal UX / TUI demo (M9)
+  auth-demo/                   provider login + credential store demo (M10)
 ```
 
 `examples/bugfix-demo`, `examples/policy-demo`, `examples/checkpoint-demo`,
@@ -805,6 +816,49 @@ let opts = code_agent_core::AgentOptions {
     ..code_agent_core::AgentOptions::default()
 };
 ```
+
+## Provider login (M10)
+
+Pick a provider, log in once, and the CLI/TUI both pull the credential
+from a unified store rather than from `ANTHROPIC_API_KEY` only.
+
+```sh
+# Provider selector — also explains visible-but-unsupported subscription
+# branches (Claude / Gemini OAuth, Codex subscription) and the supported
+# alternative for each.
+code-agent login
+
+# API-key login. `--api-key=<KEY>` or `--api-key-stdin` for scripts;
+# bare `--api-key` prompts on a real TTY.
+code-agent login anthropic --api-key=sk-ant-...
+code-agent login openai    --api-key-stdin < ./openai.key
+code-agent login gemini    --api-key=AI-...
+
+# Inspect / manage credentials.
+code-agent auth status
+code-agent auth list
+code-agent auth use anthropic
+code-agent auth refresh
+code-agent auth logout openai
+code-agent auth doctor
+
+# Provider + model picker.
+code-agent provider list
+code-agent provider use openai
+code-agent model list
+code-agent model use anthropic/claude-sonnet-4-6
+```
+
+Credential storage defaults to `auto`: prefer the OS keychain when one
+is available, otherwise fall back to a clearly opt-in file backend
+(`auth.allow_file_credential_store = true`). Tokens, OAuth codes, and
+API keys are never written to settings JSON or logs.
+
+The same surface is wired as slash commands (`/login`, `/logout`,
+`/auth`, `/provider`, `/model`) for the TUI and `code-agent chat`.
+
+See `examples/auth-demo/run.sh` for a fully offline walk-through that
+drives the fake provider end-to-end.
 
 ## Testing
 
