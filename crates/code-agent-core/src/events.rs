@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use crate::conversation::{AssistantMessage, SystemInit, ToolCall};
 use crate::hooks::HookEventName;
 use crate::options::SessionId;
+use crate::plan::{
+    PlanApprovalScope, PlanDeviation, PlanDeviationSeverity, PlanExecutionStatus, PlanId,
+    PlanStatus, PlanStepStatus, PlanSummary,
+};
 use crate::plugins::{PluginComponentKind, PluginScope, PluginSource, PluginStatus, PluginSummary};
 use crate::policy::{PolicyDecisionSource, PolicyOutcome};
 use crate::run_id::RunId;
@@ -161,7 +165,151 @@ pub enum AgentEvent {
     ModelListLoaded(ModelListLoaded),
     /// M10: an auth status check was performed.
     AuthStatusChecked(AuthStatusChecked),
+    /// M11: a new plan draft was created.
+    PlanCreated(PlanCreatedEvent),
+    /// M11: a plan revision was saved.
+    PlanRevisionCreated(PlanRevisionCreatedEvent),
+    /// M11: a plan was put into PendingApproval (awaiting user).
+    PlanApprovalRequested(PlanApprovalRequestedEvent),
+    /// M11: a plan was approved.
+    PlanApproved(PlanApprovedEvent),
+    /// M11: a plan was rejected.
+    PlanRejected(PlanRejectedEvent),
+    /// M11: act mode began executing an approved plan.
+    PlanActStarted(PlanActStartedEvent),
+    /// M11: an act-mode step transitioned to in_progress.
+    PlanStepStarted(PlanStepStartedEvent),
+    /// M11: an act-mode step's status changed (via PlanUpdate tool).
+    PlanStepUpdated(PlanStepUpdatedEvent),
+    /// M11: an act-mode step finished (completed/failed/skipped).
+    PlanStepCompleted(PlanStepCompletedEvent),
+    /// M11: an act-mode deviation was detected.
+    PlanDeviationDetected(PlanDeviationDetectedEvent),
+    /// M11: the user resolved a deviation.
+    PlanDeviationResolved(PlanDeviationResolvedEvent),
+    /// M11: a plan run reached terminal status (Completed).
+    PlanCompleted(PlanCompletedEvent),
+    /// M11: a plan run failed.
+    PlanFailed(PlanFailedEvent),
+    /// M11: a plan run needs to be re-planned.
+    PlanNeedsReplan(PlanNeedsReplanEvent),
+    /// M11: a plan was archived.
+    PlanArchived(PlanArchivedEvent),
     Result(AgentResult),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanCreatedEvent {
+    pub plan_id: PlanId,
+    pub version: u32,
+    pub title: String,
+    pub step_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanRevisionCreatedEvent {
+    pub plan_id: PlanId,
+    pub version: u32,
+    pub previous_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanApprovalRequestedEvent {
+    pub plan_id: PlanId,
+    pub version: u32,
+    pub summary: PlanSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanApprovedEvent {
+    pub plan_id: PlanId,
+    pub version: u32,
+    pub scope: PlanApprovalScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanRejectedEvent {
+    pub plan_id: PlanId,
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanActStartedEvent {
+    pub plan_id: PlanId,
+    pub version: u32,
+    pub step_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStepStartedEvent {
+    pub plan_id: PlanId,
+    pub step_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStepUpdatedEvent {
+    pub plan_id: PlanId,
+    pub step_id: String,
+    pub status: PlanStepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStepCompletedEvent {
+    pub plan_id: PlanId,
+    pub step_id: String,
+    pub final_status: PlanStepStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanDeviationDetectedEvent {
+    pub deviation: PlanDeviation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanDeviationResolvedEvent {
+    pub plan_id: PlanId,
+    pub tool_name: String,
+    pub severity: PlanDeviationSeverity,
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanCompletedEvent {
+    pub plan_id: PlanId,
+    pub version: u32,
+    pub status: PlanExecutionStatus,
+    pub completed_steps: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanFailedEvent {
+    pub plan_id: PlanId,
+    pub version: u32,
+    pub failed_steps: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanNeedsReplanEvent {
+    pub plan_id: PlanId,
+    pub version: u32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanArchivedEvent {
+    pub plan_id: PlanId,
+    pub version: u32,
+    pub status: PlanStatus,
 }
 
 /// M10 auth events. We define them here (rather than re-using the auth

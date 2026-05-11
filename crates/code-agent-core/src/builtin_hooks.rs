@@ -394,8 +394,40 @@ pub fn redact_secrets_in_value(v: &Value) -> Value {
             Value::Object(out)
         }
         Value::Array(arr) => Value::Array(arr.iter().map(redact_secrets_in_value).collect()),
+        Value::String(s) => Value::String(redact_secrets_in_str(s)),
         other => other.clone(),
     }
+}
+
+/// Replace well-known secret token shapes inside a free-form string with
+/// `[REDACTED]`. Targets the common formats users tend to paste into
+/// prompts/plans by accident: provider API keys (Anthropic `sk-ant-…`,
+/// OpenAI `sk-…`, Google `AIza…`), AWS access key ids (`AKIA…`), and
+/// generic GitHub-style tokens (`ghp_…`, `gho_…`, `ghu_…`, `ghs_…`,
+/// `ghr_…`). Conservative by design — non-matching content is returned
+/// unchanged so plan summaries and goals are not mangled.
+pub fn redact_secrets_in_str(s: &str) -> String {
+    static PATTERNS: &[&str] = &[
+        // Anthropic: sk-ant-api03-... and sk-ant-...
+        r"sk-ant-(?:api[0-9]+-)?[A-Za-z0-9_\-]{16,}",
+        // OpenAI / generic sk- token (>=20 trailing chars to avoid false positives).
+        r"sk-[A-Za-z0-9_\-]{20,}",
+        // Google API key.
+        r"AIza[A-Za-z0-9_\-]{35,}",
+        // AWS access key id.
+        r"AKIA[A-Z0-9]{16}",
+        // GitHub personal/oauth/server tokens.
+        r"gh[pousr]_[A-Za-z0-9]{20,}",
+        // Bearer header values.
+        r"(?i)bearer\s+[A-Za-z0-9_\-\.=+/]{16,}",
+    ];
+    let mut out = s.to_string();
+    for pat in PATTERNS {
+        if let Ok(re) = regex::Regex::new(pat) {
+            out = re.replace_all(&out, "[REDACTED]").into_owned();
+        }
+    }
+    out
 }
 
 /// Block Write/Edit when the new payload exceeds a configured byte threshold.

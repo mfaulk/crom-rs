@@ -418,6 +418,11 @@ pub fn supported_status_line_variables() -> &'static [&'static str] {
         "auth_method",
         "plan",
         "quota",
+        // M11 planning variables.
+        "plan_id",
+        "plan_status",
+        "plan_step",
+        "plan_progress",
     ]
 }
 

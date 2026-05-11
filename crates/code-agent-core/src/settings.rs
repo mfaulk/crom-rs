@@ -115,6 +115,100 @@ pub struct SettingsFile {
     /// M10: active model + provider, plus optional fallback list.
     #[serde(default)]
     pub model_config: Option<ModelSettingsConfig>,
+    /// M11: planning + act configuration.
+    #[serde(default)]
+    pub planning: Option<PlanningSettingsConfig>,
+}
+
+/// On-disk planning settings (M11). All fields optional; merge into
+/// [`crate::plan::PlanningOptions`] via [`PlanningSettingsConfig::apply`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningSettingsConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// `no_tools` | `read_only_workspace` | `read_only_with_approved_external`
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub require_approval_before_act: Option<bool>,
+    #[serde(default)]
+    pub enforce_plan_scope: Option<bool>,
+    #[serde(default)]
+    pub allow_read_only_tools_during_planning: Option<bool>,
+    #[serde(default)]
+    pub allow_external_tools_during_planning: Option<bool>,
+    #[serde(default)]
+    pub max_plan_steps: Option<usize>,
+    #[serde(default)]
+    pub max_plan_revisions: Option<usize>,
+    #[serde(default)]
+    pub max_plan_bytes: Option<usize>,
+    /// `default` | `accept_edits` | `dont_ask`
+    #[serde(default)]
+    pub default_act_permission_mode: Option<String>,
+    /// `deny` | `ask` | `require_replan` | `allow_with_warning`
+    #[serde(default)]
+    pub deviation_policy: Option<String>,
+    #[serde(default)]
+    pub persist_plans: Option<bool>,
+    #[serde(default)]
+    pub exploratory_reads_during_act: Option<bool>,
+    #[serde(default)]
+    pub strict_commands: Option<bool>,
+}
+
+impl PlanningSettingsConfig {
+    /// Merge this config into a mutable [`crate::plan::PlanningOptions`].
+    /// Returns an error if a string field is invalid.
+    pub fn apply(&self, opts: &mut crate::plan::PlanningOptions) -> Result<(), SettingsError> {
+        if let Some(v) = self.enabled {
+            opts.enabled = v;
+        }
+        if let Some(s) = &self.mode {
+            opts.planning_mode = crate::plan::PlanningMode::from_str_lenient(s)
+                .ok_or_else(|| SettingsError::BadPlanningMode(s.clone()))?;
+        }
+        if let Some(v) = self.require_approval_before_act {
+            opts.require_approval_before_act = v;
+        }
+        if let Some(v) = self.enforce_plan_scope {
+            opts.enforce_plan_scope = v;
+        }
+        if let Some(v) = self.allow_read_only_tools_during_planning {
+            opts.allow_read_only_tools_during_planning = v;
+        }
+        if let Some(v) = self.allow_external_tools_during_planning {
+            opts.allow_external_tools_during_planning = v;
+        }
+        if let Some(v) = self.max_plan_steps {
+            opts.max_plan_steps = v;
+        }
+        if let Some(v) = self.max_plan_revisions {
+            opts.max_plan_revisions = v;
+        }
+        if let Some(v) = self.max_plan_bytes {
+            opts.max_plan_bytes = v;
+        }
+        if let Some(s) = &self.default_act_permission_mode {
+            opts.default_act_permission_mode = PermissionMode::from_str_lenient(s)
+                .ok_or_else(|| SettingsError::BadPermissionMode(s.clone()))?;
+        }
+        if let Some(s) = &self.deviation_policy {
+            opts.deviation_policy = crate::plan::PlanDeviationPolicy::from_str_lenient(s)
+                .ok_or_else(|| SettingsError::BadDeviationPolicy(s.clone()))?;
+        }
+        if let Some(v) = self.persist_plans {
+            opts.persist_plans = v;
+        }
+        if let Some(v) = self.exploratory_reads_during_act {
+            opts.exploratory_reads_during_act = v;
+        }
+        if let Some(v) = self.strict_commands {
+            opts.strict_commands = v;
+        }
+        Ok(())
+    }
 }
 
 /// Auth subsystem settings (M10).
@@ -429,6 +523,8 @@ pub struct Settings {
     pub auth: AuthSettingsConfig,
     /// M10: active model + provider.
     pub model_config: ModelSettingsConfig,
+    /// M11: planning settings.
+    pub planning: Option<PlanningSettingsConfig>,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -458,6 +554,10 @@ pub enum SettingsError {
     BadToolSearch(String),
     #[error("{0}")]
     BadUi(#[from] UiSettingsError),
+    #[error("invalid planning.mode: {0}")]
+    BadPlanningMode(String),
+    #[error("invalid planning.deviation_policy: {0}")]
+    BadDeviationPolicy(String),
 }
 
 /// Load project settings from `<cwd>/.agent/settings.json` if present.
@@ -715,6 +815,65 @@ fn merge_into(dst: &mut Settings, src: SettingsFile, _is_user: bool) -> Result<(
     }
     if let Some(model_cfg) = src.model_config {
         merge_model_settings(&mut dst.model_config, model_cfg);
+    }
+    if let Some(planning) = src.planning {
+        merge_planning_settings(&mut dst.planning, planning)?;
+    }
+    Ok(())
+}
+
+fn merge_planning_settings(
+    dst: &mut Option<PlanningSettingsConfig>,
+    src: PlanningSettingsConfig,
+) -> Result<(), SettingsError> {
+    let target = dst.get_or_insert_with(PlanningSettingsConfig::default);
+    if src.enabled.is_some() {
+        target.enabled = src.enabled;
+    }
+    if let Some(s) = src.mode.clone() {
+        // Validate immediately so a bad value fails settings load.
+        crate::plan::PlanningMode::from_str_lenient(&s)
+            .ok_or(SettingsError::BadPlanningMode(s.clone()))?;
+        target.mode = Some(s);
+    }
+    if src.require_approval_before_act.is_some() {
+        target.require_approval_before_act = src.require_approval_before_act;
+    }
+    if src.enforce_plan_scope.is_some() {
+        target.enforce_plan_scope = src.enforce_plan_scope;
+    }
+    if src.allow_read_only_tools_during_planning.is_some() {
+        target.allow_read_only_tools_during_planning = src.allow_read_only_tools_during_planning;
+    }
+    if src.allow_external_tools_during_planning.is_some() {
+        target.allow_external_tools_during_planning = src.allow_external_tools_during_planning;
+    }
+    if src.max_plan_steps.is_some() {
+        target.max_plan_steps = src.max_plan_steps;
+    }
+    if src.max_plan_revisions.is_some() {
+        target.max_plan_revisions = src.max_plan_revisions;
+    }
+    if src.max_plan_bytes.is_some() {
+        target.max_plan_bytes = src.max_plan_bytes;
+    }
+    if let Some(s) = src.default_act_permission_mode.clone() {
+        PermissionMode::from_str_lenient(&s).ok_or(SettingsError::BadPermissionMode(s.clone()))?;
+        target.default_act_permission_mode = Some(s);
+    }
+    if let Some(s) = src.deviation_policy.clone() {
+        crate::plan::PlanDeviationPolicy::from_str_lenient(&s)
+            .ok_or(SettingsError::BadDeviationPolicy(s.clone()))?;
+        target.deviation_policy = Some(s);
+    }
+    if src.persist_plans.is_some() {
+        target.persist_plans = src.persist_plans;
+    }
+    if src.exploratory_reads_during_act.is_some() {
+        target.exploratory_reads_during_act = src.exploratory_reads_during_act;
+    }
+    if src.strict_commands.is_some() {
+        target.strict_commands = src.strict_commands;
     }
     Ok(())
 }

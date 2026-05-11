@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod mcp;
 pub mod options;
 pub mod permission;
+pub mod plan;
 pub mod plugins;
 pub mod policy;
 pub mod provider;
@@ -74,15 +75,19 @@ pub use events::{
     LoginCompleted as LoginCompletedEvent, LoginFailed as LoginFailedEvent,
     LoginStarted as LoginStartedEvent, LogoutCompleted as LogoutCompletedEvent,
     ModelListLoaded as ModelListLoadedEvent, ModelSelected as ModelSelectedEvent,
-    NotificationFailed, NotificationSent, PluginComponentFailed, PluginComponentLoaded,
-    PluginDisabled, PluginEnabled, PluginInstalled, PluginMarketplaceAdded,
-    PluginMarketplaceEntryInstalled, PluginRegistryLoaded, PluginReloaded, PluginUninstalled,
-    PluginValidationFailed, PolicyDecisionEvent, ResultSubtype, SessionRecovered,
-    SessionRecoveryFailed, SessionRuntimeState, SkillInvocationFailed, SkillLoaded,
-    SkillRegistryLoaded, SkillResourceLoaded, SlashCommandCompleted, SlashCommandExpanded,
-    SlashCommandFailed, SlashCommandRegistryLoaded, SlashCommandStarted, StatusLineConfigured,
-    SubagentCancelled, SubagentEvent as SubagentForwardedEvent, SubagentFailed, SubagentStart,
-    SubagentStop, SubagentTimedOut, TodoUpdate, ToolCallCompleted, ToolCallDenied, ToolCallStarted,
+    NotificationFailed, NotificationSent, PlanActStartedEvent, PlanApprovalRequestedEvent,
+    PlanApprovedEvent, PlanArchivedEvent, PlanCompletedEvent, PlanCreatedEvent,
+    PlanDeviationDetectedEvent, PlanDeviationResolvedEvent, PlanFailedEvent, PlanNeedsReplanEvent,
+    PlanRejectedEvent, PlanRevisionCreatedEvent, PlanStepCompletedEvent, PlanStepStartedEvent,
+    PlanStepUpdatedEvent, PluginComponentFailed, PluginComponentLoaded, PluginDisabled,
+    PluginEnabled, PluginInstalled, PluginMarketplaceAdded, PluginMarketplaceEntryInstalled,
+    PluginRegistryLoaded, PluginReloaded, PluginUninstalled, PluginValidationFailed,
+    PolicyDecisionEvent, ResultSubtype, SessionRecovered, SessionRecoveryFailed,
+    SessionRuntimeState, SkillInvocationFailed, SkillLoaded, SkillRegistryLoaded,
+    SkillResourceLoaded, SlashCommandCompleted, SlashCommandExpanded, SlashCommandFailed,
+    SlashCommandRegistryLoaded, SlashCommandStarted, StatusLineConfigured, SubagentCancelled,
+    SubagentEvent as SubagentForwardedEvent, SubagentFailed, SubagentStart, SubagentStop,
+    SubagentTimedOut, TodoUpdate, ToolCallCompleted, ToolCallDenied, ToolCallStarted,
     ToolCatalogBuilt, ToolContextBudgetUpdated, ToolDeferred, ToolDisabled, ToolLoaded,
     ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed, ToolSearchStarted,
     UiRendererChanged, UiStarted, UserToolResult,
@@ -96,6 +101,23 @@ pub use options::{is_valid_session_id_str, AgentOptions, SessionId};
 pub use permission::{
     ApprovalMemoryMode, PermissionCallback, PermissionDecision, PermissionKind, PermissionMode,
     PermissionRequest,
+};
+pub use plan::{
+    act_mode_system_prompt, act_plan, all_steps_terminal, classify_tool_call,
+    collect_policy_decisions, default_severity_for, generate_plan, new_plan_id, next_pending_step,
+    plan_scope_summary, plan_update_tool_definition, planning_allowed_tool_names,
+    planning_system_prompt, redact_secrets_in_plan, render_plan_pretty,
+    submit_plan_tool_definition, ActOutcome, ActRequest, DenyAllDeviations, FsPlanStore,
+    PlanApproval, PlanApprovalRequest, PlanApprovalScope, PlanApprover, PlanCheckpointExpectation,
+    PlanCommand, PlanContextItem, PlanCreatedBy, PlanDeviation, PlanDeviationCallback,
+    PlanDeviationDecision, PlanDeviationPolicy, PlanDeviationSeverity, PlanDocument, PlanError,
+    PlanExecutionContext, PlanExecutionStatus, PlanExecutionSummary, PlanFileAccess, PlanFileRef,
+    PlanGenerationOutcome, PlanId, PlanListFilter, PlanRejectRequest, PlanRequest, PlanRisk,
+    PlanRiskLevel, PlanScopeDecision, PlanScopeSummary, PlanStatus, PlanStep, PlanStepKind,
+    PlanStepStatus, PlanStore, PlanSummary, PlanToolUse, PlanUpdateTool, PlanValidation,
+    PlanningMode, PlanningOptions, SubmitPlanResult, SubmitPlanTool, WorkspaceRelativePath,
+    MAX_PLAN_BYTES_DEFAULT, MAX_PLAN_REVISIONS_DEFAULT, MAX_PLAN_STEPS_DEFAULT,
+    PLAN_UPDATE_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME,
 };
 pub use plugins::{
     build_plugin_runtime, discover_manifest_path, install_to_cache, is_plugin_name_safe,
@@ -121,9 +143,9 @@ pub use run_id::RunId;
 pub use settings::{
     AgentsSettingsConfig, AuthProviderEntry, AuthSettingsConfig, CheckpointRetentionConfig,
     CheckpointingConfig, CompactionSettingsConfig, EnabledPluginEntry, HooksConfig,
-    ModelFallbackEntry, ModelSettingsConfig, PluginsSettingsConfig, ProjectInstructionsMode,
-    SettingSource, Settings, SettingsError, SettingsFile, SkillsSettingsConfig,
-    SlashCommandsSettingsConfig, ToolLimitsConfig, ValidationConfig,
+    ModelFallbackEntry, ModelSettingsConfig, PlanningSettingsConfig, PluginsSettingsConfig,
+    ProjectInstructionsMode, SettingSource, Settings, SettingsError, SettingsFile,
+    SkillsSettingsConfig, SlashCommandsSettingsConfig, ToolLimitsConfig, ValidationConfig,
 };
 pub use skills::{
     compat_claude_skills_dir, filesystem_skills_dir, is_identifier_safe_skill_name,

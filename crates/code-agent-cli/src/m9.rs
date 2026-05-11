@@ -400,6 +400,113 @@ pub async fn run_doctor(cwd: &Path, settings: &Settings, redact_secrets: bool) -
         }
     }
 
+    // M11: planning subsystem.
+    text.push(String::new());
+    text.push("Planning".to_string());
+    let plan_dir = cwd.join(".agent").join("plans");
+    if is_writable(&plan_dir) || plan_dir.parent().map(is_writable).unwrap_or(false) {
+        checks.push(DoctorCheck {
+            id: "planning.store_writable".into(),
+            status: DoctorStatus::Ok,
+            severity: DoctorSeverity::Info,
+            message: "plan store writable".into(),
+            remediation: None,
+        });
+        text.push("  ✓ plan store writable".into());
+    } else {
+        checks.push(DoctorCheck {
+            id: "planning.store_writable".into(),
+            status: DoctorStatus::Fail,
+            severity: DoctorSeverity::Error,
+            message: "plan store not writable".into(),
+            remediation: Some(format!("ensure {} is writable", plan_dir.display())),
+        });
+        text.push("  ✗ plan store not writable".into());
+    }
+
+    // Scan for malformed / stale plans.
+    let mut planning = code_agent_core::PlanningOptions::default();
+    if let Some(p) = &settings.planning {
+        let _ = p.apply(&mut planning);
+    }
+    let store = code_agent_core::FsPlanStore::new(cwd.to_path_buf(), planning);
+    let mut malformed = 0usize;
+    if plan_dir.exists() {
+        if let Ok(read) = std::fs::read_dir(&plan_dir) {
+            for ent in read.flatten() {
+                let p = ent.path();
+                let name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !name.ends_with(".json") || name.contains(".v") || name == "index.jsonl" {
+                    continue;
+                }
+                let bytes = match std::fs::read(&p) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if serde_json::from_slice::<code_agent_core::PlanDocument>(&bytes).is_err() {
+                    malformed += 1;
+                }
+            }
+        }
+    }
+    if malformed == 0 {
+        checks.push(DoctorCheck {
+            id: "planning.malformed".into(),
+            status: DoctorStatus::Ok,
+            severity: DoctorSeverity::Info,
+            message: "no malformed plan files".into(),
+            remediation: None,
+        });
+        text.push("  ✓ no malformed plan files".into());
+    } else {
+        checks.push(DoctorCheck {
+            id: "planning.malformed".into(),
+            status: DoctorStatus::Warn,
+            severity: DoctorSeverity::Warning,
+            message: format!("{malformed} plan file(s) failed to parse"),
+            remediation: Some("inspect or archive corrupted plan files".into()),
+        });
+        text.push(format!("  ! {malformed} plan file(s) failed to parse"));
+    }
+
+    if let Ok(listing) = <code_agent_core::FsPlanStore as code_agent_core::PlanStore>::list(
+        &store,
+        code_agent_core::PlanListFilter::default(),
+    )
+    .await
+    {
+        let stale: Vec<_> = listing
+            .iter()
+            .filter(|s| s.status == code_agent_core::PlanStatus::Executing)
+            .collect();
+        if stale.is_empty() {
+            checks.push(DoctorCheck {
+                id: "planning.stale_executing".into(),
+                status: DoctorStatus::Ok,
+                severity: DoctorSeverity::Info,
+                message: "no stale executing plans".into(),
+                remediation: None,
+            });
+            text.push("  ✓ no stale executing plans".into());
+        } else {
+            checks.push(DoctorCheck {
+                id: "planning.stale_executing".into(),
+                status: DoctorStatus::Warn,
+                severity: DoctorSeverity::Warning,
+                message: format!("{} executing plan(s) (possibly interrupted)", stale.len()),
+                remediation: Some(format!(
+                    "inspect with `code-agent plans show {}`",
+                    stale[0].id
+                )),
+            });
+            text.push(format!("  ! {} stale executing plan(s)", stale.len()));
+        }
+    }
+
     DoctorReport { checks, text }
 }
 
@@ -641,6 +748,43 @@ pub async fn format_session_status(
     let store = FsSessionStore::new(cwd.to_path_buf());
     let listing = store.list(cwd).await.unwrap_or_default();
     out.push(format!("  sessions on disk: {}", listing.len()));
+
+    // M11: planning status. Best-effort; never fails the overall status.
+    let mut planning = code_agent_core::PlanningOptions::default();
+    if let Some(p) = &settings.planning {
+        let _ = p.apply(&mut planning);
+    }
+    let plan_store = code_agent_core::FsPlanStore::new(cwd.to_path_buf(), planning.clone());
+    if let Ok(plans) = <code_agent_core::FsPlanStore as code_agent_core::PlanStore>::list(
+        &plan_store,
+        code_agent_core::PlanListFilter {
+            status: None,
+            session_id: None,
+            limit: Some(5),
+        },
+    )
+    .await
+    {
+        out.push("  ".to_string());
+        out.push(format!("  plans on disk: {}", plans.len()));
+        if let Some(latest) = plans.first() {
+            out.push(format!(
+                "  latest plan:  {} v{} ({})",
+                latest.id,
+                latest.version,
+                latest.status.label()
+            ));
+        }
+        out.push(format!(
+            "  plan enforcement: {} (deviation: {:?})",
+            if planning.enforce_plan_scope {
+                "on"
+            } else {
+                "off"
+            },
+            planning.deviation_policy
+        ));
+    }
     out
 }
 
@@ -687,7 +831,94 @@ pub fn build_default_status_ctx(
     // directly so the status line works even when the auth subsystem
     // hasn't been touched this session. Missing fields render as "".
     populate_auth_statusline_vars(&mut ctx, cwd);
+    // M11: best-effort plan status. Walk .agent/plans/ and surface the most
+    // recently updated plan. Failures are silent — partial info is fine.
+    populate_plan_statusline_vars(&mut ctx, cwd, settings);
     ctx
+}
+
+/// Populate plan_id/plan_status/plan_step/plan_progress on the status line
+/// context from the most recent plan in `<cwd>/.agent/plans/`.
+///
+/// We walk the plan directory synchronously (no tokio block_on) so this
+/// helper is safe to call from inside an async runtime — the existing
+/// status-line code path already runs from `tokio::main` and nesting
+/// runtimes would panic.
+///
+/// Performance: the status line refreshes frequently. The hot path is
+/// **stat-only**: we walk the directory, stat each file, and pick the
+/// path with the most recent mtime. Only the single newest plan file is
+/// then read and parsed. Plans can be up to 128 KiB each, so the prior
+/// "read every plan, parse all, then choose newest" loop could turn
+/// every status refresh into hundreds of KB of disk + CPU as the plan
+/// directory grows.
+pub fn populate_plan_statusline_vars(
+    ctx: &mut StatusLineContext,
+    cwd: &Path,
+    _settings: &Settings,
+) {
+    let plan_dir = cwd.join(".agent").join("plans");
+    if !plan_dir.exists() {
+        return;
+    }
+    let read = match std::fs::read_dir(&plan_dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for ent in read.flatten() {
+        let p = ent.path();
+        let name = match p.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.ends_with(".json") || name.contains(".v") || name == "index.jsonl" {
+            continue;
+        }
+        let modified = match ent.metadata().and_then(|m| m.modified()) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        match &newest {
+            None => newest = Some((modified, p)),
+            Some((m, _)) if modified > *m => newest = Some((modified, p)),
+            _ => {}
+        }
+    }
+    let path = match newest.map(|(_, p)| p) {
+        Some(p) => p,
+        None => return,
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let plan: code_agent_core::PlanDocument = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    ctx.set("plan_id", plan.id.as_str());
+    ctx.set("plan_status", plan.status.label());
+    let completed = plan
+        .steps
+        .iter()
+        .filter(|s| matches!(s.status, code_agent_core::PlanStepStatus::Completed))
+        .count();
+    let total = plan.steps.len().max(1);
+    ctx.set("plan_progress", format!("{}/{}", completed, total));
+    if let Some(in_progress) = plan
+        .steps
+        .iter()
+        .find(|s| matches!(s.status, code_agent_core::PlanStepStatus::InProgress))
+    {
+        ctx.set("plan_step", in_progress.id.clone());
+    } else if let Some(next) = plan
+        .steps
+        .iter()
+        .find(|s| matches!(s.status, code_agent_core::PlanStepStatus::Pending))
+    {
+        ctx.set("plan_step", next.id.clone());
+    }
 }
 
 /// Populate provider/account/auth_method/plan/quota status-line variables

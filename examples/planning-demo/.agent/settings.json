@@ -1,0 +1,22 @@
+{
+  "model": "claude-sonnet-4-6",
+  "permission_mode": "default",
+  "allowed_tools": ["Read", "Glob", "Grep", "Edit", "Bash"],
+  "checkpointing": {
+    "enabled": true
+  },
+  "validation": {
+    "commands": ["cargo test"],
+    "timeout_seconds": 60
+  },
+  "planning": {
+    "enabled": true,
+    "mode": "read_only_workspace",
+    "require_approval_before_act": true,
+    "enforce_plan_scope": true,
+    "deviation_policy": "ask",
+    "exploratory_reads_during_act": true,
+    "strict_commands": true,
+    "persist_plans": true
+  }
+}

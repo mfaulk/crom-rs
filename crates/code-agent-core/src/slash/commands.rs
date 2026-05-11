@@ -71,6 +71,24 @@ pub enum BuiltInSlashCommand {
     Provider,
     /// M10: list or pick a model from the registry.
     Model,
+    /// M11: draft a plan from a prompt.
+    Plan,
+    /// M11: list known plans.
+    Plans,
+    /// M11: approve the latest plan (or a named one).
+    ApprovePlan,
+    /// M11: reject the latest plan (or a named one).
+    RejectPlan,
+    /// M11: revise the latest plan with instructions.
+    RevisePlan,
+    /// M11: open the latest plan for manual editing.
+    EditPlan,
+    /// M11: diff two versions of a plan.
+    PlanDiff,
+    /// M11: execute the latest approved plan.
+    Act,
+    /// M11: re-plan after failure or deviation.
+    Replan,
 }
 
 impl BuiltInSlashCommand {
@@ -98,6 +116,15 @@ impl BuiltInSlashCommand {
             Self::Auth => "auth",
             Self::Provider => "provider",
             Self::Model => "model",
+            Self::Plan => "plan",
+            Self::Plans => "plans",
+            Self::ApprovePlan => "approve-plan",
+            Self::RejectPlan => "reject-plan",
+            Self::RevisePlan => "revise-plan",
+            Self::EditPlan => "edit-plan",
+            Self::PlanDiff => "plan-diff",
+            Self::Act => "act",
+            Self::Replan => "replan",
         }
     }
 
@@ -125,6 +152,15 @@ impl BuiltInSlashCommand {
             Self::Auth => "Show or manage stored auth credentials.",
             Self::Provider => "List or set the active model provider.",
             Self::Model => "List or pick a model from the registry.",
+            Self::Plan => "Draft a structured plan from a prompt.",
+            Self::Plans => "List known plans.",
+            Self::ApprovePlan => "Approve the latest pending plan.",
+            Self::RejectPlan => "Reject the latest pending plan.",
+            Self::RevisePlan => "Revise the latest plan with new instructions.",
+            Self::EditPlan => "Open the latest plan for manual editing.",
+            Self::PlanDiff => "Diff two versions of the latest plan.",
+            Self::Act => "Execute the latest approved plan.",
+            Self::Replan => "Re-plan after deviation or failure.",
         }
     }
 
@@ -152,6 +188,15 @@ impl BuiltInSlashCommand {
             "auth" => Self::Auth,
             "provider" => Self::Provider,
             "model" => Self::Model,
+            "plan" => Self::Plan,
+            "plans" => Self::Plans,
+            "approve-plan" | "approve_plan" => Self::ApprovePlan,
+            "reject-plan" | "reject_plan" => Self::RejectPlan,
+            "revise-plan" | "revise_plan" => Self::RevisePlan,
+            "edit-plan" | "edit_plan" => Self::EditPlan,
+            "plan-diff" | "plan_diff" => Self::PlanDiff,
+            "act" => Self::Act,
+            "replan" => Self::Replan,
             _ => return None,
         })
     }
@@ -180,6 +225,15 @@ impl BuiltInSlashCommand {
             Self::Auth,
             Self::Provider,
             Self::Model,
+            Self::Plan,
+            Self::Plans,
+            Self::ApprovePlan,
+            Self::RejectPlan,
+            Self::RevisePlan,
+            Self::EditPlan,
+            Self::PlanDiff,
+            Self::Act,
+            Self::Replan,
         ]
     }
 }
