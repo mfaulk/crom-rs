@@ -173,9 +173,13 @@ impl Tool for BashTool {
         // non-Unix only the bash process is killed and a forked child could
         // hold the pipe open indefinitely.
         let (stdout_bytes, stdout_aborted) =
-            join_with_deadline(stdout_task, stdout_buf, DRAIN_DEADLINE).await;
+            join_with_deadline(stdout_task, stdout_buf, DRAIN_DEADLINE)
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("stdout join: {e}")))?;
         let (stderr_bytes, stderr_aborted) =
-            join_with_deadline(stderr_task, stderr_buf, DRAIN_DEADLINE).await;
+            join_with_deadline(stderr_task, stderr_buf, DRAIN_DEADLINE)
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("stderr join: {e}")))?;
 
         let mut stdout_str = String::from_utf8_lossy(&stdout_bytes).into_owned();
         let mut stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
@@ -264,32 +268,51 @@ where
 /// timeout fires, abort the task and return whatever bytes the task managed
 /// to capture into the shared buffer before being torn down.
 ///
-/// Returns `(bytes, aborted)` where `aborted` is true when the deadline
+/// Returns `Ok((bytes, aborted))` where `aborted` is true when the deadline
 /// fired before the task completed. Aborting the task drops the underlying
 /// `ChildStdout`/`ChildStderr` reader the task owned, which closes the read
 /// side of the pipe even if a descendant of the killed child is still
 /// holding the write side open. Tokio's child stdout/stderr types are
 /// `Drop`-safe while a reader future is in flight: the task simply stops
 /// being polled and the resource is released cleanly.
+///
+/// A `JoinError` from a *panicked* drain task is surfaced as `Err` so the
+/// caller does not silently report a successful execution while a drain
+/// panic was swallowed. Cancellation errors from our own `abort()` after a
+/// deadline are expected and are reported as `aborted = true`, not as an
+/// error.
 async fn join_with_deadline(
     mut task: tokio::task::JoinHandle<()>,
     buf: Arc<AsyncMutex<Vec<u8>>>,
     deadline: Duration,
-) -> (Vec<u8>, bool) {
+) -> Result<(Vec<u8>, bool), tokio::task::JoinError> {
     let abort = task.abort_handle();
     let aborted = match timeout(deadline, &mut task).await {
-        Ok(_join) => false,
+        Ok(Ok(())) => false,
+        Ok(Err(join_err)) => {
+            // The task finished before the deadline but did not return
+            // cleanly. A cancellation here is unexpected (we have not
+            // aborted yet), so treat anything non-clean as an error to
+            // propagate.
+            return Err(join_err);
+        }
         Err(_elapsed) => {
             // Tear the drain task down so it drops the pipe reader, then
             // await the handle to observe the cancellation and avoid
             // leaving an orphaned task running in the background.
             abort.abort();
-            let _ = task.await;
+            match task.await {
+                Ok(()) => {}
+                Err(join_err) if join_err.is_cancelled() => {
+                    // Expected: we just aborted it.
+                }
+                Err(join_err) => return Err(join_err),
+            }
             true
         }
     };
     let bytes = std::mem::take(&mut *buf.lock().await);
-    (bytes, aborted)
+    Ok((bytes, aborted))
 }
 
 fn redact(cmd: &str) -> String {
@@ -352,8 +375,9 @@ mod tests {
         let task = tokio::spawn(drain_into(reader, buf.clone(), 1024));
 
         let started = std::time::Instant::now();
-        let (bytes, aborted) =
-            join_with_deadline(task, buf, Duration::from_millis(150)).await;
+        let (bytes, aborted) = join_with_deadline(task, buf, Duration::from_millis(150))
+            .await
+            .expect("aborted-by-deadline must not be a join error");
         let elapsed = started.elapsed();
 
         assert!(aborted, "expected drain to be aborted by deadline");
@@ -372,10 +396,33 @@ mod tests {
         let buf = Arc::new(AsyncMutex::new(Vec::<u8>::new()));
         let task = tokio::spawn(drain_into(reader, buf.clone(), 1024));
 
-        let (bytes, aborted) =
-            join_with_deadline(task, buf, Duration::from_secs(5)).await;
+        let (bytes, aborted) = join_with_deadline(task, buf, Duration::from_secs(5))
+            .await
+            .expect("clean EOF must not be a join error");
 
         assert!(!aborted);
         assert_eq!(bytes, b"hello");
+    }
+
+    // join_with_deadline propagates a panic in the drain task as a JoinError
+    // instead of silently reporting success. This guards against the
+    // regression where Ok(_join) discarded the JoinHandle result.
+    #[tokio::test]
+    async fn drain_with_deadline_propagates_panic() {
+        let buf = Arc::new(AsyncMutex::new(Vec::<u8>::new()));
+        // Spawn a task whose Future return type matches drain_into's `()`
+        // and panics shortly after start, before the deadline fires.
+        let task: tokio::task::JoinHandle<()> = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            panic!("drain task panic");
+        });
+
+        let result = join_with_deadline(task, buf, Duration::from_secs(5)).await;
+
+        let err = result.expect_err("panicked drain task must surface JoinError");
+        assert!(
+            err.is_panic(),
+            "expected panic-flavored JoinError, got {err:?}"
+        );
     }
 }
