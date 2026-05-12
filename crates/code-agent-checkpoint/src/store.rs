@@ -457,8 +457,11 @@ impl LocalCheckpointStore {
         if manifest.exists() {
             let _ = tokio::fs::remove_file(&manifest).await;
         }
-        // Rewrite the index without the deleted entry.
-        let entries = self.load_index(session_id).await.unwrap_or_default();
+        // Rewrite the index without the deleted entry. A malformed line
+        // must propagate up: silently treating it as an empty Vec would
+        // overwrite the file with empty contents and destroy retention
+        // history. Recovery is opt-in via a dedicated path.
+        let entries = self.load_index(session_id).await?;
         let kept: Vec<IndexEntry> = entries
             .into_iter()
             .filter(|e| e.checkpoint_id != *checkpoint_id)
@@ -492,11 +495,11 @@ impl CheckpointStore for LocalCheckpointStore {
 
         // Enforce per-session checkpoint count by trimming the oldest
         // entries past the cap. Trimming happens *before* we write the
-        // new checkpoint so we don't immediately exceed the cap.
-        let mut entries = self
-            .load_index(&request.session_id)
-            .await
-            .unwrap_or_default();
+        // new checkpoint so we don't immediately exceed the cap. A
+        // malformed index line propagates as an error rather than being
+        // silently coerced to an empty Vec (which would clobber the on-
+        // disk index on the next write).
+        let mut entries = self.load_index(&request.session_id).await?;
         while entries.len() >= self.limits.max_checkpoints_per_session {
             let oldest = entries.remove(0);
             self.delete_checkpoint_locked(&request.session_id, &oldest.checkpoint_id)
@@ -786,7 +789,7 @@ impl LocalCheckpointStore {
         let lock = self.index_lock_for(session_id).await;
         let _g = lock.lock().await;
         let meta = self.read_manifest(session_id, checkpoint_id).await?;
-        let mut entries = self.load_index(session_id).await.unwrap_or_default();
+        let mut entries = self.load_index(session_id).await?;
         let mut changed = false;
         for e in &mut entries {
             if e.checkpoint_id == *checkpoint_id {
@@ -1125,6 +1128,44 @@ mod tests {
         let blobs_dir = store.blobs_dir_for(&sid).unwrap();
         let count = std::fs::read_dir(&blobs_dir).unwrap().count();
         assert_eq!(count, 1, "identical content should produce one blob");
+    }
+
+    #[tokio::test]
+    // A malformed line in the index must NOT be silently overwritten with an
+    // empty vec; callers that touch the index must propagate the parse error
+    // and leave the on-disk index untouched.
+    async fn malformed_index_is_not_silently_overwritten() {
+        let (_dir, store, sid) = fresh_store();
+        store.ensure_dirs(&sid).await.unwrap();
+        let valid = IndexEntry {
+            checkpoint_id: CheckpointId::new(),
+            session_id: sid.clone(),
+            run_id: RunId::new(),
+            created_at: OffsetDateTime::now_utc(),
+            description: None,
+            files_tracked_count: 0,
+        };
+        let mut contents = serde_json::to_string(&valid).unwrap();
+        contents.push('\n');
+        contents.push_str("{ not json }\n");
+        let path = store.index_path_for(&sid).unwrap();
+        tokio::fs::write(&path, &contents).await.unwrap();
+        let before = tokio::fs::read_to_string(&path).await.unwrap();
+        // Use delete_checkpoint_locked (the entry point that previously did
+        // unwrap_or_default() and clobbered the index).
+        let err = store
+            .delete_checkpoint_locked(&sid, &valid.checkpoint_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::MalformedManifest(_)),
+            "expected MalformedManifest, got {err:?}",
+        );
+        let after = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            before, after,
+            "malformed index file must not be overwritten on load failure"
+        );
     }
 
     #[tokio::test]
