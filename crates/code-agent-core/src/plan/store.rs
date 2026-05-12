@@ -242,6 +242,130 @@ impl FsPlanStore {
         }
     }
 
+    /// Atomic `load → validate → save` for an edited plan, holding the
+    /// per-plan lock across all three steps. Used by `plans edit` so a
+    /// concurrent writer cannot mutate the on-disk plan between the
+    /// validator reading the original and the save persisting the
+    /// edited body. The validator is called with the live on-disk plan
+    /// (`current`) and the caller's `edited` plan; returning an error
+    /// aborts the save and surfaces the validator's error to the caller.
+    pub async fn save_revision_atomic<F>(
+        &self,
+        edited: PlanDocument,
+        validator: F,
+    ) -> Result<(), PlanError>
+    where
+        F: FnOnce(&PlanDocument, &PlanDocument) -> Result<(), PlanError>,
+    {
+        Self::validate_id(&edited.id)?;
+        let lock = self.plan_lock(&edited.id).await;
+        let _guard = lock.lock().await;
+        // Load the live on-disk plan inside the lock so a concurrent
+        // `save_revision` for this id cannot slip between the load and
+        // the validator. `load` itself does not take the per-plan lock,
+        // so calling it here while we hold the guard is safe.
+        let current_path = self.current_path(&edited.id)?;
+        if !current_path.exists() {
+            return Err(PlanError::NotFound(edited.id.0.clone()));
+        }
+        let bytes = std::fs::read(&current_path).map_err(|e| PlanError::Io {
+            path: current_path.clone(),
+            source: e,
+        })?;
+        let current: PlanDocument =
+            serde_json::from_slice(&bytes).map_err(|e| PlanError::Parse {
+                path: current_path,
+                source: e,
+            })?;
+        validator(&current, &edited)?;
+        self.save_revision_locked(edited)
+    }
+
+    /// Locked body of `save_revision`: caller must hold the per-plan
+    /// mutex. Performs the approval-invalidation check, atomic writes,
+    /// `.approved.json` capture, GC, and index append.
+    fn save_revision_locked(&self, mut plan: PlanDocument) -> Result<(), PlanError> {
+        plan.updated_at = OffsetDateTime::now_utc();
+
+        // Any approval is keyed to a specific plan version. The moment the
+        // revision's version differs from the approval's recorded version
+        // — or any body field of the on-disk current plan differs from the
+        // incoming one while we're still calling ourselves Approved — we
+        // must flip the plan back to PendingApproval and drop the prior
+        // approval. This guards against three distinct mistakes:
+        //
+        //   1. A caller bumps `plan.version` but forgets to set
+        //      `created_by = RevisedBy*`.
+        //   2. A caller edits plan body fields in place at the same
+        //      version (which would otherwise leave a stale approval
+        //      attached to mutated content).
+        //   3. The act driver itself transitioning the plan into
+        //      `Executing` and back: that is intentional and we *do not*
+        //      reset for status-only edits between Approved/Executing/
+        //      Completed.
+        // Load the prior on-disk state once: needed both for body-drift
+        // detection and to decide whether this save is the first transition
+        // into Approved (which captures the write-once `.approved.json`).
+        let prev_on_disk = self.load_existing_for_compare(&plan.id);
+        let prev_status = prev_on_disk.as_ref().map(|p| p.status);
+
+        let approval_invalidated = match (&plan.approval, plan.status) {
+            (Some(approval), PlanStatus::Approved) => {
+                if approval.approved_version != plan.version {
+                    true
+                } else {
+                    // Same version but content may have drifted. Compare
+                    // against the on-disk current plan body.
+                    match prev_on_disk.as_ref() {
+                        Some(prev) => plan_body_changed(prev, &plan),
+                        None => false,
+                    }
+                }
+            }
+            _ => false,
+        };
+        if approval_invalidated {
+            plan.status = PlanStatus::PendingApproval;
+            plan.approval = None;
+        }
+        redact_secrets_in_plan(&mut plan);
+        let bytes = self.validate_plan_size(&plan)?;
+        let cur = self.current_path(&plan.id)?;
+        let ver = self.version_path(&plan.id, plan.version)?;
+        self.write_atomic(&cur, &bytes)?;
+        self.write_atomic(&ver, &bytes)?;
+
+        // If this save is the first transition into Approved, capture a
+        // write-once snapshot of the approved body. Subsequent saves at the
+        // same version (status -> Executing / Completed / Failed) will
+        // overwrite `<id>.v<n>.json` but must leave `.approved.json` alone.
+        let is_first_approval_transition = matches!(plan.status, PlanStatus::Approved)
+            && !matches!(prev_status, Some(PlanStatus::Approved));
+        if is_first_approval_transition {
+            let approved = self.approved_version_path(&plan.id, plan.version)?;
+            // Use create_new so we never clobber an existing approved
+            // snapshot. If it already exists we leave the older capture in
+            // place — that's the audit record. The approved snapshot is
+            // integrity-critical, so propagate any write failure.
+            self.write_approved_snapshot(&approved, &bytes)?;
+        }
+
+        // Soft retention cap: trim the oldest `.v<n>.json` snapshots so
+        // their count never exceeds `max_plan_revisions`. Approved
+        // snapshots are skipped — they are write-once audit records.
+        self.gc_old_version_snapshots(&plan.id);
+
+        self.append_index(&IndexEntry {
+            timestamp: now_iso(),
+            plan_id: plan.id.0.clone(),
+            version: plan.version,
+            status: plan.status,
+            event: IndexEvent::Revised,
+            session_id: plan.session_id.as_ref().map(|s| s.as_str().to_string()),
+        })?;
+        Ok(())
+    }
+
     fn append_index(&self, entry: &IndexEntry) -> Result<(), PlanError> {
         self.ensure_root()?;
         let line = serde_json::to_string(entry).map_err(|e| PlanError::Parse {
@@ -427,9 +551,8 @@ impl PlanStore for FsPlanStore {
         Ok(plan)
     }
 
-    async fn save_revision(&self, mut plan: PlanDocument) -> Result<(), PlanError> {
+    async fn save_revision(&self, plan: PlanDocument) -> Result<(), PlanError> {
         Self::validate_id(&plan.id)?;
-        plan.updated_at = OffsetDateTime::now_utc();
 
         // Serialize the read-decide-write block for this plan id so two
         // concurrent revisions cannot both observe the same prior state
@@ -437,84 +560,7 @@ impl PlanStore for FsPlanStore {
         // do not block each other.
         let lock = self.plan_lock(&plan.id).await;
         let _guard = lock.lock().await;
-
-        // Any approval is keyed to a specific plan version. The moment the
-        // revision's version differs from the approval's recorded version
-        // — or any body field of the on-disk current plan differs from the
-        // incoming one while we're still calling ourselves Approved — we
-        // must flip the plan back to PendingApproval and drop the prior
-        // approval. This guards against three distinct mistakes:
-        //
-        //   1. A caller bumps `plan.version` but forgets to set
-        //      `created_by = RevisedBy*`.
-        //   2. A caller edits plan body fields in place at the same
-        //      version (which would otherwise leave a stale approval
-        //      attached to mutated content).
-        //   3. The act driver itself transitioning the plan into
-        //      `Executing` and back: that is intentional and we *do not*
-        //      reset for status-only edits between Approved/Executing/
-        //      Completed.
-        // Load the prior on-disk state once: needed both for body-drift
-        // detection and to decide whether this save is the first transition
-        // into Approved (which captures the write-once `.approved.json`).
-        let prev_on_disk = self.load_existing_for_compare(&plan.id);
-        let prev_status = prev_on_disk.as_ref().map(|p| p.status);
-
-        let approval_invalidated = match (&plan.approval, plan.status) {
-            (Some(approval), PlanStatus::Approved) => {
-                if approval.approved_version != plan.version {
-                    true
-                } else {
-                    // Same version but content may have drifted. Compare
-                    // against the on-disk current plan body.
-                    match prev_on_disk.as_ref() {
-                        Some(prev) => plan_body_changed(prev, &plan),
-                        None => false,
-                    }
-                }
-            }
-            _ => false,
-        };
-        if approval_invalidated {
-            plan.status = PlanStatus::PendingApproval;
-            plan.approval = None;
-        }
-        redact_secrets_in_plan(&mut plan);
-        let bytes = self.validate_plan_size(&plan)?;
-        let cur = self.current_path(&plan.id)?;
-        let ver = self.version_path(&plan.id, plan.version)?;
-        self.write_atomic(&cur, &bytes)?;
-        self.write_atomic(&ver, &bytes)?;
-
-        // If this save is the first transition into Approved, capture a
-        // write-once snapshot of the approved body. Subsequent saves at the
-        // same version (status -> Executing / Completed / Failed) will
-        // overwrite `<id>.v<n>.json` but must leave `.approved.json` alone.
-        let is_first_approval_transition = matches!(plan.status, PlanStatus::Approved)
-            && !matches!(prev_status, Some(PlanStatus::Approved));
-        if is_first_approval_transition {
-            let approved = self.approved_version_path(&plan.id, plan.version)?;
-            // Use create_new so we never clobber an existing approved
-            // snapshot. If it already exists we leave the older capture in
-            // place — that's the audit record. The approved snapshot is
-            // integrity-critical, so propagate any write failure.
-            self.write_approved_snapshot(&approved, &bytes)?;
-        }
-
-        // Soft retention cap: trim the oldest `.v<n>.json` snapshots so
-        // their count never exceeds `max_plan_revisions`. Approved
-        // snapshots are skipped — they are write-once audit records.
-        self.gc_old_version_snapshots(&plan.id);
-
-        self.append_index(&IndexEntry {
-            timestamp: now_iso(),
-            plan_id: plan.id.0.clone(),
-            version: plan.version,
-            status: plan.status,
-            event: IndexEvent::Revised,
-            session_id: plan.session_id.as_ref().map(|s| s.as_str().to_string()),
-        })?;
-        Ok(())
+        self.save_revision_locked(plan)
     }
 
     async fn list(&self, filter: PlanListFilter) -> Result<Vec<PlanSummary>, PlanError> {
@@ -1421,5 +1467,96 @@ mod tests {
 
         let after = std::fs::read(&approved_path).unwrap();
         assert_eq!(after, b"preexisting", "preexisting snapshot must be kept");
+    }
+
+    #[tokio::test]
+    // `save_revision_atomic` holds the per-plan lock across load +
+    // validator + save, so a concurrent writer cannot mutate the on-disk
+    // plan between the validator inspecting it and the save persisting
+    // the edited body. Spawn a background `save_revision` that races
+    // the atomic call; the atomic call must observe its post-write state
+    // at validator time (not the pre-spawn snapshot), so the final
+    // on-disk title equals one writer's output without torn state.
+    async fn save_revision_atomic_serializes_against_concurrent_writer() {
+        use std::sync::Arc;
+        let (s, _g) = store();
+        let s = Arc::new(s);
+        let p = small_plan();
+        let id = p.id.clone();
+        s.create(p).await.unwrap();
+
+        // Spawn a background writer that races the atomic edit. It bumps
+        // version and title, just like a concurrent `plans revise`.
+        let s_bg = s.clone();
+        let id_bg = id.clone();
+        let bg = tokio::spawn(async move {
+            let mut rev = s_bg.load(&id_bg).await.unwrap();
+            rev.version += 1;
+            rev.created_by = PlanCreatedBy::RevisedByUser;
+            rev.title = "background-writer".into();
+            s_bg.save_revision(rev).await
+        });
+
+        // Wait for the background save to complete before our atomic
+        // edit, so we KNOW the validator must observe its state (the
+        // version we read at start is stale). This is the load-plus-stale
+        // edit pattern the CLI fix prevents: the user opened the plan,
+        // a concurrent writer bumped its version, and now the user's save
+        // is racing in. With atomic we want the validator to see the
+        // post-concurrent state and decide accordingly.
+        bg.await.unwrap().expect("background save must succeed");
+
+        // Build the "edited" plan based on the stale pre-bg snapshot.
+        let mut edited = s.load(&id).await.unwrap();
+        edited.title = "atomic-edit".into();
+
+        // The validator must see the latest on-disk version, NOT the
+        // stale one. Capture the observed version into a cell.
+        let observed_version = std::sync::Mutex::new(0u32);
+        let validator = |current: &PlanDocument, _edited: &PlanDocument| -> Result<(), PlanError> {
+            *observed_version.lock().unwrap() = current.version;
+            Ok(())
+        };
+        s.save_revision_atomic(edited, validator)
+            .await
+            .expect("atomic save must succeed");
+
+        // The validator must have observed the post-bg version (>=2),
+        // not the pre-bg version (1). This is the load-after-lock
+        // guarantee — without it, the CLI's load-then-save dance would
+        // have validated against the stale pre-bg state.
+        assert!(
+            *observed_version.lock().unwrap() >= 2,
+            "validator must observe post-concurrent-writer version, got {}",
+            *observed_version.lock().unwrap()
+        );
+
+        // The final on-disk title is the atomic edit's.
+        let final_plan = s.load(&id).await.unwrap();
+        assert_eq!(final_plan.title, "atomic-edit");
+    }
+
+    #[tokio::test]
+    // `save_revision_atomic` surfaces a validator error without writing.
+    // The on-disk plan must be unchanged when the validator returns Err.
+    async fn save_revision_atomic_propagates_validator_error() {
+        let (s, _g) = store();
+        let p = small_plan();
+        let id = p.id.clone();
+        s.create(p).await.unwrap();
+        let pre = s.load(&id).await.unwrap();
+
+        let mut edited = pre.clone();
+        edited.title = "should-not-persist".into();
+        let validator =
+            |_current: &PlanDocument, _edited: &PlanDocument| -> Result<(), PlanError> {
+                Err(PlanError::Invalid("validator says no".into()))
+            };
+        let err = s.save_revision_atomic(edited, validator).await.unwrap_err();
+        assert!(matches!(err, PlanError::Invalid(_)));
+
+        // On-disk state unchanged.
+        let after = s.load(&id).await.unwrap();
+        assert_eq!(after.title, pre.title);
     }
 }

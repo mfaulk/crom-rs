@@ -342,8 +342,16 @@ async fn cmd_plans_revise(settings: &Settings, args: ReviseArgs) -> Result<()> {
 }
 
 async fn cmd_plans_edit(settings: &Settings, args: EditArgs) -> Result<()> {
-    let store = plan_store(&args.common.cwd, settings);
-    let id = resolve_plan_id(&store, &args.plan_id).await?;
+    // Use the concrete `FsPlanStore` here (not the trait object returned
+    // by `plan_store`) so we can call `save_revision_atomic`, which
+    // holds the per-plan lock across load + validate + save and closes
+    // the TOCTOU between `validate_edited_plan` and the persisted save.
+    let store = Arc::new(FsPlanStore::new(
+        &args.common.cwd,
+        planning_options_from_settings(settings),
+    ));
+    let trait_store: Arc<dyn PlanStore> = store.clone();
+    let id = resolve_plan_id(&trait_store, &args.plan_id).await?;
     let plan = store.load(&id).await?;
     let live_path = args
         .common
@@ -395,13 +403,70 @@ async fn cmd_plans_edit(settings: &Settings, args: EditArgs) -> Result<()> {
             "plan id may not be changed during edit; live plan untouched"
         ));
     }
-    // Drop the tempfile guard explicitly so it's removed before we exit.
+    // Drop the tempfile guard explicitly so it's removed before we persist.
     drop(tmp);
+    let (saved_id, saved_version) = (edited.id.clone(), edited.version);
+    // Atomic load+validate+save inside the per-plan lock. Without this,
+    // a concurrent writer could mutate the on-disk plan between the
+    // validator's read and our save, letting the edit silently overwrite
+    // a state the user never reviewed.
     store
-        .save_revision(edited.clone())
+        .save_revision_atomic(edited, |current, edited| {
+            validate_edited_plan(current, edited).map_err(|e| PlanError::Invalid(format!("{e:#}")))
+        })
         .await
-        .context("save_revision rejected the edited plan; live plan untouched")?;
-    println!("[plan] saved manual edit {} v{}", edited.id, edited.version);
+        .context("rejected manual edit; live plan untouched")?;
+    println!("[plan] saved manual edit {} v{}", saved_id, saved_version);
+    Ok(())
+}
+
+/// Reject manual-edit changes that bypass plan-store invariants:
+///
+/// - `version` may not be decremented.
+/// - `status` must be preserved by an edit. Status transitions belong to
+///   approve/reject/run flows.
+/// - `approval` may not be introduced or mutated by an edit. Only
+///   `plans approve` may attach an approval block.
+///
+/// Non-mutating edits (steps, summary, etc.) are allowed; `save_revision`
+/// still performs its own approval-invalidation pass on body drift.
+pub fn validate_edited_plan(original: &PlanDocument, edited: &PlanDocument) -> Result<()> {
+    if edited.version < original.version {
+        return Err(anyhow!(
+            "field `version`: cannot downgrade plan version (was {}, edited to {}); \
+             revisions must increment, not decrement",
+            original.version,
+            edited.version
+        ));
+    }
+    if edited.status != original.status {
+        return Err(anyhow!(
+            "field `status`: cannot change plan status via edit \
+             (was {:?}, edited to {:?}); use `plans approve`, `plans reject`, or \
+             `act` to transition status",
+            original.status,
+            edited.status
+        ));
+    }
+    // `approval` may stay non-null only if it is byte-for-byte identical
+    // to the original. Comparing serialized form sidesteps having to add
+    // `PartialEq` to `PlanApproval`/`OffsetDateTime`.
+    let approval_changed = match (&original.approval, &edited.approval) {
+        (None, None) => false,
+        (Some(a), Some(b)) => {
+            let a_json = serde_json::to_value(a).unwrap_or(Value::Null);
+            let b_json = serde_json::to_value(b).unwrap_or(Value::Null);
+            a_json != b_json
+        }
+        // Either side flipped between None/Some — that's an approval mutation.
+        _ => true,
+    };
+    if approval_changed {
+        return Err(anyhow!(
+            "field `approval`: cannot set or mutate approval via edit; \
+             use `plans approve` instead"
+        ));
+    }
     Ok(())
 }
 
@@ -706,4 +771,146 @@ pub fn apply_plan_args_to_options(args: &PlanArgs, opts: &mut PlanningOptions) -
         opts.max_plan_steps = n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use code_agent_core::PlanApproval;
+    use time::OffsetDateTime;
+
+    fn base_plan() -> PlanDocument {
+        let mut p = PlanDocument::new_draft(new_plan_id(), "T", "u");
+        p.version = 3;
+        p.status = PlanStatus::PendingApproval;
+        p
+    }
+
+    #[test]
+    // validate_edited_plan rejects a version downgrade and names the
+    // offending field in the error message. Pins #79: pre-fix the
+    // editor flow handed the lowered version straight to
+    // `save_revision`, which happily wrote it back.
+    fn edit_rejects_version_downgrade() {
+        let original = base_plan();
+        let mut edited = original.clone();
+        edited.version = 2;
+        let err = validate_edited_plan(&original, &edited).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("`version`"),
+            "error should name the version field, got: {msg}"
+        );
+    }
+
+    #[test]
+    // validate_edited_plan accepts a same-version edit, including body
+    // changes (steps, summary). `save_revision` still applies its own
+    // approval-invalidation pass on body drift.
+    fn edit_allows_same_version_body_change() {
+        let original = base_plan();
+        let mut edited = original.clone();
+        edited.summary = "new summary".into();
+        validate_edited_plan(&original, &edited).expect("body-only edit must succeed");
+    }
+
+    #[test]
+    // validate_edited_plan accepts a version increment, which is how a
+    // legitimate revision (created by the act driver or `plans revise`)
+    // would appear when the user edits the latest snapshot.
+    fn edit_allows_version_increment() {
+        let original = base_plan();
+        let mut edited = original.clone();
+        edited.version = original.version + 1;
+        validate_edited_plan(&original, &edited).expect("version increment must succeed");
+    }
+
+    #[test]
+    // validate_edited_plan rejects a direct status flip to `Approved`
+    // and names the offending field. Status transitions must go through
+    // approve/reject/run flows.
+    fn edit_rejects_status_change() {
+        let original = base_plan();
+        let mut edited = original.clone();
+        edited.status = PlanStatus::Approved;
+        let err = validate_edited_plan(&original, &edited).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("`status`"),
+            "error should name the status field, got: {msg}"
+        );
+    }
+
+    #[test]
+    // validate_edited_plan rejects attaching an `approval` block via
+    // edit even when the user keeps version and status fixed. Approval
+    // is the integrity-critical record `plans approve` is supposed to
+    // own.
+    fn edit_rejects_introducing_approval() {
+        let original = base_plan();
+        let mut edited = original.clone();
+        edited.approval = Some(PlanApproval {
+            approved_at: OffsetDateTime::now_utc(),
+            approved_by: PlanApprover::CliFlag,
+            approved_version: original.version,
+            notes: Some("forged".into()),
+            scope: PlanApprovalScope::FullPlan,
+        });
+        let err = validate_edited_plan(&original, &edited).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("`approval`"),
+            "error should name the approval field, got: {msg}"
+        );
+    }
+
+    #[test]
+    // validate_edited_plan rejects mutating an existing `approval`
+    // block — e.g. changing `notes` or `approved_by` — without going
+    // through the approve flow.
+    fn edit_rejects_mutating_existing_approval() {
+        let mut original = base_plan();
+        original.status = PlanStatus::Approved;
+        let now = OffsetDateTime::now_utc();
+        original.approval = Some(PlanApproval {
+            approved_at: now,
+            approved_by: PlanApprover::CliFlag,
+            approved_version: original.version,
+            notes: Some("real".into()),
+            scope: PlanApprovalScope::FullPlan,
+        });
+        let mut edited = original.clone();
+        edited.approval = Some(PlanApproval {
+            approved_at: now,
+            approved_by: PlanApprover::CliFlag,
+            approved_version: original.version,
+            notes: Some("tampered".into()),
+            scope: PlanApprovalScope::FullPlan,
+        });
+        let err = validate_edited_plan(&original, &edited).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("`approval`"),
+            "error should name the approval field, got: {msg}"
+        );
+    }
+
+    #[test]
+    // validate_edited_plan accepts a preserved approval block (same
+    // bytes round-tripped through serde) so the no-op case is allowed.
+    fn edit_allows_preserved_approval() {
+        let mut original = base_plan();
+        original.status = PlanStatus::Approved;
+        original.approval = Some(PlanApproval {
+            approved_at: OffsetDateTime::now_utc(),
+            approved_by: PlanApprover::CliFlag,
+            approved_version: original.version,
+            notes: Some("real".into()),
+            scope: PlanApprovalScope::FullPlan,
+        });
+        // Round-trip through JSON to mimic the editor save path.
+        let json = serde_json::to_string(&original).unwrap();
+        let edited: PlanDocument = serde_json::from_str(&json).unwrap();
+        validate_edited_plan(&original, &edited).expect("identical approval must be allowed");
+    }
 }
