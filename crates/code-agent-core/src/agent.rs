@@ -2382,3 +2382,84 @@ async fn push_tool_result_user(
     });
     emit(tx, sink, sid, ev).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::ToolError;
+    use crate::permission::PermissionKind;
+    use crate::tool::{ToolContext, ToolResult};
+
+    struct StubTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for StubTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn permission_kind(&self) -> PermissionKind {
+            PermissionKind::ReadOnly
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::ok_text(""))
+        }
+    }
+
+    fn stub(name: &str) -> Arc<dyn Tool> {
+        Arc::new(StubTool {
+            name: name.to_string(),
+        })
+    }
+
+    /// tool_schemas_for_names yields schemas in lexicographic name order when
+    /// driven through the same `registry.names()` -> `BTreeSet` -> schema
+    /// pipeline the agent loop uses to build `ModelRequest.tools`. The
+    /// Anthropic API caches the tools array as a prompt prefix, so any
+    /// regression that desorts this path would silently invalidate the cache.
+    #[tokio::test]
+    async fn tool_schemas_for_names_matches_agent_request_path() {
+        let mut registry = ToolRegistry::new();
+        for n in ["zebra", "alpha", "mango", "bravo", "yak", "charlie"] {
+            registry.register(stub(n));
+        }
+
+        // Mirror the agent loop: with no ToolSearchRuntime, loaded names come
+        // from `registry.names()` collected into a BTreeSet, then passed to
+        // `tool_schemas_for_names`. This is the exact call shape that
+        // populates `ModelRequest.tools`.
+        let loaded = loaded_tool_names_for_turn(&registry, None).await;
+        let schemas = tool_schemas_for_names(&registry, &loaded);
+
+        let observed: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
+        let mut sorted = observed.clone();
+        sorted.sort();
+        assert_eq!(
+            observed, sorted,
+            "ModelRequest.tools schema order must be lexicographic so the \
+             Anthropic prompt prefix cache stays stable across resumed/forked sessions"
+        );
+        assert_eq!(
+            observed,
+            vec![
+                "alpha".to_string(),
+                "bravo".to_string(),
+                "charlie".to_string(),
+                "mango".to_string(),
+                "yak".to_string(),
+                "zebra".to_string(),
+            ]
+        );
+    }
+}
