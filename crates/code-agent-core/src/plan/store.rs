@@ -25,11 +25,14 @@
 //! during execution. Diff / compare paths prefer `.approved.json` over
 //! `.v<n>.json` for an approved version.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::options::SessionId;
 
@@ -79,17 +82,45 @@ pub trait PlanStore: Send + Sync {
 }
 
 /// On-disk implementation rooted at `<cwd>/.agent/plans/`.
+///
+/// Holds a per-plan async mutex (`plan_locks`) that serializes the
+/// read-decide-write block in `save_revision` so two concurrent revisions
+/// of the same plan id cannot both observe the same prior state and
+/// race the approval-invalidation check. Cross-process safety is NOT
+/// provided — for that, add an advisory file lock (e.g. `fs2`) once it
+/// lands in the workspace.
 #[derive(Debug, Clone)]
 pub struct FsPlanStore {
     root: PathBuf,
     options: PlanningOptions,
+    plan_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl FsPlanStore {
     pub fn new(cwd: impl Into<PathBuf>, options: PlanningOptions) -> Self {
         let cwd = cwd.into();
         let root = cwd.join(".agent").join("plans");
-        Self { root, options }
+        Self {
+            root,
+            options,
+            plan_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Returns (and lazily creates) the per-plan async mutex that
+    /// serializes `save_revision` for a single plan id. Multiple plan ids
+    /// proceed in parallel. The map mutex is held only long enough to
+    /// look up / insert the entry.
+    ///
+    /// TODO(cross-process): the workspace does not yet depend on `fs2`
+    /// or another advisory-lock crate, so concurrent writers across
+    /// processes can still race. Adding an `<id>.lock` flock here would
+    /// close that gap.
+    async fn plan_lock(&self, id: &PlanId) -> Arc<AsyncMutex<()>> {
+        let mut map = self.plan_locks.lock().await;
+        map.entry(id.0.clone())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     pub fn root(&self) -> &Path {
@@ -299,6 +330,13 @@ impl PlanStore for FsPlanStore {
     async fn save_revision(&self, mut plan: PlanDocument) -> Result<(), PlanError> {
         Self::validate_id(&plan.id)?;
         plan.updated_at = OffsetDateTime::now_utc();
+
+        // Serialize the read-decide-write block for this plan id so two
+        // concurrent revisions cannot both observe the same prior state
+        // and race the approval-invalidation check. Different plan ids
+        // do not block each other.
+        let lock = self.plan_lock(&plan.id).await;
+        let _guard = lock.lock().await;
 
         // Any approval is keyed to a specific plan version. The moment the
         // revision's version differs from the approval's recorded version
@@ -900,5 +938,66 @@ mod tests {
         let approved_doc: PlanDocument =
             serde_json::from_slice(&approved_after).expect("approved snapshot parses");
         assert_eq!(approved_doc.status, PlanStatus::Approved);
+    }
+
+    #[tokio::test]
+    // Race many concurrent `save_revision` calls against the same plan id.
+    // With the per-plan async mutex in place each call observes the
+    // serialized state, so the final on-disk plan body equals exactly one
+    // writer's input and the index records every revision. Without the
+    // lock, two writers could pass the body-drift / approval-invalidation
+    // check against the same prior state and the loser's mutated body
+    // could end up paired with the prior approval.
+    async fn save_revision_serializes_concurrent_writers() {
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let s = Arc::new(FsPlanStore::new(
+            tmp.path(),
+            PlanningOptions {
+                max_plan_revisions: 64,
+                ..PlanningOptions::default()
+            },
+        ));
+        let p = small_plan();
+        let id = p.id.clone();
+        s.create(p).await.unwrap();
+
+        let n: u32 = 16;
+        let mut handles = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let s = s.clone();
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                let mut rev = s.load(&id).await.unwrap();
+                rev.version = 2 + i; // unique version per writer
+                rev.created_by = PlanCreatedBy::RevisedByUser;
+                rev.title = format!("writer-{i}");
+                s.save_revision(rev).await
+            }));
+        }
+        let mut titles_attempted: Vec<String> = Vec::new();
+        for (i, h) in handles.into_iter().enumerate() {
+            h.await.unwrap().expect("save_revision must succeed");
+            titles_attempted.push(format!("writer-{i}"));
+        }
+
+        // The final on-disk body must match one of the attempted titles
+        // (no torn writes, no garbled state).
+        let final_plan = s.load(&id).await.unwrap();
+        assert!(
+            titles_attempted.contains(&final_plan.title),
+            "final title {:?} must equal one of {:?}",
+            final_plan.title,
+            titles_attempted
+        );
+
+        // Every revision must have appended one Revised entry to the
+        // index — a torn write would lose entries.
+        let idx = std::fs::read_to_string(s.index_path()).unwrap();
+        let revised: Vec<&str> = idx
+            .lines()
+            .filter(|l| l.contains("\"event\":\"revised\""))
+            .collect();
+        assert_eq!(revised.len(), n as usize);
     }
 }
