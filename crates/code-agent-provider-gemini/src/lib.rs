@@ -18,15 +18,27 @@ use serde_json::Value;
 
 const DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com";
 
+/// Header name Gemini accepts as an alternative to `?key=` in the URL.
+/// Using the header keeps the API key out of request URLs, where it
+/// would otherwise leak into logs, traces, and panic backtraces.
+/// Exported so transport implementations can reference the canonical
+/// name rather than duplicating the literal.
+pub const GEMINI_API_KEY_HEADER: &str = "x-goog-api-key";
+
 #[async_trait]
 pub trait GeminiTransport: Send + Sync {
     async fn post_generate(
         &self,
         url: &str,
+        api_key: &SecretString,
         body: &str,
     ) -> Result<TransportResponse, ProviderError>;
 
-    async fn list_models(&self, url: &str) -> Result<TransportResponse, ProviderError>;
+    async fn list_models(
+        &self,
+        url: &str,
+        api_key: &SecretString,
+    ) -> Result<TransportResponse, ProviderError>;
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +82,8 @@ impl GeminiProvider {
     pub async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
         let cred = (self.credential)();
         let key = require_api_key(&cred)?;
-        let url = format!("{}/v1beta/models?key={}", self.cfg.base_url, key.expose());
-        let resp = self.transport.list_models(&url).await?;
+        let url = format!("{}/v1beta/models", self.cfg.base_url);
+        let resp = self.transport.list_models(&url, &key).await?;
         if resp.status >= 200 && resp.status < 300 {
             let parsed: ModelsList = serde_json::from_str(&resp.body)
                 .map_err(|e| ProviderError::InvalidResponse(format!("models: {e}")))?;
@@ -93,15 +105,14 @@ impl ModelProvider for GeminiProvider {
     ) -> Result<BoxStream<'static, Result<ModelEvent, ProviderError>>, ProviderError> {
         let cred = (self.credential)();
         let key = require_api_key(&cred)?;
+        let model = validate_model_id(&request.model)?;
         let url = format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
-            self.cfg.base_url,
-            request.model,
-            key.expose()
+            "{}/v1beta/models/{}:generateContent",
+            self.cfg.base_url, model
         );
         let body = serde_json::to_string(&build_body(&request))
             .map_err(|e| ProviderError::Other(format!("encode body: {e}")))?;
-        let resp = self.transport.post_generate(&url, &body).await?;
+        let resp = self.transport.post_generate(&url, &key, &body).await?;
         if resp.status < 200 || resp.status >= 300 {
             return Err(ProviderError::Http(format!(
                 "gemini: status {}: {}",
@@ -124,6 +135,28 @@ fn require_api_key(cred: &ResolvedCredential) -> Result<SecretString, ProviderEr
             "Gemini provider requires an API key".into(),
         )),
     }
+}
+
+/// Reject model ids that would alter the request URL when interpolated
+/// into the path. The Gemini API only accepts identifiers like
+/// `gemini-1.5-pro`, `gemini-1.5-flash-002`, etc., so an alphanumeric
+/// charset plus `.`, `_`, and `-` is sufficient. Rejecting at the
+/// boundary avoids needing a percent-encoder dependency and ensures a
+/// caller-supplied `?`, `/`, or `#` cannot change the request target or
+/// smuggle an attacker-controlled `key=` query parameter into the URL.
+fn validate_model_id(model: &str) -> Result<&str, ProviderError> {
+    if model.is_empty() {
+        return Err(ProviderError::Other("gemini: empty model id".into()));
+    }
+    let ok = model
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !ok {
+        return Err(ProviderError::Other(format!(
+            "gemini: invalid model id {model:?} (allowed: [A-Za-z0-9._-])"
+        )));
+    }
+    Ok(model)
 }
 
 #[derive(Serialize)]
@@ -383,23 +416,36 @@ mod tests {
         gen_response: Option<TransportResponse>,
         models_response: Option<TransportResponse>,
         captured: std::sync::Mutex<Option<String>>,
+        captured_url: std::sync::Mutex<Option<String>>,
+        captured_key: std::sync::Mutex<Option<String>>,
+        captured_models_url: std::sync::Mutex<Option<String>>,
+        captured_models_key: std::sync::Mutex<Option<String>>,
     }
 
     #[async_trait]
     impl GeminiTransport for MockTransport {
         async fn post_generate(
             &self,
-            _url: &str,
+            url: &str,
+            api_key: &SecretString,
             body: &str,
         ) -> Result<TransportResponse, ProviderError> {
             *self.captured.lock().unwrap() = Some(body.to_string());
+            *self.captured_url.lock().unwrap() = Some(url.to_string());
+            *self.captured_key.lock().unwrap() = Some(api_key.expose().to_string());
             Ok(self.gen_response.clone().unwrap_or(TransportResponse {
                 status: 200,
                 body: r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1}}"#.into(),
             }))
         }
 
-        async fn list_models(&self, _url: &str) -> Result<TransportResponse, ProviderError> {
+        async fn list_models(
+            &self,
+            url: &str,
+            api_key: &SecretString,
+        ) -> Result<TransportResponse, ProviderError> {
+            *self.captured_models_url.lock().unwrap() = Some(url.to_string());
+            *self.captured_models_key.lock().unwrap() = Some(api_key.expose().to_string());
             Ok(self.models_response.clone().unwrap_or(TransportResponse {
                 status: 200,
                 body: r#"{"models":[{"name":"models/gemini-1.5-pro"},{"name":"models/gemini-1.5-flash"}]}"#.into(),
@@ -584,5 +630,127 @@ mod tests {
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains("\"name\":\"Read\""));
         assert!(!s.contains("\"name\":\"gemini-Read\""));
+    }
+
+    #[tokio::test]
+    // stream_turn must NOT embed the API key in the URL (which would
+    // leak into logs/traces/panics); it must be passed to the transport
+    // as a separate secret so the transport can attach the
+    // `x-goog-api-key` header.
+    async fn stream_turn_passes_key_via_header_not_url() {
+        let transport = Arc::new(MockTransport::default());
+        let provider = GeminiProvider::new(
+            GeminiConfig::default(),
+            transport.clone(),
+            Arc::new(|| cred("SECRET-XYZ")),
+        );
+        let req = ModelRequest {
+            model: "gemini-1.5-pro".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            deferred_tools: vec![],
+            tool_search_config: None,
+            max_tokens: 8,
+        };
+        let _ = provider.stream_turn(req).await.unwrap();
+        let url = transport.captured_url.lock().unwrap().clone().unwrap();
+        let key = transport.captured_key.lock().unwrap().clone().unwrap();
+        assert!(
+            !url.contains("key="),
+            "URL must not contain a `key=` query parameter: {url}"
+        );
+        assert!(
+            !url.contains("SECRET-XYZ"),
+            "URL must not embed the API key: {url}"
+        );
+        assert_eq!(
+            key, "SECRET-XYZ",
+            "transport must receive the API key out-of-band"
+        );
+        assert!(url.ends_with("/v1beta/models/gemini-1.5-pro:generateContent"));
+    }
+
+    #[tokio::test]
+    // list_models must NOT embed the API key in the URL.
+    async fn list_models_passes_key_via_header_not_url() {
+        let transport = Arc::new(MockTransport::default());
+        let provider = GeminiProvider::new(
+            GeminiConfig::default(),
+            transport.clone(),
+            Arc::new(|| cred("SECRET-XYZ")),
+        );
+        let _ = provider.list_models().await.unwrap();
+        let url = transport
+            .captured_models_url
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let key = transport
+            .captured_models_key
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert!(
+            !url.contains("key="),
+            "URL must not contain a `key=` query parameter: {url}"
+        );
+        assert!(
+            !url.contains("SECRET-XYZ"),
+            "URL must not embed the API key: {url}"
+        );
+        assert_eq!(key, "SECRET-XYZ");
+        assert!(url.ends_with("/v1beta/models"));
+    }
+
+    #[tokio::test]
+    // An attacker-controlled model id containing URL metacharacters must
+    // be rejected with a structured error, so it can never reach the
+    // transport and rewrite the request path or smuggle a query string.
+    async fn invalid_model_id_is_rejected() {
+        let transport = Arc::new(MockTransport::default());
+        let provider = GeminiProvider::new(
+            GeminiConfig::default(),
+            transport.clone(),
+            Arc::new(|| cred("AI-1")),
+        );
+        let req = ModelRequest {
+            model: "foo?bar".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            deferred_tools: vec![],
+            tool_search_config: None,
+            max_tokens: 8,
+        };
+        let result = provider.stream_turn(req).await;
+        match result {
+            Err(ProviderError::Other(msg)) => {
+                assert!(msg.contains("invalid model id"), "got: {msg}");
+            }
+            Err(other) => panic!("expected Other error for invalid model, got: {other:?}"),
+            Ok(_) => panic!("expected Err for invalid model id, got Ok"),
+        }
+        assert!(
+            transport.captured_url.lock().unwrap().is_none(),
+            "transport must not be called for an invalid model id"
+        );
+    }
+
+    #[test]
+    // validate_model_id accepts the typical Gemini identifier shapes and
+    // rejects anything that could alter the request URL.
+    fn validate_model_id_accepts_and_rejects() {
+        assert!(validate_model_id("gemini-1.5-pro").is_ok());
+        assert!(validate_model_id("gemini-1.5-flash-002").is_ok());
+        assert!(validate_model_id("gemini_2.0_pro").is_ok());
+        assert!(validate_model_id("").is_err());
+        assert!(validate_model_id("foo?bar").is_err());
+        assert!(validate_model_id("foo/bar").is_err());
+        assert!(validate_model_id("foo#frag").is_err());
+        assert!(validate_model_id("foo bar").is_err());
+        assert!(validate_model_id("a:generateContent?key=evil").is_err());
     }
 }
