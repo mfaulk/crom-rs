@@ -870,7 +870,10 @@ mod dangerous_bash_bypass_regression {
     // The centralized pattern list must be non-empty and every entry must compile.
     fn dangerous_bash_patterns_all_compile() {
         let raw = dangerous_bash_patterns();
-        assert!(!raw.is_empty(), "centralized pattern list must not be empty");
+        assert!(
+            !raw.is_empty(),
+            "centralized pattern list must not be empty"
+        );
         for p in raw {
             Regex::new(p).unwrap_or_else(|e| panic!("pattern {p:?} failed to compile: {e}"));
         }

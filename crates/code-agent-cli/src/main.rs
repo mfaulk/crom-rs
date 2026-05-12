@@ -6287,7 +6287,11 @@ mod classify_bash_risk_tests {
 
     fn not_high(cmd: &str) {
         let r = classify_bash_risk(cmd, &[]);
-        assert_ne!(r, BashRisk::High, "expected non-High for {cmd:?}, got {r:?}");
+        assert_ne!(
+            r,
+            BashRisk::High,
+            "expected non-High for {cmd:?}, got {r:?}"
+        );
         assert_ne!(
             r,
             BashRisk::Blocked,
