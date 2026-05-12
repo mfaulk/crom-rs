@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 
 use code_agent_core::{PermissionKind, Tool, ToolContext, ToolError, ToolResult};
@@ -18,6 +19,15 @@ use crate::truncate_with_marker;
 const SECRET_ENV_PATTERNS: &[&str] = &[
     "KEY", "SECRET", "TOKEN", "PASSWORD", "PASSWD", "ACCESS", "PRIVATE",
 ];
+
+/// Hard secondary deadline for draining stdout/stderr after we've decided the
+/// child is finished or has been killed. If a descendant inherited the pipe
+/// and refuses to release it, this prevents `execute()` from hanging forever.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Marker appended to the captured stream when the drain task had to be
+/// aborted because a descendant kept the pipe open past `DRAIN_DEADLINE`.
+const DRAIN_ABORTED_MARKER: &str = "\n[bash: drain aborted after kill]";
 
 #[derive(Debug, Deserialize)]
 struct Input {
@@ -109,11 +119,17 @@ impl Tool for BashTool {
         #[cfg(unix)]
         let child_pid: Option<u32> = child.id();
 
-        let mut stdout = child.stdout.take().expect("stdout was piped");
-        let mut stderr = child.stderr.take().expect("stderr was piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
 
-        let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, cap + 1).await });
-        let stderr_task = tokio::spawn(async move { read_capped(&mut stderr, cap + 1).await });
+        // Share the partial buffer with the drain task so that if we have to
+        // abort the task (a descendant inherited the pipe and won't release
+        // it), we can still surface whatever was captured so far.
+        let stdout_buf = Arc::new(AsyncMutex::new(Vec::<u8>::new()));
+        let stderr_buf = Arc::new(AsyncMutex::new(Vec::<u8>::new()));
+
+        let stdout_task = tokio::spawn(drain_into(stdout, stdout_buf.clone(), cap + 1));
+        let stderr_task = tokio::spawn(drain_into(stderr, stderr_buf.clone(), cap + 1));
 
         let wait_res = timeout(dur, child.wait()).await;
         let timed_out;
@@ -151,15 +167,28 @@ impl Tool for BashTool {
             }
         };
 
-        let stdout_bytes = stdout_task
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("stdout join: {e}")))?;
-        let stderr_bytes = stderr_task
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("stderr join: {e}")))?;
+        // Bound the drain join with a hard deadline. Belt-and-suspenders for
+        // descendants that inherited the pipes: on Unix the SIGKILL to the
+        // process group usually causes the readers to hit EOF, but on
+        // non-Unix only the bash process is killed and a forked child could
+        // hold the pipe open indefinitely.
+        let (stdout_bytes, stdout_aborted) =
+            join_with_deadline(stdout_task, stdout_buf, DRAIN_DEADLINE)
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("stdout join: {e}")))?;
+        let (stderr_bytes, stderr_aborted) =
+            join_with_deadline(stderr_task, stderr_buf, DRAIN_DEADLINE)
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("stderr join: {e}")))?;
 
-        let stdout_str = String::from_utf8_lossy(&stdout_bytes).into_owned();
-        let stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        let mut stdout_str = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        let mut stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        if stdout_aborted {
+            stdout_str.push_str(DRAIN_ABORTED_MARKER);
+        }
+        if stderr_aborted {
+            stderr_str.push_str(DRAIN_ABORTED_MARKER);
+        }
         let stdout_str = truncate_with_marker(&stdout_str, cap);
         let stderr_str = truncate_with_marker(&stderr_str, cap);
 
@@ -207,24 +236,83 @@ impl Tool for BashTool {
     }
 }
 
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(r: &mut R, cap: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(cap.min(8192));
+/// Drain `r` into `buf`, capping the retained bytes at `cap`.
+///
+/// Continues reading after the cap is reached so the child process does not
+/// block on a full pipe; the extra bytes are discarded. The shared `buf`
+/// lets the parent task recover whatever was captured even if this task is
+/// aborted (e.g. a descendant inherited the pipe and refuses to release it).
+async fn drain_into<R>(mut r: R, buf: Arc<AsyncMutex<Vec<u8>>>, cap: usize)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut chunk = [0u8; 4096];
     loop {
         match r.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
-                if buf.len() < cap {
-                    let take = (cap - buf.len()).min(n);
-                    buf.extend_from_slice(&chunk[..take]);
+                let mut guard = buf.lock().await;
+                if guard.len() < cap {
+                    let take = (cap - guard.len()).min(n);
+                    guard.extend_from_slice(&chunk[..take]);
                 }
-                // Continue draining so the child does not block on a full pipe,
-                // but discard data once we've reached the cap.
+                // Continue draining so the child does not block on a full
+                // pipe, but discard data once we've reached the cap.
             }
             Err(_) => break,
         }
     }
-    buf
+}
+
+/// Wait for the drain task to finish, but no longer than `deadline`. If the
+/// timeout fires, abort the task and return whatever bytes the task managed
+/// to capture into the shared buffer before being torn down.
+///
+/// Returns `Ok((bytes, aborted))` where `aborted` is true when the deadline
+/// fired before the task completed. Aborting the task drops the underlying
+/// `ChildStdout`/`ChildStderr` reader the task owned, which closes the read
+/// side of the pipe even if a descendant of the killed child is still
+/// holding the write side open. Tokio's child stdout/stderr types are
+/// `Drop`-safe while a reader future is in flight: the task simply stops
+/// being polled and the resource is released cleanly.
+///
+/// A `JoinError` from a *panicked* drain task is surfaced as `Err` so the
+/// caller does not silently report a successful execution while a drain
+/// panic was swallowed. Cancellation errors from our own `abort()` after a
+/// deadline are expected and are reported as `aborted = true`, not as an
+/// error.
+async fn join_with_deadline(
+    mut task: tokio::task::JoinHandle<()>,
+    buf: Arc<AsyncMutex<Vec<u8>>>,
+    deadline: Duration,
+) -> Result<(Vec<u8>, bool), tokio::task::JoinError> {
+    let abort = task.abort_handle();
+    let aborted = match timeout(deadline, &mut task).await {
+        Ok(Ok(())) => false,
+        Ok(Err(join_err)) => {
+            // The task finished before the deadline but did not return
+            // cleanly. A cancellation here is unexpected (we have not
+            // aborted yet), so treat anything non-clean as an error to
+            // propagate.
+            return Err(join_err);
+        }
+        Err(_elapsed) => {
+            // Tear the drain task down so it drops the pipe reader, then
+            // await the handle to observe the cancellation and avoid
+            // leaving an orphaned task running in the background.
+            abort.abort();
+            match task.await {
+                Ok(()) => {}
+                Err(join_err) if join_err.is_cancelled() => {
+                    // Expected: we just aborted it.
+                }
+                Err(join_err) => return Err(join_err),
+            }
+            true
+        }
+    };
+    let bytes = std::mem::take(&mut *buf.lock().await);
+    Ok((bytes, aborted))
 }
 
 fn redact(cmd: &str) -> String {
@@ -237,4 +325,104 @@ fn redact(cmd: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    /// A reader that delivers `prefix` once and then never returns either
+    /// EOF or further data: subsequent polls always report Pending. This
+    /// simulates a descendant of the killed child that inherited the pipe
+    /// and refuses to release it.
+    struct NeverEofReader {
+        prefix: Vec<u8>,
+        sent: bool,
+    }
+
+    impl AsyncRead for NeverEofReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.sent {
+                let n = self.prefix.len().min(buf.remaining());
+                buf.put_slice(&self.prefix[..n]);
+                self.sent = true;
+                Poll::Ready(Ok(()))
+            } else {
+                // Never wake the waker: this future is intentionally stuck
+                // until the parent aborts the task.
+                Poll::Pending
+            }
+        }
+    }
+
+    // join_with_deadline aborts a drain task that is stuck on a never-EOF
+    // reader and returns the partial buffer plus an aborted flag, instead
+    // of hanging forever (the bug from issue #12).
+    #[tokio::test]
+    async fn drain_with_deadline_aborts_on_never_eof() {
+        let reader = NeverEofReader {
+            prefix: b"partial".to_vec(),
+            sent: false,
+        };
+        let buf = Arc::new(AsyncMutex::new(Vec::<u8>::new()));
+        let task = tokio::spawn(drain_into(reader, buf.clone(), 1024));
+
+        let started = std::time::Instant::now();
+        let (bytes, aborted) = join_with_deadline(task, buf, Duration::from_millis(150))
+            .await
+            .expect("aborted-by-deadline must not be a join error");
+        let elapsed = started.elapsed();
+
+        assert!(aborted, "expected drain to be aborted by deadline");
+        assert_eq!(bytes, b"partial");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "deadline must fire promptly, took {elapsed:?}"
+        );
+    }
+
+    // join_with_deadline returns the full buffer with aborted=false when
+    // the reader reaches EOF before the deadline.
+    #[tokio::test]
+    async fn drain_with_deadline_completes_on_eof() {
+        let reader: &[u8] = b"hello";
+        let buf = Arc::new(AsyncMutex::new(Vec::<u8>::new()));
+        let task = tokio::spawn(drain_into(reader, buf.clone(), 1024));
+
+        let (bytes, aborted) = join_with_deadline(task, buf, Duration::from_secs(5))
+            .await
+            .expect("clean EOF must not be a join error");
+
+        assert!(!aborted);
+        assert_eq!(bytes, b"hello");
+    }
+
+    // join_with_deadline propagates a panic in the drain task as a JoinError
+    // instead of silently reporting success. This guards against the
+    // regression where Ok(_join) discarded the JoinHandle result.
+    #[tokio::test]
+    async fn drain_with_deadline_propagates_panic() {
+        let buf = Arc::new(AsyncMutex::new(Vec::<u8>::new()));
+        // Spawn a task whose Future return type matches drain_into's `()`
+        // and panics shortly after start, before the deadline fires.
+        let task: tokio::task::JoinHandle<()> = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            panic!("drain task panic");
+        });
+
+        let result = join_with_deadline(task, buf, Duration::from_secs(5)).await;
+
+        let err = result.expect_err("panicked drain task must surface JoinError");
+        assert!(
+            err.is_panic(),
+            "expected panic-flavored JoinError, got {err:?}"
+        );
+    }
 }
