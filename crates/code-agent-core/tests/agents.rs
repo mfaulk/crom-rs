@@ -12,7 +12,9 @@
 //! - SearchTools-in-subagent does not reveal parent-only tools
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use code_agent_core::{
@@ -1327,4 +1329,175 @@ async fn active_handles_are_cleaned_up() {
     assert!(events
         .iter()
         .any(|e| matches!(e, AgentEvent::SubagentStop(_))));
+}
+
+/// Provider that simulates a runaway child: every turn after the parent's
+/// initial tool call sleeps far longer than the configured subagent
+/// timeout. The atomic flag flips when the child task is finally dropped
+/// so the test can observe that the abort actually fired.
+#[derive(Clone)]
+struct SlowProvider {
+    parent_turns: Arc<Mutex<Vec<Vec<ModelEvent>>>>,
+    child_running: Arc<AtomicBool>,
+    child_dropped: Arc<AtomicBool>,
+    child_sleep: Duration,
+}
+
+impl SlowProvider {
+    fn new(parent: Vec<Vec<ModelEvent>>, child_sleep: Duration) -> Self {
+        Self {
+            parent_turns: Arc::new(Mutex::new(parent)),
+            child_running: Arc::new(AtomicBool::new(false)),
+            child_dropped: Arc::new(AtomicBool::new(false)),
+            child_sleep,
+        }
+    }
+}
+
+/// Tracks whether the child task was dropped (i.e. aborted) by flipping
+/// an atomic flag in `Drop`. If the parent fails to abort the child on
+/// timeout, this drop never runs while the parent waits, and the test
+/// fails by exceeding its own deadline.
+struct DropGuard {
+    running: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for DropGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+
+#[async_trait]
+impl ModelProvider for SlowProvider {
+    async fn stream_turn(
+        &self,
+        req: ModelRequest,
+    ) -> Result<BoxStream<'static, Result<ModelEvent, ProviderError>>, ProviderError> {
+        if req.system.is_some() {
+            // Child turn: simulate a long-running provider call. The drop
+            // guard lives inside the stream's `.then` future so dropping
+            // the stream (which happens when the JoinHandle is aborted)
+            // also drops the guard and flips the flag.
+            self.child_running.store(true, Ordering::Release);
+            let running = self.child_running.clone();
+            let dropped = self.child_dropped.clone();
+            let sleep = self.child_sleep;
+            let initial: BoxStream<'static, ()> = Box::pin(stream::once(async {}));
+            let stream = initial.then(move |()| {
+                let guard = DropGuard {
+                    running: running.clone(),
+                    dropped: dropped.clone(),
+                };
+                async move {
+                    let _g = guard;
+                    tokio::time::sleep(sleep).await;
+                    Ok(ModelEvent::TextDelta {
+                        text: "late".into(),
+                    })
+                }
+            });
+            Ok(Box::pin(stream))
+        } else {
+            let mut turns = self.parent_turns.lock().unwrap();
+            let events = if turns.is_empty() {
+                vec![ModelEvent::MessageStop {
+                    stop_reason: Some("end_turn".into()),
+                    usage: None,
+                }]
+            } else {
+                turns.remove(0)
+            };
+            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+}
+
+#[tokio::test]
+// Subagent timeout aborts the child task instead of detaching it: when the
+// child's provider blocks far past the configured `subagent_timeout`, the
+// parent surfaces `SubagentStatus::TimedOut` within the timeout window and
+// the child future is dropped (no leaked long-running task).
+async fn subagent_timeout_aborts_runaway_child() {
+    let parent_turns = vec![
+        vec![
+            ModelEvent::ToolCall(ToolCall {
+                id: "p1".into(),
+                name: "Agent".into(),
+                input: json!({"agent": "rev", "task": "stalled"}),
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ],
+        vec![
+            ModelEvent::TextDelta { text: "fin".into() },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            },
+        ],
+    ];
+    let timeout_dur = Duration::from_millis(200);
+    let child_sleep = Duration::from_secs(30);
+    let provider = Arc::new(SlowProvider::new(parent_turns, child_sleep));
+    let child_running = provider.child_running.clone();
+    let child_dropped = provider.child_dropped.clone();
+
+    let mut registry = AgentRegistry::new();
+    registry.register(def("rev")).unwrap();
+
+    let opts = AgentOptions {
+        allowed_tools: vec!["Agent".into()],
+        permission_mode: PermissionMode::Default,
+        permission_callback: Some(Arc::new(AlwaysAllow)),
+        max_turns: Some(4),
+        agents: registry,
+        agent_runtime: AgentRuntimeOptions {
+            subagent_timeout: timeout_dur,
+            ..AgentRuntimeOptions::default()
+        },
+        ..AgentOptions::default()
+    };
+
+    let started = Instant::now();
+    let events = run_with(provider, opts, ToolRegistry::new(), "go").await;
+    let elapsed = started.elapsed();
+
+    // The abort must fire well before the child's natural completion.
+    // Generous bound (5s) to keep CI stable, but still orders of magnitude
+    // shorter than the 30s child sleep.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "timeout must abort the child: parent waited {elapsed:?}"
+    );
+
+    // The child task's drop guard must have run — i.e. the JoinHandle was
+    // aborted, not silently detached.
+    assert!(
+        child_dropped.load(Ordering::Acquire),
+        "child task must be dropped after timeout"
+    );
+    assert!(
+        !child_running.load(Ordering::Acquire),
+        "child task must not still be running after timeout"
+    );
+
+    // The terminal subagent event must classify the run as TimedOut.
+    let stop = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::SubagentStop(s) => Some(s),
+            _ => None,
+        })
+        .expect("SubagentStop should fire");
+    assert_eq!(stop.status, SubagentStatus::TimedOut);
+
+    // The SubagentTimedOut event should also be present.
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::SubagentTimedOut(_))));
 }
