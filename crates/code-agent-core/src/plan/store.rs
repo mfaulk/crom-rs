@@ -5,15 +5,25 @@
 //! ```text
 //! .agent/
 //!   plans/
-//!     <plan-id>.json            # latest version, atomically written
-//!     <plan-id>.v<n>.json       # per-version snapshot for diffs/history
-//!     index.jsonl               # one line per write (never rewritten)
+//!     <plan-id>.json                 # latest version, atomically written
+//!     <plan-id>.v<n>.json            # per-version snapshot for diffs/history
+//!     <plan-id>.v<n>.approved.json   # write-once snapshot captured at approval time
+//!     index.jsonl                    # one line per write (never rewritten)
 //! ```
 //!
 //! All writes go through `tempfile::NamedTempFile::persist` so a partial
 //! write never replaces a valid file. A corrupted index never makes other
 //! plans unreadable: listings re-walk the directory and skip files they
 //! can't parse.
+//!
+//! Versioned snapshots `<plan-id>.v<n>.json` are overwritten with the
+//! latest state for that version (status transitions through Executing /
+//! Completed / Failed still update the same file). The `.approved.json`
+//! snapshot is taken once when a plan first transitions into the
+//! `Approved` state and is then write-once — it preserves exactly what
+//! the reviewer approved, even after the driver mutates the same version
+//! during execution. Diff / compare paths prefer `.approved.json` over
+//! `.v<n>.json` for an approved version.
 
 use std::path::{Path, PathBuf};
 
@@ -107,6 +117,17 @@ impl FsPlanStore {
         Ok(self.root.join(format!("{}.v{}.json", id.0, version)))
     }
 
+    /// Write-once snapshot path captured at approval time. Distinct from
+    /// `version_path` so post-approval status transitions (Executing /
+    /// Completed / Failed) cannot overwrite the approved body — the
+    /// approved-vs-ran audit and drift detection depend on it.
+    fn approved_version_path(&self, id: &PlanId, version: u32) -> Result<PathBuf, PlanError> {
+        Self::validate_id(id)?;
+        Ok(self
+            .root
+            .join(format!("{}.v{}.approved.json", id.0, version)))
+    }
+
     fn index_path(&self) -> PathBuf {
         self.root.join("index.jsonl")
     }
@@ -140,6 +161,38 @@ impl FsPlanStore {
         tf.persist(target).map_err(|e| PlanError::Io {
             path: target.to_path_buf(),
             source: e.error,
+        })?;
+        Ok(())
+    }
+
+    /// Write-once create of an `<id>.v<n>.approved.json` snapshot. Uses
+    /// `OpenOptions::create_new(true)` so an already-captured approval is
+    /// never overwritten. `AlreadyExists` is returned as `Ok(())` because
+    /// preserving the prior capture is the point.
+    fn write_approved_snapshot(&self, target: &Path, bytes: &[u8]) -> Result<(), PlanError> {
+        self.ensure_root()?;
+        use std::io::Write as _;
+        let mut f = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => {
+                return Err(PlanError::Io {
+                    path: target.to_path_buf(),
+                    source: e,
+                })
+            }
+        };
+        f.write_all(bytes).map_err(|e| PlanError::Io {
+            path: target.to_path_buf(),
+            source: e,
+        })?;
+        f.sync_data().map_err(|e| PlanError::Io {
+            path: target.to_path_buf(),
+            source: e,
         })?;
         Ok(())
     }
@@ -263,6 +316,12 @@ impl PlanStore for FsPlanStore {
         //      `Executing` and back: that is intentional and we *do not*
         //      reset for status-only edits between Approved/Executing/
         //      Completed.
+        // Load the prior on-disk state once: needed both for body-drift
+        // detection and to decide whether this save is the first transition
+        // into Approved (which captures the write-once `.approved.json`).
+        let prev_on_disk = self.load_existing_for_compare(&plan.id);
+        let prev_status = prev_on_disk.as_ref().map(|p| p.status);
+
         let approval_invalidated = match (&plan.approval, plan.status) {
             (Some(approval), PlanStatus::Approved) => {
                 if approval.approved_version != plan.version {
@@ -270,8 +329,8 @@ impl PlanStore for FsPlanStore {
                 } else {
                     // Same version but content may have drifted. Compare
                     // against the on-disk current plan body.
-                    match self.load_existing_for_compare(&plan.id) {
-                        Some(prev) => plan_body_changed(&prev, &plan),
+                    match prev_on_disk.as_ref() {
+                        Some(prev) => plan_body_changed(prev, &plan),
                         None => false,
                     }
                 }
@@ -288,6 +347,21 @@ impl PlanStore for FsPlanStore {
         let ver = self.version_path(&plan.id, plan.version)?;
         self.write_atomic(&cur, &bytes)?;
         self.write_atomic(&ver, &bytes)?;
+
+        // If this save is the first transition into Approved, capture a
+        // write-once snapshot of the approved body. Subsequent saves at the
+        // same version (status -> Executing / Completed / Failed) will
+        // overwrite `<id>.v<n>.json` but must leave `.approved.json` alone.
+        let is_first_approval_transition = matches!(plan.status, PlanStatus::Approved)
+            && !matches!(prev_status, Some(PlanStatus::Approved));
+        if is_first_approval_transition {
+            let approved = self.approved_version_path(&plan.id, plan.version)?;
+            // Use create_new so we never clobber an existing approved
+            // snapshot. If it already exists we leave the older capture in
+            // place — that's the audit record.
+            let _ = self.write_approved_snapshot(&approved, &bytes);
+        }
+
         self.append_index(&IndexEntry {
             timestamp: now_iso(),
             plan_id: plan.id.0.clone(),
@@ -372,6 +446,12 @@ impl PlanStore for FsPlanStore {
         let bytes = self.validate_plan_size(&plan)?;
         let cur = self.current_path(&plan.id)?;
         self.write_atomic(&cur, &bytes)?;
+        // Capture a write-once snapshot of the approved body. The
+        // versioned snapshot `<id>.v<n>.json` is still updated by later
+        // `save_revision` calls during execution, but `.approved.json`
+        // must never change once written.
+        let approved_path = self.approved_version_path(&plan.id, plan.version)?;
+        let _ = self.write_approved_snapshot(&approved_path, &bytes);
         self.append_index(&IndexEntry {
             timestamp: now_iso(),
             plan_id: plan.id.0.clone(),
@@ -499,16 +579,34 @@ fn now_iso() -> String {
 impl FsPlanStore {
     /// Best-effort blocking read of the on-disk current plan, used by
     /// `save_revision` to detect content drift while keeping the existing
-    /// approval. Returns `None` when the plan doesn't exist yet or the
-    /// file is unreadable — the caller treats that as "no comparison
-    /// possible" rather than erroring out.
+    /// approval. Prefers the write-once `<id>.v<n>.approved.json` when one
+    /// exists for the current version — that snapshot is the immutable
+    /// record of what the reviewer actually approved, whereas the live
+    /// `<id>.json` may have been overwritten with post-approval status
+    /// transitions. Returns `None` when neither path exists or the file
+    /// is unreadable — the caller treats that as "no comparison possible"
+    /// rather than erroring out.
     fn load_existing_for_compare(&self, id: &PlanId) -> Option<PlanDocument> {
         let path = self.current_path(id).ok()?;
         if !path.exists() {
             return None;
         }
         let bytes = std::fs::read(&path).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        let current: PlanDocument = serde_json::from_slice(&bytes).ok()?;
+        // Prefer the approved snapshot for the current version when
+        // present. Falls back to the live current state if it's missing.
+        let approved_path = self
+            .approved_version_path(id, current.version)
+            .ok()
+            .filter(|p| p.exists());
+        if let Some(p) = approved_path {
+            if let Ok(b) = std::fs::read(&p) {
+                if let Ok(approved) = serde_json::from_slice::<PlanDocument>(&b) {
+                    return Some(approved);
+                }
+            }
+        }
+        Some(current)
     }
 }
 
@@ -750,5 +848,57 @@ mod tests {
         p.summary = "x".repeat(2048);
         let err = s.create(p).await.unwrap_err();
         assert!(matches!(err, PlanError::TooLarge { .. }));
+    }
+
+    #[tokio::test]
+    // After approval, subsequent driver-style status transitions through
+    // Executing -> Completed -> Failed at the same version must leave the
+    // `.approved.json` write-once snapshot untouched, even though
+    // `.v<n>.json` gets overwritten with the latest state.
+    async fn approved_snapshot_survives_status_transitions() {
+        let (s, _g) = store();
+        let p = small_plan();
+        let id = p.id.clone();
+        let v = p.version;
+        s.create(p).await.unwrap();
+        let approved = s
+            .approve(PlanApprovalRequest {
+                plan_id: id.clone(),
+                approved_by: PlanApprover::TestHarness,
+                approved_version: v,
+                scope: PlanApprovalScope::FullPlan,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let approved_path = s.root.join(format!("{}.v{}.approved.json", id.0, v));
+        assert!(approved_path.exists(), "approved snapshot must be written");
+        let original_approved_bytes = std::fs::read(&approved_path).unwrap();
+
+        // Simulate the act driver: status -> Executing, save_revision.
+        let mut running = approved.clone();
+        running.status = PlanStatus::Executing;
+        s.save_revision(running).await.unwrap();
+
+        // Simulate completion: status -> Completed, save_revision.
+        let mut done = s.load(&id).await.unwrap();
+        done.status = PlanStatus::Completed;
+        s.save_revision(done).await.unwrap();
+
+        // The versioned snapshot has been overwritten with the Completed
+        // state, but the approved snapshot must still match its capture.
+        let ver_path = s.root.join(format!("{}.v{}.json", id.0, v));
+        let ver_doc: PlanDocument = serde_json::from_slice(&std::fs::read(&ver_path).unwrap())
+            .expect("versioned snapshot parses");
+        assert_eq!(ver_doc.status, PlanStatus::Completed);
+
+        let approved_after = std::fs::read(&approved_path).unwrap();
+        assert_eq!(
+            approved_after, original_approved_bytes,
+            "approved snapshot must be write-once and not change after execution"
+        );
+        let approved_doc: PlanDocument =
+            serde_json::from_slice(&approved_after).expect("approved snapshot parses");
+        assert_eq!(approved_doc.status, PlanStatus::Approved);
     }
 }
