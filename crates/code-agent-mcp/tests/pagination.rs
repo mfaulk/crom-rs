@@ -139,7 +139,7 @@ async fn list_tools_caps_at_max_pages() {
     // — at minimum the cap, at most cap + a small grace.
     let n = calls.load(Ordering::Acquire);
     assert!(
-        n >= MCP_MAX_LIST_PAGES && n <= MCP_MAX_LIST_PAGES + 2,
+        (MCP_MAX_LIST_PAGES..=MCP_MAX_LIST_PAGES + 2).contains(&n),
         "pagination should stop near {MCP_MAX_LIST_PAGES} pages, got {n}"
     );
 }

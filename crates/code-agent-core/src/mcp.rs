@@ -39,27 +39,28 @@ pub async fn register_mcp_tools(
     let load_resources = options.load_resources;
     let load_prompts = options.load_prompts;
     let max_tools_per_server = options.max_tools_per_server;
-    let discovery_futures = options
-        .servers
-        .iter()
-        .take(options.max_servers)
-        .map(|(server_name, server_config)| {
-            let server_name = server_name.clone();
-            let server_config = server_config.clone();
-            let secrets = secrets.clone();
-            async move {
-                discover_one_server(
-                    server_name,
-                    server_config,
-                    limits,
-                    secrets,
-                    load_resources,
-                    load_prompts,
-                    max_tools_per_server,
-                )
-                .await
-            }
-        });
+    let discovery_futures =
+        options
+            .servers
+            .iter()
+            .take(options.max_servers)
+            .map(|(server_name, server_config)| {
+                let server_name = server_name.clone();
+                let server_config = server_config.clone();
+                let secrets = secrets.clone();
+                async move {
+                    discover_one_server(
+                        server_name,
+                        server_config,
+                        limits,
+                        secrets,
+                        load_resources,
+                        load_prompts,
+                        max_tools_per_server,
+                    )
+                    .await
+                }
+            });
     let outcomes = join_all(discovery_futures).await;
 
     // Sequential registration so the registry sees a deterministic order
@@ -160,20 +161,19 @@ async fn discover_one_server(
         server_info: None,
         error: None,
     };
-    let mut client = match McpClient::connect(server_name.clone(), &server_config, limits, secrets)
-        .await
-    {
-        Ok(client) => client,
-        Err(err) => {
-            status.status = McpConnectionStatus::Failed;
-            status.error = Some(err.to_string());
-            return ServerDiscovery {
-                status,
-                tools: Vec::new(),
-                client: None,
-            };
-        }
-    };
+    let mut client =
+        match McpClient::connect(server_name.clone(), &server_config, limits, secrets).await {
+            Ok(client) => client,
+            Err(err) => {
+                status.status = McpConnectionStatus::Failed;
+                status.error = Some(err.to_string());
+                return ServerDiscovery {
+                    status,
+                    tools: Vec::new(),
+                    client: None,
+                };
+            }
+        };
     match client.initialize().await {
         Ok(init) => {
             status.protocol_version = Some(init.protocol_version);

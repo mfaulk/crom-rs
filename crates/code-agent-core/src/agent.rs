@@ -1177,9 +1177,30 @@ pub(crate) async fn run_loop(
             return Ok(());
         }
 
-        // Execute tool calls in order. Append a single user message containing all tool_results.
+        // Execute tool calls in (input) order. The model is allowed to
+        // emit multiple tool_use blocks in one turn; we dispatch each
+        // call's `tool.execute(...)` future concurrently via `join_all`
+        // so they overlap IO. Policy/checkpoint gating and event
+        // emission stay sequential for determinism. Results are paired
+        // with their original `tool_use_id` so the conversation sees the
+        // model's input order.
         let mut tool_result_blocks: Vec<ContentBlock> = Vec::new();
-        for call in &tool_calls {
+        // Stash per-call state captured during gating; consumed in the
+        // post-execute pass after futures complete.
+        struct PerCallState {
+            effective_input: serde_json::Value,
+            started: Instant,
+        }
+        let mut per_call_state: Vec<Option<PerCallState>> =
+            (0..tool_calls.len()).map(|_| None).collect();
+        // Boxed execute futures collected during the gating pass.
+        type ExecFut = Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::tool::ToolResult, ToolError>> + Send,
+            >,
+        >;
+        let mut exec_futures: Vec<(usize, ExecFut)> = Vec::with_capacity(tool_calls.len());
+        for (idx, call) in tool_calls.iter().enumerate() {
             if cfg.cancel.load(Ordering::Acquire) {
                 handle_interrupt(
                     &tx,
@@ -1503,199 +1524,253 @@ pub(crate) async fn run_loop(
                     .await;
                 }
             }
-            let exec = tool.execute(effective_input.clone(), ctx).await;
-            let duration_ms = elapsed_ms(started);
-            let (text, is_error, tool_result_obj) = match &exec {
-                Ok(res) => (res.flatten_text(), res.is_error, Some(res.clone())),
-                Err(ToolError::PermissionDenied(msg)) => {
-                    emit(
+            // Stash the execute future so the whole batch can run
+            // concurrently. The rest of the per-call post-execute work
+            // continues to run in turn order in the second pass below.
+            let tool_arc = tool.clone();
+            let effective_input_clone = effective_input.clone();
+            exec_futures.push((
+                idx,
+                Box::pin(async move { tool_arc.execute(effective_input_clone, ctx).await })
+                    as Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = Result<crate::tool::ToolResult, ToolError>,
+                                > + Send,
+                        >,
+                    >,
+            ));
+            // Remember per-call bookkeeping for the post-execute pass.
+            per_call_state[idx] = Some(PerCallState {
+                effective_input: effective_input.clone(),
+                started,
+            });
+            continue;
+        }
+        // === Parallel batch: run all `tool.execute(...)` futures concurrently.
+        let exec_results = if exec_futures.is_empty() {
+            Vec::new()
+        } else {
+            let (indices, futures): (Vec<_>, Vec<_>) = exec_futures.into_iter().unzip();
+            let results = futures::future::join_all(futures).await;
+            indices.into_iter().zip(results).collect::<Vec<_>>()
+        };
+        // Index results by call idx for the post-execute pass.
+        let mut exec_by_idx: Vec<Option<Result<crate::tool::ToolResult, ToolError>>> =
+            (0..tool_calls.len()).map(|_| None).collect();
+        for (idx, res) in exec_results {
+            exec_by_idx[idx] = Some(res);
+        }
+        // === Post-execute pass: iterate calls in input order. For each
+        // call that ran (i.e. wasn't short-circuited), emit completion
+        // events, run post-tool hooks, and push the tool result block.
+        for (idx, call) in tool_calls.iter().enumerate() {
+            // Calls that short-circuited in the gate-loop already had
+            // their `tool_result_blocks` entry pushed via
+            // `push_tool_result_user` — nothing to do here.
+            let Some(exec) = exec_by_idx[idx].take() else {
+                continue;
+            };
+            let state = per_call_state[idx]
+                .take()
+                .expect("gate-loop must have recorded per-call state for runnable calls");
+            let effective_input = state.effective_input;
+            let started = state.started;
+            // Re-establish the inner `_old_body_start_` once-only block:
+            {
+                let duration_ms = elapsed_ms(started);
+                let (text, is_error, tool_result_obj) = match &exec {
+                    Ok(res) => (res.flatten_text(), res.is_error, Some(res.clone())),
+                    Err(ToolError::PermissionDenied(msg)) => {
+                        emit(
+                            &tx,
+                            &session_sink,
+                            &session_id,
+                            AgentEvent::ToolCallDenied(ToolCallDenied {
+                                tool_use_id: call.id.clone(),
+                                tool_name: call.name.clone(),
+                                reason: msg.clone(),
+                            }),
+                        )
+                        .await;
+                        (format!("Permission denied: {msg}"), true, None)
+                    }
+                    Err(e) => (format!("Tool error: {e}"), true, None),
+                };
+
+                match &exec {
+                    Ok(res) => {
+                        if let Some(ev) = mcp_completion_from_result(&call.name, res, duration_ms) {
+                            emit_telemetry(
+                                &telemetry_sink,
+                                AgentTelemetryEvent::McpToolCallCompleted {
+                                    session_id: session_id.clone(),
+                                    run_id: cfg.run_id.clone(),
+                                    server_name: ev.server_name.clone(),
+                                    tool_name: ev.agent_tool_name.clone(),
+                                    duration_ms: ev.duration_ms,
+                                    result_bytes: ev.result_bytes,
+                                    outcome: if ev.is_error {
+                                        TelemetryOutcome::Error
+                                    } else {
+                                        TelemetryOutcome::Ok
+                                    },
+                                },
+                            )
+                            .await;
+                            emit(
+                                &tx,
+                                &session_sink,
+                                &session_id,
+                                AgentEvent::McpToolCallCompleted(ev),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(ev) = mcp_failure_from_error(&call.name, &e.to_string()) {
+                            emit_telemetry(
+                                &telemetry_sink,
+                                AgentTelemetryEvent::McpToolCallFailed {
+                                    session_id: session_id.clone(),
+                                    run_id: cfg.run_id.clone(),
+                                    server_name: ev.server_name.clone(),
+                                    tool_name: ev.agent_tool_name.clone(),
+                                    error_category: "mcp_tool".into(),
+                                },
+                            )
+                            .await;
+                            emit(
+                                &tx,
+                                &session_sink,
+                                &session_id,
+                                AgentEvent::McpToolCallFailed(ev),
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                if call.name == SEARCH_TOOLS_NAME {
+                    emit_search_tools_result_events(
                         &tx,
                         &session_sink,
+                        &telemetry_sink,
                         &session_id,
-                        AgentEvent::ToolCallDenied(ToolCallDenied {
-                            tool_use_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            reason: msg.clone(),
-                        }),
+                        &cfg.run_id,
+                        turns,
+                        &catalog,
+                        &effective_input,
+                        &exec,
+                        options.tool_search.strategy,
                     )
                     .await;
-                    (format!("Permission denied: {msg}"), true, None)
                 }
-                Err(e) => (format!("Tool error: {e}"), true, None),
-            };
 
-            match &exec {
-                Ok(res) => {
-                    if let Some(ev) = mcp_completion_from_result(&call.name, res, duration_ms) {
-                        emit_telemetry(
-                            &telemetry_sink,
-                            AgentTelemetryEvent::McpToolCallCompleted {
-                                session_id: session_id.clone(),
-                                run_id: cfg.run_id.clone(),
-                                server_name: ev.server_name.clone(),
-                                tool_name: ev.agent_tool_name.clone(),
-                                duration_ms: ev.duration_ms,
-                                result_bytes: ev.result_bytes,
-                                outcome: if ev.is_error {
-                                    TelemetryOutcome::Error
-                                } else {
-                                    TelemetryOutcome::Ok
-                                },
-                            },
-                        )
-                        .await;
-                        emit(
-                            &tx,
-                            &session_sink,
-                            &session_id,
-                            AgentEvent::McpToolCallCompleted(ev),
-                        )
-                        .await;
+                // If the tool was TodoWrite, broadcast a TodoUpdate.
+                if call.name == "TodoWrite" {
+                    if let Some(res) = &tool_result_obj {
+                        if let Some(updated) = res
+                            .metadata
+                            .get("todo_list")
+                            .and_then(|v| serde_json::from_value::<TodoList>(v.clone()).ok())
+                        {
+                            emit(
+                                &tx,
+                                &session_sink,
+                                &session_id,
+                                AgentEvent::TodoUpdate(crate::events::TodoUpdate { list: updated }),
+                            )
+                            .await;
+                        }
                     }
                 }
-                Err(e) => {
-                    if let Some(ev) = mcp_failure_from_error(&call.name, &e.to_string()) {
-                        emit_telemetry(
-                            &telemetry_sink,
-                            AgentTelemetryEvent::McpToolCallFailed {
-                                session_id: session_id.clone(),
-                                run_id: cfg.run_id.clone(),
-                                server_name: ev.server_name.clone(),
-                                tool_name: ev.agent_tool_name.clone(),
-                                error_category: "mcp_tool".into(),
-                            },
-                        )
-                        .await;
-                        emit(
-                            &tx,
-                            &session_sink,
-                            &session_id,
-                            AgentEvent::McpToolCallFailed(ev),
-                        )
-                        .await;
-                    }
-                }
-            }
 
-            if call.name == SEARCH_TOOLS_NAME {
-                emit_search_tools_result_events(
-                    &tx,
-                    &session_sink,
-                    &telemetry_sink,
-                    &session_id,
-                    &cfg.run_id,
-                    turns,
-                    &catalog,
-                    &effective_input,
-                    &exec,
-                    options.tool_search.strategy,
-                )
-                .await;
-            }
-
-            // If the tool was TodoWrite, broadcast a TodoUpdate.
-            if call.name == "TodoWrite" {
-                if let Some(res) = &tool_result_obj {
-                    if let Some(updated) = res
-                        .metadata
-                        .get("todo_list")
-                        .and_then(|v| serde_json::from_value::<TodoList>(v.clone()).ok())
-                    {
-                        emit(
-                            &tx,
-                            &session_sink,
-                            &session_id,
-                            AgentEvent::TodoUpdate(crate::events::TodoUpdate { list: updated }),
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            emit(
-                &tx,
-                &session_sink,
-                &session_id,
-                AgentEvent::ToolCallCompleted(ToolCallCompleted {
-                    tool_use_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    is_error,
-                    duration_ms,
-                }),
-            )
-            .await;
-            emit_telemetry(
-                &telemetry_sink,
-                AgentTelemetryEvent::ToolExecutionCompleted {
-                    session_id: session_id.clone(),
-                    run_id: cfg.run_id.clone(),
-                    turn_index: turns,
-                    tool_name: call.name.clone(),
-                    duration_ms,
-                    outcome: if is_error {
-                        TelemetryOutcome::Error
-                    } else {
-                        TelemetryOutcome::Ok
-                    },
-                    error_category: if is_error { Some("tool".into()) } else { None },
-                },
-            )
-            .await;
-
-            // Post-tool-use hooks (success or failure).
-            let post_event = if is_error {
-                HookEventName::PostToolUseFailure
-            } else {
-                HookEventName::PostToolUse
-            };
-            if !hooks.is_empty() {
-                let mut hi = HookInput::new(
-                    post_event,
-                    session_id.clone(),
-                    options.cwd.clone(),
-                    cfg.run_id.clone(),
-                );
-                hi.turn_index = turns;
-                hi.tool_name = Some(call.name.clone());
-                hi.tool_input = Some(effective_input.clone());
-                hi.tool_result = tool_result_obj.clone();
-                hi.metadata = tool_metadata(&call.name, None);
-                let records = hooks.dispatch(&hi).await;
-                let (agg, _) = aggregate(&records);
                 emit(
                     &tx,
                     &session_sink,
                     &session_id,
-                    AgentEvent::HookEvaluated(HookEvaluated {
-                        event: post_event,
-                        tool_name: Some(call.name.clone()),
-                        outcome: hook_outcome_kind(&agg, false),
-                        reason: hook_decision_reason(&agg),
+                    AgentEvent::ToolCallCompleted(ToolCallCompleted {
+                        tool_use_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        is_error,
+                        duration_ms,
                     }),
                 )
                 .await;
-                emit_hook_telemetry(
+                emit_telemetry(
                     &telemetry_sink,
+                    AgentTelemetryEvent::ToolExecutionCompleted {
+                        session_id: session_id.clone(),
+                        run_id: cfg.run_id.clone(),
+                        turn_index: turns,
+                        tool_name: call.name.clone(),
+                        duration_ms,
+                        outcome: if is_error {
+                            TelemetryOutcome::Error
+                        } else {
+                            TelemetryOutcome::Ok
+                        },
+                        error_category: if is_error { Some("tool".into()) } else { None },
+                    },
+                )
+                .await;
+
+                // Post-tool-use hooks (success or failure).
+                let post_event = if is_error {
+                    HookEventName::PostToolUseFailure
+                } else {
+                    HookEventName::PostToolUse
+                };
+                if !hooks.is_empty() {
+                    let mut hi = HookInput::new(
+                        post_event,
+                        session_id.clone(),
+                        options.cwd.clone(),
+                        cfg.run_id.clone(),
+                    );
+                    hi.turn_index = turns;
+                    hi.tool_name = Some(call.name.clone());
+                    hi.tool_input = Some(effective_input.clone());
+                    hi.tool_result = tool_result_obj.clone();
+                    hi.metadata = tool_metadata(&call.name, None);
+                    let records = hooks.dispatch(&hi).await;
+                    let (agg, _) = aggregate(&records);
+                    emit(
+                        &tx,
+                        &session_sink,
+                        &session_id,
+                        AgentEvent::HookEvaluated(HookEvaluated {
+                            event: post_event,
+                            tool_name: Some(call.name.clone()),
+                            outcome: hook_outcome_kind(&agg, false),
+                            reason: hook_decision_reason(&agg),
+                        }),
+                    )
+                    .await;
+                    emit_hook_telemetry(
+                        &telemetry_sink,
+                        &session_id,
+                        &cfg.run_id,
+                        turns,
+                        post_event,
+                        Some(&call.name),
+                        &agg,
+                    )
+                    .await;
+                }
+
+                push_tool_result_user(
+                    &tx,
+                    &session_sink,
                     &session_id,
-                    &cfg.run_id,
-                    turns,
-                    post_event,
-                    Some(&call.name),
-                    &agg,
+                    &mut tool_result_blocks,
+                    call,
+                    &text,
+                    is_error,
                 )
                 .await;
             }
-
-            push_tool_result_user(
-                &tx,
-                &session_sink,
-                &session_id,
-                &mut tool_result_blocks,
-                call,
-                &text,
-                is_error,
-            )
-            .await;
         }
 
         // PostToolBatch hook.

@@ -68,7 +68,10 @@ impl StdioMcpTransport {
         // 4x the structured payload limit + 64 KiB envelope slack, mirroring
         // `enforce_non_binary_result_limit` so a JSON-RPC envelope around a
         // permitted payload still fits.
-        let max_message_bytes = limits.max_tool_result_bytes.saturating_mul(4).max(64 * 1024);
+        let max_message_bytes = limits
+            .max_tool_result_bytes
+            .saturating_mul(4)
+            .max(64 * 1024);
         Ok(Self {
             child,
             stdin,
@@ -95,12 +98,8 @@ impl StdioMcpTransport {
     ) -> McpResult<JsonRpcResponse> {
         loop {
             let mut line = String::new();
-            let n = read_line_bounded(
-                &mut self.stdout_reader,
-                &mut line,
-                self.max_message_bytes,
-            )
-            .await?;
+            let n = read_line_bounded(&mut self.stdout_reader, &mut line, self.max_message_bytes)
+                .await?;
             if n == 0 {
                 let status = self
                     .child
@@ -241,11 +240,7 @@ fn push_log(
 /// if the line would exceed `limit` bytes. Without this guard a misbehaving
 /// MCP server can stream an arbitrarily large JSON line into memory before
 /// any payload-size check runs.
-async fn read_line_bounded<R>(
-    reader: &mut R,
-    out: &mut String,
-    limit: usize,
-) -> McpResult<usize>
+async fn read_line_bounded<R>(reader: &mut R, out: &mut String, limit: usize) -> McpResult<usize>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
@@ -269,9 +264,8 @@ where
                 limit,
             });
         }
-        let chunk = std::str::from_utf8(&buf[..take]).map_err(|e| {
-            McpError::Transport(format!("stdio MCP response not utf-8: {e}"))
-        })?;
+        let chunk = std::str::from_utf8(&buf[..take])
+            .map_err(|e| McpError::Transport(format!("stdio MCP response not utf-8: {e}")))?;
         out.push_str(chunk);
         reader.consume(take);
         total += take;

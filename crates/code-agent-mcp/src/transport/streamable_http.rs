@@ -51,7 +51,10 @@ impl StreamableHttpMcpTransport {
         // since the wire response is JSON-RPC-wrapped (envelope + base64
         // for binary content). The 4x factor mirrors the post-parse
         // sanity check in `enforce_non_binary_result_limit`.
-        let max_result_bytes = limits.max_tool_result_bytes.saturating_mul(4).max(64 * 1024);
+        let max_result_bytes = limits
+            .max_tool_result_bytes
+            .saturating_mul(4)
+            .max(64 * 1024);
         Ok(Self {
             client,
             endpoint,
@@ -131,9 +134,8 @@ impl StreamableHttpMcpTransport {
             }
             buf.extend_from_slice(&chunk);
         }
-        let body = String::from_utf8(buf).map_err(|e| {
-            McpError::Transport(format!("HTTP MCP response body not utf-8: {e}"))
-        })?;
+        let body = String::from_utf8(buf)
+            .map_err(|e| McpError::Transport(format!("HTTP MCP response body not utf-8: {e}")))?;
         if !status.is_success() {
             return Err(McpError::Http {
                 status: status.as_u16(),

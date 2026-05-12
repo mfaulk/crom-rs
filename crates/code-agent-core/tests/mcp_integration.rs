@@ -185,7 +185,10 @@ async fn start_slow_mcp(init_delay: Duration) -> String {
                     Ok(v) => v,
                     Err(_) => return,
                 };
-                let id = request.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let id = request
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
                 let payload = match method {
                     "initialize" => {
@@ -210,7 +213,8 @@ async fn start_slow_mcp(init_delay: Duration) -> String {
                     _ => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
                 };
                 if request.get("id").is_none() {
-                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                    let resp =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
                     let _ = stream.write_all(resp).await;
                     return;
                 }

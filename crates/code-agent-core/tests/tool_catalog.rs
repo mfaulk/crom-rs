@@ -447,7 +447,10 @@ fn bm25_search_results_are_stable_across_repeated_queries() {
             "Search GitHub issues by query",
         ),
         ("mcp__github__list_pulls", "List GitHub pull requests"),
-        ("mcp__slack__send_message", "Post a Slack message to a channel"),
+        (
+            "mcp__slack__send_message",
+            "Post a Slack message to a channel",
+        ),
         ("mcp__slack__search", "Search Slack messages"),
         ("mcp__docs__read", "Read documentation pages"),
         ("Read", "Read a workspace file"),

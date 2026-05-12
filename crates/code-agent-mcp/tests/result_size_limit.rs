@@ -13,9 +13,7 @@ use tokio::net::TcpListener;
 /// `body_len` bytes. The atomic returned tracks how many bytes were
 /// actually written before the connection was closed — useful to verify
 /// the client stopped reading early.
-async fn start_oversize_server(
-    body_len: usize,
-) -> (String, Arc<AtomicUsize>) {
+async fn start_oversize_server(body_len: usize) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let bytes_sent = Arc::new(AtomicUsize::new(0));
@@ -52,7 +50,8 @@ async fn start_oversize_server(
                     Err(_) => return,
                 };
                 if request.get("id").is_none() {
-                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                    let resp =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
                     let _ = stream.write_all(resp).await;
                     return;
                 }
