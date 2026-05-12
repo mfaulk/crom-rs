@@ -55,6 +55,9 @@ pub enum CheckpointError {
         current_cwd: PathBuf,
     },
 
+    #[error("invalid checkpoint configuration: {0}")]
+    InvalidConfig(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -123,6 +126,12 @@ pub trait CheckpointStore: Send + Sync {
     ) -> Result<CheckpointDiff, CheckpointError>;
 }
 
+/// Cap on per-call warnings emitted by the retention trim when every
+/// manifest unlink fails. Trimming continues regardless; this only bounds
+/// log volume so a misconfigured manifests dir doesn't flood logs at a
+/// fixed cost per `create_checkpoint`.
+const MAX_TRIM_ORPHAN_WARN: usize = 10;
+
 /// On-disk index entry for one checkpoint within a session. Stored as one
 /// JSON object per line in `checkpoints.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +162,15 @@ pub struct LocalCheckpointStore {
     index_locks: tokio::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
     >,
+    /// Per-(session, checkpoint) async mutexes that serialize manifest
+    /// read-modify-writes inside `capture_before_tool`. Without this,
+    /// two concurrent captures targeting the same checkpoint can both
+    /// read the manifest, each extend their own copy, and the second
+    /// writer overwrites the first writer's `files_tracked` entries.
+    /// Keyed by "<session_id>/<checkpoint_id>".
+    manifest_locks: tokio::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    >,
     /// Cached per-session total blob bytes, populated lazily so
     /// `capture_one_path` doesn't have to re-scan the blobs directory on
     /// every snapshot. We update incrementally when a new blob is
@@ -166,6 +184,7 @@ impl LocalCheckpointStore {
             root,
             limits: CheckpointLimits::default(),
             index_locks: tokio::sync::Mutex::new(Default::default()),
+            manifest_locks: tokio::sync::Mutex::new(Default::default()),
             storage_cache: tokio::sync::Mutex::new(Default::default()),
         }
     }
@@ -175,6 +194,7 @@ impl LocalCheckpointStore {
             root,
             limits,
             index_locks: tokio::sync::Mutex::new(Default::default()),
+            manifest_locks: tokio::sync::Mutex::new(Default::default()),
             storage_cache: tokio::sync::Mutex::new(Default::default()),
         }
     }
@@ -186,6 +206,22 @@ impl LocalCheckpointStore {
     ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         let mut g = self.index_locks.lock().await;
         g.entry(session_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Returns (and lazily creates) the per-(session, checkpoint) manifest
+    /// lock. `capture_before_tool` holds this for the read-modify-write
+    /// window so concurrent captures on the same checkpoint don't clobber
+    /// each other's `files_tracked` entries.
+    async fn manifest_lock_for(
+        &self,
+        session_id: &SessionId,
+        checkpoint_id: &CheckpointId,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{}/{}", session_id, checkpoint_id);
+        let mut g = self.manifest_locks.lock().await;
+        g.entry(key)
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -448,21 +484,37 @@ impl LocalCheckpointStore {
     /// Delete a checkpoint's manifest and its index entry. Blobs are kept
     /// (they are content-addressed and may be referenced by other
     /// checkpoints). Caller MUST hold the per-session index lock.
+    ///
+    /// Ordering invariant ("metadata first, side-effect deletes last"):
+    /// the index is loaded, validated, and atomically rewritten BEFORE
+    /// the manifest is unlinked. Reversing this order risks a dangling
+    /// index entry whose manifest is already gone: if `load_index` or
+    /// the index rewrite fails after the manifest is unlinked, the
+    /// index keeps pointing at a manifest that no longer exists and the
+    /// trim loop marches past it forever. With the current order, a
+    /// failed unlink leaves an orphaned manifest (recoverable: a re-run
+    /// of delete won't see an index entry, but a future sweep can drop
+    /// the orphan), which is strictly more recoverable than a dangling
+    /// index entry pointing at nothing.
     async fn delete_checkpoint_locked(
         &self,
         session_id: &SessionId,
         checkpoint_id: &CheckpointId,
     ) -> Result<(), CheckpointError> {
-        let manifest = self.manifest_path(session_id, checkpoint_id)?;
-        if manifest.exists() {
-            let _ = tokio::fs::remove_file(&manifest).await;
-        }
-        // Rewrite the index without the deleted entry.
-        let entries = self.load_index(session_id).await.unwrap_or_default();
+        // 1. Load + validate the index. A malformed line must propagate
+        //    up: silently treating it as an empty Vec would overwrite
+        //    the file with empty contents and destroy retention history.
+        //    Recovery is opt-in via a dedicated path.
+        let entries = self.load_index(session_id).await?;
         let kept: Vec<IndexEntry> = entries
             .into_iter()
             .filter(|e| e.checkpoint_id != *checkpoint_id)
             .collect();
+
+        // 2. Atomically rewrite the index WITHOUT the deleted entry,
+        //    BEFORE any on-disk delete. If the rewrite fails, the
+        //    manifest is still present and a retry can fully complete
+        //    the delete.
         let path = self.index_path_for(session_id)?;
         if path.exists() {
             let mut buf = String::new();
@@ -471,6 +523,16 @@ impl LocalCheckpointStore {
                 buf.push('\n');
             }
             atomic_write(&path, buf.as_bytes()).await?;
+        }
+
+        // 3. Only now unlink the manifest. Surface unlink failures
+        //    (e.g. permission denied on the manifests dir, manifest
+        //    file held open elsewhere). On failure the index already
+        //    reflects the intended state (entry gone) and the manifest
+        //    becomes an orphan a future sweep can clean up.
+        let manifest = self.manifest_path(session_id, checkpoint_id)?;
+        if manifest.exists() {
+            tokio::fs::remove_file(&manifest).await?;
         }
         Ok(())
     }
@@ -492,16 +554,82 @@ impl CheckpointStore for LocalCheckpointStore {
 
         // Enforce per-session checkpoint count by trimming the oldest
         // entries past the cap. Trimming happens *before* we write the
-        // new checkpoint so we don't immediately exceed the cap.
-        let mut entries = self
-            .load_index(&request.session_id)
-            .await
-            .unwrap_or_default();
+        // new checkpoint so we don't immediately exceed the cap. A
+        // malformed index line propagates as an error rather than being
+        // silently coerced to an empty Vec (which would clobber the on-
+        // disk index on the next write).
+        //
+        // Convergence invariant: `delete_checkpoint_locked` rewrites the
+        // on-disk index BEFORE attempting to unlink the manifest, so a
+        // unlink failure leaves the index entry already removed on disk.
+        // The orphaned manifest is recoverable via sweep tooling. The
+        // trim loop therefore MUST NOT reinsert `oldest` into `entries`
+        // and MUST continue trimming — otherwise the in-memory view
+        // diverges from disk and retention stops converging when it is
+        // actually still working. We cap aggregated orphan-on-error
+        // warnings at MAX_TRIM_ORPHAN_WARN to avoid log flooding when
+        // every unlink fails (e.g. read-only manifests dir).
+        let mut entries = self.load_index(&request.session_id).await?;
+        let mut orphan_warn_count: usize = 0;
         while entries.len() >= self.limits.max_checkpoints_per_session {
             let oldest = entries.remove(0);
-            self.delete_checkpoint_locked(&request.session_id, &oldest.checkpoint_id)
+            if let Err(err) = self
+                .delete_checkpoint_locked(&request.session_id, &oldest.checkpoint_id)
                 .await
-                .ok();
+            {
+                orphan_warn_count = orphan_warn_count.saturating_add(1);
+                if orphan_warn_count <= MAX_TRIM_ORPHAN_WARN {
+                    let manifest_path = self
+                        .manifest_path(&request.session_id, &oldest.checkpoint_id)
+                        .ok();
+                    tracing::warn!(
+                        session_id = %request.session_id,
+                        checkpoint_id = %oldest.checkpoint_id,
+                        manifest_path = ?manifest_path,
+                        error = %err,
+                        "checkpoint retention trim: manifest unlink failed; index entry removed, manifest left as recoverable orphan",
+                    );
+                }
+                // Do NOT reinsert `oldest`: the on-disk index already
+                // reflects its removal. Continue trimming.
+            }
+        }
+        if orphan_warn_count > MAX_TRIM_ORPHAN_WARN {
+            tracing::warn!(
+                session_id = %request.session_id,
+                total_orphans = orphan_warn_count,
+                cap = MAX_TRIM_ORPHAN_WARN,
+                "checkpoint retention trim: additional orphan-manifest warnings suppressed",
+            );
+        }
+
+        // Age-based retention: drop entries older than max_age_days. The
+        // count-based trim above only protects against unbounded growth;
+        // long-idle sessions could otherwise hoard expired checkpoints
+        // forever. We honor a stable `now` so the cutoff is consistent
+        // across this method.
+        if let Some(days) = self.limits.max_age_days {
+            let cutoff = OffsetDateTime::now_utc() - time::Duration::days(days as i64);
+            let aged: Vec<CheckpointId> = entries
+                .iter()
+                .filter(|e| e.created_at < cutoff)
+                .map(|e| e.checkpoint_id.clone())
+                .collect();
+            for cid in aged {
+                if let Err(err) = self
+                    .delete_checkpoint_locked(&request.session_id, &cid)
+                    .await
+                {
+                    tracing::warn!(
+                        session_id = %request.session_id,
+                        checkpoint_id = %cid,
+                        error = %err,
+                        "checkpoint age-based trim failed; keeping entry in index",
+                    );
+                    break;
+                }
+                entries.retain(|e| e.checkpoint_id != cid);
+            }
         }
 
         let checkpoint_id = CheckpointId::new();
@@ -537,6 +665,19 @@ impl CheckpointStore for LocalCheckpointStore {
         request: CaptureBeforeToolRequest,
     ) -> Result<Vec<FileSnapshotKind>, CheckpointError> {
         self.ensure_dirs(&request.session_id).await?;
+
+        // Serialize the read-modify-write of this checkpoint's manifest
+        // against any other concurrent capture targeting the same
+        // checkpoint. Without this, two callers can both read the
+        // manifest, each extend their own copy, and the second writer
+        // overwrites the first writer's `files_tracked` entries. Blob
+        // writes inside `capture_one_path` are content-addressed and
+        // safe to interleave, but the duplicate-path check below reads
+        // `meta.files_tracked` and so must also stay inside the lock.
+        let lock = self
+            .manifest_lock_for(&request.session_id, &request.checkpoint_id)
+            .await;
+        let _g = lock.lock().await;
 
         let mut meta = self
             .read_manifest(&request.session_id, &request.checkpoint_id)
@@ -786,7 +927,7 @@ impl LocalCheckpointStore {
         let lock = self.index_lock_for(session_id).await;
         let _g = lock.lock().await;
         let meta = self.read_manifest(session_id, checkpoint_id).await?;
-        let mut entries = self.load_index(session_id).await.unwrap_or_default();
+        let mut entries = self.load_index(session_id).await?;
         let mut changed = false;
         for e in &mut entries {
             if e.checkpoint_id == *checkpoint_id {
@@ -1125,6 +1266,396 @@ mod tests {
         let blobs_dir = store.blobs_dir_for(&sid).unwrap();
         let count = std::fs::read_dir(&blobs_dir).unwrap().count();
         assert_eq!(count, 1, "identical content should produce one blob");
+    }
+
+    #[tokio::test]
+    // A malformed line in the index must NOT be silently overwritten with an
+    // empty vec; callers that touch the index must propagate the parse error
+    // and leave the on-disk index untouched.
+    async fn malformed_index_is_not_silently_overwritten() {
+        let (_dir, store, sid) = fresh_store();
+        store.ensure_dirs(&sid).await.unwrap();
+        let valid = IndexEntry {
+            checkpoint_id: CheckpointId::new(),
+            session_id: sid.clone(),
+            run_id: RunId::new(),
+            created_at: OffsetDateTime::now_utc(),
+            description: None,
+            files_tracked_count: 0,
+        };
+        let mut contents = serde_json::to_string(&valid).unwrap();
+        contents.push('\n');
+        contents.push_str("{ not json }\n");
+        let path = store.index_path_for(&sid).unwrap();
+        tokio::fs::write(&path, &contents).await.unwrap();
+        let before = tokio::fs::read_to_string(&path).await.unwrap();
+        // Use delete_checkpoint_locked (the entry point that previously did
+        // unwrap_or_default() and clobbered the index).
+        let err = store
+            .delete_checkpoint_locked(&sid, &valid.checkpoint_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::MalformedManifest(_)),
+            "expected MalformedManifest, got {err:?}",
+        );
+        let after = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            before, after,
+            "malformed index file must not be overwritten on load failure"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // delete_checkpoint_locked surfaces a manifest unlink failure. Because
+    // the ordering invariant rewrites the index BEFORE the manifest is
+    // unlinked, the index entry is already gone on failure and the
+    // manifest is left as an orphan that a future sweep can detect.
+    async fn delete_surfaces_manifest_remove_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, store, sid) = fresh_store();
+        let id = store
+            .create_checkpoint(CreateCheckpointRequest {
+                session_id: sid.clone(),
+                run_id: RunId::new(),
+                cwd: store.root().to_path_buf(),
+                description: None,
+                user_message_id: None,
+                git_state: None,
+            })
+            .await
+            .unwrap();
+        let manifests = store.manifests_dir_for(&sid).unwrap();
+        let original = std::fs::metadata(&manifests).unwrap().permissions();
+        // Make the manifests dir read+exec only: unlink inside is denied.
+        std::fs::set_permissions(&manifests, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = store.delete_checkpoint_locked(&sid, &id).await;
+
+        // Always restore perms so the tempdir can be cleaned up.
+        std::fs::set_permissions(&manifests, original).unwrap();
+
+        let err = result.expect_err("delete should surface unlink failure");
+        assert!(
+            matches!(err, CheckpointError::Io(_)),
+            "expected Io error, got {err:?}",
+        );
+        // With metadata-first ordering the index entry is already gone
+        // by the time the unlink is attempted; the manifest is now an
+        // orphan rather than a dangling index pointer.
+        let list = store.list_checkpoints(&sid).await.unwrap();
+        assert!(
+            !list.iter().any(|e| e.checkpoint_id == id),
+            "index entry must be removed before the manifest unlink is attempted",
+        );
+        let manifest_path = store.manifest_path(&sid, &id).unwrap();
+        assert!(
+            manifest_path.exists(),
+            "manifest should remain on disk as a recoverable orphan after unlink failure",
+        );
+    }
+
+    #[tokio::test]
+    // A corrupt index discovered during delete must NOT cause the manifest
+    // to be removed first. delete_checkpoint_locked must load and validate
+    // the index before touching the manifest so a parse failure leaves the
+    // manifest intact and the operation is fully retryable.
+    async fn delete_with_corrupt_index_does_not_lose_manifest() {
+        let (_dir, store, sid) = fresh_store();
+        store.ensure_dirs(&sid).await.unwrap();
+
+        // Write a manifest for some checkpoint id directly (we never have
+        // to make the index valid because we're about to corrupt it).
+        let cid = CheckpointId::new();
+        let meta = CheckpointMetadata {
+            checkpoint_id: cid.clone(),
+            session_id: sid.clone(),
+            run_id: RunId::new(),
+            user_message_id: None,
+            cwd: store.root().to_path_buf(),
+            created_at: OffsetDateTime::now_utc(),
+            description: None,
+            files_tracked: Vec::new(),
+            git_state: None,
+        };
+        store.write_manifest(&sid, &meta).await.unwrap();
+        let manifest_path = store.manifest_path(&sid, &cid).unwrap();
+        assert!(manifest_path.exists(), "precondition: manifest exists");
+
+        // Corrupt the index so load_index returns a MalformedManifest
+        // error before anything destructive happens.
+        let index_path = store.index_path_for(&sid).unwrap();
+        tokio::fs::write(&index_path, b"{ not json }\n")
+            .await
+            .unwrap();
+
+        let err = store
+            .delete_checkpoint_locked(&sid, &cid)
+            .await
+            .expect_err("delete should fail with a corrupt index");
+        assert!(
+            matches!(err, CheckpointError::MalformedManifest(_)),
+            "expected MalformedManifest, got {err:?}",
+        );
+        assert!(
+            manifest_path.exists(),
+            "manifest must still be on disk when delete bails out on a corrupt index",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // Two parallel capture_before_tool calls against the same checkpoint
+    // with different paths must both end up in files_tracked on disk; the
+    // read-modify-write of the manifest is serialized per checkpoint.
+    async fn concurrent_captures_preserve_both_entries() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(LocalCheckpointStore::new(dir.path().to_path_buf()));
+        let sid = SessionId::new();
+        let id = store
+            .create_checkpoint(CreateCheckpointRequest {
+                session_id: sid.clone(),
+                run_id: RunId::new(),
+                cwd: store.root().to_path_buf(),
+                description: None,
+                user_message_id: None,
+                git_state: None,
+            })
+            .await
+            .unwrap();
+
+        // Pre-create both files so the captures emit real ExistingFile
+        // snapshots rather than MissingBeforeChange placeholders.
+        std::fs::write(dir.path().join("a.txt"), b"AAAA").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"BBBB").unwrap();
+
+        let mk_req = |path: &str| CaptureBeforeToolRequest {
+            checkpoint_id: id.clone(),
+            session_id: sid.clone(),
+            run_id: RunId::new(),
+            cwd: store.root().to_path_buf(),
+            tool_name: "Edit".into(),
+            tool_input: serde_json::json!({}),
+            paths: vec![WorkspaceRelativePath(path.into())],
+        };
+
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let r1 = mk_req("a.txt");
+        let r2 = mk_req("b.txt");
+        let (res1, res2) = tokio::join!(
+            tokio::spawn(async move { s1.capture_before_tool(r1).await }),
+            tokio::spawn(async move { s2.capture_before_tool(r2).await }),
+        );
+        res1.unwrap().unwrap();
+        res2.unwrap().unwrap();
+
+        let meta = store.get_checkpoint(&sid, &id).await.unwrap();
+        let paths: std::collections::HashSet<String> = meta
+            .files_tracked
+            .iter()
+            .map(|s| s.path().as_str().to_string())
+            .collect();
+        assert!(paths.contains("a.txt"), "missing a.txt: {paths:?}");
+        assert!(paths.contains("b.txt"), "missing b.txt: {paths:?}");
+    }
+
+    #[test]
+    // CheckpointLimits validator rejects zero values that would crash the
+    // retention trim or instantly expire every checkpoint.
+    fn limits_validate_rejects_zero_count_and_zero_age() {
+        let bad = CheckpointLimits {
+            max_checkpoints_per_session: 0,
+            ..Default::default()
+        };
+        let err = bad.validate().unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::InvalidConfig(_)),
+            "got {err:?}",
+        );
+
+        let bad_age = CheckpointLimits {
+            max_age_days: Some(0),
+            ..Default::default()
+        };
+        let err = bad_age.validate().unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::InvalidConfig(_)),
+            "got {err:?}",
+        );
+
+        CheckpointLimits::default()
+            .validate()
+            .expect("defaults must validate");
+    }
+
+    #[tokio::test]
+    // An index entry older than max_age_days is pruned when the next
+    // checkpoint is created.
+    async fn create_checkpoint_prunes_entries_past_max_age() {
+        let dir = TempDir::new().unwrap();
+        let limits = CheckpointLimits {
+            max_age_days: Some(7),
+            ..Default::default()
+        };
+        let store = LocalCheckpointStore::with_limits(dir.path().to_path_buf(), limits);
+        let sid = SessionId::new();
+        store.ensure_dirs(&sid).await.unwrap();
+
+        // Hand-write an index entry whose `created_at` is 30 days in the
+        // past plus a matching manifest. This avoids depending on system
+        // time / a real clock injection.
+        let old_id = CheckpointId::new();
+        let old_run = RunId::new();
+        let old_created = OffsetDateTime::now_utc() - time::Duration::days(30);
+        let old_entry = IndexEntry {
+            checkpoint_id: old_id.clone(),
+            session_id: sid.clone(),
+            run_id: old_run.clone(),
+            created_at: old_created,
+            description: None,
+            files_tracked_count: 0,
+        };
+        let old_meta = CheckpointMetadata {
+            checkpoint_id: old_id.clone(),
+            session_id: sid.clone(),
+            run_id: old_run,
+            user_message_id: None,
+            cwd: dir.path().to_path_buf(),
+            created_at: old_created,
+            description: None,
+            files_tracked: Vec::new(),
+            git_state: None,
+        };
+        store.write_manifest(&sid, &old_meta).await.unwrap();
+        store.append_index(&sid, &old_entry).await.unwrap();
+
+        let list = store.list_checkpoints(&sid).await.unwrap();
+        assert_eq!(list.len(), 1, "precondition: aged entry present");
+
+        // Creating a new checkpoint should prune the 30-day-old entry.
+        let new_id = store
+            .create_checkpoint(CreateCheckpointRequest {
+                session_id: sid.clone(),
+                run_id: RunId::new(),
+                cwd: dir.path().to_path_buf(),
+                description: None,
+                user_message_id: None,
+                git_state: None,
+            })
+            .await
+            .unwrap();
+
+        let list = store.list_checkpoints(&sid).await.unwrap();
+        let ids: Vec<_> = list.iter().map(|c| c.checkpoint_id.clone()).collect();
+        assert!(
+            !ids.contains(&old_id),
+            "aged entry should be pruned, got {ids:?}"
+        );
+        assert!(ids.contains(&new_id), "new entry should be present");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // Count-based trim must converge even when every manifest unlink
+    // fails. delete_checkpoint_locked rewrites the on-disk index BEFORE
+    // unlinking the manifest, so a failed unlink still shrinks the index
+    // by one entry. The trim loop therefore MUST continue (not reinsert
+    // + break) so retention drives the index below the cap. Orphan
+    // manifests remain on disk for a future sweep.
+    async fn trim_continues_after_unlink_errors_so_retention_converges() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let limits = CheckpointLimits {
+            max_checkpoints_per_session: 2,
+            ..Default::default()
+        };
+        let store = LocalCheckpointStore::with_limits(dir.path().to_path_buf(), limits);
+        let sid = SessionId::new();
+        store.ensure_dirs(&sid).await.unwrap();
+
+        // Pre-populate 4 entries with matching manifests.
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let cid = CheckpointId::new();
+            let run = RunId::new();
+            let created = OffsetDateTime::now_utc();
+            let meta = CheckpointMetadata {
+                checkpoint_id: cid.clone(),
+                session_id: sid.clone(),
+                run_id: run.clone(),
+                user_message_id: None,
+                cwd: dir.path().to_path_buf(),
+                created_at: created,
+                description: None,
+                files_tracked: Vec::new(),
+                git_state: None,
+            };
+            let entry = IndexEntry {
+                checkpoint_id: cid.clone(),
+                session_id: sid.clone(),
+                run_id: run,
+                created_at: created,
+                description: None,
+                files_tracked_count: 0,
+            };
+            store.write_manifest(&sid, &meta).await.unwrap();
+            store.append_index(&sid, &entry).await.unwrap();
+            ids.push(cid);
+        }
+        let list_before = store.list_checkpoints(&sid).await.unwrap();
+        assert_eq!(
+            list_before.len(),
+            4,
+            "precondition: 4 pre-populated entries"
+        );
+
+        // Make every manifest unlink fail by removing write permission on
+        // the manifests directory. Unlink inside a 0o555 dir is denied.
+        // This also blocks writing the new manifest, so create_checkpoint
+        // itself returns Err — but the trim must already have driven the
+        // on-disk index below the cap.
+        let manifests = store.manifests_dir_for(&sid).unwrap();
+        let original = std::fs::metadata(&manifests).unwrap().permissions();
+        std::fs::set_permissions(&manifests, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = store
+            .create_checkpoint(CreateCheckpointRequest {
+                session_id: sid.clone(),
+                run_id: RunId::new(),
+                cwd: dir.path().to_path_buf(),
+                description: None,
+                user_message_id: None,
+                git_state: None,
+            })
+            .await;
+
+        // Always restore perms so we can inspect and so the tempdir cleans up.
+        std::fs::set_permissions(&manifests, original).unwrap();
+
+        // create_checkpoint fails at write_manifest, but the trim must
+        // have already converged the on-disk index. The buggy
+        // reinsert+break behavior left 4 entries on disk (early bail);
+        // the fixed loop drives the index to (max-1) = 1.
+        assert!(result.is_err(), "expected create to fail at write_manifest");
+        let list_after = store.list_checkpoints(&sid).await.unwrap();
+        assert_eq!(
+            list_after.len(),
+            (store.limits().max_checkpoints_per_session) - 1,
+            "trim must converge to (max-1) even when every unlink fails",
+        );
+
+        // All four original manifests remain on disk as recoverable
+        // orphans (every unlink in the trim loop failed).
+        for cid in &ids {
+            let p = store.manifest_path(&sid, cid).unwrap();
+            assert!(
+                p.exists(),
+                "orphan manifest for trimmed checkpoint should remain on disk",
+            );
+        }
     }
 
     #[tokio::test]

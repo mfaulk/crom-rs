@@ -1617,6 +1617,13 @@ fn resolve_checkpoint_and_validation(
     if let Some(v) = settings.checkpointing.max_diff_bytes {
         limits.max_diff_bytes = v;
     }
+    // Reject misconfigurations early. A zero count crashes the retention
+    // trim loop (`while entries.len() >= 0` plus `entries.remove(0)`);
+    // a zero max_age_days would prune every checkpoint the instant it
+    // is written.
+    limits
+        .validate()
+        .map_err(|e| anyhow!("invalid checkpointing config: {e}"))?;
 
     let opts = CheckpointOptions {
         enabled,

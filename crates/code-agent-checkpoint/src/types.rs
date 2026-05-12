@@ -215,3 +215,25 @@ impl Default for CheckpointLimits {
         }
     }
 }
+
+impl CheckpointLimits {
+    /// Validate that no field has a value that would render checkpoint
+    /// creation impossible or that would crash the retention trim loop.
+    /// Specifically: `max_checkpoints_per_session == 0` makes the trim
+    /// loop `while entries.len() >= 0` an infinite loop / panic on
+    /// `entries.remove(0)`, and `max_age_days == Some(0)` would expire
+    /// every checkpoint the instant it's written.
+    pub fn validate(&self) -> Result<(), crate::store::CheckpointError> {
+        if self.max_checkpoints_per_session == 0 {
+            return Err(crate::store::CheckpointError::InvalidConfig(
+                "max_checkpoints_per_session must be > 0".into(),
+            ));
+        }
+        if let Some(0) = self.max_age_days {
+            return Err(crate::store::CheckpointError::InvalidConfig(
+                "max_age_days must be > 0 when set".into(),
+            ));
+        }
+        Ok(())
+    }
+}
