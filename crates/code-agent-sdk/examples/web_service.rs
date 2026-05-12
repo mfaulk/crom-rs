@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     // Simulate a single request.
     let user_request = "describe the project";
     let files = vec![("README.md", b"hello\n".to_vec())];
-    let workspace = InMemoryWorkspace::from_iter(files)?;
+    let workspace = InMemoryWorkspace::from_pairs(files)?;
     let result = runtime
         .run_once(
             AgentRequest::new(user_request)

@@ -9,7 +9,7 @@ use code_agent_sdk::{
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let workspace = InMemoryWorkspace::from_iter(vec![
+    let workspace = InMemoryWorkspace::from_pairs(vec![
         ("Cargo.toml", b"[package]\nname=\"x\"\n".to_vec()),
         ("src/main.rs", b"fn main(){}\n".to_vec()),
     ])?;

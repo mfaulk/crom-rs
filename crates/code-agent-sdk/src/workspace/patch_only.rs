@@ -208,7 +208,7 @@ mod tests {
     #[tokio::test]
     async fn writes_dont_mutate_base() {
         let base =
-            Arc::new(InMemoryWorkspace::from_iter(vec![("a.txt", b"old\n".to_vec())]).unwrap());
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"old\n".to_vec())]).unwrap());
         let ws = PatchOnlyWorkspace::new(base.clone());
         let p = WorkspacePath::new("a.txt").unwrap();
         ws.write_file(&p, b"new\n").await.unwrap();

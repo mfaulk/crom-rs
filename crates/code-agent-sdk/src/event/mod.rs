@@ -39,6 +39,10 @@ pub enum EventVerbosity {
 /// Public SDK event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// `PlanCreated` boxes the `PlanDocument` payload because the doc is much
+// larger than every other event variant; without it the whole enum would
+// inherit ~1 KB of stack footprint per event.
+#[allow(clippy::large_enum_variant)]
 pub enum SdkEvent {
     RunStarted(RunStarted),
     PlanningStarted(PlanningStarted),

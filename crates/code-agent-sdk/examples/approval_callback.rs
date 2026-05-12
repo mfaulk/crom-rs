@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
         serde_json::json!({"file_path": "README.md"}),
     );
     let workspace =
-        code_agent_sdk::InMemoryWorkspace::from_iter(vec![("README.md", b"hello\n".to_vec())])?;
+        code_agent_sdk::InMemoryWorkspace::from_pairs(vec![("README.md", b"hello\n".to_vec())])?;
     let runtime = AgentRuntime::builder()
         .provider(ProviderConfig::fake(Arc::new(provider)))
         .workspace(code_agent_sdk::WorkspaceSource::in_memory(workspace))

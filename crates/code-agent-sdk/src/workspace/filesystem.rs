@@ -90,15 +90,6 @@ impl FilesystemWorkspace {
             Ok(out)
         }
     }
-
-    fn rel_path(&self, p: &Path) -> Option<WorkspacePath> {
-        let stripped = p.strip_prefix(&self.root).ok()?;
-        let normalized = stripped.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
-        if normalized.is_empty() {
-            return None;
-        }
-        Some(WorkspacePath::from_validated(normalized))
-    }
 }
 
 #[async_trait]

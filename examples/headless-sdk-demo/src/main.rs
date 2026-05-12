@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn simple_patch() -> anyhow::Result<()> {
     // Set up an in-memory workspace that mimics a tiny Rust project.
-    let workspace = InMemoryWorkspace::from_iter(vec![
+    let workspace = InMemoryWorkspace::from_pairs(vec![
         (
             "Cargo.toml",
             include_bytes!("../fixtures/simple-rust-project/Cargo.toml").to_vec(),
@@ -71,7 +71,7 @@ async fn simple_patch() -> anyhow::Result<()> {
 }
 
 async fn in_memory() -> anyhow::Result<()> {
-    let workspace = InMemoryWorkspace::from_iter(vec![("README.md", b"old\n".to_vec())])?;
+    let workspace = InMemoryWorkspace::from_pairs(vec![("README.md", b"old\n".to_vec())])?;
     let runtime = AgentRuntime::builder()
         .provider(ProviderConfig::fake(Arc::new(EchoFakeProvider)))
         .workspace(WorkspaceSource::in_memory(workspace))
@@ -86,7 +86,7 @@ async fn in_memory() -> anyhow::Result<()> {
 
 async fn plan_act() -> anyhow::Result<()> {
     use code_agent_sdk::SdkPlanRequest;
-    let workspace = InMemoryWorkspace::from_iter(vec![("README.md", b"hi\n".to_vec())])?;
+    let workspace = InMemoryWorkspace::from_pairs(vec![("README.md", b"hi\n".to_vec())])?;
     let runtime = AgentRuntime::builder()
         .provider(ProviderConfig::fake(Arc::new(EchoFakeProvider)))
         .workspace(WorkspaceSource::in_memory(workspace))
@@ -119,7 +119,7 @@ async fn approval_callback() -> anyhow::Result<()> {
         "Read",
         serde_json::json!({"file_path": "Cargo.toml"}),
     );
-    let workspace = InMemoryWorkspace::from_iter(vec![
+    let workspace = InMemoryWorkspace::from_pairs(vec![
         ("Cargo.toml", b"[package]\nname = \"demo\"\n".to_vec()),
     ])?;
     let runtime = AgentRuntime::builder()

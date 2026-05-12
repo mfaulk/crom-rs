@@ -80,7 +80,7 @@ mod tests {
     #[tokio::test]
     async fn write_and_apply_are_denied() {
         let inner =
-            Arc::new(InMemoryWorkspace::from_iter(vec![("a.txt", b"hi\n".to_vec())]).unwrap());
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"hi\n".to_vec())]).unwrap());
         let ws = ReadOnlyWorkspace::new(inner);
         let p = WorkspacePath::new("a.txt").unwrap();
         let err = ws.write_file(&p, b"x").await.unwrap_err();

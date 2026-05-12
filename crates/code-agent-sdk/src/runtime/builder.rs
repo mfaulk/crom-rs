@@ -15,7 +15,7 @@ use crate::policy::{InteractivityMode, SideEffectPolicy, ToolPolicy};
 use crate::provider::ProviderConfig;
 use crate::runtime::{default_secret_redactor, default_storage, AgentRuntime, RuntimeInner};
 use crate::storage::AgentStorage;
-use crate::workspace::{Workspace, WorkspaceSource};
+use crate::workspace::WorkspaceSource;
 
 /// Builder for [`AgentRuntime`]. Conservative defaults: read-only side
 /// effects, headless-deny approvals, no global credential lookup, no
@@ -234,7 +234,8 @@ async fn materialize_provider(
             let _ = &mut anthropic_cfg;
             let provider = code_agent_anthropic::AnthropicProvider::new(anthropic_cfg)
                 .map_err(|e| AgentSdkError::provider("provider.init_failed", e.to_string()))?;
-            Ok((Arc::new(provider), "claude-sonnet-4-6"))
+            let provider: Arc<dyn ModelProvider> = Arc::new(provider);
+            Ok((provider, "claude-sonnet-4-6"))
         }
         #[cfg(not(feature = "anthropic"))]
         ProviderConfig::AnthropicApiKey { .. } => Err(AgentSdkError::invalid_request(

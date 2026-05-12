@@ -1,6 +1,5 @@
 //! Execution of `AgentRequest` against the underlying core agent loop.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,24 +8,16 @@ use code_agent_core::permission::PermissionMode;
 use code_agent_core::plan::{
     ActOutcome, PlanCreatedBy, PlanDocument, PlanError, PlanStatus, PlanningOptions,
 };
-use code_agent_core::{
-    Agent, AgentBuilder, AgentEvent as Ev, AgentOptions, ModelEvent, ModelProvider, ModelRequest,
-    ProviderError, Tool, ToolContext, ToolError, ToolRegistry, ToolResult,
-};
+use code_agent_core::{AgentBuilder, AgentOptions, ToolRegistry};
 use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::budget::CancellationHandle;
-use crate::callback::ApprovalRequest;
-use crate::error::{AgentSdkError, Diagnostic, DiagnosticSeverity};
-use crate::event::{
-    ApprovalRequiredEvent, DiagnosticEvent, EventVerbosity, PatchProposedEvent, SdkEvent,
-    SdkEventMapper,
-};
+use crate::error::{AgentSdkError, Diagnostic};
+use crate::event::{DiagnosticEvent, PatchProposedEvent, SdkEvent, SdkEventMapper};
 use crate::patch::{CodeArtifacts, FilePatch, PatchSet};
 use crate::plan::{ActRequest, PlanRequest, PlanResult};
-use crate::policy::{BuiltinToolSet, SideEffectLevel, SideEffectPolicy};
-use crate::request::{AgentMode, AgentRequest, PatchPolicy, PlanPolicy, RequestMetadata};
+use crate::request::{AgentMode, AgentRequest, PatchPolicy, PlanPolicy};
 use crate::result::{AgentRunResult, AgentRunStatus, EventSummary, ValidationReport};
 use crate::runtime::adapters::SdkPermissionCallback;
 use crate::runtime::validation;
@@ -40,6 +31,7 @@ use crate::{RunId, SessionId};
 /// Execute an AgentRequest. Owns the actual agent loop and returns a result
 /// summary; the streaming wrapper in `mod.rs` is responsible for shipping
 /// events to the host.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_request(
     runtime: Arc<RuntimeInner>,
     run_id: RunId,
@@ -186,12 +178,14 @@ pub(crate) async fn execute_request(
 
     // Regular run.
     let tools = build_tool_registry(&runtime.tool_policy, workspace_for_run.clone());
-    let mut options = AgentOptions::default();
-    options.model = model.clone();
-    options.session_id = session_id.clone();
-    options.max_turns = request.max_turns.or(request.budgets.max_turns);
-    options.permission_mode = PermissionMode::Default;
-    options.allowed_tools = tools.names();
+    let mut options = AgentOptions {
+        model: model.clone(),
+        session_id: session_id.clone(),
+        max_turns: request.max_turns.or(request.budgets.max_turns),
+        permission_mode: PermissionMode::Default,
+        allowed_tools: tools.names(),
+        ..Default::default()
+    };
     if let Some(root) = workspace_for_run.filesystem_root() {
         options.cwd = root;
     }
@@ -497,19 +491,21 @@ pub(crate) async fn execute_plan(
     request: PlanRequest,
 ) -> Result<PlanResult, AgentSdkError> {
     let workspace = resolve_workspace(&runtime, request.workspace).await?;
-    let mut options = AgentOptions::default();
-    options.model = request
-        .model
-        .clone()
-        .unwrap_or_else(|| runtime.default_model.clone());
+    let mut options = AgentOptions {
+        model: request
+            .model
+            .clone()
+            .unwrap_or_else(|| runtime.default_model.clone()),
+        ..Default::default()
+    };
     if let Some(root) = workspace.filesystem_root() {
         options.cwd = root;
     }
-    let mut planning = PlanningOptions {
+    let planning = PlanningOptions {
         enabled: true,
+        planning_mode: request.planning_mode,
         ..Default::default()
     };
-    planning.planning_mode = request.planning_mode;
     let provider = runtime.provider.clone();
     let tools = build_tool_registry(&runtime.tool_policy, workspace.clone());
     options.allowed_tools = tools.names();
@@ -596,8 +592,10 @@ pub(crate) async fn execute_act(
     let store = std::sync::Arc::new(InMemoryPlanStore::with_plan(plan.clone()));
 
     let started = Instant::now();
-    let mut options = AgentOptions::default();
-    options.model = model.clone();
+    let mut options = AgentOptions {
+        model: model.clone(),
+        ..Default::default()
+    };
     if let Some(root) = workspace_for_run.filesystem_root() {
         options.cwd = root;
     }
@@ -688,32 +686,6 @@ pub(crate) async fn execute_act(
         metadata,
         changed_files,
     })
-}
-
-pub(crate) fn event_summary_from(events: &[SdkEvent], duration_ms: u64) -> EventSummary {
-    let mut tool_calls = 0;
-    let mut approvals_requested = 0;
-    let mut diagnostics_count = 0;
-    for ev in events {
-        match ev {
-            SdkEvent::ToolCallStarted(_) => tool_calls += 1,
-            SdkEvent::ApprovalRequired(_) => approvals_requested += 1,
-            SdkEvent::Diagnostic(_) => diagnostics_count += 1,
-            _ => {}
-        }
-    }
-    EventSummary {
-        total_events: events.len(),
-        tool_calls,
-        approvals_requested,
-        files_changed: 0,
-        diagnostics_count,
-        duration_ms,
-    }
-}
-
-pub(crate) fn gather_artifacts(_events: &[SdkEvent]) -> CodeArtifacts {
-    CodeArtifacts::empty()
 }
 
 /// Snapshot every readable file in `workspace` into a `BTreeMap`. Used by
@@ -905,31 +877,4 @@ impl code_agent_core::plan::PlanStore for InMemoryPlanStore {
     async fn writable(&self) -> bool {
         true
     }
-}
-
-// Type juggling exports for the parent module.
-#[allow(dead_code)]
-fn _used_types(
-    _b: BuiltinToolSet,
-    _s: SideEffectPolicy,
-    _l: SideEffectLevel,
-    _v: EventVerbosity,
-    _m: AgentMode,
-    _p: PatchPolicy,
-    _pp: PlanPolicy,
-    _md: RequestMetadata,
-    _r: Result<ToolResult, ToolError>,
-    _mr: ModelRequest,
-    _me: ModelEvent,
-    _pe: ProviderError,
-    _tx: ApprovalRequest,
-    _set: BTreeSet<String>,
-    _t: Arc<dyn Tool>,
-    _tc: ToolContext,
-    _ev: Ev,
-    _ds: DiagnosticSeverity,
-    _ar: ApprovalRequiredEvent,
-    _a: Agent,
-    _provider: Arc<dyn ModelProvider>,
-) {
 }

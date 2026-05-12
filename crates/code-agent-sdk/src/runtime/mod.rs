@@ -11,10 +11,8 @@ mod validation;
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use code_agent_auth::ProviderId;
-use code_agent_core::events::AgentEvent;
 use code_agent_core::ModelProvider;
 use futures::stream::Stream;
 use tokio::sync::mpsc;
@@ -22,24 +20,17 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::budget::CancellationHandle;
 use crate::callback::{
-    AgentHost, ApprovalCallback, CredentialResolver, DefaultSecretRedactor, EventSink,
-    SecretRedactor, ToolHost,
+    ApprovalCallback, CredentialResolver, DefaultSecretRedactor, EventSink, SecretRedactor,
+    ToolHost,
 };
 use crate::error::AgentSdkError;
-use crate::event::{EventVerbosity, RunStarted, SdkEvent, SdkEventMapper};
-use crate::patch::{CodeArtifacts, PatchSet};
+use crate::event::{EventVerbosity, RunStarted, SdkEvent};
 use crate::plan::{ActRequest, PlanRequest, PlanResult};
-use crate::policy::{
-    BuiltinToolSet, InteractivityMode, SideEffectPolicy, ToolLoadingMode, ToolPolicy,
-};
-use crate::provider::ProviderConfig;
-use crate::request::{
-    AgentMode, AgentRequest, ApprovalPolicy, PatchPolicy, PlanPolicy, RequestMetadata,
-    SessionPolicy, ValidationPolicy,
-};
-use crate::result::{AgentRunResult, AgentRunStatus, EventSummary};
+use crate::policy::{InteractivityMode, ToolPolicy};
+use crate::request::{AgentRequest, SessionPolicy};
+use crate::result::{AgentRunResult, AgentRunStatus};
 use crate::storage::{AgentStorage, NoopStorage};
-use crate::workspace::{Workspace, WorkspaceSource};
+use crate::workspace::Workspace;
 use crate::{RunId, SessionId};
 
 pub use builder::AgentRuntimeBuilder;
@@ -69,14 +60,21 @@ pub(crate) struct RuntimeInner {
     pub(crate) workspace: Option<Arc<dyn Workspace>>,
     pub(crate) storage: Arc<dyn AgentStorage>,
     pub(crate) approval_callback: Option<Arc<dyn ApprovalCallback>>,
+    // The runtime holds these so future plumbing can opt them in without
+    // breaking the builder surface. Today they are accepted on the builder
+    // for forward compatibility; once they participate in the run path the
+    // dead_code allowance can be dropped.
     #[allow(dead_code)]
     pub(crate) credential_resolver: Option<Arc<dyn CredentialResolver>>,
     pub(crate) event_sink: Option<Arc<dyn EventSink>>,
+    #[allow(dead_code)]
     pub(crate) secret_redactor: Arc<dyn SecretRedactor>,
+    #[allow(dead_code)]
     pub(crate) tool_host: Option<Arc<dyn ToolHost>>,
     pub(crate) tool_policy: ToolPolicy,
     pub(crate) interactivity: InteractivityMode,
     pub(crate) verbosity: EventVerbosity,
+    #[allow(dead_code)]
     pub(crate) default_budgets: crate::budget::RunBudgets,
 }
 
@@ -320,29 +318,4 @@ pub(crate) fn default_secret_redactor() -> Arc<dyn SecretRedactor> {
 
 pub(crate) fn default_storage() -> Arc<dyn AgentStorage> {
     Arc::new(NoopStorage)
-}
-
-#[allow(dead_code)]
-pub(crate) fn _used_types(
-    _r: ProviderConfig,
-    _h: Arc<dyn AgentHost>,
-    _w: WorkspaceSource,
-    _b: BuiltinToolSet,
-    _s: SideEffectPolicy,
-    _l: ToolLoadingMode,
-    _v: EventVerbosity,
-    _c: CodeArtifacts,
-    _p: PatchSet,
-    _ap: ApprovalPolicy,
-    _pp: PlanPolicy,
-    _vp: ValidationPolicy,
-    _rm: RequestMetadata,
-    _es: EventSummary,
-    _du: Duration,
-    _instant: Instant,
-    _agent_event: AgentEvent,
-    _mapper: SdkEventMapper,
-    _pat: PatchPolicy,
-    _mode: AgentMode,
-) {
 }

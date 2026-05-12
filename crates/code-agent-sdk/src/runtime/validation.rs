@@ -17,7 +17,7 @@ pub(crate) async fn run_validation_command(
     cancellation: CancellationHandle,
 ) -> ValidationReport {
     let started = Instant::now();
-    let mut child = match Command::new("sh")
+    let child = match Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(cwd)

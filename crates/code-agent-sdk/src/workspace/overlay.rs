@@ -166,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn overlay_diff_returns_changes() {
         let base =
-            Arc::new(InMemoryWorkspace::from_iter(vec![("a.txt", b"hi\n".to_vec())]).unwrap());
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"hi\n".to_vec())]).unwrap());
         let ws = OverlayWorkspace::new(base);
         let p = WorkspacePath::new("a.txt").unwrap();
         ws.write_file(&p, b"hello\n").await.unwrap();

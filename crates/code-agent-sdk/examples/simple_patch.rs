@@ -12,7 +12,7 @@ use code_agent_sdk::{
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let workspace = InMemoryWorkspace::from_iter(vec![("README.md", b"# project\n".to_vec())])?;
+    let workspace = InMemoryWorkspace::from_pairs(vec![("README.md", b"# project\n".to_vec())])?;
     let runtime = AgentRuntime::builder()
         .provider(ProviderConfig::fake(Arc::new(EchoFakeProvider)))
         .workspace(WorkspaceSource::in_memory(workspace))

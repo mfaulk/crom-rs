@@ -214,7 +214,7 @@ async fn in_memory_storage_records_run_events() {
 /// a patch describing any pending file writes.
 #[tokio::test]
 async fn in_memory_workspace_supports_runs() {
-    let workspace = InMemoryWorkspace::from_iter(vec![("README.md", b"old\n".to_vec())]).unwrap();
+    let workspace = InMemoryWorkspace::from_pairs(vec![("README.md", b"old\n".to_vec())]).unwrap();
     let runtime = AgentRuntime::builder()
         .provider(ProviderConfig::fake(Arc::new(EchoFakeProvider)))
         .workspace(WorkspaceSource::in_memory(workspace))

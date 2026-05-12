@@ -86,12 +86,15 @@ impl CancellationHandle {
     }
 
     /// Expose the inner shared atomic. Used to thread cancellation into the
-    /// existing core `RunConfig`.
+    /// existing core `RunConfig` (forward-compat hook).
+    #[allow(dead_code)]
     pub(crate) fn flag(&self) -> Arc<AtomicBool> {
         self.flag.clone()
     }
 
-    /// Expose the inner notify so consumers can wake waiting tasks.
+    /// Expose the inner notify so consumers can wake waiting tasks
+    /// (forward-compat hook).
+    #[allow(dead_code)]
     pub(crate) fn notify(&self) -> Arc<tokio::sync::Notify> {
         self.notify.clone()
     }

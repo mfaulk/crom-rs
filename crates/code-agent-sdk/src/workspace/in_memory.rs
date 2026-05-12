@@ -35,7 +35,9 @@ impl InMemoryWorkspace {
     }
 
     /// Build an in-memory workspace from a list of (path, content) pairs.
-    pub fn from_iter<I, P, B>(iter: I) -> Result<Self, crate::error::AgentSdkError>
+    /// Named `from_pairs` (not `from_iter`) to avoid shadowing
+    /// [`std::iter::FromIterator::from_iter`].
+    pub fn from_pairs<I, P, B>(iter: I) -> Result<Self, crate::error::AgentSdkError>
     where
         I: IntoIterator<Item = (P, B)>,
         P: TryInto<WorkspacePath, Error = crate::error::AgentSdkError>,
@@ -315,7 +317,7 @@ mod tests {
     use super::*;
 
     fn ws() -> InMemoryWorkspace {
-        InMemoryWorkspace::from_iter(vec![
+        InMemoryWorkspace::from_pairs(vec![
             ("src/lib.rs", b"fn main() {}\n".to_vec()),
             ("README.md", b"# Hello\n".to_vec()),
         ])

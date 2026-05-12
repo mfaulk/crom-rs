@@ -144,7 +144,7 @@ mod tests {
     /// EchoFakeProvider streams back the user's last message.
     #[tokio::test]
     async fn echo_provider_echoes() {
-        let p = EchoFakeProvider::default();
+        let p = EchoFakeProvider;
         let req = ModelRequest {
             model: "fake".to_string(),
             system: None,
