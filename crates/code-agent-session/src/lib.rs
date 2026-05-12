@@ -576,11 +576,24 @@ pub async fn summarize_session(
         session_id: session_id.to_string(),
         ..Default::default()
     };
-    // Each AgentResult event reports cumulative cost for its run, so summing
-    // every event would double-count whenever a run emits more than one
-    // Result. Keep the last reported cost per run id and sum those at the end.
-    let mut last_cost_per_run: std::collections::HashMap<Option<code_agent_core::RunId>, f64> =
+    // Each AgentResult event with a run_id reports cumulative cost for its
+    // run, so summing every event would double-count whenever a run emits
+    // more than one Result. Keep the last reported cost per run id and sum
+    // those at the end.
+    //
+    // Legacy logs (and any Result lacking a run_id) cannot be bucketed by
+    // run: collapsing every `None` into a single map entry would silently
+    // drop all but the last value. Instead, treat each None-tagged result
+    // as an independent contribution and add it to `uncounted_sum`. This
+    // can over-count if multiple None-tagged events came from the same run
+    // (each reporting cumulative cost), but the alternative — dropping
+    // values — silently undercounts, which is worse for a billing-adjacent
+    // summary. Sessions written by this codebase always include a run_id,
+    // so this fallback only affects legacy fixtures.
+    let mut last_cost_per_run: std::collections::HashMap<code_agent_core::RunId, f64> =
         std::collections::HashMap::new();
+    let mut uncounted_sum: f64 = 0.0;
+    let mut saw_any_cost = false;
     for r in &records {
         if s.cwd.is_none() {
             s.cwd = Some(r.cwd.clone());
@@ -609,18 +622,31 @@ pub async fn summarize_session(
                         s.total_output_tokens += u.output_tokens;
                     }
                     if let Some(c) = res.total_cost_usd {
-                        // Overwrite, not add: each Result is cumulative for
-                        // its run. Records appear in append order, so the
-                        // final write per run id wins.
-                        last_cost_per_run.insert(res.run_id.clone(), c);
+                        saw_any_cost = true;
+                        match &res.run_id {
+                            Some(run_id) => {
+                                // Overwrite, not add: each Result is
+                                // cumulative for its run. Records appear in
+                                // append order, so the final write per run
+                                // id wins.
+                                last_cost_per_run.insert(run_id.clone(), c);
+                            }
+                            None => {
+                                // No run id to bucket by — accumulate
+                                // directly. See note on `uncounted_sum`
+                                // above.
+                                uncounted_sum += c;
+                            }
+                        }
                     }
                 }
                 _ => {}
             },
         }
     }
-    if !last_cost_per_run.is_empty() {
-        s.total_cost_usd = Some(last_cost_per_run.values().sum());
+    if saw_any_cost {
+        let bucketed: f64 = last_cost_per_run.values().sum();
+        s.total_cost_usd = Some(bucketed + uncounted_sum);
     }
     Ok(s)
 }
@@ -1052,6 +1078,68 @@ mod tests {
         assert!(
             (total - 0.25).abs() < 1e-9,
             "expected 0.25 (last of run-a + last of run-b), got {total}"
+        );
+    }
+
+    #[tokio::test]
+    // Legacy logs may emit AgentResult events without a run_id. Each such event
+    // must contribute its full cost to the total — collapsing them into a
+    // single Option<None> bucket would silently drop all but the last value.
+    async fn summary_cost_sums_results_without_run_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        store
+            .append(&id, result_record(&dir, &id, None, 0.10))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, None, 0.20))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, None, 0.05))
+            .await
+            .unwrap();
+
+        let summary = summarize_session(&store, &id).await.unwrap();
+        let total = summary.total_cost_usd.expect("cost should be reported");
+        // None-tagged results cannot be bucketed by run, so each contributes
+        // its reported value. Expected: 0.10 + 0.20 + 0.05 = 0.35.
+        assert!(
+            (total - 0.35).abs() < 1e-9,
+            "expected 0.35 (sum of all None-tagged results), got {total}"
+        );
+    }
+
+    #[tokio::test]
+    // Mixed log: a real run_id reports cumulative 0.10 then 0.20 (last wins,
+    // contributing 0.20), and a legacy None-tagged result contributes 0.05.
+    // The total must be 0.25 — bucket Some(run_id), sum None.
+    async fn summary_cost_mixed_run_id_and_none() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        store
+            .append(&id, result_record(&dir, &id, Some("run-a"), 0.10))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, Some("run-a"), 0.20))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, None, 0.05))
+            .await
+            .unwrap();
+
+        let summary = summarize_session(&store, &id).await.unwrap();
+        let total = summary.total_cost_usd.expect("cost should be reported");
+        assert!(
+            (total - 0.25).abs() < 1e-9,
+            "expected 0.25 (last of run-a + sum of None), got {total}"
         );
     }
 
