@@ -126,6 +126,12 @@ pub trait CheckpointStore: Send + Sync {
     ) -> Result<CheckpointDiff, CheckpointError>;
 }
 
+/// Cap on per-call warnings emitted by the retention trim when every
+/// manifest unlink fails. Trimming continues regardless; this only bounds
+/// log volume so a misconfigured manifests dir doesn't flood logs at a
+/// fixed cost per `create_checkpoint`.
+const MAX_TRIM_ORPHAN_WARN: usize = 10;
+
 /// On-disk index entry for one checkpoint within a session. Stored as one
 /// JSON object per line in `checkpoints.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -552,27 +558,49 @@ impl CheckpointStore for LocalCheckpointStore {
         // malformed index line propagates as an error rather than being
         // silently coerced to an empty Vec (which would clobber the on-
         // disk index on the next write).
+        //
+        // Convergence invariant: `delete_checkpoint_locked` rewrites the
+        // on-disk index BEFORE attempting to unlink the manifest, so a
+        // unlink failure leaves the index entry already removed on disk.
+        // The orphaned manifest is recoverable via sweep tooling. The
+        // trim loop therefore MUST NOT reinsert `oldest` into `entries`
+        // and MUST continue trimming — otherwise the in-memory view
+        // diverges from disk and retention stops converging when it is
+        // actually still working. We cap aggregated orphan-on-error
+        // warnings at MAX_TRIM_ORPHAN_WARN to avoid log flooding when
+        // every unlink fails (e.g. read-only manifests dir).
         let mut entries = self.load_index(&request.session_id).await?;
+        let mut orphan_warn_count: usize = 0;
         while entries.len() >= self.limits.max_checkpoints_per_session {
             let oldest = entries.remove(0);
             if let Err(err) = self
                 .delete_checkpoint_locked(&request.session_id, &oldest.checkpoint_id)
                 .await
             {
-                // Don't silently drop the failure: a `.ok()` would lie to
-                // ourselves about the trim having succeeded. Keep the
-                // entry in the index so a later run can retry, and bail
-                // out of the trim loop — if one delete failed the next
-                // one likely will too (e.g. read-only manifests dir).
-                tracing::warn!(
-                    session_id = %request.session_id,
-                    checkpoint_id = %oldest.checkpoint_id,
-                    error = %err,
-                    "checkpoint retention trim failed; keeping entry in index",
-                );
-                entries.insert(0, oldest);
-                break;
+                orphan_warn_count = orphan_warn_count.saturating_add(1);
+                if orphan_warn_count <= MAX_TRIM_ORPHAN_WARN {
+                    let manifest_path = self
+                        .manifest_path(&request.session_id, &oldest.checkpoint_id)
+                        .ok();
+                    tracing::warn!(
+                        session_id = %request.session_id,
+                        checkpoint_id = %oldest.checkpoint_id,
+                        manifest_path = ?manifest_path,
+                        error = %err,
+                        "checkpoint retention trim: manifest unlink failed; index entry removed, manifest left as recoverable orphan",
+                    );
+                }
+                // Do NOT reinsert `oldest`: the on-disk index already
+                // reflects its removal. Continue trimming.
             }
+        }
+        if orphan_warn_count > MAX_TRIM_ORPHAN_WARN {
+            tracing::warn!(
+                session_id = %request.session_id,
+                total_orphans = orphan_warn_count,
+                cap = MAX_TRIM_ORPHAN_WARN,
+                "checkpoint retention trim: additional orphan-manifest warnings suppressed",
+            );
         }
 
         // Age-based retention: drop entries older than max_age_days. The
@@ -1526,6 +1554,104 @@ mod tests {
             "aged entry should be pruned, got {ids:?}"
         );
         assert!(ids.contains(&new_id), "new entry should be present");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // Count-based trim must converge even when every manifest unlink
+    // fails. delete_checkpoint_locked rewrites the on-disk index BEFORE
+    // unlinking the manifest, so a failed unlink still shrinks the index
+    // by one entry. The trim loop therefore MUST continue (not reinsert
+    // + break) so retention drives the index below the cap. Orphan
+    // manifests remain on disk for a future sweep.
+    async fn trim_continues_after_unlink_errors_so_retention_converges() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let limits = CheckpointLimits {
+            max_checkpoints_per_session: 2,
+            ..Default::default()
+        };
+        let store = LocalCheckpointStore::with_limits(dir.path().to_path_buf(), limits);
+        let sid = SessionId::new();
+        store.ensure_dirs(&sid).await.unwrap();
+
+        // Pre-populate 4 entries with matching manifests.
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let cid = CheckpointId::new();
+            let run = RunId::new();
+            let created = OffsetDateTime::now_utc();
+            let meta = CheckpointMetadata {
+                checkpoint_id: cid.clone(),
+                session_id: sid.clone(),
+                run_id: run.clone(),
+                user_message_id: None,
+                cwd: dir.path().to_path_buf(),
+                created_at: created,
+                description: None,
+                files_tracked: Vec::new(),
+                git_state: None,
+            };
+            let entry = IndexEntry {
+                checkpoint_id: cid.clone(),
+                session_id: sid.clone(),
+                run_id: run,
+                created_at: created,
+                description: None,
+                files_tracked_count: 0,
+            };
+            store.write_manifest(&sid, &meta).await.unwrap();
+            store.append_index(&sid, &entry).await.unwrap();
+            ids.push(cid);
+        }
+        let list_before = store.list_checkpoints(&sid).await.unwrap();
+        assert_eq!(list_before.len(), 4, "precondition: 4 pre-populated entries");
+
+        // Make every manifest unlink fail by removing write permission on
+        // the manifests directory. Unlink inside a 0o555 dir is denied.
+        // This also blocks writing the new manifest, so create_checkpoint
+        // itself returns Err — but the trim must already have driven the
+        // on-disk index below the cap.
+        let manifests = store.manifests_dir_for(&sid).unwrap();
+        let original = std::fs::metadata(&manifests).unwrap().permissions();
+        std::fs::set_permissions(&manifests, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = store
+            .create_checkpoint(CreateCheckpointRequest {
+                session_id: sid.clone(),
+                run_id: RunId::new(),
+                cwd: dir.path().to_path_buf(),
+                description: None,
+                user_message_id: None,
+                git_state: None,
+            })
+            .await;
+
+        // Always restore perms so we can inspect and so the tempdir cleans up.
+        std::fs::set_permissions(&manifests, original).unwrap();
+
+        // create_checkpoint fails at write_manifest, but the trim must
+        // have already converged the on-disk index. The buggy
+        // reinsert+break behavior left 4 entries on disk (early bail);
+        // the fixed loop drives the index to (max-1) = 1.
+        assert!(result.is_err(), "expected create to fail at write_manifest");
+        let list_after = store.list_checkpoints(&sid).await.unwrap();
+        assert_eq!(
+            list_after.len(),
+            (store.limits().max_checkpoints_per_session) - 1,
+            "trim must converge to (max-1) even when every unlink fails",
+        );
+
+        // All four original manifests remain on disk as recoverable
+        // orphans (every unlink in the trim loop failed).
+        for cid in &ids {
+            let p = store.manifest_path(&sid, cid).unwrap();
+            assert!(
+                p.exists(),
+                "orphan manifest for trimmed checkpoint should remain on disk",
+            );
+        }
     }
 
     #[tokio::test]
