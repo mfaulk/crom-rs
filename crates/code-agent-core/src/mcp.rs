@@ -8,6 +8,7 @@ use code_agent_mcp::{
     McpToolCallCompleted, McpToolCallFailed, McpToolCallStarted, McpToolDefinition, McpToolSummary,
     McpToolsDiscovered,
 };
+use futures::future::join_all;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -32,78 +33,53 @@ pub async fn register_mcp_tools(
     }
     let limits = options.limits();
     let secrets = options.secret_values();
-    for (server_name, server_config) in options.servers.iter().take(options.max_servers) {
-        let transport = transport_kind(server_config);
-        let mut status = McpServerStatus {
-            name: server_name.clone(),
-            status: McpConnectionStatus::Connecting,
-            transport,
-            protocol_version: None,
-            tool_count: 0,
-            resource_count: None,
-            prompt_count: None,
-            server_info: None,
-            error: None,
-        };
-        let mut client =
-            match McpClient::connect(server_name.clone(), server_config, limits, secrets.clone())
+    // Run per-server discovery (connect + initialize + list_tools/resources/
+    // prompts) concurrently. With N servers each taking ~1s to handshake,
+    // sequential discovery was O(N) startup; this brings it to ~max(servers).
+    let load_resources = options.load_resources;
+    let load_prompts = options.load_prompts;
+    let max_tools_per_server = options.max_tools_per_server;
+    let discovery_futures = options
+        .servers
+        .iter()
+        .take(options.max_servers)
+        .map(|(server_name, server_config)| {
+            let server_name = server_name.clone();
+            let server_config = server_config.clone();
+            let secrets = secrets.clone();
+            async move {
+                discover_one_server(
+                    server_name,
+                    server_config,
+                    limits,
+                    secrets,
+                    load_resources,
+                    load_prompts,
+                    max_tools_per_server,
+                )
                 .await
-            {
-                Ok(client) => client,
-                Err(err) => {
-                    status.status = McpConnectionStatus::Failed;
-                    status.error = Some(err.to_string());
-                    report.statuses.push(status);
-                    continue;
-                }
-            };
-        match client.initialize().await {
-            Ok(init) => {
-                status.protocol_version = Some(init.protocol_version);
-                status.server_info = Some(init.server_info);
             }
-            Err(err) => {
-                status.status = McpConnectionStatus::Failed;
-                status.error = Some(err.to_string());
-                report.logs.extend(
-                    client
-                        .drain_logs()
-                        .into_iter()
-                        .map(|entry| (server_name.clone(), entry)),
-                );
-                report.statuses.push(status);
-                continue;
-            }
-        }
-        let tools = match client.list_tools().await {
-            Ok(tools) => tools,
-            Err(err) => {
-                status.status = McpConnectionStatus::Failed;
-                status.error = Some(err.to_string());
-                report.logs.extend(
-                    client
-                        .drain_logs()
-                        .into_iter()
-                        .map(|entry| (server_name.clone(), entry)),
-                );
-                report.statuses.push(status);
-                continue;
-            }
-        };
-        if tools.len() > options.max_tools_per_server {
-            status.status = McpConnectionStatus::Failed;
-            status.error = Some(format!(
-                "server exposed {} tools, exceeding max_tools_per_server {}",
-                tools.len(),
-                options.max_tools_per_server
-            ));
+        });
+    let outcomes = join_all(discovery_futures).await;
+
+    // Sequential registration so the registry sees a deterministic order
+    // and `registry.get(...)` duplicate-check is race-free.
+    for outcome in outcomes {
+        let ServerDiscovery {
+            mut status,
+            tools,
+            client,
+        } = outcome;
+        if status.status == McpConnectionStatus::Failed || client.is_none() {
             report.statuses.push(status);
             continue;
         }
-        let client = Arc::new(Mutex::new(client));
+        let client = client.expect("checked above");
+        let server_name = status.name.clone();
+        let transport = status.transport;
         let mut summaries = Vec::new();
         for tool in tools {
-            let agent_name = match agent_tool_name(server_name, &tool.name) {
+            let agent_name = match agent_tool_name(&server_name, &tool.name) {
                 Ok(name) => name,
                 Err(err) => {
                     status.status = McpConnectionStatus::Failed;
@@ -137,14 +113,6 @@ pub async fn register_mcp_tools(
             McpConnectionStatus::Connected
         };
         status.tool_count = summaries.len();
-        if options.load_resources {
-            let mut locked = client.lock().await;
-            status.resource_count = locked.list_resources().await.ok().map(|r| r.len());
-        }
-        if options.load_prompts {
-            let mut locked = client.lock().await;
-            status.prompt_count = locked.list_prompts().await.ok().map(|p| p.len());
-        }
         report.discovered.push(McpToolsDiscovered {
             server_name: server_name.clone(),
             tools: summaries,
@@ -160,6 +128,109 @@ pub async fn register_mcp_tools(
         report.statuses.push(status);
     }
     report
+}
+
+/// Per-server outcome from the parallel discovery phase. Tools/clients are
+/// passed back to the caller to be registered serially.
+struct ServerDiscovery {
+    status: McpServerStatus,
+    tools: Vec<McpToolDefinition>,
+    client: Option<Arc<Mutex<McpClient>>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn discover_one_server(
+    server_name: String,
+    server_config: McpServerConfig,
+    limits: McpLimits,
+    secrets: Vec<String>,
+    load_resources: bool,
+    load_prompts: bool,
+    max_tools_per_server: usize,
+) -> ServerDiscovery {
+    let transport = transport_kind(&server_config);
+    let mut status = McpServerStatus {
+        name: server_name.clone(),
+        status: McpConnectionStatus::Connecting,
+        transport,
+        protocol_version: None,
+        tool_count: 0,
+        resource_count: None,
+        prompt_count: None,
+        server_info: None,
+        error: None,
+    };
+    let mut client = match McpClient::connect(server_name.clone(), &server_config, limits, secrets)
+        .await
+    {
+        Ok(client) => client,
+        Err(err) => {
+            status.status = McpConnectionStatus::Failed;
+            status.error = Some(err.to_string());
+            return ServerDiscovery {
+                status,
+                tools: Vec::new(),
+                client: None,
+            };
+        }
+    };
+    match client.initialize().await {
+        Ok(init) => {
+            status.protocol_version = Some(init.protocol_version);
+            status.server_info = Some(init.server_info);
+        }
+        Err(err) => {
+            status.status = McpConnectionStatus::Failed;
+            status.error = Some(err.to_string());
+            // Drain logs before discarding the client.
+            let _ = client.drain_logs();
+            return ServerDiscovery {
+                status,
+                tools: Vec::new(),
+                client: None,
+            };
+        }
+    }
+    let tools = match client.list_tools().await {
+        Ok(tools) => tools,
+        Err(err) => {
+            status.status = McpConnectionStatus::Failed;
+            status.error = Some(err.to_string());
+            let _ = client.drain_logs();
+            return ServerDiscovery {
+                status,
+                tools: Vec::new(),
+                client: None,
+            };
+        }
+    };
+    if tools.len() > max_tools_per_server {
+        status.status = McpConnectionStatus::Failed;
+        status.error = Some(format!(
+            "server exposed {} tools, exceeding max_tools_per_server {}",
+            tools.len(),
+            max_tools_per_server
+        ));
+        return ServerDiscovery {
+            status,
+            tools: Vec::new(),
+            client: None,
+        };
+    }
+    // Optionally fetch resources/prompts. Errors here are non-fatal and
+    // omitted from `status` so the discovery hot path stays parallel.
+    if load_resources {
+        status.resource_count = client.list_resources().await.ok().map(|r| r.len());
+    }
+    if load_prompts {
+        status.prompt_count = client.list_prompts().await.ok().map(|p| p.len());
+    }
+    let client = Arc::new(Mutex::new(client));
+    ServerDiscovery {
+        status,
+        tools,
+        client: Some(client),
+    }
 }
 
 pub fn transport_kind(config: &McpServerConfig) -> code_agent_mcp::McpTransportKind {

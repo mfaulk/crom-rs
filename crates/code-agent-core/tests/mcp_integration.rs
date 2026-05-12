@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use code_agent_core::{
@@ -146,4 +146,141 @@ async fn mcp_tool_call_runs_through_agent_loop() {
             AgentEvent::Result(r) if matches!(r.subtype, ResultSubtype::Success)
         )
     }));
+}
+
+/// Tiny MCP server that injects a synthetic init delay so the test can
+/// measure whether discovery runs in parallel.
+async fn start_slow_mcp(init_delay: Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut header_bytes = Vec::new();
+                let mut buf = [0u8; 1];
+                while stream.read_exact(&mut buf).await.is_ok() {
+                    header_bytes.push(buf[0]);
+                    if header_bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = String::from_utf8_lossy(&header_bytes).to_string();
+                let len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                let _ = stream.read_exact(&mut body).await;
+                let request: serde_json::Value = match serde_json::from_slice(&body) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let id = request.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let payload = match method {
+                    "initialize" => {
+                        tokio::time::sleep(init_delay).await;
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "slow", "version": "0.1.0"}
+                            }
+                        })
+                    }
+                    "tools/list" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"tools": [
+                            {"name": "noop", "description": "", "inputSchema": {"type": "object"}}
+                        ]}
+                    }),
+                    _ => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                };
+                if request.get("id").is_none() {
+                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                    let _ = stream.write_all(resp).await;
+                    return;
+                }
+                let body = payload.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/mcp")
+}
+
+#[tokio::test]
+// MCP server discovery runs in parallel: with three servers that each
+// add a 500ms init delay, the registration phase finishes in well under
+// 3*500ms (the sequential bound).
+async fn mcp_discovery_runs_in_parallel() {
+    let delay = Duration::from_millis(500);
+    let urls = [
+        start_slow_mcp(delay).await,
+        start_slow_mcp(delay).await,
+        start_slow_mcp(delay).await,
+    ];
+
+    let mut servers = BTreeMap::new();
+    for (i, url) in urls.iter().enumerate() {
+        servers.insert(
+            format!("s{i}"),
+            code_agent_mcp::McpServerConfig::StreamableHttp(
+                code_agent_mcp::StreamableHttpMcpServerConfig {
+                    url: url.clone(),
+                    headers: BTreeMap::new(),
+                    startup_timeout: Some(Duration::from_secs(5)),
+                    request_timeout: Some(Duration::from_secs(5)),
+                },
+            ),
+        );
+    }
+    let options = McpOptions {
+        enabled: true,
+        servers,
+        ..McpOptions::default()
+    };
+
+    let mut registry = ToolRegistry::new();
+    let started = Instant::now();
+    let report = code_agent_core::register_mcp_tools(&mut registry, &options).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(report.statuses.len(), 3);
+    assert!(
+        report
+            .statuses
+            .iter()
+            .all(|s| matches!(s.status, code_agent_mcp::McpConnectionStatus::Connected)),
+        "all servers should connect, got: {:?}",
+        report
+            .statuses
+            .iter()
+            .map(|s| (&s.name, &s.status, &s.error))
+            .collect::<Vec<_>>()
+    );
+    // Sequential would be ~1500ms. Parallel completes in ~500ms with
+    // some overhead. The generous 1100ms ceiling tolerates CI jitter
+    // while still strongly distinguishing the two regimes.
+    assert!(
+        elapsed < Duration::from_millis(1100),
+        "discovery must run in parallel: elapsed={elapsed:?}"
+    );
 }
