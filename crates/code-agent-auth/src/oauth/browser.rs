@@ -220,7 +220,7 @@ pub fn finish_oauth_browser_login(
     let callback_query = if let Some(forced) = options.force_callback_query.as_deref() {
         forced.to_string()
     } else if let Some(cb) = session.callback.as_ref() {
-        wait_for_callback(&cb.listener, options.timeout)?
+        wait_for_callback(&cb.listener, &cb.callback_path, options.timeout)?
     } else {
         return Err(AuthError::new(
             AuthErrorKind::OAuthTimeout,
@@ -306,26 +306,14 @@ fn parse_callback_query(query: &str) -> CallbackParams {
 }
 
 fn url_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '+' {
-            out.push(' ');
-        } else if c == '%' {
-            let h = chars.next().unwrap_or(' ');
-            let l = chars.next().unwrap_or(' ');
-            let hex = format!("{h}{l}");
-            if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                out.push(b as char);
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    crate::oauth::token::url_decode(s)
 }
 
-fn wait_for_callback(listener: &TcpListener, timeout: Duration) -> Result<String, AuthError> {
+fn wait_for_callback(
+    listener: &TcpListener,
+    callback_path: &str,
+    timeout: Duration,
+) -> Result<String, AuthError> {
     listener
         .set_nonblocking(true)
         .map_err(|e| AuthError::new(AuthErrorKind::Network, format!("set_nonblocking: {e}")))?;
@@ -358,6 +346,43 @@ fn wait_for_callback(listener: &TcpListener, timeout: Duration) -> Result<String
                         break;
                     }
                 }
+
+                let request_line = total.lines().next().unwrap_or("");
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let target = parts.next().unwrap_or("");
+                let (path, query) = match target.split_once('?') {
+                    Some((p, q)) => (p, q),
+                    None => (target, ""),
+                };
+
+                // Reject everything that is not a GET to the configured
+                // callback path. Drop the stream and keep listening — a
+                // favicon probe or stray local request must not consume
+                // the only callback we accept.
+                if method != "GET" {
+                    let body = b"Method Not Allowed";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(body);
+                    let _ = stream.flush();
+                    continue;
+                }
+                if path != callback_path {
+                    let body = b"Not Found";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(body);
+                    let _ = stream.flush();
+                    continue;
+                }
+
                 let body = b"<html><body><p>You may close this tab and return to the terminal.</p></body></html>";
                 let _ = write!(
                     stream,
@@ -367,13 +392,7 @@ fn wait_for_callback(listener: &TcpListener, timeout: Duration) -> Result<String
                 let _ = stream.write_all(body);
                 let _ = stream.flush();
 
-                let request_line = total.lines().next().unwrap_or("").to_string();
-                let query = request_line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|target| target.split_once('?').map(|(_, q)| q.to_string()))
-                    .unwrap_or_default();
-                return Ok(query);
+                return Ok(query.to_string());
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(50));
@@ -581,5 +600,119 @@ mod tests {
             let dec = url_decode(&enc);
             assert_eq!(dec, s);
         }
+    }
+
+    #[test]
+    // url_decode reassembles multi-byte UTF-8 percent-encoded sequences
+    // into a single Unicode scalar, not one char per encoded byte.
+    fn url_decode_handles_multi_byte_utf8() {
+        let decoded = url_decode("%C3%A9");
+        assert_eq!(decoded, "é");
+        assert_eq!(decoded.chars().count(), 1);
+    }
+
+    #[test]
+    // url_decode translates %20 to a single space (pinning existing behavior).
+    fn url_decode_translates_percent20_to_space() {
+        assert_eq!(url_decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    // url_decode preserves a trailing `%` with no following chars as a literal.
+    fn url_decode_preserves_lone_percent() {
+        assert_eq!(url_decode("%"), "%");
+    }
+
+    #[test]
+    // url_decode preserves `%` followed by a single trailing char as literals.
+    fn url_decode_preserves_percent_with_one_trailing_char() {
+        assert_eq!(url_decode("%A"), "%A");
+    }
+
+    #[test]
+    // url_decode preserves `%` followed by two non-hex chars as literals.
+    fn url_decode_preserves_percent_with_two_non_hex_chars() {
+        assert_eq!(url_decode("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    // url_decode preserves a malformed escape embedded in surrounding text.
+    fn url_decode_preserves_malformed_escape_in_context() {
+        assert_eq!(url_decode("a%Zb"), "a%Zb");
+    }
+
+    #[test]
+    // url_decode decodes a well-formed single-byte hex escape (pinning behavior).
+    fn url_decode_decodes_single_byte_escape() {
+        assert_eq!(url_decode("%41"), "A");
+    }
+
+    fn bind_local_listener() -> (TcpListener, u16) {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    fn send_raw_request(port: u16, request: &str) -> std::net::TcpStream {
+        use std::net::TcpStream;
+        let mut stream = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        stream
+    }
+
+    #[test]
+    // wait_for_callback skips a request whose path does not match the
+    // configured callback path (e.g. a favicon probe) and continues
+    // listening until the real callback arrives.
+    fn wait_for_callback_skips_non_matching_paths() {
+        let (listener, port) = bind_local_listener();
+        let handle = std::thread::spawn(move || {
+            wait_for_callback(&listener, "/callback", Duration::from_secs(5))
+        });
+
+        // First probe to /favicon.ico must be ignored.
+        let probe = send_raw_request(
+            port,
+            "GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        // Drain and drop the probe response so the server can move on.
+        drop(probe);
+
+        // Real callback arrives on the configured path.
+        let real = send_raw_request(
+            port,
+            "GET /callback?state=S&code=C HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        drop(real);
+
+        let query = handle.join().unwrap().unwrap();
+        assert_eq!(query, "state=S&code=C");
+    }
+
+    #[test]
+    // wait_for_callback rejects non-GET methods and keeps listening for
+    // the real callback.
+    fn wait_for_callback_rejects_non_get_methods() {
+        let (listener, port) = bind_local_listener();
+        let handle = std::thread::spawn(move || {
+            wait_for_callback(&listener, "/callback", Duration::from_secs(5))
+        });
+
+        // POST to the right path is rejected; loop must continue.
+        let bad = send_raw_request(
+            port,
+            "POST /callback HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        drop(bad);
+
+        let good = send_raw_request(
+            port,
+            "GET /callback?state=X&code=Y HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        drop(good);
+
+        let query = handle.join().unwrap().unwrap();
+        assert_eq!(query, "state=X&code=Y");
     }
 }

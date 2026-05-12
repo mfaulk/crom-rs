@@ -315,21 +315,7 @@ fn parse_form(body: &str) -> BTreeMap<String, String> {
 }
 
 fn decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '+' {
-            out.push(' ');
-        } else if c == '%' {
-            let hex: String = (0..2).filter_map(|_| chars.next()).collect();
-            if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                out.push(b as char);
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    crate::oauth::token::url_decode(s)
 }
 
 #[cfg(test)]
@@ -451,5 +437,50 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.token.access_token.starts_with("fake-device-at-"));
+    }
+
+    #[test]
+    // Form-decoder reassembles multi-byte UTF-8 percent sequences into a
+    // single Unicode scalar rather than one char per encoded byte.
+    fn decode_handles_multi_byte_utf8() {
+        let decoded = decode("%C3%A9");
+        assert_eq!(decoded, "é");
+        assert_eq!(decoded.chars().count(), 1);
+    }
+
+    #[test]
+    // Form-decoder translates %20 to a single space (pinning existing behavior).
+    fn decode_translates_percent20_to_space() {
+        assert_eq!(decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    // Form-decoder preserves a trailing `%` with no following chars as a literal.
+    fn decode_preserves_lone_percent() {
+        assert_eq!(decode("%"), "%");
+    }
+
+    #[test]
+    // Form-decoder preserves `%` followed by a single trailing char as literals.
+    fn decode_preserves_percent_with_one_trailing_char() {
+        assert_eq!(decode("%A"), "%A");
+    }
+
+    #[test]
+    // Form-decoder preserves `%` followed by two non-hex chars as literals.
+    fn decode_preserves_percent_with_two_non_hex_chars() {
+        assert_eq!(decode("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    // Form-decoder preserves a malformed escape embedded in surrounding text.
+    fn decode_preserves_malformed_escape_in_context() {
+        assert_eq!(decode("a%Zb"), "a%Zb");
+    }
+
+    #[test]
+    // Form-decoder decodes a well-formed single-byte hex escape (pinning behavior).
+    fn decode_decodes_single_byte_escape() {
+        assert_eq!(decode("%41"), "A");
     }
 }
