@@ -370,6 +370,20 @@ pub struct HookAddedContext(pub String);
 /// Merge a list of hook outputs by priority.
 ///
 /// Priority: `Deny` > `Ask` > `Allow` > `AddContext` > `Continue`.
+///
+/// # `updated_input` propagation
+///
+/// `updated_input` from an `Allow` output is only carried through to the
+/// aggregated decision when the final decision is `Allow`. When any hook
+/// escalates to `Ask` or `Deny`, prior `Allow.updated_input` values are
+/// discarded: the aggregated `Ask`/`Deny` variants do not carry
+/// `updated_input`, and downstream callers see the original input.
+///
+/// Hooks that rewrite tool/prompt input via `Allow { updated_input }` must
+/// not also escalate the same chain to `Ask`/`Deny`; if they do, the
+/// rewrite is silently dropped. This is an intentional invariant — see the
+/// `ask_discards_prior_allow_updated_input` regression test — so that
+/// `Ask`/`Deny` callers always observe the unmodified original input.
 pub fn aggregate(records: &[HookCallRecord]) -> (HookAggregateDecision, HookAddedContext) {
     let mut decision: HookAggregateDecision = HookAggregateDecision::Continue;
     let mut updated_input: Option<serde_json::Value> = None;
@@ -501,6 +515,52 @@ mod tests {
                 assert_eq!(updated_input.unwrap()["x"], 1);
             }
             _ => panic!("expected Allow"),
+        }
+    }
+
+    #[test]
+    // Pins documented invariant: when a hook chain escalates to Ask after a
+    // prior Allow with updated_input, the aggregate decision is Ask and the
+    // earlier updated_input is discarded (the Ask variant has no
+    // updated_input field). Any future change that would surface the rewrite
+    // through Ask must be intentional and update this test.
+    fn ask_discards_prior_allow_updated_input() {
+        let records = vec![
+            rec(HookOutput::Allow {
+                updated_input: Some(serde_json::json!({"rewritten": true})),
+            }),
+            rec(HookOutput::Ask {
+                reason: "needs confirmation".into(),
+            }),
+        ];
+        let (d, _) = aggregate(&records);
+        match d {
+            HookAggregateDecision::Ask { reason } => {
+                assert_eq!(reason, "needs confirmation");
+            }
+            other => panic!("expected Ask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // Pins documented invariant: Deny similarly discards a prior
+    // Allow.updated_input. The aggregate Deny variant carries no
+    // updated_input and downstream callers see the original input.
+    fn deny_discards_prior_allow_updated_input() {
+        let records = vec![
+            rec(HookOutput::Allow {
+                updated_input: Some(serde_json::json!({"rewritten": true})),
+            }),
+            rec(HookOutput::Deny {
+                reason: "blocked".into(),
+            }),
+        ];
+        let (d, _) = aggregate(&records);
+        match d {
+            HookAggregateDecision::Deny { reason } => {
+                assert_eq!(reason, "blocked");
+            }
+            other => panic!("expected Deny, got {other:?}"),
         }
     }
 
