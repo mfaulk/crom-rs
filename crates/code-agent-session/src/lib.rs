@@ -729,6 +729,45 @@ pub fn replay_conversation(records: &[SessionRecord]) -> Conversation {
             },
         }
     }
+    // If the session ended right after an AssistantMessage with tool_use
+    // blocks but before any matching UserToolResult, the Anthropic API will
+    // reject the resumed call because every tool_use must be answered. The
+    // session is no longer running, so synthesize a cancelled tool_result
+    // for each dangling tool_use_id (Anthropic's recommended pattern for
+    // cancelled tool calls). This preserves the assistant turn rather than
+    // discarding work.
+    if let Some(last) = conv.messages.last() {
+        if last.role == MessageRole::Assistant {
+            let already_answered: std::collections::HashSet<String> = pending_tool_results
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult(tr) => Some(tr.tool_use_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            let dangling: Vec<String> = last
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse(tc) if !already_answered.contains(&tc.id) => {
+                        Some(tc.id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            for id in dangling {
+                pending_tool_results.push(ContentBlock::ToolResult(
+                    code_agent_core::ConvToolResult {
+                        tool_use_id: id,
+                        content: vec![ToolResultContent::Text {
+                            text: "cancelled - agent interrupted".to_string(),
+                        }],
+                        is_error: true,
+                    },
+                ));
+            }
+        }
+    }
     flush_results(&mut conv, &mut pending_tool_results);
     conv
 }
@@ -1014,5 +1053,104 @@ mod tests {
             (total - 0.25).abs() < 1e-9,
             "expected 0.25 (last of run-a + last of run-b), got {total}"
         );
+    }
+
+    #[tokio::test]
+    // replay_conversation must not leave a tail tool_use block without a
+    // matching tool_result; a session killed mid-flight would otherwise be
+    // rejected by the Anthropic API on resume. The reconstructed conversation
+    // must either drop the dangling tool_use blocks from the tail assistant
+    // message OR end with a synthetic tool_result block for each tool_use_id.
+    async fn replay_synthesizes_cancelled_tool_results_for_dangling_tool_uses() {
+        use code_agent_core::{AssistantContent, ContentBlock, ToolCall};
+
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        // A user prompt followed by an assistant message with two tool_use
+        // blocks, then session end (no UserToolResult events).
+        append_user_prompt(&store, dir.path(), &id, "do two things")
+            .await
+            .unwrap();
+        let am = AgentEvent::AssistantMessage(AssistantMessage {
+            content: vec![
+                AssistantContent::Text {
+                    text: "okay".into(),
+                },
+                AssistantContent::ToolUse(ToolCall {
+                    id: "call_a".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"cmd": "ls"}),
+                }),
+                AssistantContent::ToolUse(ToolCall {
+                    id: "call_b".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"cmd": "pwd"}),
+                }),
+            ],
+            stop_reason: Some("tool_use".into()),
+        });
+        store
+            .append(
+                &id,
+                SessionRecord {
+                    timestamp: now_iso(),
+                    cwd: dir.path().to_path_buf(),
+                    session_id: id.to_string(),
+                    payload: SessionPayload::Event(am),
+                },
+            )
+            .await
+            .unwrap();
+
+        let recs = store.load(&id).await.unwrap();
+        let conv = replay_conversation(&recs);
+
+        // The conversation must be valid for an Anthropic resume: every
+        // tool_use in the final assistant message has a matching tool_result
+        // in the following user message, OR the tool_use blocks are absent.
+        // Find the last assistant message.
+        let last_assistant_idx = conv
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::Assistant)
+            .expect("expected at least one assistant message");
+
+        let unresolved_tool_use_ids: Vec<String> = conv.messages[last_assistant_idx]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse(tc) => Some(tc.id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        if unresolved_tool_use_ids.is_empty() {
+            // Acceptable outcome: the tail tool_use blocks were dropped.
+            return;
+        }
+
+        // Otherwise every tool_use must be answered by a tool_result in a
+        // following user message.
+        let mut answered: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for m in &conv.messages[last_assistant_idx + 1..] {
+            if m.role != MessageRole::User {
+                continue;
+            }
+            for b in &m.content {
+                if let ContentBlock::ToolResult(tr) = b {
+                    answered.insert(tr.tool_use_id.clone());
+                }
+            }
+        }
+        for id in &unresolved_tool_use_ids {
+            assert!(
+                answered.contains(id),
+                "tool_use_id {id} has no matching tool_result; \
+                 conversation: {conv:#?}"
+            );
+        }
     }
 }
