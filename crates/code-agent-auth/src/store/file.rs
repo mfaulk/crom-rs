@@ -14,6 +14,13 @@
 //! making a single rainbow table built from a list of plain emails
 //! useless. A truly random per-store salt is tracked as a follow-up.
 //!
+//! Before the salted layout, the filename was the unsalted
+//! `acct_<sha256(account_id)[..12]>.json`. To avoid silently logging
+//! existing users out across that upgrade, `get` and `delete` fall back
+//! to the legacy unsalted filename when the salted file is absent, and
+//! `put` removes the legacy file after writing the salted file so the
+//! store self-migrates on the next credential refresh or login.
+//!
 //! Writes go through a sibling temp file in the same directory and are
 //! renamed over the target via `tempfile::persist`, so concurrent
 //! readers never observe a torn write and a crash mid-write leaves the
@@ -64,6 +71,35 @@ impl FileCredentialBackend {
         provider: &ProviderId,
         account_id: &AccountId,
     ) -> Result<PathBuf, AuthError> {
+        let provider_dir = self.provider_dir(provider)?;
+        // Mix the provider id into the hash as a poor-man's salt so a
+        // directory listing across providers cannot be cracked with a
+        // single rainbow table keyed on plain email. A truly random
+        // per-store salt (persisted as `.salt`, 0o600) is tracked as a
+        // follow-up — the provider-id salt is zero-migration and
+        // strictly better than the previous unsalted hash.
+        Ok(provider_dir.join(format!(
+            "{}.json",
+            account_id.redacted_hash_with_salt(provider.as_str())
+        )))
+    }
+
+    /// Path the previous (pre-salt) layout would have used for
+    /// `(provider, account_id)`. Read-only fallback: used by `get` and
+    /// `delete` so an upgrade from the unsalted layout does not silently
+    /// log the user out. `put` migrates the file to the new path on
+    /// next write by writing to [`Self::account_path`] and removing the
+    /// legacy path.
+    fn legacy_account_path(
+        &self,
+        provider: &ProviderId,
+        account_id: &AccountId,
+    ) -> Result<PathBuf, AuthError> {
+        let provider_dir = self.provider_dir(provider)?;
+        Ok(provider_dir.join(format!("{}.json", account_id.redacted_hash())))
+    }
+
+    fn provider_dir(&self, provider: &ProviderId) -> Result<PathBuf, AuthError> {
         let provider_dir = self.dir.join(provider.as_str());
         // Create the per-provider subdirectory and then audit it. The
         // audit catches the case where the parent is fine but a
@@ -81,16 +117,7 @@ impl FileCredentialBackend {
             let _ = std::fs::set_permissions(&provider_dir, std::fs::Permissions::from_mode(0o700));
         }
         verify_secrets_dir(&provider_dir)?;
-        // Mix the provider id into the hash as a poor-man's salt so a
-        // directory listing across providers cannot be cracked with a
-        // single rainbow table keyed on plain email. A truly random
-        // per-store salt (persisted as `.salt`, 0o600) is tracked as a
-        // follow-up — the provider-id salt is zero-migration and
-        // strictly better than the previous unsalted hash.
-        Ok(provider_dir.join(format!(
-            "{}.json",
-            account_id.redacted_hash_with_salt(provider.as_str())
-        )))
+        Ok(provider_dir)
     }
 }
 
@@ -205,6 +232,14 @@ impl SecretBackend for FileCredentialBackend {
             AuthError::new(AuthErrorKind::Unknown, format!("serialize secret: {}", e))
         })?;
         write_secret_file(&path, &bytes)?;
+        // Migrate-on-write: if a legacy (unsalted) record exists for the
+        // same (provider, account_id) tuple, remove it now that the
+        // canonical salted file has been written. Tolerate a missing
+        // legacy file — the migration is best-effort.
+        let legacy = self.legacy_account_path(provider, account_id)?;
+        if legacy != path && legacy.exists() {
+            let _ = std::fs::remove_file(&legacy);
+        }
         Ok(())
     }
 
@@ -214,13 +249,25 @@ impl SecretBackend for FileCredentialBackend {
         account_id: &AccountId,
     ) -> Result<Option<StoredCredentialSecret>, AuthError> {
         let path = self.account_path(provider, account_id)?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(&path).map_err(|e| {
+        let resolved = if path.exists() {
+            path
+        } else {
+            // Fallback: an upgrade across the unsalted-to-salted layout
+            // would otherwise read `None` here and quietly log the user
+            // out. Try the legacy filename so existing on-disk records
+            // remain reachable. `put` migrates to the new path next time
+            // a write happens.
+            let legacy = self.legacy_account_path(provider, account_id)?;
+            if legacy.exists() {
+                legacy
+            } else {
+                return Ok(None);
+            }
+        };
+        let bytes = std::fs::read(&resolved).map_err(|e| {
             AuthError::new(
                 AuthErrorKind::CredentialStoreUnavailable,
-                format!("read secret {}: {}", path.display(), e),
+                format!("read secret {}: {}", resolved.display(), e),
             )
         })?;
         let on_disk: OnDiskSecret = serde_json::from_slice(&bytes)
@@ -240,6 +287,17 @@ impl SecretBackend for FileCredentialBackend {
                 AuthError::new(
                     AuthErrorKind::CredentialStoreUnavailable,
                     format!("remove secret {}: {}", path.display(), e),
+                )
+            })?;
+        }
+        // Also clear any legacy unsalted record so a stale credential is
+        // not left behind on disk after a logout.
+        let legacy = self.legacy_account_path(provider, account_id)?;
+        if legacy != path && legacy.exists() {
+            std::fs::remove_file(&legacy).map_err(|e| {
+                AuthError::new(
+                    AuthErrorKind::CredentialStoreUnavailable,
+                    format!("remove legacy secret {}: {}", legacy.display(), e),
                 )
             })?;
         }
@@ -457,6 +515,84 @@ mod tests {
         ));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secret file must be 0o600 on unix");
+    }
+
+    #[test]
+    // `get` falls back to the legacy unsalted filename when no
+    // salted-layout file exists, so upgrading across the salting
+    // change does not silently log existing users out.
+    fn get_falls_back_to_legacy_unsalted_filename() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = FileCredentialBackend::new(dir.path().to_path_buf()).unwrap();
+        let provider = ProviderId::Anthropic;
+        let acct = AccountId::new("legacy-user@example.com");
+        // Manually pre-populate the directory with a legacy unsalted
+        // record under the OLD filename, exactly as a previous version
+        // of the backend would have written it.
+        let provider_dir = dir.path().join(provider.as_str());
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let legacy_path = provider_dir.join(format!("{}.json", acct.redacted_hash()));
+        let payload = br#"{"api_key":"legacy-secret"}"#;
+        std::fs::write(&legacy_path, payload).unwrap();
+
+        let got = backend
+            .get(&provider, &acct)
+            .unwrap()
+            .expect("legacy record should be visible to get()");
+        assert_eq!(got.api_key.as_ref().unwrap().expose(), "legacy-secret");
+    }
+
+    #[test]
+    // `put` migrates an existing legacy unsalted file to the new
+    // salted layout by writing the new path and removing the old one
+    // on the next write.
+    fn put_migrates_legacy_unsalted_file_to_salted_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = FileCredentialBackend::new(dir.path().to_path_buf()).unwrap();
+        let provider = ProviderId::Anthropic;
+        let acct = AccountId::new("migrating@example.com");
+        let provider_dir = dir.path().join(provider.as_str());
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let legacy_path = provider_dir.join(format!("{}.json", acct.redacted_hash()));
+        let salted_path =
+            provider_dir.join(format!("{}.json", acct.redacted_hash_with_salt(provider.as_str())));
+        assert_ne!(legacy_path, salted_path);
+        std::fs::write(&legacy_path, br#"{"api_key":"old"}"#).unwrap();
+
+        backend
+            .put(
+                &provider,
+                &acct,
+                &StoredCredentialSecret {
+                    api_key: Some(SecretString::new("new".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(salted_path.exists(), "salted file should be written");
+        assert!(
+            !legacy_path.exists(),
+            "legacy file should be removed after migration write"
+        );
+    }
+
+    #[test]
+    // `delete` removes a legacy unsalted file as well, so a logout
+    // does not leave a stale credential behind on disk during the
+    // upgrade window.
+    fn delete_removes_legacy_unsalted_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = FileCredentialBackend::new(dir.path().to_path_buf()).unwrap();
+        let provider = ProviderId::OpenAi;
+        let acct = AccountId::new("deleting@example.com");
+        let provider_dir = dir.path().join(provider.as_str());
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let legacy_path = provider_dir.join(format!("{}.json", acct.redacted_hash()));
+        std::fs::write(&legacy_path, br#"{"api_key":"x"}"#).unwrap();
+
+        backend.delete(&provider, &acct).unwrap();
+        assert!(!legacy_path.exists());
     }
 
     #[test]
