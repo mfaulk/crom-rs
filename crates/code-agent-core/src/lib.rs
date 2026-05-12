@@ -39,6 +39,7 @@ pub use agents::{
     SubagentRuntime, SubagentStatus, SUBAGENT_TOOL_NAME,
 };
 pub use builtin_hooks::{
+    compiled_dangerous_bash_patterns, dangerous_bash_patterns, is_dangerous_bash_command,
     redact_secrets_in_value, AuditEntry, AuditLogHook, BlockDangerousBashHook,
     BlockEnvFileWritesHook, BlockMcpServerHook, BlockMcpToolNameHook, BlockMcpWriteLikeToolHook,
     MaxPatchSizeHook, McpAuditLogHook, McpResultSizeLimitHook, McpSecretRedactionHook,
