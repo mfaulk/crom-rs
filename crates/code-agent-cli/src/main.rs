@@ -7359,8 +7359,12 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
         .cwd
         .canonicalize()
         .with_context(|| format!("--cwd {}", args.cwd.display()))?;
-    let settings =
-        code_agent_core::settings::load(&cwd, SettingSource::UserAndProject).unwrap_or_default();
+    let settings = code_agent_core::settings::load(&cwd, SettingSource::UserAndProject)
+        .map_err(|e| {
+            eprintln!("[tui] failed to load settings: {e}");
+            e
+        })
+        .context("load settings")?;
     let caps = code_agent_tui::detect_capabilities_from_env();
     let cli_override = args
         .renderer
