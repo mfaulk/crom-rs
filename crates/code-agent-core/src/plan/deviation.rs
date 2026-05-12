@@ -364,7 +364,6 @@ fn access_label(a: PlanFileAccess) -> &'static str {
         PlanFileAccess::Write => "write",
         PlanFileAccess::Edit => "edit",
         PlanFileAccess::Create => "create",
-        PlanFileAccess::Delete => "delete",
     }
 }
 

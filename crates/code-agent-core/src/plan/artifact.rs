@@ -239,6 +239,10 @@ impl PlanRiskLevel {
     }
 }
 
+// LINT: keep variants in sync with `access_for_file_tool` in
+// `plan::deviation`. Only access kinds with a concrete tool mapping
+// belong here — adding a variant that no tool can produce silently
+// turns those operations into `Ambiguous` deviations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanFileAccess {
@@ -246,7 +250,6 @@ pub enum PlanFileAccess {
     Write,
     Edit,
     Create,
-    Delete,
 }
 
 impl PlanFileAccess {
@@ -256,7 +259,6 @@ impl PlanFileAccess {
             "write" => Self::Write,
             "edit" | "modify" => Self::Edit,
             "create" => Self::Create,
-            "delete" | "remove" => Self::Delete,
             _ => return None,
         })
     }
@@ -653,6 +655,21 @@ mod tests {
             WorkspaceRelativePath::try_new("a\\b\\c").unwrap().as_str(),
             "a/b/c"
         );
+    }
+
+    #[test]
+    // PlanFileAccess::from_str_lenient no longer accepts `delete`/`remove`:
+    // there is no tool that maps to a delete-style access today, so
+    // accepting the string would silently produce a half-implemented
+    // variant. Pins the Option-A resolution for #82 — re-introduce only
+    // when a concrete deletion tool flows through the classifier.
+    fn plan_file_access_rejects_delete() {
+        assert!(PlanFileAccess::from_str_lenient("read").is_some());
+        assert!(PlanFileAccess::from_str_lenient("write").is_some());
+        assert!(PlanFileAccess::from_str_lenient("edit").is_some());
+        assert!(PlanFileAccess::from_str_lenient("create").is_some());
+        assert!(PlanFileAccess::from_str_lenient("delete").is_none());
+        assert!(PlanFileAccess::from_str_lenient("remove").is_none());
     }
 
     #[test]
