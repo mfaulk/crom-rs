@@ -109,6 +109,27 @@ fn skills_init_works() {
 }
 
 #[test]
+// `commands list` surfaces filesystem skill parse errors on stderr instead
+// of silently dropping them.
+fn commands_list_surfaces_skill_parse_errors() {
+    let tmp = TempDir::new().unwrap();
+    let skills = tmp.path().join(".agent").join("skills");
+    std::fs::create_dir_all(&skills).unwrap();
+    // No frontmatter — the loader emits a MissingFrontmatter error.
+    write_skill(&skills, "broken", "no frontmatter\n");
+    let out = Command::new(bin())
+        .args(["commands", "list", "--cwd"])
+        .arg(tmp.path())
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[skills]"),
+        "expected '[skills]' diagnostic on stderr, got: {stderr}"
+    );
+}
+
+#[test]
 // `commands list` includes built-ins and any custom command files.
 fn commands_list_works() {
     let tmp = TempDir::new().unwrap();

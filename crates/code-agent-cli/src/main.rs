@@ -4505,11 +4505,14 @@ fn load_commands_for_cli(
     } else {
         code_agent_core::filesystem_skills_dir(&cwd)
     };
-    let (skill_defs, _skill_errors) = code_agent_core::load_filesystem_skills(
+    let (skill_defs, skill_errors) = code_agent_core::load_filesystem_skills(
         &skills_dir,
         code_agent_core::SkillSource::Project,
         code_agent_core::DEFAULT_MAX_SKILL_MD_BYTES,
     );
+    for e in skill_errors {
+        eprintln!("[skills] {e}");
+    }
     let mut sk = code_agent_core::SkillRegistry::new();
     for d in skill_defs {
         let _ = sk.register(d);
