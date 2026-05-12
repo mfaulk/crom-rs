@@ -295,6 +295,7 @@ dependencies = [
  "code-agent-mcp",
  "code-agent-provider-gemini",
  "code-agent-provider-openai",
+ "code-agent-sdk",
  "code-agent-session",
  "code-agent-tools",
  "code-agent-tui",
@@ -380,6 +381,37 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+]
+
+[[package]]
+name = "code-agent-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "code-agent-anthropic",
+ "code-agent-auth",
+ "code-agent-checkpoint",
+ "code-agent-core",
+ "code-agent-provider-gemini",
+ "code-agent-provider-openai",
+ "code-agent-tools",
+ "futures",
+ "globset",
+ "hex",
+ "ignore",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

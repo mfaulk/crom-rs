@@ -2,6 +2,7 @@ mod auth_cmd;
 mod m9;
 mod plan_cmd;
 mod plugins;
+mod sdk_cmd;
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -159,6 +160,9 @@ enum Command {
     /// M11: manage plans (list/show/approve/reject/revise/diff/archive/export).
     #[command(subcommand)]
     Plans(plan_cmd::PlansCommand),
+    /// M12: run a coding task through the embeddable SDK (no TUI, no
+    /// interactive auth, conservative side-effect defaults).
+    HeadlessRun(sdk_cmd::HeadlessRunArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -1430,6 +1434,7 @@ async fn main() -> ExitCode {
                     .unwrap_or_default();
             plan_cmd::cmd_plans(&settings, cmd).await
         }
+        Command::HeadlessRun(args) => sdk_cmd::cmd_headless_run(args).await,
     };
 
     match result {

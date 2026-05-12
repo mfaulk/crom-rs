@@ -1,0 +1,111 @@
+[package]
+name = "code-agent-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Embeddable headless Rust SDK for code-agent."
+
+[features]
+default = ["filesystem-workspace", "in-memory-workspace", "anthropic", "planning"]
+
+# Core feature flags
+filesystem-workspace = []
+in-memory-workspace = []
+planning = []
+fake-provider = []
+
+# Optional provider integrations. The SDK exposes provider-config helpers
+# only when the corresponding feature is enabled.
+anthropic = ["dep:code-agent-anthropic"]
+openai = ["dep:code-agent-provider-openai"]
+gemini = ["dep:code-agent-provider-gemini"]
+
+# Optional subsystems
+mcp = []
+plugins = []
+skills = []
+subagents = []
+checkpointing = ["dep:code-agent-checkpoint"]
+
+# Deliberately empty stubs: the SDK NEVER depends on CLI or TUI code.
+# These flags exist so consumers can audit/build with explicit
+# "no-cli/no-tui" expectations and so future migrations can hang
+# adapters off these flags.
+cli = []
+tui = []
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+similar = { workspace = true }
+time = { workspace = true }
+globset = { workspace = true }
+ignore = { workspace = true }
+regex = { workspace = true }
+
+code-agent-core = { workspace = true }
+code-agent-auth = { workspace = true }
+code-agent-tools = { workspace = true }
+
+# Optional provider integrations
+code-agent-anthropic = { workspace = true, optional = true }
+code-agent-provider-openai = { workspace = true, optional = true }
+code-agent-provider-gemini = { workspace = true, optional = true }
+code-agent-checkpoint = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Each example below requires the fake-provider feature for an offline
+# build. Run with: `cargo run --example <name> --features fake-provider -p code-agent-sdk`
+[[example]]
+name = "simple_patch"
+required-features = ["fake-provider"]
+
+[[example]]
+name = "in_memory_workspace"
+required-features = ["fake-provider"]
+
+[[example]]
+name = "plan_then_act"
+required-features = ["fake-provider"]
+
+[[example]]
+name = "web_service"
+required-features = ["fake-provider"]
+
+[[example]]
+name = "custom_tool"
+required-features = ["fake-provider"]
+
+[[example]]
+name = "approval_callback"
+required-features = ["fake-provider"]
+
+[[example]]
+name = "cancel_run"
+required-features = ["fake-provider"]
+
+[[example]]
+name = "noop_storage"
+required-features = ["fake-provider"]
+
+[[example]]
+name = "fake_provider"
+required-features = ["fake-provider"]
