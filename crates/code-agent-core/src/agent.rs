@@ -1768,10 +1768,12 @@ pub(crate) async fn run_loop(
         // before an earlier call's future resolves.
         let mut tool_result_blocks: Vec<ContentBlock> = Vec::with_capacity(tool_calls.len());
         for (idx, call) in tool_calls.iter().enumerate() {
-            let pending = pending_results[idx].take().unwrap_or_else(|| PendingResult {
-                body: "Tool result missing".to_string(),
-                is_error: true,
-            });
+            let pending = pending_results[idx]
+                .take()
+                .unwrap_or_else(|| PendingResult {
+                    body: "Tool result missing".to_string(),
+                    is_error: true,
+                });
             push_tool_result_user(
                 &tx,
                 &session_sink,

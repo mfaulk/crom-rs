@@ -334,11 +334,8 @@ async fn failed_discovery_surfaces_drained_logs() {
         report.statuses[0]
     );
     assert!(
-        report
-            .logs
-            .iter()
-            .any(|(name, entry)| name == "broken"
-                && entry.message.contains("synthetic discovery failure log")),
+        report.logs.iter().any(|(name, entry)| name == "broken"
+            && entry.message.contains("synthetic discovery failure log")),
         "failure-path logs must propagate to the report; got: {:?}",
         report.logs
     );
