@@ -9,7 +9,7 @@ pub mod resources;
 pub mod tools;
 pub mod transport;
 
-pub use client::{McpClient, McpServerInit};
+pub use client::{McpClient, McpServerInit, MCP_MAX_LIST_PAGES};
 pub use config::{
     load_mcp_options, merge_mcp_options, redact_json_value, redact_text_with_secrets,
     redact_value_with_secrets, McpConfigFile, McpExternalEffectPolicy, McpLimits, McpOptions,
