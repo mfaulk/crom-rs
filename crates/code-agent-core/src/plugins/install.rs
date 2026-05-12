@@ -46,6 +46,16 @@ pub enum PluginInstallError {
     },
     #[error("plugin {name} is not installed in scope {scope:?}")]
     NotInstalled { name: String, scope: PluginScope },
+    #[error(
+        "install failed (primary: {primary}) and rollback also failed ({rollback}); \
+         previous version was preserved at {backup_path} — restore it manually"
+    )]
+    RollbackFailed {
+        #[source]
+        primary: std::io::Error,
+        rollback: std::io::Error,
+        backup_path: PathBuf,
+    },
 }
 
 /// Where the install/registry helpers expect to read and write plugin
@@ -195,7 +205,13 @@ pub fn install_to_cache(
         .canonicalize()
         .unwrap_or_else(|_| source_dir.to_path_buf());
     if let Err(e) = copy_dir_recursive(source_dir, &staging, &canonical_source) {
-        let _ = std::fs::remove_dir_all(&staging);
+        if let Err(cleanup_err) = std::fs::remove_dir_all(&staging) {
+            tracing::warn!(
+                path = %staging.display(),
+                error = %cleanup_err,
+                "plugin install: failed to clean up staging directory after copy error"
+            );
+        }
         return Err(PluginInstallError::Io {
             path: staging,
             source: e,
@@ -210,7 +226,13 @@ pub fn install_to_cache(
     let backup = staging_dir(&target.with_extension("backup"));
     let backup_existed = if target.exists() {
         if let Err(e) = std::fs::rename(&target, &backup) {
-            let _ = std::fs::remove_dir_all(&staging);
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&staging) {
+                tracing::warn!(
+                    path = %staging.display(),
+                    error = %cleanup_err,
+                    "plugin install: failed to clean up staging directory after backup rename error"
+                );
+            }
             return Err(PluginInstallError::Io {
                 path: target.clone(),
                 source: e,
@@ -222,18 +244,52 @@ pub fn install_to_cache(
     };
     if let Err(e) = std::fs::rename(&staging, &target) {
         // Try to roll back the backup so the previous install is
-        // restored.
+        // restored. If the rollback itself fails, surface a dedicated
+        // error variant so the operator can recover the previous
+        // install manually from the backup path.
         if backup_existed {
-            let _ = std::fs::rename(&backup, &target);
+            if let Err(rollback_err) = std::fs::rename(&backup, &target) {
+                tracing::error!(
+                    backup_path = %backup.display(),
+                    target = %target.display(),
+                    primary = %e,
+                    rollback = %rollback_err,
+                    "plugin install: rollback rename failed; previous version preserved at backup path"
+                );
+                if let Err(cleanup_err) = std::fs::remove_dir_all(&staging) {
+                    tracing::warn!(
+                        path = %staging.display(),
+                        error = %cleanup_err,
+                        "plugin install: failed to clean up staging directory after rollback error"
+                    );
+                }
+                return Err(PluginInstallError::RollbackFailed {
+                    primary: e,
+                    rollback: rollback_err,
+                    backup_path: backup,
+                });
+            }
         }
-        let _ = std::fs::remove_dir_all(&staging);
+        if let Err(cleanup_err) = std::fs::remove_dir_all(&staging) {
+            tracing::warn!(
+                path = %staging.display(),
+                error = %cleanup_err,
+                "plugin install: failed to clean up staging directory after rename error"
+            );
+        }
         return Err(PluginInstallError::Io {
             path: target.clone(),
             source: e,
         });
     }
     if backup_existed {
-        let _ = std::fs::remove_dir_all(&backup);
+        if let Err(e) = std::fs::remove_dir_all(&backup) {
+            tracing::warn!(
+                path = %backup.display(),
+                error = %e,
+                "plugin install: failed to remove backup directory after successful swap"
+            );
+        }
     }
     // Ensure the data dir exists once after install so plugins that rely
     // on `${CODE_AGENT_PLUGIN_DATA}` can find it on first run.
@@ -384,16 +440,29 @@ pub fn remove_data_dir(layout: &PluginInstallLayout, name: &str) -> Result<(), P
     Ok(())
 }
 
+/// Outcome of a [`prune_orphans`] run. `removed` only contains entries
+/// whose deletion actually succeeded (or would have succeeded under
+/// `dry_run`). Entries whose `remove_dir_all`/`remove_dir` call returned
+/// an `io::Error` are reported in `failed` with the original error so
+/// callers can surface the failure to the operator instead of silently
+/// claiming the cache is clean.
+#[derive(Debug, Default)]
+pub struct PruneOutcome {
+    pub removed: Vec<(String, Option<String>)>,
+    pub failed: Vec<(String, Option<String>, std::io::Error)>,
+}
+
 /// Walk the cache directory and remove plugin entries that are not in
-/// `keep`. Returns the list of removed `(name, version)` pairs.
+/// `keep`. Returns the [`PruneOutcome`] partitioning successful removals
+/// from per-entry deletion failures.
 pub fn prune_orphans(
     layout: &PluginInstallLayout,
     keep: &[(String, Option<String>)],
     dry_run: bool,
-) -> Result<Vec<(String, Option<String>)>, PluginInstallError> {
-    let mut removed = Vec::new();
+) -> Result<PruneOutcome, PluginInstallError> {
+    let mut outcome = PruneOutcome::default();
     if !layout.cache_root.exists() {
-        return Ok(removed);
+        return Ok(outcome);
     }
     let entries = std::fs::read_dir(&layout.cache_root).map_err(|e| PluginInstallError::Io {
         path: layout.cache_root.clone(),
@@ -442,16 +511,32 @@ pub fn prune_orphans(
                 any_kept = true;
                 continue;
             }
-            removed.push((plugin_name.clone(), version_opt.clone()));
-            if !dry_run {
-                let _ = std::fs::remove_dir_all(&ver_path);
+            // Attempt the deletion FIRST so we only report what was
+            // actually removed. On dry_run we just record the intent.
+            if dry_run {
+                outcome.removed.push((plugin_name.clone(), version_opt));
+            } else {
+                match std::fs::remove_dir_all(&ver_path) {
+                    Ok(()) => {
+                        outcome.removed.push((plugin_name.clone(), version_opt));
+                    }
+                    Err(e) => {
+                        // Treat a failed delete as a "kept" entry so we
+                        // don't subsequently try to remove the parent
+                        // directory (which would also fail).
+                        any_kept = true;
+                        outcome.failed.push((plugin_name.clone(), version_opt, e));
+                    }
+                }
             }
         }
         if !dry_run && !any_kept {
-            let _ = std::fs::remove_dir(&plugin_path);
+            if let Err(e) = std::fs::remove_dir(&plugin_path) {
+                outcome.failed.push((plugin_name.clone(), None, e));
+            }
         }
     }
-    Ok(removed)
+    Ok(outcome)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path, canonical_root: &Path) -> std::io::Result<()> {
@@ -561,17 +646,106 @@ mod tests {
         install_to_cache(&plugin_dir, &layout, &manifest, false).unwrap();
         // Pretend a second version was previously installed.
         std::fs::create_dir_all(layout.cache_root.join("my-plugin").join("9.9.9")).unwrap();
-        let removed = prune_orphans(
+        let outcome = prune_orphans(
             &layout,
             &[("my-plugin".into(), Some("0.1.0".into()))],
             false,
         )
         .unwrap();
         assert_eq!(
-            removed,
+            outcome.removed,
             vec![("my-plugin".to_string(), Some("9.9.9".to_string()))]
         );
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
         assert!(!layout.cache_root.join("my-plugin").join("9.9.9").exists());
+    }
+
+    #[test]
+    // Static assertion: the new RollbackFailed variant exists with the
+    // expected fields (primary, rollback, backup_path) and threads the
+    // primary `io::Error` through as the error `source()`. We can't
+    // easily simulate `rename(&backup, &target)` failing in a portable
+    // way, so construct the variant directly and verify shape +
+    // formatting + source chain.
+    fn rollback_failed_variant_carries_both_errors_and_backup_path() {
+        use std::error::Error;
+
+        let primary = std::io::Error::other("primary");
+        let rollback = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "rollback");
+        let backup_path = PathBuf::from("/tmp/some-backup");
+        let err = PluginInstallError::RollbackFailed {
+            primary,
+            rollback,
+            backup_path: backup_path.clone(),
+        };
+        // Display mentions the backup path so the operator knows where
+        // to recover from.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("/tmp/some-backup"),
+            "expected backup path in display; got: {rendered}"
+        );
+        assert!(rendered.contains("rollback also failed"));
+        // The `source()` chain exposes the primary IO error (per
+        // #[source] on `primary`).
+        let source = err.source().expect("expected source");
+        assert!(
+            source.to_string().contains("primary"),
+            "expected primary in source chain; got: {source}"
+        );
+    }
+
+    #[test]
+    // Happy-path install still works end-to-end after the rollback
+    // wiring changes (regression guard for #59).
+    fn install_to_cache_happy_path_with_rollback_wiring() {
+        let work = TempDir::new().unwrap();
+        let plugin_dir = write_plugin(work.path(), "my-plugin", Some("0.1.0"));
+        std::fs::write(plugin_dir.join("README.md"), "hi").unwrap();
+        let layout = PluginInstallLayout::project(work.path());
+        let manifest = parse_and_validate_source(&plugin_dir, false, false).unwrap();
+        let cache = install_to_cache(&plugin_dir, &layout, &manifest, false).unwrap();
+        assert!(cache.join("README.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // When `remove_dir_all` fails (here: the version dir's parent is
+    // chmod'd read+execute only so the inode cannot be unlinked), the
+    // entry must NOT appear in `outcome.removed`. It MUST appear in
+    // `outcome.failed` with the original IO error so the operator can
+    // see the cache state is not actually clean.
+    fn prune_reports_failed_removal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = TempDir::new().unwrap();
+        let layout = PluginInstallLayout::project(work.path());
+        // Build an orphan version dir manually so it has no special
+        // permission setup.
+        let parent = layout.cache_root.join("my-plugin");
+        let ver = parent.join("9.9.9");
+        std::fs::create_dir_all(&ver).unwrap();
+        std::fs::write(ver.join("file"), "x").unwrap();
+
+        // Lock the parent so `remove_dir_all` on `ver` fails (can't
+        // unlink children when the parent is not writable).
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = prune_orphans(&layout, &[], false).unwrap();
+
+        // Restore perms so TempDir can clean up at drop time.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            outcome.removed.is_empty(),
+            "should not have claimed to remove anything: {:?}",
+            outcome.removed
+        );
+        assert_eq!(outcome.failed.len(), 1, "{:?}", outcome.failed);
+        let (n, v, _err) = &outcome.failed[0];
+        assert_eq!(n, "my-plugin");
+        assert_eq!(v.as_deref(), Some("9.9.9"));
+        assert!(ver.exists(), "the version dir should still exist on disk");
     }
 
     #[test]
