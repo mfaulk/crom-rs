@@ -76,11 +76,15 @@ impl Hook for BlockEnvFileWritesHook {
 /// over-broad. False positives are preferred over false negatives.
 pub fn dangerous_bash_patterns() -> &'static [&'static str] {
     &[
-        // `rm` with `-r` and `-f` combined or in either order, including
-        // flag-order swap `rm -fr`, merged `rm -rf`, or split flags
-        // `rm -r -f` / `rm -f -r`. Targets the literal `/` root or `*`
-        // glob expansion. The earlier pattern only matched `-rf` exactly.
-        r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*|-r\s+-f|-f\s+-r)\b",
+        // `rm` with BOTH `-r` and `-f` set, combined or split in either
+        // order (`-rf`, `-fr`, `-r -f`, `-f -r`), AND a dangerous target.
+        // Dangerous targets are: literal `/`, `~`/`$HOME`/`${HOME}`, a
+        // bare or path-leading `*` glob, and system-root directories
+        // (`/etc`, `/var`, `/usr`, `/bin`, `/sbin`, `/boot`, `/lib`,
+        // `/dev`). Without the target constraint the pattern blocked
+        // benign cleanup like `rm -rf /tmp/build-cache` and
+        // `rm -rf target/`.
+        r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*|-r[a-zA-Z]*\s+-[a-zA-Z]*f[a-zA-Z]*|-f[a-zA-Z]*\s+-[a-zA-Z]*r[a-zA-Z]*)(?:\s+-[a-zA-Z]+)*\s+(?:/(?:\s|$)|~(?:/?(?:\s|$|\*))|\$\{?HOME\}?(?:\s|/|$)|\*(?:\s|$)|/\*|/(?:etc|var|usr|bin|sbin|boot|lib|dev)(?:/|\s|$))",
         // `sudo` at start of command or as a standalone token.
         r"(^|\s)sudo(\s|$)",
         // `curl`/`wget` whose output is piped to a shell. Looks for
@@ -89,10 +93,13 @@ pub fn dangerous_bash_patterns() -> &'static [&'static str] {
         // pipe, which missed `wget -qO- url | sh` (the `-qO-` token
         // contains a `|`-adjacent dash that broke `[^|]*`).
         r"\b(?:curl|wget)\b.*\|\s*(?:sh|bash|zsh|fish)\b",
-        // `chmod` with `-R` and a permissive numeric mode in either
-        // order, e.g. `chmod -R 777 dir` and `chmod 777 -R dir`.
-        // Catches 666/777/etc. (any mode with a 7 or 6 in any digit).
-        r"\bchmod\s+(?:-R\s+0?[0-7]*[67][0-7]*|0?[0-7]*[67][0-7]*\s+-R)\b",
+        // `chmod -R` (in either flag/mode order) with a permissive mode
+        // — i.e. one whose last (world) octet has the write bit set.
+        // The world digit must be in `{2, 3, 6, 7}`. Modes whose write
+        // bit lives in the user/group octets (e.g. `644`, `755`) are
+        // not flagged; the earlier `[67]` anywhere-in-mode rule
+        // misfired on `644` because the `6` matched the user octet.
+        r"\bchmod\s+(?:-R\s+0?[0-7]{2}[2367]\b|0?[0-7]{2}[2367]\s+-R\b)",
         // `eval` invoking command substitution: `eval "$(...)"` or
         // `eval \`...\``. Bypasses any pattern that only inspects the
         // outer command name.
@@ -795,21 +802,85 @@ mod dangerous_bash_bypass_regression {
     }
 
     #[tokio::test]
-    // Bypass: `rm -r -f /` uses split flags to evade the merged `-rf` pattern.
-    async fn blocks_rm_r_then_f_split() {
-        assert_blocked("rm -r -f /tmp").await;
+    // Bypass: split `-r -f` against the root must still be blocked.
+    async fn blocks_rm_r_then_f_split_against_root() {
+        assert_blocked("rm -r -f /").await;
     }
 
     #[tokio::test]
-    // Bypass: `rm -f -r` (reverse split) must still be blocked.
-    async fn blocks_rm_f_then_r_split() {
-        assert_blocked("rm -f -r /tmp").await;
+    // Bypass: reverse split `-f -r` against the root must still be blocked.
+    async fn blocks_rm_f_then_r_split_against_root() {
+        assert_blocked("rm -f -r /").await;
+    }
+
+    #[tokio::test]
+    // `rm -rf ~/` deletes the user's home directory tree.
+    async fn blocks_rm_rf_tilde() {
+        assert_blocked("rm -rf ~/").await;
+    }
+
+    #[tokio::test]
+    // `rm -rf $HOME` resolves to the user's home and must be blocked.
+    async fn blocks_rm_rf_home_envvar() {
+        assert_blocked("rm -rf $HOME").await;
+    }
+
+    #[tokio::test]
+    // `rm -rf /etc` (a system root directory) must be blocked.
+    async fn blocks_rm_rf_etc() {
+        assert_blocked("rm -rf /etc").await;
+    }
+
+    #[tokio::test]
+    // Cleanup of a project temp dir must NOT be blocked — the previous
+    // pattern over-matched on any `rm -rf` regardless of target.
+    async fn allows_rm_rf_tmp_build_cache() {
+        assert_allowed("rm -rf /tmp/build-cache").await;
+    }
+
+    #[tokio::test]
+    // `rm -rf target/` (cargo build output) must not be blocked.
+    async fn allows_rm_rf_target_dir() {
+        assert_allowed("rm -rf target/").await;
+    }
+
+    #[tokio::test]
+    // `rm -rf node_modules` must not be blocked.
+    async fn allows_rm_rf_node_modules() {
+        assert_allowed("rm -rf node_modules").await;
     }
 
     #[tokio::test]
     // Bypass: `chmod 777 -R …` puts the mode before the recursive flag.
     async fn blocks_chmod_mode_before_recursive_flag() {
         assert_blocked("chmod 777 -R /etc").await;
+    }
+
+    #[tokio::test]
+    // World-writable + executable recursive chmod must be blocked.
+    async fn blocks_chmod_r_666() {
+        assert_blocked("chmod -R 666 dir").await;
+    }
+
+    #[tokio::test]
+    // World-writable recursive chmod must be blocked (last octet has
+    // the write bit).
+    async fn blocks_chmod_r_777() {
+        assert_blocked("chmod -R 777 dir").await;
+    }
+
+    #[tokio::test]
+    // Recursive 644 is benign (only owner has write) — earlier pattern
+    // mistakenly flagged any mode containing a `6` anywhere.
+    async fn allows_chmod_r_644() {
+        assert_allowed("chmod -R 644 dir").await;
+    }
+
+    #[tokio::test]
+    // Recursive 755 is benign (executable but world-readable only) —
+    // earlier pattern flagged it because of the `7` in the user octet.
+    async fn allows_chmod_r_755() {
+        assert_allowed("chmod -R 755 dir").await;
     }
 
     #[tokio::test]

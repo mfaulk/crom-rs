@@ -979,6 +979,16 @@ enum LogFormat {
     Json,
 }
 
+/// Known explicit-form rule tags.
+///
+/// Used by [`parse_cli_rule`] to decide whether a `Tool::<tag>:rest`
+/// string is an explicit-form rule. Any `::<token>:` whose token is NOT
+/// in this set falls through to the legacy `Tool:rest` parser, so a
+/// legacy value like `Bash:^foo::bar$` (a regex containing `::`) or
+/// `Edit:foo::bar` (a glob containing `::`) is preserved verbatim
+/// instead of being rejected with a "missing tag value" error.
+const KNOWN_RULE_TAGS: &[&str] = &["regex", "glob", "mcp_tool_glob", "agent_name"];
+
 /// Parse a `--yes-to` / `--deny` rule string into a [`ToolRule`].
 ///
 /// Recognized forms (first match wins):
@@ -991,47 +1001,60 @@ enum LogFormat {
 ///   * `Bash:<re>`                         → `BashCommandRegex` (back-compat)
 ///   * `Tool:<glob>` (non-Bash)            → `FilePathGlob`  (back-compat)
 ///
-/// The explicit `Tool::<tag>:rest` form is the preferred syntax: it makes
-/// the intended ToolRule variant unambiguous and is required to address
-/// non-Bash tools with non-path-glob variants. The earlier code treated
-/// every `Tool:rest` form as `FilePathGlob`, which silently downgraded
-/// any user attempt to set, e.g., an MCP rule on the CLI.
+/// The explicit `Tool::<tag>:rest` form is opt-in by exact tag name from
+/// [`KNOWN_RULE_TAGS`]. Strings that contain `::` but do NOT have the
+/// shape `<Tool>::<known_tag>:<rest>` fall through to the legacy
+/// `Tool:rest` parser so values like `Bash:^foo::bar$` (regex with `::`)
+/// or `Edit:foo::bar` (glob with `::`) keep working unchanged.
+///
+/// The explicit form is the preferred syntax: it makes the intended
+/// ToolRule variant unambiguous and is required to address non-Bash
+/// tools with non-path-glob variants. The earlier code treated every
+/// `Tool:rest` form as `FilePathGlob`, which silently downgraded any
+/// user attempt to set, e.g., an MCP rule on the CLI.
 fn parse_cli_rule(s: &str) -> Result<ToolRule> {
     let err = |e: String| anyhow!("--yes-to/--deny rule {s:?}: {e}");
 
-    // Explicit `Tool::<tag>:rest` form. Look for `::` before any single
-    // `:`; if found, the prefix-before-`::` is the tool/server name and
-    // the next `:`-delimited token is the variant tag.
+    // Explicit `Tool::<known_tag>:rest` form. We require BOTH the `::`
+    // separator AND a known tag name immediately after it, followed by
+    // a `:` and the rest. Any other shape — `::` without a following
+    // `:`, or `::` followed by an unknown token — falls through to the
+    // legacy `Tool:rest` parser so existing patterns continue to parse.
     if let Some((tool, after_double)) = s.split_once("::") {
-        if tool.is_empty() {
-            return Err(err("empty tool name before `::`".into()));
+        if !tool.is_empty() {
+            if let Some((tag, rest)) = after_double.split_once(':') {
+                if KNOWN_RULE_TAGS.contains(&tag) {
+                    return match tag {
+                        "regex" => {
+                            if tool != "Bash" {
+                                return Err(err(format!(
+                                    "::regex: is only valid with tool=Bash, got tool={tool:?}"
+                                )));
+                            }
+                            ToolRule::try_bash_command_regex(rest).map_err(err)
+                        }
+                        "glob" => ToolRule::try_file_path_glob(tool, rest).map_err(err),
+                        "mcp_tool_glob" => ToolRule::try_mcp_server_glob(tool, rest).map_err(err),
+                        "agent_name" => {
+                            if tool != "Agent" {
+                                return Err(err(format!(
+                                    "::agent_name: is only valid with tool=Agent, got tool={tool:?}"
+                                )));
+                            }
+                            ToolRule::try_agent_name_glob(rest).map_err(err)
+                        }
+                        // KNOWN_RULE_TAGS gates the match; any value here is
+                        // a programmer error in the table, not user input.
+                        other => Err(err(format!("internal: unhandled known tag `{other}`"))),
+                    };
+                }
+                // Unknown tag — fall through to legacy parsing below.
+            }
+            // `::` without a following `:` — fall through to legacy.
         }
-        let (tag, rest) = after_double
-            .split_once(':')
-            .ok_or_else(|| err(format!("missing tag value after `{}::<tag>:`", tool)))?;
-        return match tag {
-            "regex" => {
-                if tool != "Bash" {
-                    return Err(err(format!(
-                        "::regex: is only valid with tool=Bash, got tool={tool:?}"
-                    )));
-                }
-                ToolRule::try_bash_command_regex(rest).map_err(err)
-            }
-            "glob" => ToolRule::try_file_path_glob(tool, rest).map_err(err),
-            "mcp_tool_glob" => ToolRule::try_mcp_server_glob(tool, rest).map_err(err),
-            "agent_name" => {
-                if tool != "Agent" {
-                    return Err(err(format!(
-                        "::agent_name: is only valid with tool=Agent, got tool={tool:?}"
-                    )));
-                }
-                ToolRule::try_agent_name_glob(rest).map_err(err)
-            }
-            other => Err(err(format!(
-                "unknown rule tag `::{other}:` (valid: regex, glob, mcp_tool_glob, agent_name)"
-            ))),
-        };
+        // Empty tool name before `::` — fall through to legacy, where
+        // a leading `:` will surface as an empty-tool error from the
+        // legacy parser if the value is otherwise malformed.
     }
 
     // Back-compat: `Tool:rest`. Bash → BashCommandRegex, everything else
@@ -1177,15 +1200,47 @@ mod parse_cli_rule_tests {
     }
 
     #[test]
-    // Unknown tag in `Tool::<tag>:rest` must produce a parse error that
-    // names the bad tag, instead of silently degrading.
-    fn unknown_tag_errors() {
-        let err = parse_cli_rule("Edit::xyzzy:foo").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("unknown rule tag") && msg.contains("xyzzy"),
-            "expected error naming unknown tag; got: {msg}"
-        );
+    // Unknown tag in `Tool::<tag>:rest` falls through to legacy
+    // `Tool:rest` parsing so values with `::` embedded in a regex or
+    // glob (e.g. `Edit:foo::bar`, `Bash:^foo::bar$`) still parse. The
+    // earlier behaviour rejected any `::`-containing string, which
+    // regressed previously-valid CLI invocations.
+    fn unknown_tag_falls_through_to_legacy() {
+        let r = parse_cli_rule("Edit::xyzzy:foo").unwrap();
+        match r {
+            ToolRule::FilePathGlob { tool, pattern } => {
+                assert_eq!(tool, "Edit");
+                // Legacy parser sees `Edit:` + the remainder, which
+                // starts with the second `:` of `::`.
+                assert_eq!(pattern, ":xyzzy:foo");
+            }
+            other => panic!("expected FilePathGlob fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // Back-compat: a legacy Bash regex that happens to contain `::`
+    // must parse as BashCommandRegex with the `::` preserved verbatim.
+    fn bash_legacy_regex_with_double_colon_preserved() {
+        let r = parse_cli_rule("Bash:^foo::bar$").unwrap();
+        match r {
+            ToolRule::BashCommandRegex(re) => assert_eq!(re, "^foo::bar$"),
+            other => panic!("expected BashCommandRegex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // Back-compat: a legacy Edit glob that happens to contain `::`
+    // must parse as FilePathGlob with the `::` preserved verbatim.
+    fn edit_legacy_glob_with_double_colon_preserved() {
+        let r = parse_cli_rule("Edit:foo::bar").unwrap();
+        match r {
+            ToolRule::FilePathGlob { tool, pattern } => {
+                assert_eq!(tool, "Edit");
+                assert_eq!(pattern, "foo::bar");
+            }
+            other => panic!("expected FilePathGlob, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1229,15 +1284,41 @@ mod parse_cli_rule_tests {
     }
 
     #[test]
-    // Missing value after the tag (`Edit::glob:` with empty rest) must
-    // produce a parse error from the underlying validator.
-    fn missing_value_after_tag_errors() {
-        let err = parse_cli_rule("Edit::glob").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("missing tag value"),
-            "expected missing-value error; got: {msg}"
-        );
+    // `Edit::glob` (no `:` after the tag) does not match the strict
+    // explicit-form shape, so it falls through to legacy `Edit:rest`
+    // parsing: pattern=`:glob`.
+    fn explicit_tag_without_rest_falls_through_to_legacy() {
+        let r = parse_cli_rule("Edit::glob").unwrap();
+        match r {
+            ToolRule::FilePathGlob { tool, pattern } => {
+                assert_eq!(tool, "Edit");
+                assert_eq!(pattern, ":glob");
+            }
+            other => panic!("expected FilePathGlob fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // `Bash::regex:^cargo` still routes through the explicit-tag
+    // branch and produces a BashCommandRegex.
+    fn explicit_bash_regex_still_parses() {
+        let r = parse_cli_rule("Bash::regex:^cargo").unwrap();
+        match r {
+            ToolRule::BashCommandRegex(re) => assert_eq!(re, "^cargo"),
+            other => panic!("expected BashCommandRegex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // `Bash::unknown_tag:rest` falls through to legacy `Bash:rest`
+    // parsing — the explicit form is opt-in by known tag only, so
+    // unknown tokens after `::` do not hijack legacy syntax.
+    fn bash_unknown_tag_falls_through_to_legacy_bash_regex() {
+        let r = parse_cli_rule("Bash::unknown_tag:rest").unwrap();
+        match r {
+            ToolRule::BashCommandRegex(re) => assert_eq!(re, ":unknown_tag:rest"),
+            other => panic!("expected BashCommandRegex fallback, got {other:?}"),
+        }
     }
 }
 
@@ -6331,9 +6412,11 @@ mod classify_bash_risk_tests {
     }
 
     #[test]
-    // Bypass: split `-r -f` flags must be classified High.
+    // Bypass: split `-r -f` flags against the root must be classified
+    // High. `/tmp` is a benign cleanup target and was removed when the
+    // dangerous-target gate landed.
     fn rm_r_then_f_split_is_high() {
-        high("rm -r -f /tmp");
+        high("rm -r -f /");
     }
 
     #[test]
