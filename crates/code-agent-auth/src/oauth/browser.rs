@@ -655,8 +655,7 @@ mod tests {
 
     fn send_raw_request(port: u16, request: &str) -> std::net::TcpStream {
         use std::net::TcpStream;
-        let mut stream =
-            TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).unwrap();
+        let mut stream = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).unwrap();
         stream.write_all(request.as_bytes()).unwrap();
         stream.flush().unwrap();
         stream
