@@ -669,6 +669,124 @@ async fn multiple_tool_calls_run_in_parallel() {
     assert_eq!(final_result(&events).subtype, ResultSubtype::Success);
 }
 
+/// A `Mutating` tool that records `(name, "start"|"end")` events in a shared
+/// log around a 300ms sleep so a test can detect overlap between concurrent
+/// invocations.
+struct TracingMutatingTool {
+    name: &'static str,
+    duration: Duration,
+    log: Arc<Mutex<Vec<(String, &'static str)>>>,
+}
+
+#[async_trait]
+impl Tool for TracingMutatingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "mutating tool that logs start/end"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type": "object"})
+    }
+    fn permission_kind(&self) -> PermissionKind {
+        PermissionKind::Mutating
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push((self.name.to_string(), "start"));
+        tokio::time::sleep(self.duration).await;
+        self.log
+            .lock()
+            .unwrap()
+            .push((self.name.to_string(), "end"));
+        Ok(ToolResult::ok_text("done"))
+    }
+}
+
+#[tokio::test]
+// Mutating tool calls in a single turn must serialize (not race): with two
+// 300ms `Mutating` tools the trace must show tool 1 fully complete before
+// tool 2 starts. Parallelizing them would interleave start/end and risk
+// races on overlapping file state or process state.
+async fn mutating_tool_calls_run_sequentially_within_turn() {
+    let log = Arc::new(Mutex::new(Vec::<(String, &'static str)>::new()));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ModelEvent::ToolCall(code_agent_core::ToolCall {
+                id: "t1".into(),
+                name: "Mut1".into(),
+                input: json!({}),
+            }),
+            ModelEvent::ToolCall(code_agent_core::ToolCall {
+                id: "t2".into(),
+                name: "Mut2".into(),
+                input: json!({}),
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ],
+        vec![
+            ModelEvent::TextDelta { text: "ok".into() },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            },
+        ],
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(TracingMutatingTool {
+        name: "Mut1",
+        duration: Duration::from_millis(300),
+        log: log.clone(),
+    }));
+    tools.register(Arc::new(TracingMutatingTool {
+        name: "Mut2",
+        duration: Duration::from_millis(300),
+        log: log.clone(),
+    }));
+    let opts = AgentOptions {
+        max_turns: Some(4),
+        allowed_tools: vec!["Mut1".into(), "Mut2".into()],
+        permission_mode: PermissionMode::AcceptEdits,
+        permission_callback: Some(Arc::new(AlwaysAllow)),
+        ..AgentOptions::default()
+    };
+
+    let _ = run(provider, opts, tools, "go").await;
+
+    let trace = log.lock().unwrap().clone();
+    assert_eq!(
+        trace.len(),
+        4,
+        "expected start/end for each mutating tool: {trace:?}"
+    );
+    assert_eq!(
+        trace[0].1, "start",
+        "first event must be a start: {trace:?}"
+    );
+    assert_eq!(
+        trace[1].1, "end",
+        "mutating tools must not overlap; expected end before next start: {trace:?}"
+    );
+    assert_eq!(
+        trace[0].0, trace[1].0,
+        "the second event must end the same tool that started: {trace:?}"
+    );
+    assert_ne!(
+        trace[0].0, trace[2].0,
+        "the second mutating tool must be different from the first: {trace:?}"
+    );
+}
+
 /// Permission callback that denies any tool call whose tool name matches the
 /// configured target. Used to force a specific call to short-circuit while
 /// other calls in the same turn run normally.

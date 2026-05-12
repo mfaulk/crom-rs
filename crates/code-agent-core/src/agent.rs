@@ -1178,12 +1178,14 @@ pub(crate) async fn run_loop(
         }
 
         // Execute tool calls in (input) order. The model is allowed to
-        // emit multiple tool_use blocks in one turn; we dispatch each
-        // call's `tool.execute(...)` future concurrently via `join_all`
-        // so they overlap IO. Policy/checkpoint gating and event
-        // emission stay sequential for determinism. Results are paired
-        // with their original `tool_use_id` so the conversation sees the
-        // model's input order.
+        // emit multiple tool_use blocks in one turn. Read-only tools
+        // (`PermissionKind::ReadOnly`) can safely overlap their IO and
+        // run concurrently via `join_all`. Mutating, Execution,
+        // External, and Orchestration tools may race on overlapping
+        // files, child processes, MCP server state, or other shared
+        // resources, so they are partitioned out and run strictly
+        // sequentially within the turn. Policy/checkpoint gating and
+        // event emission stay sequential for determinism.
         //
         // Per-call result body slotted by input position. Filled both by
         // gate-loop short-circuits (denials) and by the post-execute
@@ -1212,7 +1214,8 @@ pub(crate) async fn run_loop(
                 dyn std::future::Future<Output = Result<crate::tool::ToolResult, ToolError>> + Send,
             >,
         >;
-        let mut exec_futures: Vec<(usize, ExecFut)> = Vec::with_capacity(tool_calls.len());
+        let mut parallel_futures: Vec<(usize, ExecFut)> = Vec::with_capacity(tool_calls.len());
+        let mut sequential_futures: Vec<(usize, ExecFut)> = Vec::with_capacity(tool_calls.len());
         for (idx, call) in tool_calls.iter().enumerate() {
             if cfg.cancel.load(Ordering::Acquire) {
                 handle_interrupt(
@@ -1502,35 +1505,53 @@ pub(crate) async fn run_loop(
                     .await;
                 }
             }
-            // Stash the execute future so the whole batch can run
-            // concurrently. The rest of the per-call post-execute work
-            // continues to run in turn order in the second pass below.
+            // Stash the execute future. Read-only tools join the
+            // parallel batch — overlapping their IO is safe and a
+            // significant win when the model fans out several Reads or
+            // Greps in one turn. Mutating, Execution, External, and
+            // Orchestration tools fall through to the sequential batch
+            // so concurrent invocations cannot race on overlapping
+            // files, child processes, MCP server state, or other shared
+            // resources. The per-call post-execute bookkeeping is
+            // recorded once here regardless of which batch the call
+            // lands in.
             let tool_arc = tool.clone();
             let effective_input_clone = effective_input.clone();
-            exec_futures.push((
-                idx,
-                Box::pin(async move { tool_arc.execute(effective_input_clone, ctx).await })
-                    as ExecFut,
-            ));
-            // Remember per-call bookkeeping for the post-execute pass.
+            let fut: ExecFut =
+                Box::pin(async move { tool_arc.execute(effective_input_clone, ctx).await });
+            if matches!(kind, crate::permission::PermissionKind::ReadOnly) {
+                parallel_futures.push((idx, fut));
+            } else {
+                sequential_futures.push((idx, fut));
+            }
             per_call_state[idx] = Some(PerCallState {
                 effective_input: effective_input.clone(),
                 started,
             });
             continue;
         }
-        // === Parallel batch: run all `tool.execute(...)` futures concurrently.
-        let exec_results = if exec_futures.is_empty() {
+        // === Parallel batch: run all read-only `tool.execute(...)`
+        // futures concurrently. They cannot race on observable state.
+        let parallel_results = if parallel_futures.is_empty() {
             Vec::new()
         } else {
-            let (indices, futures): (Vec<_>, Vec<_>) = exec_futures.into_iter().unzip();
+            let (indices, futures): (Vec<_>, Vec<_>) = parallel_futures.into_iter().unzip();
             let results = futures::future::join_all(futures).await;
             indices.into_iter().zip(results).collect::<Vec<_>>()
         };
+        // === Sequential batch: run mutating/execution/external/
+        // orchestration tools strictly one at a time so they cannot
+        // race. Within the batch they run in original input order.
+        let mut sequential_results: Vec<(usize, Result<crate::tool::ToolResult, ToolError>)> =
+            Vec::with_capacity(sequential_futures.len());
+        for (idx, fut) in sequential_futures {
+            let res = fut.await;
+            sequential_results.push((idx, res));
+        }
         // Index results by call idx for the post-execute pass.
         let mut exec_by_idx: Vec<Option<Result<crate::tool::ToolResult, ToolError>>> =
             (0..tool_calls.len()).map(|_| None).collect();
-        for (idx, res) in exec_results {
+        for (idx, res) in parallel_results.into_iter().chain(sequential_results) {
             exec_by_idx[idx] = Some(res);
         }
         // === Post-execute pass: iterate calls in input order. For each
