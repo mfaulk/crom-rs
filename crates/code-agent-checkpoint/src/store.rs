@@ -1606,7 +1606,11 @@ mod tests {
             ids.push(cid);
         }
         let list_before = store.list_checkpoints(&sid).await.unwrap();
-        assert_eq!(list_before.len(), 4, "precondition: 4 pre-populated entries");
+        assert_eq!(
+            list_before.len(),
+            4,
+            "precondition: 4 pre-populated entries"
+        );
 
         // Make every manifest unlink fail by removing write permission on
         // the manifests directory. Unlink inside a 0o555 dir is denied.
