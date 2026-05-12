@@ -44,7 +44,7 @@ impl AuthProvider for OpenAiAuthProvider {
             ));
         }
         let account = StoredAccount {
-            account_id: AccountId::new("openai-api-key"),
+            account_id: AccountId::from_api_key("openai", key.expose()),
             provider: ProviderId::OpenAi,
             login_method: LoginMethodKind::ApiKey,
             display_email: None,
@@ -138,5 +138,28 @@ mod tests {
         let methods = provider.supported_login_methods();
         assert_eq!(methods.len(), 1);
         assert!(matches!(methods[0], LoginMethod::ApiKey));
+    }
+
+    #[tokio::test]
+    // Two distinct OpenAI API keys produce two distinct synthetic account
+    // ids so a second login does not silently overwrite the first.
+    async fn distinct_api_keys_yield_distinct_account_ids() {
+        let provider = OpenAiAuthProvider;
+        let a = provider
+            .login(
+                LoginRequest::api_key(LoginMethodKind::ApiKey, "sk-openai-a"),
+                AuthContext::default(),
+            )
+            .await
+            .unwrap();
+        let b = provider
+            .login(
+                LoginRequest::api_key(LoginMethodKind::ApiKey, "sk-openai-b"),
+                AuthContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(a.account.account_id, b.account.account_id);
+        assert!(a.account.account_id.as_str().starts_with("openai-apikey-"));
     }
 }

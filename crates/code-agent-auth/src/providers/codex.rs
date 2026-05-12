@@ -113,7 +113,7 @@ impl AuthProvider for CodexAuthProvider {
                 ));
             }
             let account = StoredAccount {
-                account_id: AccountId::new("codex-api-key"),
+                account_id: AccountId::from_api_key("codex", key.expose()),
                 provider: ProviderId::Codex,
                 login_method: LoginMethodKind::ApiKey,
                 display_email: None,
@@ -207,6 +207,29 @@ mod tests {
         let req = LoginRequest::api_key(LoginMethodKind::ApiKey, "sk-codex-1");
         let result = provider.login(req, AuthContext::default()).await.unwrap();
         assert_eq!(result.account.provider, ProviderId::Codex);
+    }
+
+    #[tokio::test]
+    // Two distinct Codex API keys produce two distinct synthetic account
+    // ids so a second login does not silently overwrite the first.
+    async fn distinct_api_keys_yield_distinct_account_ids() {
+        let provider = CodexAuthProvider::default();
+        let a = provider
+            .login(
+                LoginRequest::api_key(LoginMethodKind::ApiKey, "sk-codex-a"),
+                AuthContext::default(),
+            )
+            .await
+            .unwrap();
+        let b = provider
+            .login(
+                LoginRequest::api_key(LoginMethodKind::ApiKey, "sk-codex-b"),
+                AuthContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(a.account.account_id, b.account.account_id);
+        assert!(a.account.account_id.as_str().starts_with("codex-apikey-"));
     }
 
     #[tokio::test]

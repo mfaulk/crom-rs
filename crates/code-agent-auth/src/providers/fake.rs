@@ -138,7 +138,7 @@ impl AuthProvider for FakeAuthProvider {
         }
         Ok(LoginResult {
             account: StoredAccount {
-                account_id: AccountId::new("fake-api-key"),
+                account_id: AccountId::from_api_key("fake", key.expose()),
                 provider: ProviderId::Fake,
                 login_method: LoginMethodKind::ApiKey,
                 display_email: None,
