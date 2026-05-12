@@ -478,29 +478,37 @@ impl LocalCheckpointStore {
     /// Delete a checkpoint's manifest and its index entry. Blobs are kept
     /// (they are content-addressed and may be referenced by other
     /// checkpoints). Caller MUST hold the per-session index lock.
+    ///
+    /// Ordering invariant ("metadata first, side-effect deletes last"):
+    /// the index is loaded, validated, and atomically rewritten BEFORE
+    /// the manifest is unlinked. Reversing this order risks a dangling
+    /// index entry whose manifest is already gone: if `load_index` or
+    /// the index rewrite fails after the manifest is unlinked, the
+    /// index keeps pointing at a manifest that no longer exists and the
+    /// trim loop marches past it forever. With the current order, a
+    /// failed unlink leaves an orphaned manifest (recoverable: a re-run
+    /// of delete won't see an index entry, but a future sweep can drop
+    /// the orphan), which is strictly more recoverable than a dangling
+    /// index entry pointing at nothing.
     async fn delete_checkpoint_locked(
         &self,
         session_id: &SessionId,
         checkpoint_id: &CheckpointId,
     ) -> Result<(), CheckpointError> {
-        let manifest = self.manifest_path(session_id, checkpoint_id)?;
-        if manifest.exists() {
-            // Surface unlink failures (e.g. permission denied on the
-            // manifests dir, manifest file held open elsewhere): a silent
-            // failure here would leave the index pointing at a manifest we
-            // didn't actually remove, and the trim loop would keep
-            // marching past it forever.
-            tokio::fs::remove_file(&manifest).await?;
-        }
-        // Rewrite the index without the deleted entry. A malformed line
-        // must propagate up: silently treating it as an empty Vec would
-        // overwrite the file with empty contents and destroy retention
-        // history. Recovery is opt-in via a dedicated path.
+        // 1. Load + validate the index. A malformed line must propagate
+        //    up: silently treating it as an empty Vec would overwrite
+        //    the file with empty contents and destroy retention history.
+        //    Recovery is opt-in via a dedicated path.
         let entries = self.load_index(session_id).await?;
         let kept: Vec<IndexEntry> = entries
             .into_iter()
             .filter(|e| e.checkpoint_id != *checkpoint_id)
             .collect();
+
+        // 2. Atomically rewrite the index WITHOUT the deleted entry,
+        //    BEFORE any on-disk delete. If the rewrite fails, the
+        //    manifest is still present and a retry can fully complete
+        //    the delete.
         let path = self.index_path_for(session_id)?;
         if path.exists() {
             let mut buf = String::new();
@@ -509,6 +517,16 @@ impl LocalCheckpointStore {
                 buf.push('\n');
             }
             atomic_write(&path, buf.as_bytes()).await?;
+        }
+
+        // 3. Only now unlink the manifest. Surface unlink failures
+        //    (e.g. permission denied on the manifests dir, manifest
+        //    file held open elsewhere). On failure the index already
+        //    reflects the intended state (entry gone) and the manifest
+        //    becomes an orphan a future sweep can clean up.
+        let manifest = self.manifest_path(session_id, checkpoint_id)?;
+        if manifest.exists() {
+            tokio::fs::remove_file(&manifest).await?;
         }
         Ok(())
     }
@@ -1262,9 +1280,10 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    // delete_checkpoint_locked must surface a manifest unlink error rather
-    // than silently discarding it; the index entry is left in place so a
-    // later run can retry.
+    // delete_checkpoint_locked surfaces a manifest unlink failure. Because
+    // the ordering invariant rewrites the index BEFORE the manifest is
+    // unlinked, the index entry is already gone on failure and the
+    // manifest is left as an orphan that a future sweep can detect.
     async fn delete_surfaces_manifest_remove_error() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1295,11 +1314,66 @@ mod tests {
             matches!(err, CheckpointError::Io(_)),
             "expected Io error, got {err:?}",
         );
-        // Index entry must still be present so a later retry can pick it up.
+        // With metadata-first ordering the index entry is already gone
+        // by the time the unlink is attempted; the manifest is now an
+        // orphan rather than a dangling index pointer.
         let list = store.list_checkpoints(&sid).await.unwrap();
         assert!(
-            list.iter().any(|e| e.checkpoint_id == id),
-            "index entry must be kept after a failed unlink",
+            !list.iter().any(|e| e.checkpoint_id == id),
+            "index entry must be removed before the manifest unlink is attempted",
+        );
+        let manifest_path = store.manifest_path(&sid, &id).unwrap();
+        assert!(
+            manifest_path.exists(),
+            "manifest should remain on disk as a recoverable orphan after unlink failure",
+        );
+    }
+
+    #[tokio::test]
+    // A corrupt index discovered during delete must NOT cause the manifest
+    // to be removed first. delete_checkpoint_locked must load and validate
+    // the index before touching the manifest so a parse failure leaves the
+    // manifest intact and the operation is fully retryable.
+    async fn delete_with_corrupt_index_does_not_lose_manifest() {
+        let (_dir, store, sid) = fresh_store();
+        store.ensure_dirs(&sid).await.unwrap();
+
+        // Write a manifest for some checkpoint id directly (we never have
+        // to make the index valid because we're about to corrupt it).
+        let cid = CheckpointId::new();
+        let meta = CheckpointMetadata {
+            checkpoint_id: cid.clone(),
+            session_id: sid.clone(),
+            run_id: RunId::new(),
+            user_message_id: None,
+            cwd: store.root().to_path_buf(),
+            created_at: OffsetDateTime::now_utc(),
+            description: None,
+            files_tracked: Vec::new(),
+            git_state: None,
+        };
+        store.write_manifest(&sid, &meta).await.unwrap();
+        let manifest_path = store.manifest_path(&sid, &cid).unwrap();
+        assert!(manifest_path.exists(), "precondition: manifest exists");
+
+        // Corrupt the index so load_index returns a MalformedManifest
+        // error before anything destructive happens.
+        let index_path = store.index_path_for(&sid).unwrap();
+        tokio::fs::write(&index_path, b"{ not json }\n")
+            .await
+            .unwrap();
+
+        let err = store
+            .delete_checkpoint_locked(&sid, &cid)
+            .await
+            .expect_err("delete should fail with a corrupt index");
+        assert!(
+            matches!(err, CheckpointError::MalformedManifest(_)),
+            "expected MalformedManifest, got {err:?}",
+        );
+        assert!(
+            manifest_path.exists(),
+            "manifest must still be on disk when delete bails out on a corrupt index",
         );
     }
 
