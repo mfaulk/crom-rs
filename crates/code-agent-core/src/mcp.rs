@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use code_agent_mcp::{
@@ -70,8 +70,17 @@ pub async fn register_mcp_tools(
             mut status,
             tools,
             client,
+            logs: failure_logs,
         } = outcome;
         if status.status == McpConnectionStatus::Failed || client.is_none() {
+            // Surface stderr/log lines captured before the failure so
+            // operators can diagnose why a server failed to initialize
+            // or list tools. The parallel discovery hot path previously
+            // dropped these — regression vs. the sequential path.
+            let server_name = status.name.clone();
+            report
+                .logs
+                .extend(failure_logs.into_iter().map(|e| (server_name.clone(), e)));
             report.statuses.push(status);
             continue;
         }
@@ -131,12 +140,16 @@ pub async fn register_mcp_tools(
     report
 }
 
-/// Per-server outcome from the parallel discovery phase. Tools/clients are
-/// passed back to the caller to be registered serially.
+/// Per-server outcome from the parallel discovery phase. `logs` carries any
+/// stderr/log lines drained from the client when discovery failed before
+/// the client could be returned for registration; on the success path the
+/// client itself is still drained in `register_mcp_tools`, so `logs` stays
+/// empty there to avoid double-reporting.
 struct ServerDiscovery {
     status: McpServerStatus,
     tools: Vec<McpToolDefinition>,
     client: Option<Arc<Mutex<McpClient>>>,
+    logs: Vec<code_agent_mcp::McpServerLogEntry>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -167,10 +180,13 @@ async fn discover_one_server(
             Err(err) => {
                 status.status = McpConnectionStatus::Failed;
                 status.error = Some(err.to_string());
+                // No client was returned, so there are no transport
+                // logs to drain — the failure happened during spawn.
                 return ServerDiscovery {
                     status,
                     tools: Vec::new(),
                     client: None,
+                    logs: Vec::new(),
                 };
             }
         };
@@ -182,12 +198,11 @@ async fn discover_one_server(
         Err(err) => {
             status.status = McpConnectionStatus::Failed;
             status.error = Some(err.to_string());
-            // Drain logs before discarding the client.
-            let _ = client.drain_logs();
             return ServerDiscovery {
                 status,
                 tools: Vec::new(),
                 client: None,
+                logs: drain_logs_after_failure(&mut client).await,
             };
         }
     }
@@ -196,11 +211,11 @@ async fn discover_one_server(
         Err(err) => {
             status.status = McpConnectionStatus::Failed;
             status.error = Some(err.to_string());
-            let _ = client.drain_logs();
             return ServerDiscovery {
                 status,
                 tools: Vec::new(),
                 client: None,
+                logs: drain_logs_after_failure(&mut client).await,
             };
         }
     };
@@ -215,6 +230,7 @@ async fn discover_one_server(
             status,
             tools: Vec::new(),
             client: None,
+            logs: drain_logs_after_failure(&mut client).await,
         };
     }
     // Optionally fetch resources/prompts. Errors here are non-fatal and
@@ -230,7 +246,28 @@ async fn discover_one_server(
         status,
         tools,
         client: Some(client),
+        logs: Vec::new(),
     }
+}
+
+/// Drain logs from a client whose discovery just failed, allowing a short
+/// grace period for the async stderr capture task to flush any final
+/// lines emitted by the server before it exited. Without the yield/wait
+/// step the parent often races the stderr task and reports an empty log
+/// vector even though the child wrote diagnostic output. The wait is
+/// short and only paid on failure, so it does not affect the happy
+/// path.
+async fn drain_logs_after_failure(
+    client: &mut McpClient,
+) -> Vec<code_agent_mcp::McpServerLogEntry> {
+    // Yield first so any already-queued stderr line that just hasn't
+    // been polled gets a chance to land before we sleep. Then a tiny
+    // bounded sleep covers the common case where the child wrote
+    // stderr immediately before exiting and the OS hasn't propagated
+    // the bytes yet.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client.drain_logs()
 }
 
 pub fn transport_kind(config: &McpServerConfig) -> code_agent_mcp::McpTransportKind {

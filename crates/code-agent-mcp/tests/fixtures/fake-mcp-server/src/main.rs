@@ -8,6 +8,15 @@ fn main() {
         println!("not json");
         return;
     }
+    if mode == "invalid-json-with-stderr" {
+        // Emit a synthetic stderr line so the transport captures it as
+        // a log, then emit invalid JSON-RPC on stdout so the initialize
+        // request fails. Used by integration tests that assert
+        // failure-path log propagation through MCP discovery.
+        eprintln!("fake-mcp-server: synthetic discovery failure log");
+        println!("not json");
+        return;
+    }
     if mode == "sleep" {
         std::thread::sleep(std::time::Duration::from_secs(10));
         return;

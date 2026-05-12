@@ -288,3 +288,58 @@ async fn mcp_discovery_runs_in_parallel() {
         "discovery must run in parallel: elapsed={elapsed:?}"
     );
 }
+
+#[tokio::test]
+// When MCP discovery fails (initialize returns malformed stdout), the
+// stderr drained from the failing server is surfaced via
+// `report.logs` so operators can diagnose the failure. The parallel
+// discovery path previously dropped these logs on the floor, which was
+// a regression vs. the sequential path.
+async fn failed_discovery_surfaces_drained_logs() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../code-agent-mcp/tests/fixtures/fake-mcp-server/Cargo.toml");
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_MCP_MODE".into(), "invalid-json-with-stderr".into());
+    let options = McpOptions {
+        enabled: true,
+        servers: BTreeMap::from([(
+            "broken".into(),
+            code_agent_mcp::McpServerConfig::Stdio(StdioMcpServerConfig {
+                command: "cargo".into(),
+                args: vec![
+                    "run".into(),
+                    "--quiet".into(),
+                    "--manifest-path".into(),
+                    manifest.display().to_string(),
+                ],
+                env,
+                cwd: None,
+                startup_timeout: Some(Duration::from_secs(5)),
+                request_timeout: Some(Duration::from_secs(5)),
+            }),
+        )]),
+        ..McpOptions::default()
+    };
+
+    let mut registry = ToolRegistry::new();
+    let report = code_agent_core::register_mcp_tools(&mut registry, &options).await;
+
+    assert_eq!(report.statuses.len(), 1);
+    assert!(
+        matches!(
+            report.statuses[0].status,
+            code_agent_mcp::McpConnectionStatus::Failed
+        ),
+        "discovery against an invalid-json server should fail: {:?}",
+        report.statuses[0]
+    );
+    assert!(
+        report
+            .logs
+            .iter()
+            .any(|(name, entry)| name == "broken"
+                && entry.message.contains("synthetic discovery failure log")),
+        "failure-path logs must propagate to the report; got: {:?}",
+        report.logs
+    );
+}
