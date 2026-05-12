@@ -203,36 +203,43 @@ impl FsPlanStore {
         Ok(())
     }
 
-    /// Write-once create of an `<id>.v<n>.approved.json` snapshot. Uses
-    /// `OpenOptions::create_new(true)` so an already-captured approval is
-    /// never overwritten. `AlreadyExists` is returned as `Ok(())` because
-    /// preserving the prior capture is the point.
+    /// Write-once, crash-safe create of an `<id>.v<n>.approved.json`
+    /// snapshot. The body is staged to a temp file in the target's parent
+    /// directory, `sync_data`'d, then renamed into place via
+    /// `persist_noclobber` so a crash mid-write cannot leave a partial
+    /// `.approved.json` at the final path. `AlreadyExists` from the
+    /// rename is treated as `Ok(())` because the prior capture is the
+    /// audit record we want to preserve.
+    ///
+    /// Note: if a partial `.approved.json` is already present from a
+    /// pre-fix crash, this writer treats it as the existing capture and
+    /// leaves it alone (same as the previous behavior). Going forward
+    /// the temp-and-rename pattern prevents new partials from being
+    /// created.
     fn write_approved_snapshot(&self, target: &Path, bytes: &[u8]) -> Result<(), PlanError> {
         self.ensure_root()?;
+        let dir = target.parent().unwrap_or(&self.root);
+        let mut tf = tempfile::NamedTempFile::new_in(dir).map_err(|e| PlanError::Io {
+            path: target.to_path_buf(),
+            source: e,
+        })?;
         use std::io::Write as _;
-        let mut f = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(target)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-            Err(e) => {
-                return Err(PlanError::Io {
-                    path: target.to_path_buf(),
-                    source: e,
-                })
-            }
-        };
-        f.write_all(bytes).map_err(|e| PlanError::Io {
+        tf.write_all(bytes).map_err(|e| PlanError::Io {
             path: target.to_path_buf(),
             source: e,
         })?;
-        f.sync_data().map_err(|e| PlanError::Io {
+        tf.as_file().sync_data().map_err(|e| PlanError::Io {
             path: target.to_path_buf(),
             source: e,
         })?;
-        Ok(())
+        match tf.persist_noclobber(target) {
+            Ok(_) => Ok(()),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(PlanError::Io {
+                path: target.to_path_buf(),
+                source: e.error,
+            }),
+        }
     }
 
     fn append_index(&self, entry: &IndexEntry) -> Result<(), PlanError> {
@@ -288,12 +295,26 @@ impl FsPlanStore {
     /// versioned snapshots for `id`, sorts by version number, and deletes
     /// the oldest until at most `max_plan_revisions` remain.
     /// `<id>.v<n>.approved.json` snapshots are never touched — they are
-    /// the write-once approval audit record.
+    /// the write-once approval audit record. The snapshot whose version
+    /// matches the current on-disk `<id>.json` is also protected so a
+    /// non-monotonic write (e.g. a manual edit, or out-of-order writes
+    /// that record a lower version after a higher one) cannot leave the
+    /// live current plan without its matching versioned snapshot.
     fn gc_old_version_snapshots(&self, id: &PlanId) {
         let limit = self.options.max_plan_revisions;
         if limit == 0 {
             return;
         }
+        // Determine the live current version (if any) so we can protect
+        // its versioned snapshot from deletion regardless of where it
+        // ranks numerically.
+        let current_version: Option<u32> = self
+            .current_path(id)
+            .ok()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<PlanDocument>(&b).ok())
+            .map(|p| p.version);
+
         let prefix = format!("{}.v", id.0);
         let suffix = ".json";
         let read = match std::fs::read_dir(&self.root) {
@@ -327,13 +348,27 @@ impl FsPlanStore {
         }
         versioned.sort_by_key(|(v, _)| *v);
         let to_remove = versioned.len() - limit;
-        for (v, path) in versioned.into_iter().take(to_remove) {
+        let mut removed = 0usize;
+        for (v, path) in versioned.into_iter() {
+            if removed >= to_remove {
+                break;
+            }
+            // Never delete the snapshot that pairs with the live current
+            // plan. If a non-monotonic save recorded a lower version after
+            // a higher one, the numeric ordering alone would otherwise
+            // pick the current version for deletion.
+            if current_version == Some(v) {
+                continue;
+            }
             match std::fs::remove_file(&path) {
-                Ok(()) => tracing::debug!(
-                    plan_id = %id.0,
-                    version = v,
-                    "plan store GC: removed old version snapshot"
-                ),
+                Ok(()) => {
+                    removed += 1;
+                    tracing::debug!(
+                        plan_id = %id.0,
+                        version = v,
+                        "plan store GC: removed old version snapshot"
+                    );
+                }
                 Err(e) => tracing::debug!(
                     plan_id = %id.0,
                     version = v,
@@ -461,8 +496,9 @@ impl PlanStore for FsPlanStore {
             let approved = self.approved_version_path(&plan.id, plan.version)?;
             // Use create_new so we never clobber an existing approved
             // snapshot. If it already exists we leave the older capture in
-            // place — that's the audit record.
-            let _ = self.write_approved_snapshot(&approved, &bytes);
+            // place — that's the audit record. The approved snapshot is
+            // integrity-critical, so propagate any write failure.
+            self.write_approved_snapshot(&approved, &bytes)?;
         }
 
         // Soft retention cap: trim the oldest `.v<n>.json` snapshots so
@@ -557,9 +593,10 @@ impl PlanStore for FsPlanStore {
         // Capture a write-once snapshot of the approved body. The
         // versioned snapshot `<id>.v<n>.json` is still updated by later
         // `save_revision` calls during execution, but `.approved.json`
-        // must never change once written.
+        // must never change once written. The approved snapshot is
+        // integrity-critical, so propagate any write failure.
         let approved_path = self.approved_version_path(&plan.id, plan.version)?;
-        let _ = self.write_approved_snapshot(&approved_path, &bytes);
+        self.write_approved_snapshot(&approved_path, &bytes)?;
         self.append_index(&IndexEntry {
             timestamp: now_iso(),
             plan_id: plan.id.0.clone(),
@@ -1140,5 +1177,249 @@ mod tests {
             approved_path.exists(),
             "approved snapshot must be preserved by GC"
         );
+    }
+
+    #[tokio::test]
+    // GC must protect the snapshot whose version matches the live current
+    // plan, even when other snapshots have HIGHER numeric versions. This
+    // covers the non-monotonic case: e.g. an out-of-order concurrent
+    // writer or a manual edit left v3.json / v4.json on disk while the
+    // current plan is still at v2. Numeric-only eviction would target v2
+    // first; the protection rule must keep it.
+    async fn gc_protects_current_version_when_higher_snapshots_exist() {
+        let tmp = TempDir::new().unwrap();
+        let limit: usize = 2;
+        let s = FsPlanStore::new(
+            tmp.path(),
+            PlanningOptions {
+                max_plan_revisions: limit,
+                ..PlanningOptions::default()
+            },
+        );
+        let p = small_plan();
+        let id = p.id.clone();
+        s.create(p).await.unwrap();
+        // Current plan is at version 1 (`v1.json`).
+        let v1_path = s.root.join(format!("{}.v1.json", id.0));
+        assert!(v1_path.exists());
+
+        // Simulate an out-of-order / racing writer that left higher
+        // version snapshots on disk without advancing the current
+        // pointer. Write them directly so `<id>.json` still says v1.
+        let body = std::fs::read(&v1_path).unwrap();
+        let v3_path = s.root.join(format!("{}.v3.json", id.0));
+        let v4_path = s.root.join(format!("{}.v4.json", id.0));
+        std::fs::write(&v3_path, &body).unwrap();
+        std::fs::write(&v4_path, &body).unwrap();
+
+        // Now perform a save_revision at the same low version 1 (idempotent
+        // re-save) so GC fires. With limit=2 and three snapshots present
+        // (v1, v3, v4), one must be evicted. Numeric ranking alone would
+        // pick v1 (the lowest) — which is the CURRENT version — so
+        // without the protection the live current plan would lose its
+        // matching snapshot.
+        let mut rev = s.load(&id).await.unwrap();
+        // Keep version = 1; title bump just to trigger a write.
+        rev.title = "still-v1".into();
+        rev.created_by = PlanCreatedBy::RevisedByUser;
+        s.save_revision(rev).await.unwrap();
+
+        // GC must have kept the current version's snapshot.
+        assert!(
+            v1_path.exists(),
+            "GC must preserve the snapshot pairing with current plan version (v1) \
+             even though v3 and v4 outrank it numerically"
+        );
+        // And the snapshot count after GC must equal the limit.
+        let mut versions: Vec<u32> = Vec::new();
+        let prefix = format!("{}.v", id.0);
+        for entry in std::fs::read_dir(&s.root).unwrap().flatten() {
+            let name = entry.file_name().into_string().unwrap();
+            if !name.starts_with(&prefix) || !name.ends_with(".json") {
+                continue;
+            }
+            if name.ends_with(".approved.json") {
+                continue;
+            }
+            let middle = &name[prefix.len()..name.len() - ".json".len()];
+            if let Ok(v) = middle.parse::<u32>() {
+                versions.push(v);
+            }
+        }
+        versions.sort();
+        assert_eq!(
+            versions.len(),
+            limit,
+            "snapshot count {} must equal limit {limit} after GC",
+            versions.len()
+        );
+        assert!(
+            versions.contains(&1),
+            "v1 (current) must remain among kept snapshots: {versions:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    // If the approved-snapshot temp+rename fails (e.g. read-only plans
+    // dir), `approve` must surface the error rather than silently
+    // dropping it. The approved snapshot is integrity-critical.
+    async fn approve_propagates_approved_snapshot_write_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let (s, _g) = store();
+        let p = small_plan();
+        let id = p.id.clone();
+        let v = p.version;
+        s.create(p).await.unwrap();
+
+        // Make the plans directory read-only so the temp file create or
+        // the rename inside `write_approved_snapshot` fails.
+        let mut perms = std::fs::metadata(&s.root).unwrap().permissions();
+        let original = perms.mode();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&s.root, perms).unwrap();
+
+        let err = s
+            .approve(PlanApprovalRequest {
+                plan_id: id,
+                approved_by: PlanApprover::TestHarness,
+                approved_version: v,
+                scope: PlanApprovalScope::FullPlan,
+                notes: None,
+            })
+            .await;
+
+        // Restore perms so TempDir drop can clean up.
+        let mut perms = std::fs::metadata(&s.root).unwrap().permissions();
+        perms.set_mode(original);
+        std::fs::set_permissions(&s.root, perms).unwrap();
+
+        let err = err.expect_err("approve must fail when approved snapshot write fails");
+        assert!(matches!(err, PlanError::Io { .. }), "got: {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    // `save_revision`'s first-transition-into-Approved path captures the
+    // write-once `.approved.json`. If that write fails, the revision
+    // itself must fail rather than silently dropping the snapshot.
+    async fn save_revision_propagates_approved_snapshot_write_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let (s, _g) = store();
+        // Start in PendingApproval, then save a revision that transitions
+        // into Approved with an approval payload. The first-approval
+        // branch in `save_revision` will then try to write
+        // `.approved.json`. We make the dir read-only just before that
+        // save by performing it directly (no chmod between writes).
+        let p = small_plan();
+        let id = p.id.clone();
+        let v = p.version;
+        s.create(p).await.unwrap();
+
+        // Build a revision that flips status to Approved with an
+        // approval payload aligned to the same version (so the
+        // invalidation check doesn't reset it).
+        let mut rev = s.load(&id).await.unwrap();
+        rev.status = PlanStatus::Approved;
+        rev.approval = Some(PlanApproval {
+            approved_at: OffsetDateTime::now_utc(),
+            approved_by: PlanApprover::TestHarness,
+            approved_version: v,
+            notes: None,
+            scope: PlanApprovalScope::FullPlan,
+        });
+
+        // Make the plans dir read-only so the .approved.json write
+        // fails. The current-file and version-file writes go to the
+        // same dir, so they may fail first — either way, the result
+        // must be an `Err`, not a silent drop of the approved snapshot.
+        let mut perms = std::fs::metadata(&s.root).unwrap().permissions();
+        let original = perms.mode();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&s.root, perms).unwrap();
+
+        let res = s.save_revision(rev).await;
+
+        let mut perms = std::fs::metadata(&s.root).unwrap().permissions();
+        perms.set_mode(original);
+        std::fs::set_permissions(&s.root, perms).unwrap();
+
+        let err = res.expect_err("save_revision must propagate write failure");
+        assert!(matches!(err, PlanError::Io { .. }), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    // Approving twice for the same plan version must not error: the
+    // second approve sees an existing `.approved.json` and is expected
+    // to leave it in place. This pins the temp-and-rename + noclobber
+    // behavior: a partial-file race / repeated approve is tolerated as
+    // a no-op, not an integrity failure.
+    async fn approve_is_idempotent_when_snapshot_already_exists() {
+        let (s, _g) = store();
+        let p = small_plan();
+        let id = p.id.clone();
+        let v = p.version;
+        s.create(p).await.unwrap();
+
+        s.approve(PlanApprovalRequest {
+            plan_id: id.clone(),
+            approved_by: PlanApprover::TestHarness,
+            approved_version: v,
+            scope: PlanApprovalScope::FullPlan,
+            notes: None,
+        })
+        .await
+        .unwrap();
+        let approved_path = s.root.join(format!("{}.v{}.approved.json", id.0, v));
+        let original = std::fs::read(&approved_path).unwrap();
+
+        // A second approve at the same version must succeed and must
+        // leave the existing approved snapshot byte-for-byte unchanged.
+        s.approve(PlanApprovalRequest {
+            plan_id: id,
+            approved_by: PlanApprover::TestHarness,
+            approved_version: v,
+            scope: PlanApprovalScope::FullPlan,
+            notes: Some("second pass".into()),
+        })
+        .await
+        .expect("second approve must not error when snapshot exists");
+        let after = std::fs::read(&approved_path).unwrap();
+        assert_eq!(
+            after, original,
+            "approved snapshot must remain the original capture"
+        );
+    }
+
+    #[tokio::test]
+    // Crash-safety regression: if a pre-existing `.approved.json` is
+    // present (e.g. a partial leftover from a prior crash, or an
+    // intentional capture), the writer must not panic and must not
+    // overwrite it. Approving over a pre-existing file is a no-op.
+    async fn approve_leaves_preexisting_approved_snapshot_intact() {
+        let (s, _g) = store();
+        let p = small_plan();
+        let id = p.id.clone();
+        let v = p.version;
+        s.create(p).await.unwrap();
+
+        // Pre-create an `.approved.json` (simulating a leftover from a
+        // crashed earlier writer). Use distinctive bytes so we can
+        // assert it was not overwritten.
+        let approved_path = s.root.join(format!("{}.v{}.approved.json", id.0, v));
+        std::fs::write(&approved_path, b"preexisting").unwrap();
+
+        s.approve(PlanApprovalRequest {
+            plan_id: id,
+            approved_by: PlanApprover::TestHarness,
+            approved_version: v,
+            scope: PlanApprovalScope::FullPlan,
+            notes: None,
+        })
+        .await
+        .expect("approve must succeed when a preexisting snapshot is present");
+
+        let after = std::fs::read(&approved_path).unwrap();
+        assert_eq!(after, b"preexisting", "preexisting snapshot must be kept");
     }
 }
