@@ -523,33 +523,45 @@ fn parse_tools(raws: Vec<RawToolUse>) -> Result<Vec<PlanToolUse>, PlanError> {
     Ok(out)
 }
 
-/// Reject bare wildcard tool names. The plan-scope classifier compiles
-/// `tool_name` as a glob; `"*"` and `"**"` match every tool name and
-/// would silently authorize tools that the plan never enumerated. The
-/// remaining classifier paths fall through to `Ambiguous` for tools
-/// without a structural constraint, so a blanket wildcard combined with
-/// a non-strict deviation policy effectively turns plan-scope into a
-/// no-op. Force authors to use either an exact name or a non-empty
-/// prefix like `mcp__github__*`.
+/// Reject overly broad tool-name patterns. The plan-scope classifier
+/// compiles `tool_name` as a `globset` glob, so any glob metacharacter
+/// — not just `*` — can match unrelated tools (`?*`, `[a-z]*`,
+/// `{foo,bar}*` all match almost anything). Combined with the
+/// classifier's `Ambiguous` fallthrough and a non-strict deviation
+/// policy, a broad pattern effectively turns plan-scope into a no-op.
+///
+/// Allowed shapes:
+/// - An exact name with no glob metacharacters at all (e.g. `Bash`,
+///   `mcp__github__create_issue`).
+/// - A literal-prefix glob `<prefix>*` where `<prefix>` is non-empty
+///   and contains no glob metacharacters (e.g. `mcp__github__*`).
+///
+/// The minimum literal prefix length is 1 character. MCP tool prefixes
+/// like `mcp__github__*` are the primary use case, and shorter prefixes
+/// (`a*`) are still narrower than the rejected bare-wildcard forms; a
+/// length floor would block legitimate exact tool names whose family
+/// glob is single-character.
 fn validate_tool_name_pattern(name: &str) -> Result<(), PlanError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err(PlanError::Invalid("tool_name is empty".into()));
     }
-    if trimmed == "*" || trimmed == "**" {
-        return Err(PlanError::Invalid(format!(
-            "tool_name `{trimmed}` is a bare wildcard; use an exact name or a non-empty prefix \
-             like `mcp__github__*`"
-        )));
+    const GLOB_META: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
+    // Exact name (no glob metacharacters) is always allowed.
+    if !trimmed.chars().any(|c| GLOB_META.contains(&c)) {
+        return Ok(());
     }
-    // Reject a leading `*` (`*foo`, `*` was already caught) — a leading
-    // wildcard would still match every tool starting with anything.
-    if trimmed.starts_with('*') {
-        return Err(PlanError::Invalid(format!(
-            "tool_name `{trimmed}` starts with a wildcard; require a non-empty literal prefix"
-        )));
+    // Otherwise the only permitted shape is `<literal_prefix>*` where
+    // the prefix is non-empty and contains no glob metacharacters.
+    if let Some(prefix) = trimmed.strip_suffix('*') {
+        if !prefix.is_empty() && !prefix.chars().any(|c| GLOB_META.contains(&c)) {
+            return Ok(());
+        }
     }
-    Ok(())
+    Err(PlanError::Invalid(format!(
+        "tool_name `{trimmed}` is too broad a wildcard or uses unsupported glob metacharacters; \
+         allowed shapes are an exact name or `<literal_prefix>*` (e.g. `mcp__github__*`)"
+    )))
 }
 
 fn parse_permission_kind(s: Option<&str>) -> PermissionKind {
@@ -949,6 +961,165 @@ mod tests {
         let snap = handle.snapshot().await.unwrap();
         assert_eq!(snap.plan.requested_tools.len(), 1);
         assert_eq!(snap.plan.requested_tools[0].tool_name, "ok_prefix*");
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects `tool_name: "?*"`; `?` matches any single char,
+    // so the pattern matches every non-empty tool name.
+    async fn submit_plan_rejects_question_mark_wildcard() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "?*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("glob metacharacters"),
+                "expected glob-meta rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects `tool_name: "[a-z]*"`; a leading char class is
+    // an unbounded wildcard equivalent to bare `*`.
+    async fn submit_plan_rejects_charclass_wildcard() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "[a-z]*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("glob metacharacters"),
+                "expected glob-meta rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects `tool_name: "{foo,bar}*"`; a leading
+    // alternation broadens the prefix beyond a single literal.
+    async fn submit_plan_rejects_brace_wildcard() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "{foo,bar}*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("glob metacharacters"),
+                "expected glob-meta rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects `tool_name: "?"`; a lone `?` is a glob
+    // metacharacter that matches any single-character tool name.
+    async fn submit_plan_rejects_lone_question_mark() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "?"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("glob metacharacters"),
+                "expected glob-meta rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects `tool_name: "mc?p_*"`; the literal prefix
+    // before the trailing `*` must itself be metacharacter-free.
+    async fn submit_plan_rejects_question_inside_prefix() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "mc?p_*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("glob metacharacters"),
+                "expected glob-meta rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan accepts an exact tool name with underscores like
+    // `Bash` — no glob metacharacters means exact-match only.
+    async fn submit_plan_accepts_exact_name_with_underscore() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle.clone(), PlanningOptions::default());
+        let r = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "Bash"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+        let snap = handle.snapshot().await.unwrap();
+        assert_eq!(snap.plan.requested_tools.len(), 1);
+        assert_eq!(snap.plan.requested_tools[0].tool_name, "Bash");
     }
 
     #[tokio::test]
