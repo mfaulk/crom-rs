@@ -723,6 +723,11 @@ async fn run_subagent(
         let _ = cancel_for_task;
         let _ = notify_for_task;
     });
+    // Capture an `AbortHandle` so we can forcibly stop the child on
+    // timeout. Without this the timeout only sets the cooperative cancel
+    // flag; an unresponsive child (e.g. blocked on a provider call) keeps
+    // running and burning tokens even after this function returns.
+    let abort_handle = agent_handle.abort_handle();
     // Drain the child events so the channel doesn't fill (the side effects
     // happen in the ChildSessionSink already; this loop is just to keep
     // the channel flowing).
@@ -756,10 +761,24 @@ async fn run_subagent(
     // success vs. internal failure.
     let join_outcome = match timeout(timeout_dur, agent_handle).await {
         Ok(Ok(())) => None,
-        Ok(Err(_join)) => Some(SubagentStatus::Failed),
+        Ok(Err(join_err)) => {
+            // Distinguish panic (real failure) from abort (the parent
+            // aborted us — already accounted for upstream). For an
+            // unsolicited cancellation here, treat as failure.
+            if join_err.is_cancelled() {
+                Some(SubagentStatus::Cancelled)
+            } else {
+                Some(SubagentStatus::Failed)
+            }
+        }
         Err(_elapsed) => {
+            // First raise the cooperative cancel signal so anything that
+            // checks it can drop the request mid-call, then forcibly abort
+            // the JoinHandle so the child cannot keep burning tokens past
+            // the timeout window.
             cancel.store(true, Ordering::Release);
             cancel_notify.notify_waiters();
+            abort_handle.abort();
             Some(SubagentStatus::TimedOut)
         }
     };

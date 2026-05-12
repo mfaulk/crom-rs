@@ -430,3 +430,89 @@ fn visibility_honors_runtime_mcp_external_effect_policy() {
         .expect("AllowWithApproval should surface External MCP tools");
     assert_eq!(m.visibility, ToolVisibility::RequiresApproval);
 }
+
+#[test]
+// Repeated BM25 searches against the same catalog return identical scores —
+// the cached BM25 corpus stats (avg doc length, per-document term counts)
+// must produce the same ranking as the original on-demand computation.
+fn bm25_search_results_are_stable_across_repeated_queries() {
+    let options = ToolSearchOptions::default();
+    let mut builder = ToolCatalogBuilder::new(options.clone());
+    // A modest corpus so we exercise both common and rare query terms.
+    let names = [
+        ("mcp__github__list_issues", "List GitHub repository issues"),
+        ("mcp__github__get_issue", "Get one GitHub issue by number"),
+        (
+            "mcp__github__search_issues",
+            "Search GitHub issues by query",
+        ),
+        ("mcp__github__list_pulls", "List GitHub pull requests"),
+        (
+            "mcp__slack__send_message",
+            "Post a Slack message to a channel",
+        ),
+        ("mcp__slack__search", "Search Slack messages"),
+        ("mcp__docs__read", "Read documentation pages"),
+        ("Read", "Read a workspace file"),
+        ("Grep", "Search workspace text with ripgrep"),
+        ("Glob", "Find workspace files matching a glob pattern"),
+    ];
+    for (n, d) in names {
+        let tool: Arc<dyn Tool> = if n.starts_with("mcp__") {
+            mcp_tool(n, d)
+        } else {
+            local_tool(n, d)
+        };
+        builder = builder.ingest_tool(tool);
+    }
+    let catalog = builder.build();
+    let visibility = options.visibility_context(
+        PermissionMode::Default,
+        vec![ToolRule::try_tool_glob("mcp__*").unwrap()],
+        vec![],
+        vec![],
+        code_agent_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule,
+    );
+
+    let queries = ["github issue", "slack message search", "read file"];
+    for q in queries {
+        let first = catalog
+            .search(
+                ToolSearchQuery {
+                    query: q.into(),
+                    limit: 5,
+                    source_filter: None,
+                    include_risky: true,
+                },
+                ToolSearchStrategy::Bm25,
+                &visibility,
+            )
+            .unwrap();
+        // Repeat the same search several times — the cache should be
+        // stable across calls.
+        for _ in 0..5 {
+            let again = catalog
+                .search(
+                    ToolSearchQuery {
+                        query: q.into(),
+                        limit: 5,
+                        source_filter: None,
+                        include_risky: true,
+                    },
+                    ToolSearchStrategy::Bm25,
+                    &visibility,
+                )
+                .unwrap();
+            assert_eq!(first.matches.len(), again.matches.len());
+            for (a, b) in first.matches.iter().zip(again.matches.iter()) {
+                assert_eq!(a.tool_name, b.tool_name);
+                assert!(
+                    (a.score - b.score).abs() < 1e-6,
+                    "BM25 score drifted across repeated queries: {} vs {}",
+                    a.score,
+                    b.score
+                );
+            }
+        }
+    }
+}

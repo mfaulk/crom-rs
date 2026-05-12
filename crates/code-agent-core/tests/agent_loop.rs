@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use code_agent_core::{
@@ -556,4 +557,352 @@ async fn eager_mode_does_not_register_search_tools() {
     assert!(!events
         .iter()
         .any(|event| matches!(event, AgentEvent::ToolSearchCompleted(_))));
+}
+
+struct SleepTool {
+    name: &'static str,
+    duration: Duration,
+}
+
+#[async_trait]
+impl Tool for SleepTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "sleep then echo"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type": "object"})
+    }
+    fn permission_kind(&self) -> PermissionKind {
+        PermissionKind::ReadOnly
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: code_agent_core::ToolContext,
+    ) -> Result<code_agent_core::ToolResult, ToolError> {
+        tokio::time::sleep(self.duration).await;
+        Ok(code_agent_core::ToolResult::ok_text("done"))
+    }
+}
+
+#[tokio::test]
+// Multiple tool_use blocks in one model turn run concurrently: with two
+// 500ms tools the turn must finish in well under 1s (the sequential
+// bound), and both `tool_result` blocks must appear in the conversation
+// paired to the original `tool_use_id` order.
+async fn multiple_tool_calls_run_in_parallel() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ModelEvent::ToolCall(code_agent_core::ToolCall {
+                id: "t1".into(),
+                name: "Slow1".into(),
+                input: json!({}),
+            }),
+            ModelEvent::ToolCall(code_agent_core::ToolCall {
+                id: "t2".into(),
+                name: "Slow2".into(),
+                input: json!({}),
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ],
+        vec![
+            ModelEvent::TextDelta { text: "ok".into() },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            },
+        ],
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(SleepTool {
+        name: "Slow1",
+        duration: Duration::from_millis(500),
+    }));
+    tools.register(Arc::new(SleepTool {
+        name: "Slow2",
+        duration: Duration::from_millis(500),
+    }));
+    let opts = AgentOptions {
+        max_turns: Some(4),
+        allowed_tools: vec!["Slow1".into(), "Slow2".into()],
+        ..AgentOptions::default()
+    };
+
+    let started = Instant::now();
+    let events = run(provider, opts, tools, "go").await;
+    let elapsed = started.elapsed();
+
+    // Sequential would be at least 1000ms. Parallel completes in ~500ms
+    // plus some scheduling overhead. The 900ms ceiling clearly
+    // distinguishes the two regimes while leaving CI jitter slack.
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "tool calls must run in parallel: elapsed={elapsed:?}"
+    );
+
+    let user_results: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::UserToolResult(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        user_results.len(),
+        2,
+        "both calls must produce a tool_result"
+    );
+    // tool_result blocks must come back paired with the original ids.
+    let ids: Vec<_> = user_results
+        .iter()
+        .map(|r| r.tool_use_id.as_str())
+        .collect();
+    assert!(ids.contains(&"t1"));
+    assert!(ids.contains(&"t2"));
+
+    assert_eq!(final_result(&events).subtype, ResultSubtype::Success);
+}
+
+/// A `Mutating` tool that records `(name, "start"|"end")` events in a shared
+/// log around a 300ms sleep so a test can detect overlap between concurrent
+/// invocations.
+struct TracingMutatingTool {
+    name: &'static str,
+    duration: Duration,
+    log: Arc<Mutex<Vec<(String, &'static str)>>>,
+}
+
+#[async_trait]
+impl Tool for TracingMutatingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "mutating tool that logs start/end"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type": "object"})
+    }
+    fn permission_kind(&self) -> PermissionKind {
+        PermissionKind::Mutating
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push((self.name.to_string(), "start"));
+        tokio::time::sleep(self.duration).await;
+        self.log
+            .lock()
+            .unwrap()
+            .push((self.name.to_string(), "end"));
+        Ok(ToolResult::ok_text("done"))
+    }
+}
+
+#[tokio::test]
+// Mutating tool calls in a single turn must serialize (not race): with two
+// 300ms `Mutating` tools the trace must show tool 1 fully complete before
+// tool 2 starts. Parallelizing them would interleave start/end and risk
+// races on overlapping file state or process state.
+async fn mutating_tool_calls_run_sequentially_within_turn() {
+    let log = Arc::new(Mutex::new(Vec::<(String, &'static str)>::new()));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ModelEvent::ToolCall(code_agent_core::ToolCall {
+                id: "t1".into(),
+                name: "Mut1".into(),
+                input: json!({}),
+            }),
+            ModelEvent::ToolCall(code_agent_core::ToolCall {
+                id: "t2".into(),
+                name: "Mut2".into(),
+                input: json!({}),
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ],
+        vec![
+            ModelEvent::TextDelta { text: "ok".into() },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            },
+        ],
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(TracingMutatingTool {
+        name: "Mut1",
+        duration: Duration::from_millis(300),
+        log: log.clone(),
+    }));
+    tools.register(Arc::new(TracingMutatingTool {
+        name: "Mut2",
+        duration: Duration::from_millis(300),
+        log: log.clone(),
+    }));
+    let opts = AgentOptions {
+        max_turns: Some(4),
+        allowed_tools: vec!["Mut1".into(), "Mut2".into()],
+        permission_mode: PermissionMode::AcceptEdits,
+        permission_callback: Some(Arc::new(AlwaysAllow)),
+        ..AgentOptions::default()
+    };
+
+    let _ = run(provider, opts, tools, "go").await;
+
+    let trace = log.lock().unwrap().clone();
+    assert_eq!(
+        trace.len(),
+        4,
+        "expected start/end for each mutating tool: {trace:?}"
+    );
+    assert_eq!(
+        trace[0].1, "start",
+        "first event must be a start: {trace:?}"
+    );
+    assert_eq!(
+        trace[1].1, "end",
+        "mutating tools must not overlap; expected end before next start: {trace:?}"
+    );
+    assert_eq!(
+        trace[0].0, trace[1].0,
+        "the second event must end the same tool that started: {trace:?}"
+    );
+    assert_ne!(
+        trace[0].0, trace[2].0,
+        "the second mutating tool must be different from the first: {trace:?}"
+    );
+}
+
+/// Permission callback that denies any tool call whose tool name matches the
+/// configured target. Used to force a specific call to short-circuit while
+/// other calls in the same turn run normally.
+struct DenyByName {
+    deny_tool: &'static str,
+}
+
+#[async_trait]
+impl PermissionCallback for DenyByName {
+    async fn approve(&self, req: PermissionRequest) -> PermissionDecision {
+        if req.tool_name == self.deny_tool {
+            PermissionDecision::Deny {
+                reason: format!("denied {}", self.deny_tool),
+            }
+        } else {
+            PermissionDecision::AllowOnce
+        }
+    }
+}
+
+#[tokio::test]
+// When a turn contains a mix of allowed and denied tool calls, the
+// `UserToolResult` events (i.e. the `tool_result` blocks sent back to the
+// model) must appear in input order. A regression where short-circuited
+// denials emit their result immediately while runnable calls emit later
+// reverses the order for `[allowed, denied]` turns, which violates the
+// Anthropic API's input-order invariant for tool_result blocks.
+async fn tool_results_preserve_input_order_when_some_calls_short_circuit() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ModelEvent::ToolCall(code_agent_core::ToolCall {
+                id: "t0".into(),
+                name: "AllowedExec".into(),
+                input: json!({}),
+            }),
+            ModelEvent::ToolCall(code_agent_core::ToolCall {
+                id: "t1".into(),
+                name: "DeniedExec".into(),
+                input: json!({}),
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ],
+        vec![
+            ModelEvent::TextDelta { text: "ok".into() },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            },
+        ],
+    ]));
+    let allowed_flag = Arc::new(Mutex::new(false));
+    let denied_flag = Arc::new(Mutex::new(false));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ExecToolNamed {
+        name: "AllowedExec",
+        flag: allowed_flag.clone(),
+    }));
+    tools.register(Arc::new(ExecToolNamed {
+        name: "DeniedExec",
+        flag: denied_flag.clone(),
+    }));
+    let opts = AgentOptions {
+        max_turns: Some(4),
+        allowed_tools: vec!["AllowedExec".into(), "DeniedExec".into()],
+        permission_mode: PermissionMode::Default,
+        permission_callback: Some(Arc::new(DenyByName {
+            deny_tool: "DeniedExec",
+        })),
+        ..AgentOptions::default()
+    };
+
+    let events = run(provider, opts, tools, "go").await;
+    let order: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::UserToolResult(r) => Some(r.tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["t0", "t1"],
+        "tool_result blocks must be emitted in input order; got {order:?}"
+    );
+    assert!(*allowed_flag.lock().unwrap(), "allowed tool should run");
+    assert!(!*denied_flag.lock().unwrap(), "denied tool must not run");
+}
+
+struct ExecToolNamed {
+    name: &'static str,
+    flag: Arc<Mutex<bool>>,
+}
+
+#[async_trait]
+impl Tool for ExecToolNamed {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        ""
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type": "object"})
+    }
+    fn permission_kind(&self) -> PermissionKind {
+        PermissionKind::Execution
+    }
+    async fn execute(
+        &self,
+        _: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        *self.flag.lock().unwrap() = true;
+        Ok(ToolResult::ok_text("ran"))
+    }
 }

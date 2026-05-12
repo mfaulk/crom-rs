@@ -16,6 +16,12 @@ use crate::transport::stdio::StdioMcpTransport;
 use crate::transport::streamable_http::StreamableHttpMcpTransport;
 use crate::transport::{response_value, McpServerLogEntry, McpTransport, McpTransportKind};
 
+/// Hard cap on the number of `*/list` pages we will iterate before giving
+/// up. A misbehaving server that always advertises a non-empty
+/// `nextCursor` would otherwise hang the client forever; this cap turns
+/// that into a structured error instead.
+pub const MCP_MAX_LIST_PAGES: usize = 1024;
+
 pub struct McpClient {
     pub server_name: String,
     pub transport_kind: McpTransportKind,
@@ -109,7 +115,7 @@ impl McpClient {
     pub async fn list_tools(&mut self) -> McpResult<Vec<McpToolDefinition>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..MCP_MAX_LIST_PAGES {
             let params = cursor
                 .as_ref()
                 .map(|c| json!({ "cursor": c }))
@@ -118,10 +124,22 @@ impl McpClient {
             let page: ListToolsResponse = serde_json::from_value(value)?;
             out.extend(page.tools);
             match page.next_cursor {
-                Some(next) if !next.is_empty() => cursor = Some(next),
+                Some(next) if !next.is_empty() => {
+                    if Some(&next) == cursor.as_ref() {
+                        // Server is returning the same cursor twice in a row.
+                        // Treat as a misbehaving server rather than spinning.
+                        return Err(McpError::InvalidJsonRpc(
+                            "tools/list pagination cursor did not advance".into(),
+                        ));
+                    }
+                    cursor = Some(next);
+                }
                 _ => return Ok(out),
             }
         }
+        Err(McpError::InvalidJsonRpc(format!(
+            "tools/list exceeded {MCP_MAX_LIST_PAGES} pages"
+        )))
     }
 
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> McpResult<McpToolResult> {
@@ -137,16 +155,26 @@ impl McpClient {
     pub async fn list_resources(&mut self) -> McpResult<Vec<McpResource>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..MCP_MAX_LIST_PAGES {
             let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
             let value = self.request("resources/list", params).await?;
             let page: ListResourcesResponse = serde_json::from_value(value)?;
             out.extend(page.resources);
             match page.next_cursor {
-                Some(next) if !next.is_empty() => cursor = Some(next),
+                Some(next) if !next.is_empty() => {
+                    if Some(&next) == cursor.as_ref() {
+                        return Err(McpError::InvalidJsonRpc(
+                            "resources/list pagination cursor did not advance".into(),
+                        ));
+                    }
+                    cursor = Some(next);
+                }
                 _ => return Ok(out),
             }
         }
+        Err(McpError::InvalidJsonRpc(format!(
+            "resources/list exceeded {MCP_MAX_LIST_PAGES} pages"
+        )))
     }
 
     pub async fn read_resource(&mut self, uri: &str) -> McpResult<Vec<McpResourceContents>> {
@@ -160,16 +188,26 @@ impl McpClient {
     pub async fn list_prompts(&mut self) -> McpResult<Vec<McpPrompt>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        for _ in 0..MCP_MAX_LIST_PAGES {
             let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
             let value = self.request("prompts/list", params).await?;
             let page: ListPromptsResponse = serde_json::from_value(value)?;
             out.extend(page.prompts);
             match page.next_cursor {
-                Some(next) if !next.is_empty() => cursor = Some(next),
+                Some(next) if !next.is_empty() => {
+                    if Some(&next) == cursor.as_ref() {
+                        return Err(McpError::InvalidJsonRpc(
+                            "prompts/list pagination cursor did not advance".into(),
+                        ));
+                    }
+                    cursor = Some(next);
+                }
                 _ => return Ok(out),
             }
         }
+        Err(McpError::InvalidJsonRpc(format!(
+            "prompts/list exceeded {MCP_MAX_LIST_PAGES} pages"
+        )))
     }
 
     pub fn drain_logs(&mut self) -> Vec<McpServerLogEntry> {

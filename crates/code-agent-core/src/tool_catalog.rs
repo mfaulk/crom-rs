@@ -673,6 +673,10 @@ pub struct ToolCatalog {
     options: ToolSearchOptions,
     documents: BTreeMap<String, ToolSearchDocument>,
     document_frequency: HashMap<String, usize>,
+    /// Cached corpus statistics. Built once at construction so per-search
+    /// scoring is O(query_terms) instead of O(documents * query_terms).
+    bm25_avg_doc_len: f32,
+    total_docs: f32,
 }
 
 impl ToolCatalog {
@@ -1238,21 +1242,19 @@ impl ToolCatalog {
     }
 
     fn bm25_score(&self, document: &ToolSearchDocument, query_tokens: &[String]) -> f32 {
+        // Corpus statistics (`total_docs`, `bm25_avg_doc_len`) and per-doc
+        // term counts are precomputed at catalog construction time so this
+        // hot path is O(query_tokens) instead of O(documents).
         let mut score = 0.0;
-        let doc_len = document.all_tokens.len().max(1) as f32;
-        let avg_len = self
-            .documents
-            .values()
-            .map(|d| d.all_tokens.len())
-            .sum::<usize>()
-            .max(1) as f32
-            / self.documents.len().max(1) as f32;
-        let mut term_counts: HashMap<&str, usize> = HashMap::new();
-        for token in &document.all_tokens {
-            *term_counts.entry(token.as_str()).or_default() += 1;
-        }
+        let doc_len = document.doc_len.max(1) as f32;
+        let avg_len = if self.bm25_avg_doc_len > 0.0 {
+            self.bm25_avg_doc_len
+        } else {
+            1.0
+        };
+        let total_docs = self.total_docs.max(1.0);
         for token in query_tokens {
-            let Some(tf) = term_counts.get(token.as_str()).copied() else {
+            let Some(tf) = document.term_counts.get(token).copied() else {
                 continue;
             };
             let df = self
@@ -1261,7 +1263,6 @@ impl ToolCatalog {
                 .copied()
                 .unwrap_or(0)
                 .max(1) as f32;
-            let total_docs = self.documents.len().max(1) as f32;
             let idf = ((total_docs - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.1);
             let tf = tf as f32;
             let k1 = 1.2;
@@ -1355,11 +1356,20 @@ impl ToolCatalogBuilder {
             );
         }
         let document_frequency = compute_document_frequency(documents.values());
+        let total_docs = documents.len() as f32;
+        let bm25_avg_doc_len = if documents.is_empty() {
+            0.0
+        } else {
+            let total_tokens: usize = documents.values().map(|d| d.doc_len).sum();
+            total_tokens as f32 / total_docs.max(1.0)
+        };
         ToolCatalog {
             descriptors,
             options: self.options,
             documents,
             document_frequency,
+            bm25_avg_doc_len,
+            total_docs,
         }
     }
 }
@@ -1375,6 +1385,12 @@ pub struct ToolSearchDocument {
     pub aliases: Vec<String>,
     pub category: Option<String>,
     all_tokens: Vec<String>,
+    /// Precomputed term-frequency table for this document. Built once at
+    /// catalog construction time; reused by every BM25 / hybrid query.
+    term_counts: HashMap<String, usize>,
+    /// Cached `all_tokens.len()` so scoring does not call `.len()` on the
+    /// Vec repeatedly (negligible but free).
+    doc_len: usize,
 }
 
 impl ToolSearchDocument {
@@ -1415,6 +1431,11 @@ impl ToolSearchDocument {
         if let Some(category) = &category {
             all_tokens.extend(tokenize(category));
         }
+        let doc_len = all_tokens.len();
+        let mut term_counts: HashMap<String, usize> = HashMap::with_capacity(doc_len);
+        for token in &all_tokens {
+            *term_counts.entry(token.clone()).or_default() += 1;
+        }
         Self {
             tool_name: descriptor.name.clone(),
             source_text,
@@ -1425,6 +1446,8 @@ impl ToolSearchDocument {
             aliases,
             category,
             all_tokens,
+            term_counts,
+            doc_len,
         }
     }
 }

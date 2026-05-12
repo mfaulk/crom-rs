@@ -1177,9 +1177,46 @@ pub(crate) async fn run_loop(
             return Ok(());
         }
 
-        // Execute tool calls in order. Append a single user message containing all tool_results.
-        let mut tool_result_blocks: Vec<ContentBlock> = Vec::new();
-        for call in &tool_calls {
+        // Execute tool calls in (input) order. The model is allowed to
+        // emit multiple tool_use blocks in one turn. Read-only tools
+        // (`PermissionKind::ReadOnly`) can safely overlap their IO and
+        // run concurrently via `join_all`. Mutating, Execution,
+        // External, and Orchestration tools may race on overlapping
+        // files, child processes, MCP server state, or other shared
+        // resources, so they are partitioned out and run strictly
+        // sequentially within the turn. Policy/checkpoint gating and
+        // event emission stay sequential for determinism.
+        //
+        // Per-call result body slotted by input position. Filled both by
+        // gate-loop short-circuits (denials) and by the post-execute
+        // pass. A final loop emits `UserToolResult` events and pushes
+        // `ContentBlock::ToolResult` blocks in input order so the
+        // Anthropic API invariant (tool_result blocks must follow
+        // tool_use blocks in input order) is preserved even when some
+        // calls deny before others have run.
+        struct PendingResult {
+            body: String,
+            is_error: bool,
+        }
+        let mut pending_results: Vec<Option<PendingResult>> =
+            (0..tool_calls.len()).map(|_| None).collect();
+        // Stash per-call state captured during gating; consumed in the
+        // post-execute pass after futures complete.
+        struct PerCallState {
+            effective_input: serde_json::Value,
+            started: Instant,
+        }
+        let mut per_call_state: Vec<Option<PerCallState>> =
+            (0..tool_calls.len()).map(|_| None).collect();
+        // Boxed execute futures collected during the gating pass.
+        type ExecFut = Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::tool::ToolResult, ToolError>> + Send,
+            >,
+        >;
+        let mut parallel_futures: Vec<(usize, ExecFut)> = Vec::with_capacity(tool_calls.len());
+        let mut sequential_futures: Vec<(usize, ExecFut)> = Vec::with_capacity(tool_calls.len());
+        for (idx, call) in tool_calls.iter().enumerate() {
             if cfg.cancel.load(Ordering::Acquire) {
                 handle_interrupt(
                     &tx,
@@ -1219,17 +1256,10 @@ pub(crate) async fn run_loop(
                     }),
                 )
                 .await;
-                let body = format!("Tool denied: {}", reason);
-                push_tool_result_user(
-                    &tx,
-                    &session_sink,
-                    &session_id,
-                    &mut tool_result_blocks,
-                    call,
-                    &body,
-                    true,
-                )
-                .await;
+                pending_results[idx] = Some(PendingResult {
+                    body: format!("Tool denied: {}", reason),
+                    is_error: true,
+                });
                 continue;
             }
 
@@ -1248,17 +1278,10 @@ pub(crate) async fn run_loop(
                         }),
                     )
                     .await;
-                    let body = format!("Tool denied: {}", reason);
-                    push_tool_result_user(
-                        &tx,
-                        &session_sink,
-                        &session_id,
-                        &mut tool_result_blocks,
-                        call,
-                        &body,
-                        true,
-                    )
-                    .await;
+                    pending_results[idx] = Some(PendingResult {
+                        body: format!("Tool denied: {}", reason),
+                        is_error: true,
+                    });
                     continue;
                 }
             };
@@ -1323,17 +1346,10 @@ pub(crate) async fn run_loop(
                     }),
                 )
                 .await;
-                let body = format!("Tool denied: {}", reason);
-                push_tool_result_user(
-                    &tx,
-                    &session_sink,
-                    &session_id,
-                    &mut tool_result_blocks,
-                    call,
-                    &body,
-                    true,
-                )
-                .await;
+                pending_results[idx] = Some(PendingResult {
+                    body: format!("Tool denied: {}", reason),
+                    is_error: true,
+                });
                 continue;
             }
 
@@ -1383,17 +1399,10 @@ pub(crate) async fn run_loop(
                             }),
                         )
                         .await;
-                        let body = format!("Tool denied: {}", reason);
-                        push_tool_result_user(
-                            &tx,
-                            &session_sink,
-                            &session_id,
-                            &mut tool_result_blocks,
-                            call,
-                            &body,
-                            true,
-                        )
-                        .await;
+                        pending_results[idx] = Some(PendingResult {
+                            body: format!("Tool denied: {}", reason),
+                            is_error: true,
+                        });
                         continue;
                     }
                 } else {
@@ -1421,17 +1430,10 @@ pub(crate) async fn run_loop(
                             }),
                         )
                         .await;
-                        let body = format!("Tool denied: checkpoint capture failed ({})", reason);
-                        push_tool_result_user(
-                            &tx,
-                            &session_sink,
-                            &session_id,
-                            &mut tool_result_blocks,
-                            call,
-                            &body,
-                            true,
-                        )
-                        .await;
+                        pending_results[idx] = Some(PendingResult {
+                            body: format!("Tool denied: checkpoint capture failed ({})", reason),
+                            is_error: true,
+                        });
                         continue;
                     }
                 }
@@ -1503,197 +1505,283 @@ pub(crate) async fn run_loop(
                     .await;
                 }
             }
-            let exec = tool.execute(effective_input.clone(), ctx).await;
-            let duration_ms = elapsed_ms(started);
-            let (text, is_error, tool_result_obj) = match &exec {
-                Ok(res) => (res.flatten_text(), res.is_error, Some(res.clone())),
-                Err(ToolError::PermissionDenied(msg)) => {
-                    emit(
+            // Stash the execute future. Read-only tools join the
+            // parallel batch — overlapping their IO is safe and a
+            // significant win when the model fans out several Reads or
+            // Greps in one turn. Mutating, Execution, External, and
+            // Orchestration tools fall through to the sequential batch
+            // so concurrent invocations cannot race on overlapping
+            // files, child processes, MCP server state, or other shared
+            // resources. The per-call post-execute bookkeeping is
+            // recorded once here regardless of which batch the call
+            // lands in.
+            let tool_arc = tool.clone();
+            let effective_input_clone = effective_input.clone();
+            let fut: ExecFut =
+                Box::pin(async move { tool_arc.execute(effective_input_clone, ctx).await });
+            if matches!(kind, crate::permission::PermissionKind::ReadOnly) {
+                parallel_futures.push((idx, fut));
+            } else {
+                sequential_futures.push((idx, fut));
+            }
+            per_call_state[idx] = Some(PerCallState {
+                effective_input: effective_input.clone(),
+                started,
+            });
+            continue;
+        }
+        // === Parallel batch: run all read-only `tool.execute(...)`
+        // futures concurrently. They cannot race on observable state.
+        let parallel_results = if parallel_futures.is_empty() {
+            Vec::new()
+        } else {
+            let (indices, futures): (Vec<_>, Vec<_>) = parallel_futures.into_iter().unzip();
+            let results = futures::future::join_all(futures).await;
+            indices.into_iter().zip(results).collect::<Vec<_>>()
+        };
+        // === Sequential batch: run mutating/execution/external/
+        // orchestration tools strictly one at a time so they cannot
+        // race. Within the batch they run in original input order.
+        let mut sequential_results: Vec<(usize, Result<crate::tool::ToolResult, ToolError>)> =
+            Vec::with_capacity(sequential_futures.len());
+        for (idx, fut) in sequential_futures {
+            let res = fut.await;
+            sequential_results.push((idx, res));
+        }
+        // Index results by call idx for the post-execute pass.
+        let mut exec_by_idx: Vec<Option<Result<crate::tool::ToolResult, ToolError>>> =
+            (0..tool_calls.len()).map(|_| None).collect();
+        for (idx, res) in parallel_results.into_iter().chain(sequential_results) {
+            exec_by_idx[idx] = Some(res);
+        }
+        // === Post-execute pass: iterate calls in input order. For each
+        // call that ran (i.e. wasn't short-circuited), emit completion
+        // events, run post-tool hooks, and push the tool result block.
+        for (idx, call) in tool_calls.iter().enumerate() {
+            // Calls that short-circuited in the gate-loop already had
+            // their `tool_result_blocks` entry pushed via
+            // `push_tool_result_user` — nothing to do here.
+            let Some(exec) = exec_by_idx[idx].take() else {
+                continue;
+            };
+            let state = per_call_state[idx]
+                .take()
+                .expect("gate-loop must have recorded per-call state for runnable calls");
+            let effective_input = state.effective_input;
+            let started = state.started;
+            // Re-establish the inner `_old_body_start_` once-only block:
+            {
+                let duration_ms = elapsed_ms(started);
+                let (text, is_error, tool_result_obj) = match &exec {
+                    Ok(res) => (res.flatten_text(), res.is_error, Some(res.clone())),
+                    Err(ToolError::PermissionDenied(msg)) => {
+                        emit(
+                            &tx,
+                            &session_sink,
+                            &session_id,
+                            AgentEvent::ToolCallDenied(ToolCallDenied {
+                                tool_use_id: call.id.clone(),
+                                tool_name: call.name.clone(),
+                                reason: msg.clone(),
+                            }),
+                        )
+                        .await;
+                        (format!("Permission denied: {msg}"), true, None)
+                    }
+                    Err(e) => (format!("Tool error: {e}"), true, None),
+                };
+
+                match &exec {
+                    Ok(res) => {
+                        if let Some(ev) = mcp_completion_from_result(&call.name, res, duration_ms) {
+                            emit_telemetry(
+                                &telemetry_sink,
+                                AgentTelemetryEvent::McpToolCallCompleted {
+                                    session_id: session_id.clone(),
+                                    run_id: cfg.run_id.clone(),
+                                    server_name: ev.server_name.clone(),
+                                    tool_name: ev.agent_tool_name.clone(),
+                                    duration_ms: ev.duration_ms,
+                                    result_bytes: ev.result_bytes,
+                                    outcome: if ev.is_error {
+                                        TelemetryOutcome::Error
+                                    } else {
+                                        TelemetryOutcome::Ok
+                                    },
+                                },
+                            )
+                            .await;
+                            emit(
+                                &tx,
+                                &session_sink,
+                                &session_id,
+                                AgentEvent::McpToolCallCompleted(ev),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(ev) = mcp_failure_from_error(&call.name, &e.to_string()) {
+                            emit_telemetry(
+                                &telemetry_sink,
+                                AgentTelemetryEvent::McpToolCallFailed {
+                                    session_id: session_id.clone(),
+                                    run_id: cfg.run_id.clone(),
+                                    server_name: ev.server_name.clone(),
+                                    tool_name: ev.agent_tool_name.clone(),
+                                    error_category: "mcp_tool".into(),
+                                },
+                            )
+                            .await;
+                            emit(
+                                &tx,
+                                &session_sink,
+                                &session_id,
+                                AgentEvent::McpToolCallFailed(ev),
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                if call.name == SEARCH_TOOLS_NAME {
+                    emit_search_tools_result_events(
                         &tx,
                         &session_sink,
+                        &telemetry_sink,
                         &session_id,
-                        AgentEvent::ToolCallDenied(ToolCallDenied {
-                            tool_use_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            reason: msg.clone(),
-                        }),
+                        &cfg.run_id,
+                        turns,
+                        &catalog,
+                        &effective_input,
+                        &exec,
+                        options.tool_search.strategy,
                     )
                     .await;
-                    (format!("Permission denied: {msg}"), true, None)
                 }
-                Err(e) => (format!("Tool error: {e}"), true, None),
-            };
 
-            match &exec {
-                Ok(res) => {
-                    if let Some(ev) = mcp_completion_from_result(&call.name, res, duration_ms) {
-                        emit_telemetry(
-                            &telemetry_sink,
-                            AgentTelemetryEvent::McpToolCallCompleted {
-                                session_id: session_id.clone(),
-                                run_id: cfg.run_id.clone(),
-                                server_name: ev.server_name.clone(),
-                                tool_name: ev.agent_tool_name.clone(),
-                                duration_ms: ev.duration_ms,
-                                result_bytes: ev.result_bytes,
-                                outcome: if ev.is_error {
-                                    TelemetryOutcome::Error
-                                } else {
-                                    TelemetryOutcome::Ok
-                                },
-                            },
-                        )
-                        .await;
-                        emit(
-                            &tx,
-                            &session_sink,
-                            &session_id,
-                            AgentEvent::McpToolCallCompleted(ev),
-                        )
-                        .await;
+                // If the tool was TodoWrite, broadcast a TodoUpdate.
+                if call.name == "TodoWrite" {
+                    if let Some(res) = &tool_result_obj {
+                        if let Some(updated) = res
+                            .metadata
+                            .get("todo_list")
+                            .and_then(|v| serde_json::from_value::<TodoList>(v.clone()).ok())
+                        {
+                            emit(
+                                &tx,
+                                &session_sink,
+                                &session_id,
+                                AgentEvent::TodoUpdate(crate::events::TodoUpdate { list: updated }),
+                            )
+                            .await;
+                        }
                     }
                 }
-                Err(e) => {
-                    if let Some(ev) = mcp_failure_from_error(&call.name, &e.to_string()) {
-                        emit_telemetry(
-                            &telemetry_sink,
-                            AgentTelemetryEvent::McpToolCallFailed {
-                                session_id: session_id.clone(),
-                                run_id: cfg.run_id.clone(),
-                                server_name: ev.server_name.clone(),
-                                tool_name: ev.agent_tool_name.clone(),
-                                error_category: "mcp_tool".into(),
-                            },
-                        )
-                        .await;
-                        emit(
-                            &tx,
-                            &session_sink,
-                            &session_id,
-                            AgentEvent::McpToolCallFailed(ev),
-                        )
-                        .await;
-                    }
-                }
-            }
 
-            if call.name == SEARCH_TOOLS_NAME {
-                emit_search_tools_result_events(
-                    &tx,
-                    &session_sink,
-                    &telemetry_sink,
-                    &session_id,
-                    &cfg.run_id,
-                    turns,
-                    &catalog,
-                    &effective_input,
-                    &exec,
-                    options.tool_search.strategy,
-                )
-                .await;
-            }
-
-            // If the tool was TodoWrite, broadcast a TodoUpdate.
-            if call.name == "TodoWrite" {
-                if let Some(res) = &tool_result_obj {
-                    if let Some(updated) = res
-                        .metadata
-                        .get("todo_list")
-                        .and_then(|v| serde_json::from_value::<TodoList>(v.clone()).ok())
-                    {
-                        emit(
-                            &tx,
-                            &session_sink,
-                            &session_id,
-                            AgentEvent::TodoUpdate(crate::events::TodoUpdate { list: updated }),
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            emit(
-                &tx,
-                &session_sink,
-                &session_id,
-                AgentEvent::ToolCallCompleted(ToolCallCompleted {
-                    tool_use_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    is_error,
-                    duration_ms,
-                }),
-            )
-            .await;
-            emit_telemetry(
-                &telemetry_sink,
-                AgentTelemetryEvent::ToolExecutionCompleted {
-                    session_id: session_id.clone(),
-                    run_id: cfg.run_id.clone(),
-                    turn_index: turns,
-                    tool_name: call.name.clone(),
-                    duration_ms,
-                    outcome: if is_error {
-                        TelemetryOutcome::Error
-                    } else {
-                        TelemetryOutcome::Ok
-                    },
-                    error_category: if is_error { Some("tool".into()) } else { None },
-                },
-            )
-            .await;
-
-            // Post-tool-use hooks (success or failure).
-            let post_event = if is_error {
-                HookEventName::PostToolUseFailure
-            } else {
-                HookEventName::PostToolUse
-            };
-            if !hooks.is_empty() {
-                let mut hi = HookInput::new(
-                    post_event,
-                    session_id.clone(),
-                    options.cwd.clone(),
-                    cfg.run_id.clone(),
-                );
-                hi.turn_index = turns;
-                hi.tool_name = Some(call.name.clone());
-                hi.tool_input = Some(effective_input.clone());
-                hi.tool_result = tool_result_obj.clone();
-                hi.metadata = tool_metadata(&call.name, None);
-                let records = hooks.dispatch(&hi).await;
-                let (agg, _) = aggregate(&records);
                 emit(
                     &tx,
                     &session_sink,
                     &session_id,
-                    AgentEvent::HookEvaluated(HookEvaluated {
-                        event: post_event,
-                        tool_name: Some(call.name.clone()),
-                        outcome: hook_outcome_kind(&agg, false),
-                        reason: hook_decision_reason(&agg),
+                    AgentEvent::ToolCallCompleted(ToolCallCompleted {
+                        tool_use_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        is_error,
+                        duration_ms,
                     }),
                 )
                 .await;
-                emit_hook_telemetry(
+                emit_telemetry(
                     &telemetry_sink,
-                    &session_id,
-                    &cfg.run_id,
-                    turns,
-                    post_event,
-                    Some(&call.name),
-                    &agg,
+                    AgentTelemetryEvent::ToolExecutionCompleted {
+                        session_id: session_id.clone(),
+                        run_id: cfg.run_id.clone(),
+                        turn_index: turns,
+                        tool_name: call.name.clone(),
+                        duration_ms,
+                        outcome: if is_error {
+                            TelemetryOutcome::Error
+                        } else {
+                            TelemetryOutcome::Ok
+                        },
+                        error_category: if is_error { Some("tool".into()) } else { None },
+                    },
                 )
                 .await;
-            }
 
+                // Post-tool-use hooks (success or failure).
+                let post_event = if is_error {
+                    HookEventName::PostToolUseFailure
+                } else {
+                    HookEventName::PostToolUse
+                };
+                if !hooks.is_empty() {
+                    let mut hi = HookInput::new(
+                        post_event,
+                        session_id.clone(),
+                        options.cwd.clone(),
+                        cfg.run_id.clone(),
+                    );
+                    hi.turn_index = turns;
+                    hi.tool_name = Some(call.name.clone());
+                    hi.tool_input = Some(effective_input.clone());
+                    hi.tool_result = tool_result_obj.clone();
+                    hi.metadata = tool_metadata(&call.name, None);
+                    let records = hooks.dispatch(&hi).await;
+                    let (agg, _) = aggregate(&records);
+                    emit(
+                        &tx,
+                        &session_sink,
+                        &session_id,
+                        AgentEvent::HookEvaluated(HookEvaluated {
+                            event: post_event,
+                            tool_name: Some(call.name.clone()),
+                            outcome: hook_outcome_kind(&agg, false),
+                            reason: hook_decision_reason(&agg),
+                        }),
+                    )
+                    .await;
+                    emit_hook_telemetry(
+                        &telemetry_sink,
+                        &session_id,
+                        &cfg.run_id,
+                        turns,
+                        post_event,
+                        Some(&call.name),
+                        &agg,
+                    )
+                    .await;
+                }
+
+                pending_results[idx] = Some(PendingResult {
+                    body: text,
+                    is_error,
+                });
+            }
+        }
+
+        // Final pass: emit `UserToolResult` events and append tool_result
+        // blocks in input order. Buffering above (both for
+        // short-circuits and for runnable calls) guarantees the
+        // Anthropic API invariant that tool_result blocks follow their
+        // tool_use blocks in input order, even when a later call denies
+        // before an earlier call's future resolves.
+        let mut tool_result_blocks: Vec<ContentBlock> = Vec::with_capacity(tool_calls.len());
+        for (idx, call) in tool_calls.iter().enumerate() {
+            let pending = pending_results[idx]
+                .take()
+                .unwrap_or_else(|| PendingResult {
+                    body: "Tool result missing".to_string(),
+                    is_error: true,
+                });
             push_tool_result_user(
                 &tx,
                 &session_sink,
                 &session_id,
                 &mut tool_result_blocks,
                 call,
-                &text,
-                is_error,
+                &pending.body,
+                pending.is_error,
             )
             .await;
         }

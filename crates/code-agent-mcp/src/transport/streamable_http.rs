@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use reqwest::Url;
 use serde_json::Value;
@@ -17,6 +18,10 @@ pub struct StreamableHttpMcpTransport {
     protocol_version: Option<String>,
     timeout: std::time::Duration,
     secrets: Vec<String>,
+    /// Per-response byte cap. Once the body stream exceeds this we abort
+    /// reading and return `ResultTooLarge` instead of materializing the
+    /// full payload into memory.
+    max_result_bytes: usize,
 }
 
 impl StreamableHttpMcpTransport {
@@ -42,6 +47,14 @@ impl StreamableHttpMcpTransport {
             .timeout(timeout)
             .build()
             .map_err(|e| McpError::Transport(format!("failed to build HTTP client: {e}")))?;
+        // Allow some slack above the structured `max_tool_result_bytes`
+        // since the wire response is JSON-RPC-wrapped (envelope + base64
+        // for binary content). The 4x factor mirrors the post-parse
+        // sanity check in `enforce_non_binary_result_limit`.
+        let max_result_bytes = limits
+            .max_tool_result_bytes
+            .saturating_mul(4)
+            .max(64 * 1024);
         Ok(Self {
             client,
             endpoint,
@@ -49,6 +62,7 @@ impl StreamableHttpMcpTransport {
             protocol_version: None,
             timeout,
             secrets,
+            max_result_bytes,
         })
     }
 
@@ -97,9 +111,31 @@ impl StreamableHttpMcpTransport {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = response.text().await.map_err(|e| {
-            McpError::Transport(format!("failed reading HTTP MCP response body: {e}"))
-        })?;
+        // Drain the body as a chunked stream so we can stop reading the
+        // moment we exceed `max_result_bytes`. Buffering the full body up
+        // front would let a multi-MB response materialize in memory before
+        // the limit check ran.
+        let limit = self.max_result_bytes;
+        let mut byte_stream = response.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                if e.is_timeout() {
+                    McpError::timeout(self.timeout)
+                } else {
+                    McpError::Transport(format!("failed reading HTTP MCP response body: {e}"))
+                }
+            })?;
+            if buf.len().saturating_add(chunk.len()) > limit {
+                return Err(McpError::ResultTooLarge {
+                    actual: buf.len().saturating_add(chunk.len()),
+                    limit,
+                });
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(buf)
+            .map_err(|e| McpError::Transport(format!("HTTP MCP response body not utf-8: {e}")))?;
         if !status.is_success() {
             return Err(McpError::Http {
                 status: status.as_u16(),
