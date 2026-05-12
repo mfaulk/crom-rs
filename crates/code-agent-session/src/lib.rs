@@ -576,6 +576,11 @@ pub async fn summarize_session(
         session_id: session_id.to_string(),
         ..Default::default()
     };
+    // Each AgentResult event reports cumulative cost for its run, so summing
+    // every event would double-count whenever a run emits more than one
+    // Result. Keep the last reported cost per run id and sum those at the end.
+    let mut last_cost_per_run: std::collections::HashMap<Option<code_agent_core::RunId>, f64> =
+        std::collections::HashMap::new();
     for r in &records {
         if s.cwd.is_none() {
             s.cwd = Some(r.cwd.clone());
@@ -603,18 +608,19 @@ pub async fn summarize_session(
                         s.total_input_tokens += u.input_tokens;
                         s.total_output_tokens += u.output_tokens;
                     }
-                    // Each Result reports the cumulative cost for its run.
-                    // Summing across runs yields the session-wide total;
-                    // overwriting (the old behavior) under-reported cost
-                    // for any session with more than one run (resumed,
-                    // continued, forked, or chat sessions).
                     if let Some(c) = res.total_cost_usd {
-                        s.total_cost_usd = Some(s.total_cost_usd.unwrap_or(0.0) + c);
+                        // Overwrite, not add: each Result is cumulative for
+                        // its run. Records appear in append order, so the
+                        // final write per run id wins.
+                        last_cost_per_run.insert(res.run_id.clone(), c);
                     }
                 }
                 _ => {}
             },
         }
+    }
+    if !last_cost_per_run.is_empty() {
+        s.total_cost_usd = Some(last_cost_per_run.values().sum());
     }
     Ok(s)
 }
@@ -730,7 +736,7 @@ pub fn replay_conversation(records: &[SessionRecord]) -> Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use code_agent_core::{AssistantMessage, ResultSubtype};
+    use code_agent_core::{AgentResult, AssistantMessage, ResultSubtype, RunId, SessionId};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -951,5 +957,62 @@ mod tests {
         let recs = store.load(&id).await.unwrap();
         let conv = replay_conversation(&recs);
         assert_eq!(conv.messages.len(), 2);
+    }
+
+    // Build a SessionRecord wrapping an AgentResult event with the given run id
+    // and cumulative cost. Used by the cost-accounting tests.
+    fn result_record(
+        dir: &TempDir,
+        session_id: &SessionId,
+        run_id: Option<&str>,
+        cost: f64,
+    ) -> SessionRecord {
+        let res = AgentResult {
+            subtype: ResultSubtype::Success,
+            result: None,
+            session_id: session_id.clone(),
+            run_id: run_id.map(|s| RunId(s.to_string())),
+            num_turns: 1,
+            usage: None,
+            total_cost_usd: Some(cost),
+        };
+        SessionRecord {
+            timestamp: now_iso(),
+            cwd: dir.path().to_path_buf(),
+            session_id: session_id.to_string(),
+            payload: SessionPayload::Event(AgentEvent::Result(res)),
+        }
+    }
+
+    #[tokio::test]
+    // summarize_session aggregates cost as (last per run_id), summed across runs.
+    // Two distinct runs are recorded; run A reports cumulative 0.10 then 0.20,
+    // run B reports 0.05. The session total must be 0.25 (0.20 + 0.05), not
+    // 0.35 (sum of all events) or 0.30 (sum-of-deltas miscomputed).
+    async fn summary_cost_takes_last_per_run() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        store
+            .append(&id, result_record(&dir, &id, Some("run-a"), 0.10))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, Some("run-a"), 0.20))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, Some("run-b"), 0.05))
+            .await
+            .unwrap();
+
+        let summary = summarize_session(&store, &id).await.unwrap();
+        let total = summary.total_cost_usd.expect("cost should be reported");
+        // Floating-point compare with epsilon to avoid representation noise.
+        assert!(
+            (total - 0.25).abs() < 1e-9,
+            "expected 0.25 (last of run-a + last of run-b), got {total}"
+        );
     }
 }
