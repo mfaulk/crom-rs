@@ -9,6 +9,10 @@
 //! On Unix the directory is created with `0700` and per-account files
 //! with `0600`. The hashed filename keeps the on-disk listing free of
 //! identifiable account ids while still producing a stable lookup key.
+//! The hash input is `sha256(<provider_id> || 0x00 || <account_id>)` so
+//! the same email under two providers maps to two different filenames,
+//! making a single rainbow table built from a list of plain emails
+//! useless. A truly random per-store salt is tracked as a follow-up.
 //!
 //! Writes go through a sibling temp file in the same directory and are
 //! renamed over the target via `tempfile::persist`, so concurrent
@@ -61,7 +65,16 @@ impl FileCredentialBackend {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&provider_dir, std::fs::Permissions::from_mode(0o700));
         }
-        provider_dir.join(format!("{}.json", account_id.redacted_hash()))
+        // Mix the provider id into the hash as a poor-man's salt so a
+        // directory listing across providers cannot be cracked with a
+        // single rainbow table keyed on plain email. A truly random
+        // per-store salt (persisted as `.salt`, 0o600) is tracked as a
+        // follow-up — the provider-id salt is zero-migration and
+        // strictly better than the previous unsalted hash.
+        provider_dir.join(format!(
+            "{}.json",
+            account_id.redacted_hash_with_salt(provider.as_str())
+        ))
     }
 }
 
@@ -256,6 +269,48 @@ mod tests {
     }
 
     #[test]
+    // The on-disk filename for the same account id under two different
+    // providers must differ, so a directory listing cannot be cracked
+    // with a single rainbow table keyed on a plain email. This is the
+    // observable consequence of mixing the provider id into the hash
+    // input as a poor-man's salt.
+    fn filename_differs_across_providers_for_same_account_id() {
+        let dir1 = tempfile::TempDir::new().unwrap();
+        let dir2 = tempfile::TempDir::new().unwrap();
+        let backend1 = FileCredentialBackend::new(dir1.path().to_path_buf()).unwrap();
+        let backend2 = FileCredentialBackend::new(dir2.path().to_path_buf()).unwrap();
+        let acct = AccountId::new("user@example.com");
+        let secret = StoredCredentialSecret {
+            api_key: Some(SecretString::new("k".into())),
+            ..Default::default()
+        };
+        backend1.put(&ProviderId::Anthropic, &acct, &secret).unwrap();
+        backend2.put(&ProviderId::OpenAi, &acct, &secret).unwrap();
+        let name1 = std::fs::read_dir(dir1.path().join(ProviderId::Anthropic.as_str()))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        let name2 = std::fs::read_dir(dir2.path().join(ProviderId::OpenAi.as_str()))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        assert_ne!(
+            name1, name2,
+            "same email under two providers must hash to different filenames"
+        );
+        assert!(name1.starts_with("acct_"));
+        assert!(name2.starts_with("acct_"));
+    }
+
+    #[test]
     // Filename uses the redacted hash, not the raw account id, so a
     // directory listing does not reveal user identifiers.
     fn filename_uses_hashed_account_id() {
@@ -307,7 +362,10 @@ mod tests {
         let path = dir
             .path()
             .join(provider.as_str())
-            .join(format!("{}.json", acct.redacted_hash()));
+            .join(format!(
+                "{}.json",
+                acct.redacted_hash_with_salt(provider.as_str())
+            ));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secret file must be 0o600 on unix");
     }
@@ -342,7 +400,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let canonical = format!("{}.json", acct.redacted_hash());
+        let canonical = format!("{}.json", acct.redacted_hash_with_salt(provider.as_str()));
         let entries: Vec<String> = std::fs::read_dir(dir.path().join(provider.as_str()))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
