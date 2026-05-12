@@ -342,8 +342,16 @@ async fn cmd_plans_revise(settings: &Settings, args: ReviseArgs) -> Result<()> {
 }
 
 async fn cmd_plans_edit(settings: &Settings, args: EditArgs) -> Result<()> {
-    let store = plan_store(&args.common.cwd, settings);
-    let id = resolve_plan_id(&store, &args.plan_id).await?;
+    // Use the concrete `FsPlanStore` here (not the trait object returned
+    // by `plan_store`) so we can call `save_revision_atomic`, which
+    // holds the per-plan lock across load + validate + save and closes
+    // the TOCTOU between `validate_edited_plan` and the persisted save.
+    let store = Arc::new(FsPlanStore::new(
+        &args.common.cwd,
+        planning_options_from_settings(settings),
+    ));
+    let trait_store: Arc<dyn PlanStore> = store.clone();
+    let id = resolve_plan_id(&trait_store, &args.plan_id).await?;
     let plan = store.load(&id).await?;
     let live_path = args
         .common
@@ -395,20 +403,20 @@ async fn cmd_plans_edit(settings: &Settings, args: EditArgs) -> Result<()> {
             "plan id may not be changed during edit; live plan untouched"
         ));
     }
-    // Re-load the original from the store now (rather than reusing the
-    // `plan` snapshot from before $EDITOR launched) so the comparison
-    // reflects the live on-disk state at decision time. This also makes
-    // the validation testable in isolation via `validate_edited_plan`.
-    let original = store.load(&plan.id).await?;
-    validate_edited_plan(&original, &edited)
-        .context("rejected manual edit; live plan untouched")?;
-    // Drop the tempfile guard explicitly so it's removed before we exit.
+    // Drop the tempfile guard explicitly so it's removed before we persist.
     drop(tmp);
+    let (saved_id, saved_version) = (edited.id.clone(), edited.version);
+    // Atomic load+validate+save inside the per-plan lock. Without this,
+    // a concurrent writer could mutate the on-disk plan between the
+    // validator's read and our save, letting the edit silently overwrite
+    // a state the user never reviewed.
     store
-        .save_revision(edited.clone())
+        .save_revision_atomic(edited, |current, edited| {
+            validate_edited_plan(current, edited).map_err(|e| PlanError::Invalid(format!("{e:#}")))
+        })
         .await
-        .context("save_revision rejected the edited plan; live plan untouched")?;
-    println!("[plan] saved manual edit {} v{}", edited.id, edited.version);
+        .context("rejected manual edit; live plan untouched")?;
+    println!("[plan] saved manual edit {} v{}", saved_id, saved_version);
     Ok(())
 }
 
