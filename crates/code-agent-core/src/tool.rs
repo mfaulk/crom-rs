@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -109,9 +109,14 @@ pub trait Tool: Send + Sync {
     ) -> Result<ToolResult, ToolError>;
 }
 
+/// Tools are stored in a `BTreeMap` so iteration order is lexicographic by
+/// name. The Anthropic API caches the `tools` array as part of the prompt
+/// prefix; if the order varies across resumed or forked sessions the cache
+/// is invalidated, which raises cost and lowers hit rate. Lookups remain
+/// O(log n), which is negligible for the small tool sets we register.
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -128,9 +133,8 @@ impl ToolRegistry {
     }
 
     pub fn names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.tools.keys().cloned().collect();
-        v.sort();
-        v
+        // BTreeMap keys already iterate in lexicographic order.
+        self.tools.keys().cloned().collect()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Arc<dyn Tool>> + '_ {
@@ -163,5 +167,84 @@ impl ToolRegistry {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::ToolError;
+    use crate::permission::PermissionKind;
+
+    struct StubTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for StubTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn permission_kind(&self) -> PermissionKind {
+            PermissionKind::ReadOnly
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::ok_text(""))
+        }
+    }
+
+    fn stub(name: &str) -> Arc<dyn Tool> {
+        Arc::new(StubTool {
+            name: name.to_string(),
+        })
+    }
+
+    /// Registry::iter yields tools in lexicographic order regardless of insertion order.
+    #[test]
+    fn iter_returns_tools_in_lexicographic_order() {
+        let mut registry = ToolRegistry::new();
+        // Insert in a non-sorted order; names chosen so a HashMap would
+        // very likely produce a different ordering across rebuilds.
+        for n in ["zebra", "alpha", "mango", "bravo"] {
+            registry.register(stub(n));
+        }
+        let observed: Vec<String> = registry.iter().map(|t| t.name().to_string()).collect();
+        assert_eq!(
+            observed,
+            vec![
+                "alpha".to_string(),
+                "bravo".to_string(),
+                "mango".to_string(),
+                "zebra".to_string(),
+            ],
+            "ToolRegistry::iter must yield tools in lexicographic name order so the \
+             Anthropic tools array stays stable across resumed/forked sessions"
+        );
+    }
+
+    /// Registry::iter ordering is stable across distinct instances built in different insertion orders.
+    #[test]
+    fn iter_ordering_is_stable_across_instances() {
+        let mut a = ToolRegistry::new();
+        for n in ["zebra", "alpha", "mango", "bravo"] {
+            a.register(stub(n));
+        }
+        let mut b = ToolRegistry::new();
+        for n in ["mango", "bravo", "zebra", "alpha"] {
+            b.register(stub(n));
+        }
+        let a_names: Vec<String> = a.iter().map(|t| t.name().to_string()).collect();
+        let b_names: Vec<String> = b.iter().map(|t| t.name().to_string()).collect();
+        assert_eq!(a_names, b_names);
     }
 }
