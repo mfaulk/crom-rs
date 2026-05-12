@@ -104,19 +104,27 @@ pub fn classify_tool_call(
     }
 
     // Now check tool-specific input constraints.
-    match tool_name {
-        "Bash" => classify_bash(plan, options, input),
-        "Edit" | "Write" | "Read" => classify_file_tool(plan, options, tool_name, input),
-        _ => {
-            // Fallback: tool is mentioned in the plan but we don't have a
-            // structured constraint to enforce. Permit, but mark Ambiguous
-            // so downstream UI can flag it.
-            PlanScopeDecision::Ambiguous {
-                reason: format!("tool `{tool_name}` matched plan but no constraint to enforce"),
-            }
-        }
+    if tool_name == "Bash" {
+        return classify_bash(plan, options, input);
+    }
+    if FILE_TOOL_NAMES.contains(&tool_name) {
+        return classify_file_tool(plan, options, tool_name, input);
+    }
+    // Fallback: tool is mentioned in the plan but we don't have a
+    // structured constraint to enforce. Permit, but mark Ambiguous
+    // so downstream UI can flag it.
+    PlanScopeDecision::Ambiguous {
+        reason: format!("tool `{tool_name}` matched plan but no constraint to enforce"),
     }
 }
+
+/// Canonical list of file-touching tool names that flow through
+/// [`classify_file_tool`]. The list is the single source of truth shared
+/// between the dispatch in [`classify_tool_call`] and the access mapping
+/// in [`access_for_file_tool`]. A `debug_assert!` inside
+/// [`classify_file_tool`] catches any drift between the two in tests and
+/// debug builds; release builds fail closed (`OutOfScope`).
+pub(crate) const FILE_TOOL_NAMES: &[&str] = &["Edit", "Write", "Read"];
 
 fn matches_tool_name(planned: &str, actual: &str) -> bool {
     // Fail-closed: refuse to match unsafe patterns at the matcher itself,
@@ -234,13 +242,14 @@ fn classify_bash(
 }
 
 /// Map a tool name to the `PlanFileAccess` it implies, or `None` if the
-/// tool is not a known file-touching tool. Returning `None` lets callers
-/// fail safely (treat as Ambiguous) instead of panicking when a future
-/// file tool is added without a matching mapping.
+/// tool is not a known file-touching tool. The set of names that may
+/// legitimately reach this map is enumerated by [`FILE_TOOL_NAMES`].
 ///
-/// LINT: when adding a new file-touching tool, extend both this match
-/// and the dispatch arm in [`classify_tool_call`] (`"Edit" | "Write" |
-/// "Read"` branch). The two must stay in sync.
+/// LINT: when adding a new file-touching tool, extend [`FILE_TOOL_NAMES`],
+/// this match, and the [`PlanFileAccess`] variant it implies. The three
+/// sites must stay in lockstep — a debug_assert in [`classify_file_tool`]
+/// catches a missing mapping in tests/debug builds, and release builds
+/// fail closed (`OutOfScope`) rather than authorizing the call.
 pub(crate) fn access_for_file_tool(tool_name: &str) -> Option<PlanFileAccess> {
     match tool_name {
         "Read" => Some(PlanFileAccess::Read),
@@ -263,20 +272,26 @@ fn classify_file_tool(
         };
     }
 
-    // LINT: keep this arm in sync with the dispatch in `classify_tool_call`
-    // (`"Edit" | "Write" | "Read"` branch). When adding a new file-touching
-    // tool here, also extend the dispatch arm and the corresponding
-    // PlanFileAccess variant. Returning `None` for an unknown tool name
-    // routes the call into the conservative Ambiguous fallthrough below
-    // rather than panicking — but the contract is that every entry in the
-    // dispatch arm has a matching entry here.
+    // CONTRACT: every entry in `FILE_TOOL_NAMES` MUST have a matching
+    // `access_for_file_tool` mapping. The dispatch in `classify_tool_call`
+    // routes only names from `FILE_TOOL_NAMES` here, so missing the map
+    // means the lists drifted. Catch that in tests/debug builds…
+    debug_assert!(
+        !FILE_TOOL_NAMES.contains(&tool_name) || access_for_file_tool(tool_name).is_some(),
+        "FILE_TOOL_NAMES entry `{tool_name}` has no access_for_file_tool mapping; \
+         keep the two in sync"
+    );
+    // …and FAIL CLOSED in release: an unmapped file-touching tool is
+    // denied as OutOfScope rather than silently routed through Ambiguous
+    // (which the PlanScopeCallback approves under headless AlwaysAllow).
     let want = match access_for_file_tool(tool_name) {
         Some(a) => a,
         None => {
-            return PlanScopeDecision::Ambiguous {
+            return PlanScopeDecision::OutOfScope {
                 reason: format!(
                     "file tool `{tool_name}` has no structured access mapping; \
-                     classifier cannot enforce a constraint"
+                     denying call to avoid silent authorization (maintainer: extend \
+                     FILE_TOOL_NAMES + access_for_file_tool in plan::deviation)"
                 ),
             };
         }
@@ -826,16 +841,20 @@ mod tests {
     }
 
     #[test]
-    // classify_file_tool routes an unknown file-tool name through the
-    // Ambiguous fallback instead of panicking. Pins #81: the prior
-    // `unreachable!()` in the match would have crashed if the dispatch
-    // arm in classify_tool_call ever grew without updating this match.
-    fn classify_file_tool_unknown_tool_is_ambiguous_not_panic() {
+    // classify_file_tool fails closed (OutOfScope) when given a file-tool
+    // name that the dispatch arm in classify_tool_call routes here but
+    // that has no `access_for_file_tool` mapping. Previously the helper
+    // returned Ambiguous, which the PlanScopeCallback treated as "fall
+    // through to the inner approve" — under headless `AlwaysAllow` that
+    // is a silent authorize, replacing one safety mechanism (panic) with
+    // another silent allow. The mapping must fail closed instead.
+    fn classify_file_tool_unknown_tool_is_out_of_scope_not_ambiguous() {
         let p = plan_with_edit();
         let opt = PlanningOptions::default();
-        // Call the helper directly so we exercise the previously-
-        // unreachable arm without having to extend `classify_tool_call`'s
-        // dispatch in the test.
+        // Call the helper directly so we exercise the unmapped branch
+        // without having to extend `classify_tool_call`'s dispatch in the
+        // test. The dispatch contract is captured separately via
+        // `FILE_TOOL_NAMES` + a debug_assert in classify_file_tool.
         let d = super::classify_file_tool(
             &p,
             &opt,
@@ -843,13 +862,32 @@ mod tests {
             &json!({"file_path": "src/parser.rs"}),
         );
         match d {
-            PlanScopeDecision::Ambiguous { reason } => {
+            PlanScopeDecision::OutOfScope { reason } => {
                 assert!(
                     reason.contains("FutureDelete"),
-                    "ambiguous reason should name the offending tool, got: {reason}"
+                    "out-of-scope reason should name the offending tool, got: {reason}"
+                );
+                assert!(
+                    reason.contains("access mapping") || reason.contains("not approved"),
+                    "out-of-scope reason should explain why the call was denied, got: {reason}"
                 );
             }
-            other => panic!("expected Ambiguous for unknown file tool, got: {other:?}"),
+            other => panic!("expected OutOfScope for unknown file tool, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    // FILE_TOOL_NAMES is the single source of truth shared between the
+    // dispatch arm in classify_tool_call and access_for_file_tool. Every
+    // name in the list MUST have a mapping; the converse is asserted at
+    // runtime via debug_assert!. Pins the contract so a future author
+    // adding a new file tool sees both sites flagged.
+    fn file_tool_names_all_have_access_mapping() {
+        for name in super::FILE_TOOL_NAMES {
+            assert!(
+                super::access_for_file_tool(name).is_some(),
+                "FILE_TOOL_NAMES entry `{name}` has no access_for_file_tool mapping"
+            );
         }
     }
 }
