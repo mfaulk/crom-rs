@@ -754,7 +754,10 @@ mod tests {
             "mcp__github__*",
             "mcp__github__create_issue"
         ));
-        assert!(super::matches_tool_name("mcp__github__*", "mcp__github__list"));
+        assert!(super::matches_tool_name(
+            "mcp__github__*",
+            "mcp__github__list"
+        ));
         assert!(!super::matches_tool_name(
             "mcp__github__*",
             "mcp__gitlab__create_issue"
