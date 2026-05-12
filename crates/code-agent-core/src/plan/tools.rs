@@ -526,14 +526,16 @@ fn parse_permission_kind(s: Option<&str>) -> PermissionKind {
 /// Used as a fallback when the model returns prose instead of calling
 /// SubmitPlan. Always sets `unstructured_warning` so the caller can flag
 /// the plan in the UI.
+/// Maximum number of *characters* (not bytes) retained in the fallback
+/// plan summary. UTF-8 codepoints are variable width, so a byte-based cap
+/// would panic when the cut falls in the middle of a multi-byte codepoint
+/// (e.g. emoji at byte offset 1023).
+const UNSTRUCTURED_SUMMARY_CHAR_CAP: usize = 1024;
+
 pub fn parse_submit_plan_input(text: &str, base: PlanDocument) -> SubmitPlanResult {
     let mut plan = base;
     let trimmed = text.trim();
-    plan.summary = if trimmed.len() > 1024 {
-        format!("{}…", &trimmed[..1024])
-    } else {
-        trimmed.to_string()
-    };
+    plan.summary = truncate_with_ellipsis(trimmed, UNSTRUCTURED_SUMMARY_CHAR_CAP);
     if plan.title.is_empty() {
         plan.title = trimmed
             .lines()
@@ -569,6 +571,21 @@ pub fn parse_submit_plan_input(text: &str, base: PlanDocument) -> SubmitPlanResu
 
 fn plan_unstructured_warning_text() -> Option<String> {
     Some("plan is unstructured: review carefully before approving".into())
+}
+
+/// Truncate `s` to at most `max_chars` Unicode scalar values, appending
+/// an ellipsis when truncation occurs. Operates on `char_indices` so the
+/// cut never falls inside a multi-byte UTF-8 codepoint.
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let mut indices = s.char_indices();
+    if let Some((cut, _)) = indices.nth(max_chars) {
+        let mut out = String::with_capacity(cut + 3);
+        out.push_str(&s[..cut]);
+        out.push('…');
+        out
+    } else {
+        s.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -846,5 +863,29 @@ mod tests {
         assert_eq!(r.plan.steps.len(), 1);
         assert_eq!(r.plan.status, PlanStatus::PendingApproval);
         assert!(r.plan.unstructured_warning.is_some());
+    }
+
+    #[test]
+    // Textual fallback summary truncation must not panic when the cap
+    // falls on a multi-byte UTF-8 codepoint boundary (e.g. an emoji).
+    // Pre-fix this panicked with "byte index 1024 is not a char boundary".
+    fn unstructured_fallback_multibyte_boundary_no_panic() {
+        // Build a string where a 4-byte emoji straddles the 1024-byte cap.
+        // 1023 ASCII bytes + one 4-byte emoji ("🦀") + trailing text means
+        // byte 1024 lands inside the emoji.
+        let mut text = String::with_capacity(2048);
+        for _ in 0..1023 {
+            text.push('a');
+        }
+        text.push('🦀');
+        text.push_str(" trailing tail content");
+
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "u");
+        let r = parse_submit_plan_input(&text, base);
+        // Must produce a valid UTF-8 String ending in the ellipsis sentinel.
+        assert!(r.plan.summary.ends_with('…'));
+        // And the summary must be valid UTF-8 (implicit since it's a String,
+        // but assert chars().count() works without panic on the result).
+        let _ = r.plan.summary.chars().count();
     }
 }
