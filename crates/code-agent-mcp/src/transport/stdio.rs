@@ -22,6 +22,10 @@ pub struct StdioMcpTransport {
     logs: Arc<Mutex<VecDeque<McpServerLogEntry>>>,
     max_log_bytes: usize,
     secrets: Vec<String>,
+    /// Per-message cap on stdout: a misbehaving server that emits a
+    /// gigantic JSON-RPC line should fail with `ResultTooLarge` instead
+    /// of streaming the whole thing into memory.
+    max_message_bytes: usize,
 }
 
 impl StdioMcpTransport {
@@ -61,6 +65,10 @@ impl StdioMcpTransport {
             limits.max_stderr_bytes,
             secrets.clone(),
         );
+        // 4x the structured payload limit + 64 KiB envelope slack, mirroring
+        // `enforce_non_binary_result_limit` so a JSON-RPC envelope around a
+        // permitted payload still fits.
+        let max_message_bytes = limits.max_tool_result_bytes.saturating_mul(4).max(64 * 1024);
         Ok(Self {
             child,
             stdin,
@@ -69,6 +77,7 @@ impl StdioMcpTransport {
             logs,
             max_log_bytes: limits.max_stderr_bytes,
             secrets,
+            max_message_bytes,
         })
     }
 
@@ -86,7 +95,12 @@ impl StdioMcpTransport {
     ) -> McpResult<JsonRpcResponse> {
         loop {
             let mut line = String::new();
-            let n = self.stdout_reader.read_line(&mut line).await?;
+            let n = read_line_bounded(
+                &mut self.stdout_reader,
+                &mut line,
+                self.max_message_bytes,
+            )
+            .await?;
             if n == 0 {
                 let status = self
                     .child
@@ -220,5 +234,49 @@ fn push_log(
     let current: usize = guard.iter().map(|e| e.message.len()).sum();
     if current < max_bytes {
         guard.push_back(entry);
+    }
+}
+
+/// Read a single line of UTF-8 from `reader`, aborting with `ResultTooLarge`
+/// if the line would exceed `limit` bytes. Without this guard a misbehaving
+/// MCP server can stream an arbitrarily large JSON line into memory before
+/// any payload-size check runs.
+async fn read_line_bounded<R>(
+    reader: &mut R,
+    out: &mut String,
+    limit: usize,
+) -> McpResult<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut total = 0usize;
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(total);
+        }
+        // Look for a newline within the buffered chunk.
+        let pos = buf.iter().position(|b| *b == b'\n');
+        let take = match pos {
+            Some(p) => p + 1,
+            None => buf.len(),
+        };
+        // Enforce the cap before copying so we never materialize past it.
+        if total.saturating_add(take) > limit {
+            return Err(McpError::ResultTooLarge {
+                actual: total.saturating_add(take),
+                limit,
+            });
+        }
+        let chunk = std::str::from_utf8(&buf[..take]).map_err(|e| {
+            McpError::Transport(format!("stdio MCP response not utf-8: {e}"))
+        })?;
+        out.push_str(chunk);
+        reader.consume(take);
+        total += take;
+        if pos.is_some() {
+            return Ok(total);
+        }
     }
 }
