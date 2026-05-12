@@ -731,15 +731,13 @@ pub fn replay_conversation(records: &[SessionRecord]) -> Conversation {
         for b in &last.content {
             if let ContentBlock::ToolUse(tc) = b {
                 if !already_answered.contains(&tc.id) {
-                    pending.push(ContentBlock::ToolResult(
-                        code_agent_core::ConvToolResult {
-                            tool_use_id: tc.id.clone(),
-                            content: vec![ToolResultContent::Text {
-                                text: "cancelled - agent interrupted".to_string(),
-                            }],
-                            is_error: true,
-                        },
-                    ));
+                    pending.push(ContentBlock::ToolResult(code_agent_core::ConvToolResult {
+                        tool_use_id: tc.id.clone(),
+                        content: vec![ToolResultContent::Text {
+                            text: "cancelled - agent interrupted".to_string(),
+                        }],
+                        is_error: true,
+                    }));
                 }
             }
         }
@@ -1230,8 +1228,7 @@ mod tests {
 
         // Otherwise every tool_use must be answered by a tool_result in a
         // following user message.
-        let mut answered: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
         for m in &conv.messages[last_assistant_idx + 1..] {
             if m.role != MessageRole::User {
                 continue;
@@ -1328,13 +1325,12 @@ mod tests {
             if tool_use_ids.is_empty() {
                 continue;
             }
-            let next = conv
-                .messages
-                .get(i + 1)
-                .unwrap_or_else(|| panic!(
+            let next = conv.messages.get(i + 1).unwrap_or_else(|| {
+                panic!(
                     "assistant turn at index {i} has tool_use blocks but \
                      no following message; conversation: {conv:#?}"
-                ));
+                )
+            });
             assert_eq!(
                 next.role,
                 MessageRole::User,
