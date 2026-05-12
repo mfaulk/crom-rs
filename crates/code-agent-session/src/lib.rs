@@ -576,6 +576,24 @@ pub async fn summarize_session(
         session_id: session_id.to_string(),
         ..Default::default()
     };
+    // Each AgentResult event with a run_id reports cumulative cost for its
+    // run, so summing every event would double-count whenever a run emits
+    // more than one Result. Keep the last reported cost per run id and sum
+    // those at the end.
+    //
+    // Legacy logs (and any Result lacking a run_id) cannot be bucketed by
+    // run: collapsing every `None` into a single map entry would silently
+    // drop all but the last value. Instead, treat each None-tagged result
+    // as an independent contribution and add it to `uncounted_sum`. This
+    // can over-count if multiple None-tagged events came from the same run
+    // (each reporting cumulative cost), but the alternative — dropping
+    // values — silently undercounts, which is worse for a billing-adjacent
+    // summary. Sessions written by this codebase always include a run_id,
+    // so this fallback only affects legacy fixtures.
+    let mut last_cost_per_run: std::collections::HashMap<code_agent_core::RunId, f64> =
+        std::collections::HashMap::new();
+    let mut uncounted_sum: f64 = 0.0;
+    let mut saw_any_cost = false;
     for r in &records {
         if s.cwd.is_none() {
             s.cwd = Some(r.cwd.clone());
@@ -603,18 +621,32 @@ pub async fn summarize_session(
                         s.total_input_tokens += u.input_tokens;
                         s.total_output_tokens += u.output_tokens;
                     }
-                    // Each Result reports the cumulative cost for its run.
-                    // Summing across runs yields the session-wide total;
-                    // overwriting (the old behavior) under-reported cost
-                    // for any session with more than one run (resumed,
-                    // continued, forked, or chat sessions).
                     if let Some(c) = res.total_cost_usd {
-                        s.total_cost_usd = Some(s.total_cost_usd.unwrap_or(0.0) + c);
+                        saw_any_cost = true;
+                        match &res.run_id {
+                            Some(run_id) => {
+                                // Overwrite, not add: each Result is
+                                // cumulative for its run. Records appear in
+                                // append order, so the final write per run
+                                // id wins.
+                                last_cost_per_run.insert(run_id.clone(), c);
+                            }
+                            None => {
+                                // No run id to bucket by — accumulate
+                                // directly. See note on `uncounted_sum`
+                                // above.
+                                uncounted_sum += c;
+                            }
+                        }
                     }
                 }
                 _ => {}
             },
         }
+    }
+    if saw_any_cost {
+        let bucketed: f64 = last_cost_per_run.values().sum();
+        s.total_cost_usd = Some(bucketed + uncounted_sum);
     }
     Ok(s)
 }
@@ -671,6 +703,46 @@ pub fn replay_conversation(records: &[SessionRecord]) -> Conversation {
     let mut conv = Conversation::new();
     let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
 
+    // Before transitioning away from the last assistant turn (either to the
+    // next assistant turn or to a new user prompt or to the end of the
+    // transcript), synthesize cancelled tool_results for any tool_use blocks
+    // in the most recent assistant message that have no matching entry in
+    // `pending_tool_results`. Without this repair the Anthropic API would
+    // reject the resumed conversation because every tool_use must be
+    // answered. We do this for *every* assistant turn, not just the tail,
+    // so that interior dangling tool_use blocks (e.g. two assistant turns
+    // recorded back-to-back without intervening tool results) are also
+    // repaired. Tool_use blocks are preserved — we never drop them — so the
+    // model can see what was attempted.
+    let repair_dangling = |conv: &Conversation, pending: &mut Vec<ContentBlock>| {
+        let Some(last) = conv.messages.last() else {
+            return;
+        };
+        if last.role != MessageRole::Assistant {
+            return;
+        }
+        let already_answered: std::collections::HashSet<String> = pending
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(tr) => Some(tr.tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        for b in &last.content {
+            if let ContentBlock::ToolUse(tc) = b {
+                if !already_answered.contains(&tc.id) {
+                    pending.push(ContentBlock::ToolResult(code_agent_core::ConvToolResult {
+                        tool_use_id: tc.id.clone(),
+                        content: vec![ToolResultContent::Text {
+                            text: "cancelled - agent interrupted".to_string(),
+                        }],
+                        is_error: true,
+                    }));
+                }
+            }
+        }
+    };
+
     let flush_results = |conv: &mut Conversation, pending: &mut Vec<ContentBlock>| {
         if !pending.is_empty() {
             conv.push(Message {
@@ -683,6 +755,7 @@ pub fn replay_conversation(records: &[SessionRecord]) -> Conversation {
     for r in records {
         match &r.payload {
             SessionPayload::UserPrompt { text } => {
+                repair_dangling(&conv, &mut pending_tool_results);
                 flush_results(&mut conv, &mut pending_tool_results);
                 conv.push(Message::user_text(text.clone()));
             }
@@ -691,6 +764,7 @@ pub fn replay_conversation(records: &[SessionRecord]) -> Conversation {
             | SessionPayload::SubagentMetadata { .. } => {}
             SessionPayload::Event(ev) => match ev {
                 AgentEvent::AssistantMessage(am) => {
+                    repair_dangling(&conv, &mut pending_tool_results);
                     flush_results(&mut conv, &mut pending_tool_results);
                     let mut blocks: Vec<ContentBlock> = Vec::new();
                     for b in &am.content {
@@ -723,6 +797,10 @@ pub fn replay_conversation(records: &[SessionRecord]) -> Conversation {
             },
         }
     }
+    // Tail repair: if the transcript ended right after an AssistantMessage
+    // with unmatched tool_use blocks, synthesize cancelled results for them
+    // before flushing the final pending user message.
+    repair_dangling(&conv, &mut pending_tool_results);
     flush_results(&mut conv, &mut pending_tool_results);
     conv
 }
@@ -730,7 +808,7 @@ pub fn replay_conversation(records: &[SessionRecord]) -> Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use code_agent_core::{AssistantMessage, ResultSubtype};
+    use code_agent_core::{AgentResult, AssistantMessage, ResultSubtype, RunId, SessionId};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -951,5 +1029,330 @@ mod tests {
         let recs = store.load(&id).await.unwrap();
         let conv = replay_conversation(&recs);
         assert_eq!(conv.messages.len(), 2);
+    }
+
+    // Build a SessionRecord wrapping an AgentResult event with the given run id
+    // and cumulative cost. Used by the cost-accounting tests.
+    fn result_record(
+        dir: &TempDir,
+        session_id: &SessionId,
+        run_id: Option<&str>,
+        cost: f64,
+    ) -> SessionRecord {
+        let res = AgentResult {
+            subtype: ResultSubtype::Success,
+            result: None,
+            session_id: session_id.clone(),
+            run_id: run_id.map(|s| RunId(s.to_string())),
+            num_turns: 1,
+            usage: None,
+            total_cost_usd: Some(cost),
+        };
+        SessionRecord {
+            timestamp: now_iso(),
+            cwd: dir.path().to_path_buf(),
+            session_id: session_id.to_string(),
+            payload: SessionPayload::Event(AgentEvent::Result(res)),
+        }
+    }
+
+    #[tokio::test]
+    // summarize_session aggregates cost as (last per run_id), summed across runs.
+    // Two distinct runs are recorded; run A reports cumulative 0.10 then 0.20,
+    // run B reports 0.05. The session total must be 0.25 (0.20 + 0.05), not
+    // 0.35 (sum of all events) or 0.30 (sum-of-deltas miscomputed).
+    async fn summary_cost_takes_last_per_run() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        store
+            .append(&id, result_record(&dir, &id, Some("run-a"), 0.10))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, Some("run-a"), 0.20))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, Some("run-b"), 0.05))
+            .await
+            .unwrap();
+
+        let summary = summarize_session(&store, &id).await.unwrap();
+        let total = summary.total_cost_usd.expect("cost should be reported");
+        // Floating-point compare with epsilon to avoid representation noise.
+        assert!(
+            (total - 0.25).abs() < 1e-9,
+            "expected 0.25 (last of run-a + last of run-b), got {total}"
+        );
+    }
+
+    #[tokio::test]
+    // Legacy logs may emit AgentResult events without a run_id. Each such event
+    // must contribute its full cost to the total — collapsing them into a
+    // single Option<None> bucket would silently drop all but the last value.
+    async fn summary_cost_sums_results_without_run_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        store
+            .append(&id, result_record(&dir, &id, None, 0.10))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, None, 0.20))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, None, 0.05))
+            .await
+            .unwrap();
+
+        let summary = summarize_session(&store, &id).await.unwrap();
+        let total = summary.total_cost_usd.expect("cost should be reported");
+        // None-tagged results cannot be bucketed by run, so each contributes
+        // its reported value. Expected: 0.10 + 0.20 + 0.05 = 0.35.
+        assert!(
+            (total - 0.35).abs() < 1e-9,
+            "expected 0.35 (sum of all None-tagged results), got {total}"
+        );
+    }
+
+    #[tokio::test]
+    // Mixed log: a real run_id reports cumulative 0.10 then 0.20 (last wins,
+    // contributing 0.20), and a legacy None-tagged result contributes 0.05.
+    // The total must be 0.25 — bucket Some(run_id), sum None.
+    async fn summary_cost_mixed_run_id_and_none() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        store
+            .append(&id, result_record(&dir, &id, Some("run-a"), 0.10))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, Some("run-a"), 0.20))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record(&dir, &id, None, 0.05))
+            .await
+            .unwrap();
+
+        let summary = summarize_session(&store, &id).await.unwrap();
+        let total = summary.total_cost_usd.expect("cost should be reported");
+        assert!(
+            (total - 0.25).abs() < 1e-9,
+            "expected 0.25 (last of run-a + sum of None), got {total}"
+        );
+    }
+
+    #[tokio::test]
+    // replay_conversation must not leave a tail tool_use block without a
+    // matching tool_result; a session killed mid-flight would otherwise be
+    // rejected by the Anthropic API on resume. The reconstructed conversation
+    // must either drop the dangling tool_use blocks from the tail assistant
+    // message OR end with a synthetic tool_result block for each tool_use_id.
+    async fn replay_synthesizes_cancelled_tool_results_for_dangling_tool_uses() {
+        use code_agent_core::{AssistantContent, ContentBlock, ToolCall};
+
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        // A user prompt followed by an assistant message with two tool_use
+        // blocks, then session end (no UserToolResult events).
+        append_user_prompt(&store, dir.path(), &id, "do two things")
+            .await
+            .unwrap();
+        let am = AgentEvent::AssistantMessage(AssistantMessage {
+            content: vec![
+                AssistantContent::Text {
+                    text: "okay".into(),
+                },
+                AssistantContent::ToolUse(ToolCall {
+                    id: "call_a".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"cmd": "ls"}),
+                }),
+                AssistantContent::ToolUse(ToolCall {
+                    id: "call_b".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"cmd": "pwd"}),
+                }),
+            ],
+            stop_reason: Some("tool_use".into()),
+        });
+        store
+            .append(
+                &id,
+                SessionRecord {
+                    timestamp: now_iso(),
+                    cwd: dir.path().to_path_buf(),
+                    session_id: id.to_string(),
+                    payload: SessionPayload::Event(am),
+                },
+            )
+            .await
+            .unwrap();
+
+        let recs = store.load(&id).await.unwrap();
+        let conv = replay_conversation(&recs);
+
+        // The conversation must be valid for an Anthropic resume: every
+        // tool_use in the final assistant message has a matching tool_result
+        // in the following user message, OR the tool_use blocks are absent.
+        // Find the last assistant message.
+        let last_assistant_idx = conv
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::Assistant)
+            .expect("expected at least one assistant message");
+
+        let unresolved_tool_use_ids: Vec<String> = conv.messages[last_assistant_idx]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse(tc) => Some(tc.id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        if unresolved_tool_use_ids.is_empty() {
+            // Acceptable outcome: the tail tool_use blocks were dropped.
+            return;
+        }
+
+        // Otherwise every tool_use must be answered by a tool_result in a
+        // following user message.
+        let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for m in &conv.messages[last_assistant_idx + 1..] {
+            if m.role != MessageRole::User {
+                continue;
+            }
+            for b in &m.content {
+                if let ContentBlock::ToolResult(tr) = b {
+                    answered.insert(tr.tool_use_id.clone());
+                }
+            }
+        }
+        for id in &unresolved_tool_use_ids {
+            assert!(
+                answered.contains(id),
+                "tool_use_id {id} has no matching tool_result; \
+                 conversation: {conv:#?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    // An interior assistant message can have unmatched tool_use blocks when
+    // two assistant turns appear back-to-back with no UserToolResult events
+    // recorded between them (e.g. orchestrator interrupted the first turn
+    // and the model re-prompted). The replayed transcript must still be
+    // valid for an Anthropic resume: every tool_use block in *any*
+    // assistant message must be answered by a tool_result block in the
+    // immediately following user message.
+    async fn replay_synthesizes_results_for_interior_dangling_tool_use() {
+        use code_agent_core::{AssistantContent, ContentBlock, ToolCall};
+
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        append_user_prompt(&store, dir.path(), &id, "do stuff")
+            .await
+            .unwrap();
+        // First assistant turn with a tool_use, but no following tool_result.
+        let am1 = AgentEvent::AssistantMessage(AssistantMessage {
+            content: vec![AssistantContent::ToolUse(ToolCall {
+                id: "call_a".into(),
+                name: "shell".into(),
+                input: serde_json::json!({"cmd": "ls"}),
+            })],
+            stop_reason: Some("tool_use".into()),
+        });
+        // Second assistant turn appears immediately after, also with a
+        // tool_use, again with no tool_result. Then a final user message
+        // (e.g. user follow-up) closes the session.
+        let am2 = AgentEvent::AssistantMessage(AssistantMessage {
+            content: vec![AssistantContent::ToolUse(ToolCall {
+                id: "call_b".into(),
+                name: "shell".into(),
+                input: serde_json::json!({"cmd": "pwd"}),
+            })],
+            stop_reason: Some("tool_use".into()),
+        });
+        for ev in [am1, am2] {
+            store
+                .append(
+                    &id,
+                    SessionRecord {
+                        timestamp: now_iso(),
+                        cwd: dir.path().to_path_buf(),
+                        session_id: id.to_string(),
+                        payload: SessionPayload::Event(ev),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        append_user_prompt(&store, dir.path(), &id, "actually scratch that")
+            .await
+            .unwrap();
+
+        let recs = store.load(&id).await.unwrap();
+        let conv = replay_conversation(&recs);
+
+        // For every assistant message, collect tool_use ids and assert they
+        // are answered by tool_result blocks in the immediately following
+        // user message.
+        for (i, m) in conv.messages.iter().enumerate() {
+            if m.role != MessageRole::Assistant {
+                continue;
+            }
+            let tool_use_ids: Vec<String> = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse(tc) => Some(tc.id.clone()),
+                    _ => None,
+                })
+                .collect();
+            if tool_use_ids.is_empty() {
+                continue;
+            }
+            let next = conv.messages.get(i + 1).unwrap_or_else(|| {
+                panic!(
+                    "assistant turn at index {i} has tool_use blocks but \
+                     no following message; conversation: {conv:#?}"
+                )
+            });
+            assert_eq!(
+                next.role,
+                MessageRole::User,
+                "assistant turn at index {i} must be followed by a User \
+                 message with tool_results; got {next:#?}"
+            );
+            let answered: std::collections::HashSet<String> = next
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult(tr) => Some(tr.tool_use_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            for tu_id in &tool_use_ids {
+                assert!(
+                    answered.contains(tu_id),
+                    "tool_use_id {tu_id} on assistant turn {i} has no \
+                     matching tool_result in the next message; \
+                     conversation: {conv:#?}"
+                );
+            }
+        }
     }
 }
