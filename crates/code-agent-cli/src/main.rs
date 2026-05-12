@@ -1439,7 +1439,7 @@ async fn resolve_common(
         let mut tmp_slash_defs: Vec<code_agent_core::CustomSlashCommandDefinition> = Vec::new();
         let mut tmp_agents = options.agents.clone();
         let mut tmp_mcp = options.mcp.clone();
-        let registry = plugins::apply_to_registries(
+        let (registry, _registration_warnings) = plugins::apply_to_registries(
             plugin_build,
             &mut tmp_skills,
             &mut tmp_slash_defs,
@@ -1752,7 +1752,9 @@ fn load_agent_registry_and_runtime(
         let starters = code_agent_core::builtin_starter_definitions();
         for name in builtin_names {
             if let Some(d) = starters.iter().find(|d| &d.name == name) {
-                registry.register_builtin(d.clone()).ok();
+                if let Err(e) = registry.register_builtin(d.clone()) {
+                    eprintln!("[agents] {e}");
+                }
             }
         }
     }
@@ -4515,7 +4517,9 @@ fn load_commands_for_cli(
     }
     let mut sk = code_agent_core::SkillRegistry::new();
     for d in skill_defs {
-        let _ = sk.register(d);
+        if let Err(e) = sk.register(d) {
+            eprintln!("[skills] {e}");
+        }
     }
     reg = reg.with_skills(&sk);
     Ok(reg)

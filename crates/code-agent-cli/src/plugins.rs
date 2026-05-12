@@ -1121,9 +1121,36 @@ pub fn build_for_invocation(
     build_plugin_runtime(settings, &ctx)
 }
 
+/// Why a plugin-supplied component could not be merged into the
+/// in-memory registries. Returned by [`apply_to_registries`] so callers
+/// can choose to log, surface to UI, or abort. `apply_to_registries`
+/// always logs to stderr in addition to returning these.
+#[derive(Debug)]
+pub enum RegistrationWarning {
+    Skill(String),
+    Agent(String),
+    McpServer { name: String, sanitized: String },
+}
+
+impl std::fmt::Display for RegistrationWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegistrationWarning::Skill(msg) => write!(f, "skipping skill: {msg}"),
+            RegistrationWarning::Agent(msg) => write!(f, "skipping agent: {msg}"),
+            RegistrationWarning::McpServer { name, sanitized } => write!(
+                f,
+                "skipping MCP server {name} — sanitized name {sanitized} already in use"
+            ),
+        }
+    }
+}
+
 /// Apply a [`PluginRuntimeBuild`] to the in-memory registries used by the
 /// agent. Returns the merged plugin registry so the caller can attach
-/// it to `AgentOptions`.
+/// it to `AgentOptions`, plus a list of [`RegistrationWarning`] entries
+/// for each skipped component (duplicate skill/agent names, MCP server
+/// name collisions, etc.). Each warning is also printed to stderr so the
+/// default behavior matches the previous log-and-continue behavior.
 ///
 /// MCP server collisions: plugin-namespaced names use `plugin.server`
 /// shape; MCP itself rejects `.` so the name is sanitized to
@@ -1136,13 +1163,22 @@ pub fn apply_to_registries(
     slash_defs: &mut Vec<code_agent_core::CustomSlashCommandDefinition>,
     agents: &mut code_agent_core::AgentRegistry,
     mcp: &mut code_agent_mcp::McpOptions,
-) -> code_agent_core::PluginRegistry {
+) -> (code_agent_core::PluginRegistry, Vec<RegistrationWarning>) {
+    let mut warnings: Vec<RegistrationWarning> = Vec::new();
     for skill in build.aggregated.skills {
-        let _ = skills.register(skill);
+        if let Err(e) = skills.register(skill) {
+            let msg = e.to_string();
+            eprintln!("[plugin] skipping skill: {msg}");
+            warnings.push(RegistrationWarning::Skill(msg));
+        }
     }
     slash_defs.extend(build.aggregated.commands);
     for agent in build.aggregated.agents {
-        let _ = agents.register_filesystem(agent);
+        if let Err(e) = agents.register_filesystem(agent) {
+            let msg = e.to_string();
+            eprintln!("[plugin] skipping agent: {msg}");
+            warnings.push(RegistrationWarning::Agent(msg));
+        }
     }
     let mut sanitized_seen: std::collections::BTreeSet<String> =
         mcp.servers.keys().cloned().collect();
@@ -1152,12 +1188,16 @@ pub fn apply_to_registries(
             eprintln!(
                 "[plugin] skipping MCP server {name} — sanitized name {sanitized} already in use"
             );
+            warnings.push(RegistrationWarning::McpServer {
+                name: name.clone(),
+                sanitized: sanitized.clone(),
+            });
             continue;
         }
         sanitized_seen.insert(sanitized.clone());
         mcp.servers.insert(sanitized, cfg);
     }
-    build.registry
+    (build.registry, warnings)
 }
 
 /// Project the parts of a [`Settings`] back into a [`SettingsFile`] so
@@ -1361,6 +1401,10 @@ fn compare_version_strings(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use code_agent_core::{
+        AgentDefinition, LoadedPluginComponents, PluginRegistry, PluginRuntimeBuild,
+        SkillDefinition, SkillRegistry, SkillSource,
+    };
 
     #[test]
     // Numeric version comparison: 0.10.0 > 0.9.0 (lexical comparison would say
@@ -1373,6 +1417,91 @@ mod tests {
         assert_eq!(
             compare_version_strings("1.0.0", "1.0.0"),
             std::cmp::Ordering::Equal
+        );
+    }
+
+    fn dummy_skill(name: &str) -> SkillDefinition {
+        SkillDefinition {
+            name: name.to_string(),
+            description: "d".into(),
+            instructions: "body".into(),
+            argument_hint: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            resources: Vec::new(),
+            metadata: serde_json::Value::Null,
+            source: SkillSource::Project,
+            root_dir: std::path::PathBuf::from("/tmp"),
+        }
+    }
+
+    #[test]
+    // apply_to_registries returns a RegistrationWarning for a plugin-supplied
+    // skill whose name collides with one already in the skill registry,
+    // instead of silently dropping the duplicate.
+    fn apply_to_registries_surfaces_skill_collision() {
+        let mut skills = SkillRegistry::new();
+        // Seed an existing skill so the plugin's same-named skill collides.
+        skills.register(dummy_skill("dup")).unwrap();
+        let mut slash_defs: Vec<code_agent_core::CustomSlashCommandDefinition> = Vec::new();
+        let mut agents = code_agent_core::AgentRegistry::new();
+        let mut mcp = code_agent_mcp::McpOptions::default();
+
+        let mut aggregated = LoadedPluginComponents::default();
+        aggregated.skills.push(dummy_skill("dup"));
+        let build = PluginRuntimeBuild {
+            registry: PluginRegistry::default(),
+            aggregated,
+            validation_failures: Vec::new(),
+        };
+
+        let (_reg, warnings) =
+            apply_to_registries(build, &mut skills, &mut slash_defs, &mut agents, &mut mcp);
+        assert_eq!(warnings.len(), 1, "expected 1 warning, got {warnings:?}");
+        assert!(
+            matches!(&warnings[0], RegistrationWarning::Skill(_)),
+            "expected a Skill warning, got {:?}",
+            warnings[0]
+        );
+    }
+
+    fn dummy_agent(name: &str) -> AgentDefinition {
+        AgentDefinition {
+            name: name.to_string(),
+            description: "d".into(),
+            prompt: "p".into(),
+            ..AgentDefinition::default()
+        }
+    }
+
+    #[test]
+    // apply_to_registries also surfaces agent-name collisions as warnings
+    // rather than dropping the duplicate registration error.
+    fn apply_to_registries_surfaces_agent_collision() {
+        let mut skills = SkillRegistry::new();
+        let mut slash_defs: Vec<code_agent_core::CustomSlashCommandDefinition> = Vec::new();
+        let mut agents = code_agent_core::AgentRegistry::new();
+        // Pre-register one filesystem agent; the plugin tries to register
+        // a second one with the same name via filesystem origin, which
+        // trips the duplicate-name check.
+        agents.register_filesystem(dummy_agent("agent-x")).unwrap();
+        let mut mcp = code_agent_mcp::McpOptions::default();
+
+        let mut aggregated = LoadedPluginComponents::default();
+        aggregated.agents.push(dummy_agent("agent-x"));
+        let build = PluginRuntimeBuild {
+            registry: PluginRegistry::default(),
+            aggregated,
+            validation_failures: Vec::new(),
+        };
+
+        let (_reg, warnings) =
+            apply_to_registries(build, &mut skills, &mut slash_defs, &mut agents, &mut mcp);
+        assert_eq!(warnings.len(), 1, "expected 1 warning, got {warnings:?}");
+        assert!(
+            matches!(&warnings[0], RegistrationWarning::Agent(_)),
+            "expected an Agent warning, got {:?}",
+            warnings[0]
         );
     }
 }
