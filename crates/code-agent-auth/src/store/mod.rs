@@ -283,18 +283,7 @@ impl CredentialStore {
         let bytes = serde_json::to_vec_pretty(idx).map_err(|e| {
             AuthError::new(AuthErrorKind::Unknown, format!("serialize index: {}", e))
         })?;
-        std::fs::write(path, bytes).map_err(|e| {
-            AuthError::new(
-                AuthErrorKind::CredentialStoreUnavailable,
-                format!("write index {}: {}", path.display(), e),
-            )
-        })?;
-        // Tighten permissions on Unix: 0600.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
+        file::write_secret_file(path, &bytes)?;
         Ok(())
     }
 }

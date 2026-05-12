@@ -89,19 +89,7 @@ impl SecretBackend for FileCredentialBackend {
         let bytes = serde_json::to_vec(&dst).map_err(|e| {
             AuthError::new(AuthErrorKind::Unknown, format!("serialize secret: {}", e))
         })?;
-        std::fs::write(&path, bytes).map_err(|e| {
-            AuthError::new(
-                AuthErrorKind::CredentialStoreUnavailable,
-                format!("write secret {}: {}", path.display(), e),
-            )
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-
+        write_secret_file(&path, &bytes)?;
         Ok(())
     }
 
@@ -142,6 +130,42 @@ impl SecretBackend for FileCredentialBackend {
         }
         Ok(())
     }
+}
+
+/// Write `bytes` to `path` with strict permissions.
+///
+/// On Unix the file is created with mode `0o600` from the start via
+/// `OpenOptions::mode`, closing the window where the file would briefly
+/// be world-readable under a default umask. The bytes are flushed with
+/// `sync_data` before the handle is dropped. On non-Unix platforms this
+/// falls back to `std::fs::write` (best-effort).
+pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
+    let io_err = |e: std::io::Error| {
+        AuthError::new(
+            AuthErrorKind::CredentialStoreUnavailable,
+            format!("write secret {}: {}", path.display(), e),
+        )
+    };
+
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(io_err)?;
+        f.write_all(bytes).map_err(io_err)?;
+        f.sync_data().map_err(io_err)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes).map_err(io_err)?;
+    }
+    Ok(())
 }
 
 /// Pick a default secrets directory next to the account index file. If
@@ -222,6 +246,35 @@ mod tests {
             assert!(!name.contains("user"));
             assert!(!name.contains("example"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // Per-account secret files are created with mode 0o600 from the
+    // start (via OpenOptions::mode), so there is no window during which
+    // the file is readable by other users under a default umask.
+    fn secret_file_is_strictly_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = FileCredentialBackend::new(dir.path().to_path_buf()).unwrap();
+        let provider = ProviderId::Anthropic;
+        let acct = AccountId::new("strict-perm");
+        backend
+            .put(
+                &provider,
+                &acct,
+                &StoredCredentialSecret {
+                    api_key: Some(SecretString::new("k".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let path = dir
+            .path()
+            .join(provider.as_str())
+            .join(format!("{}.json", acct.redacted_hash()));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret file must be 0o600 on unix");
     }
 
     #[test]
