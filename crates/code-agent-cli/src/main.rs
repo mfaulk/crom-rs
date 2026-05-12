@@ -5158,9 +5158,10 @@ impl code_agent_provider_openai::OpenAiTransport for ReqwestOpenAiTransport {
     }
 }
 
-/// Minimal `reqwest`-backed Gemini transport. Same trade-off as the
-/// OpenAI variant — the request payload includes `?key=<API_KEY>` so
-/// no Authorization header is needed.
+/// Minimal `reqwest`-backed Gemini transport. The API key is sent via
+/// the `x-goog-api-key` request header rather than `?key=<API_KEY>` so
+/// it does not leak into URL-shaped surfaces (logs, traces, panic
+/// backtraces, reqwest debug output).
 struct ReqwestGeminiTransport {
     client: reqwest::Client,
 }
@@ -5180,6 +5181,7 @@ impl code_agent_provider_gemini::GeminiTransport for ReqwestGeminiTransport {
     async fn post_generate(
         &self,
         url: &str,
+        api_key: &code_agent_auth::SecretString,
         body: &str,
     ) -> std::result::Result<
         code_agent_provider_gemini::TransportResponse,
@@ -5188,6 +5190,7 @@ impl code_agent_provider_gemini::GeminiTransport for ReqwestGeminiTransport {
         let resp = self
             .client
             .post(url)
+            .header(code_agent_provider_gemini::GEMINI_API_KEY_HEADER, api_key.expose())
             .header("content-type", "application/json")
             .body(body.to_string())
             .send()
@@ -5204,6 +5207,7 @@ impl code_agent_provider_gemini::GeminiTransport for ReqwestGeminiTransport {
     async fn list_models(
         &self,
         url: &str,
+        api_key: &code_agent_auth::SecretString,
     ) -> std::result::Result<
         code_agent_provider_gemini::TransportResponse,
         code_agent_core::ProviderError,
@@ -5211,6 +5215,7 @@ impl code_agent_provider_gemini::GeminiTransport for ReqwestGeminiTransport {
         let resp = self
             .client
             .get(url)
+            .header(code_agent_provider_gemini::GEMINI_API_KEY_HEADER, api_key.expose())
             .send()
             .await
             .map_err(|e| code_agent_core::ProviderError::Http(format!("gemini models: {e}")))?;
