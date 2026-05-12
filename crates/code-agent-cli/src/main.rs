@@ -5190,7 +5190,10 @@ impl code_agent_provider_gemini::GeminiTransport for ReqwestGeminiTransport {
         let resp = self
             .client
             .post(url)
-            .header(code_agent_provider_gemini::GEMINI_API_KEY_HEADER, api_key.expose())
+            .header(
+                code_agent_provider_gemini::GEMINI_API_KEY_HEADER,
+                api_key.expose(),
+            )
             .header("content-type", "application/json")
             .body(body.to_string())
             .send()
@@ -5215,7 +5218,10 @@ impl code_agent_provider_gemini::GeminiTransport for ReqwestGeminiTransport {
         let resp = self
             .client
             .get(url)
-            .header(code_agent_provider_gemini::GEMINI_API_KEY_HEADER, api_key.expose())
+            .header(
+                code_agent_provider_gemini::GEMINI_API_KEY_HEADER,
+                api_key.expose(),
+            )
             .send()
             .await
             .map_err(|e| code_agent_core::ProviderError::Http(format!("gemini models: {e}")))?;

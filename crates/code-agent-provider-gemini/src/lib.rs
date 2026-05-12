@@ -660,8 +660,14 @@ mod tests {
             !url.contains("key="),
             "URL must not contain a `key=` query parameter: {url}"
         );
-        assert!(!url.contains("SECRET-XYZ"), "URL must not embed the API key: {url}");
-        assert_eq!(key, "SECRET-XYZ", "transport must receive the API key out-of-band");
+        assert!(
+            !url.contains("SECRET-XYZ"),
+            "URL must not embed the API key: {url}"
+        );
+        assert_eq!(
+            key, "SECRET-XYZ",
+            "transport must receive the API key out-of-band"
+        );
         assert!(url.ends_with("/v1beta/models/gemini-1.5-pro:generateContent"));
     }
 
@@ -675,10 +681,26 @@ mod tests {
             Arc::new(|| cred("SECRET-XYZ")),
         );
         let _ = provider.list_models().await.unwrap();
-        let url = transport.captured_models_url.lock().unwrap().clone().unwrap();
-        let key = transport.captured_models_key.lock().unwrap().clone().unwrap();
-        assert!(!url.contains("key="), "URL must not contain a `key=` query parameter: {url}");
-        assert!(!url.contains("SECRET-XYZ"), "URL must not embed the API key: {url}");
+        let url = transport
+            .captured_models_url
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let key = transport
+            .captured_models_key
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert!(
+            !url.contains("key="),
+            "URL must not contain a `key=` query parameter: {url}"
+        );
+        assert!(
+            !url.contains("SECRET-XYZ"),
+            "URL must not embed the API key: {url}"
+        );
         assert_eq!(key, "SECRET-XYZ");
         assert!(url.ends_with("/v1beta/models"));
     }
