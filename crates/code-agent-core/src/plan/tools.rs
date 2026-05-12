@@ -362,7 +362,7 @@ impl SubmitPlanInput {
             .collect();
         base.files = parse_files(self.files)?;
         base.steps = parse_steps(self.steps, options)?;
-        base.requested_tools = parse_tools(self.requested_tools);
+        base.requested_tools = parse_tools(self.requested_tools)?;
         base.validations = self
             .validations
             .into_iter()
@@ -455,7 +455,7 @@ fn parse_steps(raws: Vec<RawStep>, options: &PlanningOptions) -> Result<Vec<Plan
             description: r.description,
             status: PlanStepStatus::Pending,
             kind,
-            expected_tools: parse_tools(r.expected_tools),
+            expected_tools: parse_tools(r.expected_tools)?,
             expected_files,
             expected_commands,
             expected_outcome: r.expected_outcome,
@@ -509,15 +509,47 @@ fn parse_commands(raws: Vec<RawCommand>) -> Result<Vec<PlanCommand>, PlanError> 
     Ok(out)
 }
 
-fn parse_tools(raws: Vec<RawToolUse>) -> Vec<PlanToolUse> {
-    raws.into_iter()
-        .map(|r| PlanToolUse {
+fn parse_tools(raws: Vec<RawToolUse>) -> Result<Vec<PlanToolUse>, PlanError> {
+    let mut out = Vec::with_capacity(raws.len());
+    for r in raws {
+        validate_tool_name_pattern(&r.tool_name)?;
+        out.push(PlanToolUse {
             tool_name: r.tool_name,
             permission_kind: parse_permission_kind(r.permission_kind.as_deref()),
             input_constraints: r.input_constraints.unwrap_or(Value::Null),
             reason: r.reason,
-        })
-        .collect()
+        });
+    }
+    Ok(out)
+}
+
+/// Reject bare wildcard tool names. The plan-scope classifier compiles
+/// `tool_name` as a glob; `"*"` and `"**"` match every tool name and
+/// would silently authorize tools that the plan never enumerated. The
+/// remaining classifier paths fall through to `Ambiguous` for tools
+/// without a structural constraint, so a blanket wildcard combined with
+/// a non-strict deviation policy effectively turns plan-scope into a
+/// no-op. Force authors to use either an exact name or a non-empty
+/// prefix like `mcp__github__*`.
+fn validate_tool_name_pattern(name: &str) -> Result<(), PlanError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(PlanError::Invalid("tool_name is empty".into()));
+    }
+    if trimmed == "*" || trimmed == "**" {
+        return Err(PlanError::Invalid(format!(
+            "tool_name `{trimmed}` is a bare wildcard; use an exact name or a non-empty prefix \
+             like `mcp__github__*`"
+        )));
+    }
+    // Reject a leading `*` (`*foo`, `*` was already caught) — a leading
+    // wildcard would still match every tool starting with anything.
+    if trimmed.starts_with('*') {
+        return Err(PlanError::Invalid(format!(
+            "tool_name `{trimmed}` starts with a wildcard; require a non-empty literal prefix"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_permission_kind(s: Option<&str>) -> PermissionKind {
@@ -863,6 +895,60 @@ mod tests {
             ),
             other => panic!("expected InvalidInput, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects a bare-wildcard `tool_name: "*"` in
+    // `requested_tools`. A bare wildcard combined with the classifier's
+    // Ambiguous fallthrough would let any tool slip past plan scope.
+    async fn submit_plan_rejects_bare_wildcard_tool_name() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("wildcard"),
+                "expected wildcard rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan accepts a prefix-glob `tool_name: "ok_prefix*"`. Plans
+    // legitimately need to wildcard MCP tool families like
+    // `mcp__github__*`, so the validation rejects only bare/leading
+    // wildcards.
+    async fn submit_plan_accepts_prefix_wildcard_tool_name() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle.clone(), PlanningOptions::default());
+        let r = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "ok_prefix*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+        let snap = handle.snapshot().await.unwrap();
+        assert_eq!(snap.plan.requested_tools.len(), 1);
+        assert_eq!(snap.plan.requested_tools[0].tool_name, "ok_prefix*");
     }
 
     #[tokio::test]
