@@ -213,8 +213,6 @@ mod tests {
     #[test]
     fn iter_returns_tools_in_lexicographic_order() {
         let mut registry = ToolRegistry::new();
-        // Insert in a non-sorted order; names chosen so a HashMap would
-        // very likely produce a different ordering across rebuilds.
         for n in ["zebra", "alpha", "mango", "bravo"] {
             registry.register(stub(n));
         }
@@ -230,6 +228,40 @@ mod tests {
             "ToolRegistry::iter must yield tools in lexicographic name order so the \
              Anthropic tools array stays stable across resumed/forked sessions"
         );
+    }
+
+    /// Registry::iter ordering equals its own sorted copy (direct invariant — no
+    /// reliance on coincidental HashMap reordering to detect regressions).
+    #[test]
+    fn iter_order_equals_sorted_copy() {
+        let mut registry = ToolRegistry::new();
+        for n in [
+            "zebra", "alpha", "mango", "bravo", "yak", "charlie", "tango", "delta",
+        ] {
+            registry.register(stub(n));
+        }
+        let observed: Vec<String> = registry.iter().map(|t| t.name().to_string()).collect();
+        let mut sorted = observed.clone();
+        sorted.sort();
+        assert_eq!(
+            observed, sorted,
+            "ToolRegistry::iter must be in sorted order; any future change that \
+             reintroduces unordered iteration will fail this invariant deterministically"
+        );
+    }
+
+    /// Registry::names equals its own sorted copy — the catalog seen by the
+    /// agent for cache-stable prompt prefixes is itself in sorted order.
+    #[test]
+    fn names_order_equals_sorted_copy() {
+        let mut registry = ToolRegistry::new();
+        for n in ["zebra", "alpha", "mango", "bravo", "yak", "charlie"] {
+            registry.register(stub(n));
+        }
+        let observed = registry.names();
+        let mut sorted = observed.clone();
+        sorted.sort();
+        assert_eq!(observed, sorted);
     }
 
     /// Registry::iter ordering is stable across distinct instances built in different insertion orders.
