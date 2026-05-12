@@ -455,7 +455,12 @@ impl LocalCheckpointStore {
     ) -> Result<(), CheckpointError> {
         let manifest = self.manifest_path(session_id, checkpoint_id)?;
         if manifest.exists() {
-            let _ = tokio::fs::remove_file(&manifest).await;
+            // Surface unlink failures (e.g. permission denied on the
+            // manifests dir, manifest file held open elsewhere): a silent
+            // failure here would leave the index pointing at a manifest we
+            // didn't actually remove, and the trim loop would keep
+            // marching past it forever.
+            tokio::fs::remove_file(&manifest).await?;
         }
         // Rewrite the index without the deleted entry. A malformed line
         // must propagate up: silently treating it as an empty Vec would
@@ -502,9 +507,24 @@ impl CheckpointStore for LocalCheckpointStore {
         let mut entries = self.load_index(&request.session_id).await?;
         while entries.len() >= self.limits.max_checkpoints_per_session {
             let oldest = entries.remove(0);
-            self.delete_checkpoint_locked(&request.session_id, &oldest.checkpoint_id)
+            if let Err(err) = self
+                .delete_checkpoint_locked(&request.session_id, &oldest.checkpoint_id)
                 .await
-                .ok();
+            {
+                // Don't silently drop the failure: a `.ok()` would lie to
+                // ourselves about the trim having succeeded. Keep the
+                // entry in the index so a later run can retry, and bail
+                // out of the trim loop — if one delete failed the next
+                // one likely will too (e.g. read-only manifests dir).
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    checkpoint_id = %oldest.checkpoint_id,
+                    error = %err,
+                    "checkpoint retention trim failed; keeping entry in index",
+                );
+                entries.insert(0, oldest);
+                break;
+            }
         }
 
         let checkpoint_id = CheckpointId::new();
@@ -1165,6 +1185,49 @@ mod tests {
         assert_eq!(
             before, after,
             "malformed index file must not be overwritten on load failure"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // delete_checkpoint_locked must surface a manifest unlink error rather
+    // than silently discarding it; the index entry is left in place so a
+    // later run can retry.
+    async fn delete_surfaces_manifest_remove_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, store, sid) = fresh_store();
+        let id = store
+            .create_checkpoint(CreateCheckpointRequest {
+                session_id: sid.clone(),
+                run_id: RunId::new(),
+                cwd: store.root().to_path_buf(),
+                description: None,
+                user_message_id: None,
+                git_state: None,
+            })
+            .await
+            .unwrap();
+        let manifests = store.manifests_dir_for(&sid).unwrap();
+        let original = std::fs::metadata(&manifests).unwrap().permissions();
+        // Make the manifests dir read+exec only: unlink inside is denied.
+        std::fs::set_permissions(&manifests, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = store.delete_checkpoint_locked(&sid, &id).await;
+
+        // Always restore perms so the tempdir can be cleaned up.
+        std::fs::set_permissions(&manifests, original).unwrap();
+
+        let err = result.expect_err("delete should surface unlink failure");
+        assert!(
+            matches!(err, CheckpointError::Io(_)),
+            "expected Io error, got {err:?}",
+        );
+        // Index entry must still be present so a later retry can pick it up.
+        let list = store.list_checkpoints(&sid).await.unwrap();
+        assert!(
+            list.iter().any(|e| e.checkpoint_id == id),
+            "index entry must be kept after a failed unlink",
         );
     }
 
