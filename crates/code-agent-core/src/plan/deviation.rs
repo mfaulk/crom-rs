@@ -13,7 +13,7 @@ use super::artifact::{
     PlanCommand, PlanDocument, PlanFileAccess, PlanFileRef, PlanId, PlanStep, WorkspaceRelativePath,
 };
 use super::options::PlanningOptions;
-use super::tools::{PLAN_UPDATE_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME};
+use super::tools::{is_safe_tool_pattern, PLAN_UPDATE_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME};
 
 /// What plan-scope evaluation decided about one tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,11 +119,31 @@ pub fn classify_tool_call(
 }
 
 fn matches_tool_name(planned: &str, actual: &str) -> bool {
+    // Fail-closed: refuse to match unsafe patterns at the matcher itself,
+    // not just at SubmitPlan parse time. A plan loaded from disk pre-
+    // dating the parser-side validation (or smuggled in through some
+    // other persistence path) can still carry patterns like `?*`,
+    // `[a-z]*`, or `{foo,bar}*` that the underlying `globset` engine
+    // would happily match against every tool. Returning `false` here
+    // forces the user to re-submit a valid plan and is the same shape
+    // check the parser applies — see [`is_safe_tool_pattern`].
+    if !is_safe_tool_pattern(planned) {
+        tracing::warn!(
+            target: "plan.deviation",
+            planned,
+            "refusing to match unsafe planned tool_name pattern (fails shape check); \
+             plan must be re-submitted with an exact name or `<literal_prefix>*`"
+        );
+        return false;
+    }
     if planned == actual {
         return true;
     }
-    // Glob support: `mcp__fake__*` etc.
-    if planned.contains('*') || planned.contains('?') {
+    // Glob support: `mcp__fake__*` etc. The shape check above already
+    // guarantees `planned` is either an exact name (handled above) or
+    // `<literal_prefix>*` with no other metacharacters, so the glob
+    // compile here cannot expand to a broad wildcard.
+    if planned.contains('*') {
         if let Ok(glob) = globset::Glob::new(planned) {
             return glob.compile_matcher().is_match(actual);
         }
@@ -686,5 +706,67 @@ mod tests {
         let opt = PlanningOptions::default();
         let d = classify_tool_call(&p, &opt, PLAN_UPDATE_TOOL_NAME, &json!({}));
         assert_eq!(d, PlanScopeDecision::InScope);
+    }
+
+    #[test]
+    // matches_tool_name returns false for `?*` even though globset would
+    // happily compile and match it against every real tool name. Closes
+    // the legacy-plan bypass for plans persisted before parser-side
+    // validation existed.
+    fn matches_tool_name_rejects_bare_question_star() {
+        assert!(!super::matches_tool_name("?*", "Bash"));
+        assert!(!super::matches_tool_name("?*", "Read"));
+        assert!(!super::matches_tool_name("?*", "mcp__github__create_issue"));
+    }
+
+    #[test]
+    // matches_tool_name returns false for a character-class wildcard
+    // `[a-z]*`; the shape check refuses any glob metacharacter outside
+    // a single trailing `*`.
+    fn matches_tool_name_rejects_character_class_wildcard() {
+        assert!(!super::matches_tool_name("[a-z]*", "Bash"));
+        assert!(!super::matches_tool_name("[a-z]*", "read"));
+    }
+
+    #[test]
+    // matches_tool_name returns false for a brace-alternation pattern
+    // `{foo,bar}*`; globset would expand it, but the shape check
+    // forbids `{`/`}` entirely.
+    fn matches_tool_name_rejects_brace_alternation() {
+        assert!(!super::matches_tool_name("{foo,bar}*", "foo"));
+        assert!(!super::matches_tool_name("{foo,bar}*", "bar_tool"));
+    }
+
+    #[test]
+    // matches_tool_name returns false for a lone `?` because the only
+    // permitted glob shape is `<non-empty-literal-prefix>*`.
+    fn matches_tool_name_rejects_lone_question_mark() {
+        assert!(!super::matches_tool_name("?", "B"));
+        assert!(!super::matches_tool_name("?", "Bash"));
+    }
+
+    #[test]
+    // matches_tool_name still accepts the canonical MCP family glob
+    // `mcp__github__*` against a concrete tool in that family — the
+    // tightening must not regress the legitimate use case.
+    fn matches_tool_name_accepts_mcp_prefix_glob() {
+        assert!(super::matches_tool_name(
+            "mcp__github__*",
+            "mcp__github__create_issue"
+        ));
+        assert!(super::matches_tool_name("mcp__github__*", "mcp__github__list"));
+        assert!(!super::matches_tool_name(
+            "mcp__github__*",
+            "mcp__gitlab__create_issue"
+        ));
+    }
+
+    #[test]
+    // matches_tool_name still accepts an exact tool name against itself
+    // (no glob involvement). Pins the exact-match path through the
+    // shape check.
+    fn matches_tool_name_accepts_exact_name() {
+        assert!(super::matches_tool_name("Bash", "Bash"));
+        assert!(!super::matches_tool_name("Bash", "Edit"));
     }
 }

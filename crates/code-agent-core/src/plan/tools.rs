@@ -523,10 +523,10 @@ fn parse_tools(raws: Vec<RawToolUse>) -> Result<Vec<PlanToolUse>, PlanError> {
     Ok(out)
 }
 
-/// Reject overly broad tool-name patterns. The plan-scope classifier
-/// compiles `tool_name` as a `globset` glob, so any glob metacharacter
-/// — not just `*` — can match unrelated tools (`?*`, `[a-z]*`,
-/// `{foo,bar}*` all match almost anything). Combined with the
+/// Shared shape check for a planned `tool_name`. The plan-scope
+/// classifier compiles `tool_name` as a `globset` glob, so any glob
+/// metacharacter — not just `*` — can match unrelated tools (`?*`,
+/// `[a-z]*`, `{foo,bar}*` all match almost anything). Combined with the
 /// classifier's `Ambiguous` fallthrough and a non-strict deviation
 /// policy, a broad pattern effectively turns plan-scope into a no-op.
 ///
@@ -541,22 +541,46 @@ fn parse_tools(raws: Vec<RawToolUse>) -> Result<Vec<PlanToolUse>, PlanError> {
 /// (`a*`) are still narrower than the rejected bare-wildcard forms; a
 /// length floor would block legitimate exact tool names whose family
 /// glob is single-character.
-fn validate_tool_name_pattern(name: &str) -> Result<(), PlanError> {
+///
+/// Empty / whitespace-only names are rejected.
+///
+/// This is the single source of truth used by both the SubmitPlan
+/// parser (eager validation at submit time, see
+/// [`validate_tool_name_pattern`]) and the deviation classifier (fail-
+/// closed enforcement at match time, see
+/// [`super::deviation::matches_tool_name`]). Plans loaded from disk
+/// pre-dating the parser-side validation must still be rejected when
+/// they reach the classifier.
+pub(crate) fn is_safe_tool_pattern(name: &str) -> bool {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err(PlanError::Invalid("tool_name is empty".into()));
+        return false;
     }
     const GLOB_META: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
     // Exact name (no glob metacharacters) is always allowed.
     if !trimmed.chars().any(|c| GLOB_META.contains(&c)) {
-        return Ok(());
+        return true;
     }
     // Otherwise the only permitted shape is `<literal_prefix>*` where
     // the prefix is non-empty and contains no glob metacharacters.
     if let Some(prefix) = trimmed.strip_suffix('*') {
         if !prefix.is_empty() && !prefix.chars().any(|c| GLOB_META.contains(&c)) {
-            return Ok(());
+            return true;
         }
+    }
+    false
+}
+
+/// Reject overly broad tool-name patterns at SubmitPlan parse time.
+/// Shape-checking lives in [`is_safe_tool_pattern`]; this wrapper turns
+/// a `false` outcome into a structured [`PlanError`] for the parser.
+fn validate_tool_name_pattern(name: &str) -> Result<(), PlanError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(PlanError::Invalid("tool_name is empty".into()));
+    }
+    if is_safe_tool_pattern(trimmed) {
+        return Ok(());
     }
     Err(PlanError::Invalid(format!(
         "tool_name `{trimmed}` is too broad a wildcard or uses unsupported glob metacharacters; \
