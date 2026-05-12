@@ -6412,9 +6412,11 @@ mod classify_bash_risk_tests {
     }
 
     #[test]
-    // Bypass: split `-r -f` flags must be classified High.
+    // Bypass: split `-r -f` flags against the root must be classified
+    // High. `/tmp` is a benign cleanup target and was removed when the
+    // dangerous-target gate landed.
     fn rm_r_then_f_split_is_high() {
-        high("rm -r -f /tmp");
+        high("rm -r -f /");
     }
 
     #[test]
