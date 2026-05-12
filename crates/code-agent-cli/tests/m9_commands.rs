@@ -359,3 +359,23 @@ fn omitted_commands_not_present() {
         );
     }
 }
+
+#[test]
+// `tui` against a malformed settings.json surfaces the parse error
+// instead of silently falling back to defaults.
+fn tui_surfaces_settings_load_error() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join(".agent")).unwrap();
+    std::fs::write(dir.path().join(".agent/settings.json"), b"not json{").unwrap();
+    let out = run(&["tui", "--renderer", "plain", "--snapshot"], dir.path());
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit, got success. stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[tui] failed to load settings"),
+        "stderr missing tui error prefix: {stderr}"
+    );
+}
