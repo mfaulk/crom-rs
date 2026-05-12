@@ -13,7 +13,7 @@ use super::artifact::{
     PlanCommand, PlanDocument, PlanFileAccess, PlanFileRef, PlanId, PlanStep, WorkspaceRelativePath,
 };
 use super::options::PlanningOptions;
-use super::tools::{PLAN_UPDATE_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME};
+use super::tools::{is_safe_tool_pattern, PLAN_UPDATE_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME};
 
 /// What plan-scope evaluation decided about one tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,11 +119,31 @@ pub fn classify_tool_call(
 }
 
 fn matches_tool_name(planned: &str, actual: &str) -> bool {
+    // Fail-closed: refuse to match unsafe patterns at the matcher itself,
+    // not just at SubmitPlan parse time. A plan loaded from disk pre-
+    // dating the parser-side validation (or smuggled in through some
+    // other persistence path) can still carry patterns like `?*`,
+    // `[a-z]*`, or `{foo,bar}*` that the underlying `globset` engine
+    // would happily match against every tool. Returning `false` here
+    // forces the user to re-submit a valid plan and is the same shape
+    // check the parser applies — see [`is_safe_tool_pattern`].
+    if !is_safe_tool_pattern(planned) {
+        tracing::warn!(
+            target: "plan.deviation",
+            planned,
+            "refusing to match unsafe planned tool_name pattern (fails shape check); \
+             plan must be re-submitted with an exact name or `<literal_prefix>*`"
+        );
+        return false;
+    }
     if planned == actual {
         return true;
     }
-    // Glob support: `mcp__fake__*` etc.
-    if planned.contains('*') || planned.contains('?') {
+    // Glob support: `mcp__fake__*` etc. The shape check above already
+    // guarantees `planned` is either an exact name (handled above) or
+    // `<literal_prefix>*` with no other metacharacters, so the glob
+    // compile here cannot expand to a broad wildcard.
+    if planned.contains('*') {
         if let Ok(glob) = globset::Glob::new(planned) {
             return glob.compile_matcher().is_match(actual);
         }
@@ -175,6 +195,16 @@ fn classify_bash(
             break;
         }
         if let Some(re) = c.command_regex.as_deref() {
+            // Defense-in-depth: refuse to use a planned regex that
+            // contains an inline flag group like `(?m)`. The SubmitPlan
+            // parser already rejects these, but a plan loaded from
+            // older stores or another path could still contain one,
+            // and `(?m)` together with our `^…$` wrapping would re-
+            // interpret the anchors as line anchors and authorize
+            // newline-smuggled commands.
+            if re.contains("(?") {
+                continue;
+            }
             // SAFETY: anchor the planned regex so a pattern like
             // `cargo test` does not silently authorize `echo hacked &&
             // cargo test`. We auto-prepend `^` and append `$` if the
@@ -565,6 +595,62 @@ mod tests {
     }
 
     #[test]
+    // Pins the underlying bypass: an inline `(?m)` flag turns the
+    // auto-anchored `^…$` wrapping into line anchors, so a plain
+    // regex::Regex would match a newline-smuggled command. This test
+    // is the upstream proof of the bug, alongside the SubmitPlan-parser
+    // rejection test in `plan::tools`.
+    fn anchored_multiline_flag_matches_newline_smuggled_command() {
+        let bypass = regex::Regex::new("^(?m)^cargo test$$").unwrap();
+        assert!(bypass.is_match("cargo test\nrm -rf ~/"));
+    }
+
+    #[test]
+    // Defense-in-depth: even if a plan somehow carries a `(?m)`
+    // regex (e.g. loaded from disk pre-fix), `classify_bash` must
+    // refuse to authorize via that regex. The exact `cargo test`
+    // string is still allowed via the structural `command` field.
+    fn classify_bash_skips_flag_group_regex() {
+        let mut p = plan_with_edit();
+        p.steps[0].expected_commands.push(PlanCommand {
+            command: "cargo test".into(),
+            command_regex: Some("(?m)^cargo test$".into()),
+            cwd: None,
+            reason: None,
+        });
+        p.requested_tools.push(PlanToolUse {
+            tool_name: "Bash".into(),
+            permission_kind: PermissionKind::Execution,
+            input_constraints: serde_json::Value::Null,
+            reason: None,
+        });
+        p.steps[0].expected_tools.push(PlanToolUse {
+            tool_name: "Bash".into(),
+            permission_kind: PermissionKind::Execution,
+            input_constraints: serde_json::Value::Null,
+            reason: None,
+        });
+        let opt = PlanningOptions::default();
+        // Exact `cargo test` still matches the literal `command` field.
+        assert_eq!(
+            classify_tool_call(&p, &opt, "Bash", &json!({"command": "cargo test"})),
+            PlanScopeDecision::InScope
+        );
+        // Newline-smuggled form is NOT authorized: the regex is
+        // skipped, and the literal command does not match.
+        let smuggled = classify_tool_call(
+            &p,
+            &opt,
+            "Bash",
+            &json!({"command": "cargo test\nrm -rf ~/"}),
+        );
+        assert!(
+            !matches!(smuggled, PlanScopeDecision::InScope),
+            "newline-smuggled command must not be in-scope, got {smuggled:?}"
+        );
+    }
+
+    #[test]
     // file_paths_equal collapses `./` and `//` so semantically-equivalent
     // forms compare equal to the planned path.
     fn path_equality_handles_dot_and_double_slash() {
@@ -620,5 +706,70 @@ mod tests {
         let opt = PlanningOptions::default();
         let d = classify_tool_call(&p, &opt, PLAN_UPDATE_TOOL_NAME, &json!({}));
         assert_eq!(d, PlanScopeDecision::InScope);
+    }
+
+    #[test]
+    // matches_tool_name returns false for `?*` even though globset would
+    // happily compile and match it against every real tool name. Closes
+    // the legacy-plan bypass for plans persisted before parser-side
+    // validation existed.
+    fn matches_tool_name_rejects_bare_question_star() {
+        assert!(!super::matches_tool_name("?*", "Bash"));
+        assert!(!super::matches_tool_name("?*", "Read"));
+        assert!(!super::matches_tool_name("?*", "mcp__github__create_issue"));
+    }
+
+    #[test]
+    // matches_tool_name returns false for a character-class wildcard
+    // `[a-z]*`; the shape check refuses any glob metacharacter outside
+    // a single trailing `*`.
+    fn matches_tool_name_rejects_character_class_wildcard() {
+        assert!(!super::matches_tool_name("[a-z]*", "Bash"));
+        assert!(!super::matches_tool_name("[a-z]*", "read"));
+    }
+
+    #[test]
+    // matches_tool_name returns false for a brace-alternation pattern
+    // `{foo,bar}*`; globset would expand it, but the shape check
+    // forbids `{`/`}` entirely.
+    fn matches_tool_name_rejects_brace_alternation() {
+        assert!(!super::matches_tool_name("{foo,bar}*", "foo"));
+        assert!(!super::matches_tool_name("{foo,bar}*", "bar_tool"));
+    }
+
+    #[test]
+    // matches_tool_name returns false for a lone `?` because the only
+    // permitted glob shape is `<non-empty-literal-prefix>*`.
+    fn matches_tool_name_rejects_lone_question_mark() {
+        assert!(!super::matches_tool_name("?", "B"));
+        assert!(!super::matches_tool_name("?", "Bash"));
+    }
+
+    #[test]
+    // matches_tool_name still accepts the canonical MCP family glob
+    // `mcp__github__*` against a concrete tool in that family — the
+    // tightening must not regress the legitimate use case.
+    fn matches_tool_name_accepts_mcp_prefix_glob() {
+        assert!(super::matches_tool_name(
+            "mcp__github__*",
+            "mcp__github__create_issue"
+        ));
+        assert!(super::matches_tool_name(
+            "mcp__github__*",
+            "mcp__github__list"
+        ));
+        assert!(!super::matches_tool_name(
+            "mcp__github__*",
+            "mcp__gitlab__create_issue"
+        ));
+    }
+
+    #[test]
+    // matches_tool_name still accepts an exact tool name against itself
+    // (no glob involvement). Pins the exact-match path through the
+    // shape check.
+    fn matches_tool_name_accepts_exact_name() {
+        assert!(super::matches_tool_name("Bash", "Bash"));
+        assert!(!super::matches_tool_name("Bash", "Edit"));
     }
 }

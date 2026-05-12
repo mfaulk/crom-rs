@@ -362,7 +362,7 @@ impl SubmitPlanInput {
             .collect();
         base.files = parse_files(self.files)?;
         base.steps = parse_steps(self.steps, options)?;
-        base.requested_tools = parse_tools(self.requested_tools);
+        base.requested_tools = parse_tools(self.requested_tools)?;
         base.validations = self
             .validations
             .into_iter()
@@ -455,7 +455,7 @@ fn parse_steps(raws: Vec<RawStep>, options: &PlanningOptions) -> Result<Vec<Plan
             description: r.description,
             status: PlanStepStatus::Pending,
             kind,
-            expected_tools: parse_tools(r.expected_tools),
+            expected_tools: parse_tools(r.expected_tools)?,
             expected_files,
             expected_commands,
             expected_outcome: r.expected_outcome,
@@ -477,6 +477,19 @@ fn parse_commands(raws: Vec<RawCommand>) -> Result<Vec<PlanCommand>, PlanError> 
     let mut out = Vec::with_capacity(raws.len());
     for r in raws {
         if let Some(re) = &r.command_regex {
+            // Reject inline flag groups (e.g. `(?m)`, `(?s)`, `(?x)`).
+            // Defense against newline-injection bypass: a planned
+            // `(?m)^cargo test$` paired with the classifier's anchoring
+            // becomes `^(?m)^cargo test$$`, which matches
+            // `cargo test\nrm -rf ~/` because `(?m)` re-interprets the
+            // anchors as line anchors. Plan authors don't need flag
+            // groups; reject any occurrence of `(?` to keep the rule
+            // simple and broad.
+            if re.contains("(?") {
+                return Err(PlanError::Invalid(format!(
+                    "command_regex must not contain inline flag groups (`(?`): {re}"
+                )));
+            }
             // Validate regex eagerly so invalid expressions are surfaced now,
             // not at deviation-classification time.
             regex::Regex::new(re)
@@ -496,15 +509,83 @@ fn parse_commands(raws: Vec<RawCommand>) -> Result<Vec<PlanCommand>, PlanError> 
     Ok(out)
 }
 
-fn parse_tools(raws: Vec<RawToolUse>) -> Vec<PlanToolUse> {
-    raws.into_iter()
-        .map(|r| PlanToolUse {
+fn parse_tools(raws: Vec<RawToolUse>) -> Result<Vec<PlanToolUse>, PlanError> {
+    let mut out = Vec::with_capacity(raws.len());
+    for r in raws {
+        validate_tool_name_pattern(&r.tool_name)?;
+        out.push(PlanToolUse {
             tool_name: r.tool_name,
             permission_kind: parse_permission_kind(r.permission_kind.as_deref()),
             input_constraints: r.input_constraints.unwrap_or(Value::Null),
             reason: r.reason,
-        })
-        .collect()
+        });
+    }
+    Ok(out)
+}
+
+/// Shared shape check for a planned `tool_name`. The plan-scope
+/// classifier compiles `tool_name` as a `globset` glob, so any glob
+/// metacharacter — not just `*` — can match unrelated tools (`?*`,
+/// `[a-z]*`, `{foo,bar}*` all match almost anything). Combined with the
+/// classifier's `Ambiguous` fallthrough and a non-strict deviation
+/// policy, a broad pattern effectively turns plan-scope into a no-op.
+///
+/// Allowed shapes:
+/// - An exact name with no glob metacharacters at all (e.g. `Bash`,
+///   `mcp__github__create_issue`).
+/// - A literal-prefix glob `<prefix>*` where `<prefix>` is non-empty
+///   and contains no glob metacharacters (e.g. `mcp__github__*`).
+///
+/// The minimum literal prefix length is 1 character. MCP tool prefixes
+/// like `mcp__github__*` are the primary use case, and shorter prefixes
+/// (`a*`) are still narrower than the rejected bare-wildcard forms; a
+/// length floor would block legitimate exact tool names whose family
+/// glob is single-character.
+///
+/// Empty / whitespace-only names are rejected.
+///
+/// This is the single source of truth used by both the SubmitPlan
+/// parser (eager validation at submit time, see
+/// [`validate_tool_name_pattern`]) and the deviation classifier (fail-
+/// closed enforcement at match time, see
+/// [`super::deviation::matches_tool_name`]). Plans loaded from disk
+/// pre-dating the parser-side validation must still be rejected when
+/// they reach the classifier.
+pub(crate) fn is_safe_tool_pattern(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    const GLOB_META: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
+    // Exact name (no glob metacharacters) is always allowed.
+    if !trimmed.chars().any(|c| GLOB_META.contains(&c)) {
+        return true;
+    }
+    // Otherwise the only permitted shape is `<literal_prefix>*` where
+    // the prefix is non-empty and contains no glob metacharacters.
+    if let Some(prefix) = trimmed.strip_suffix('*') {
+        if !prefix.is_empty() && !prefix.chars().any(|c| GLOB_META.contains(&c)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reject overly broad tool-name patterns at SubmitPlan parse time.
+/// Shape-checking lives in [`is_safe_tool_pattern`]; this wrapper turns
+/// a `false` outcome into a structured [`PlanError`] for the parser.
+fn validate_tool_name_pattern(name: &str) -> Result<(), PlanError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(PlanError::Invalid("tool_name is empty".into()));
+    }
+    if is_safe_tool_pattern(trimmed) {
+        return Ok(());
+    }
+    Err(PlanError::Invalid(format!(
+        "tool_name `{trimmed}` is too broad a wildcard or uses unsupported glob metacharacters; \
+         allowed shapes are an exact name or `<literal_prefix>*` (e.g. `mcp__github__*`)"
+    )))
 }
 
 fn parse_permission_kind(s: Option<&str>) -> PermissionKind {
@@ -526,14 +607,16 @@ fn parse_permission_kind(s: Option<&str>) -> PermissionKind {
 /// Used as a fallback when the model returns prose instead of calling
 /// SubmitPlan. Always sets `unstructured_warning` so the caller can flag
 /// the plan in the UI.
+/// Maximum number of *characters* (not bytes) retained in the fallback
+/// plan summary. UTF-8 codepoints are variable width, so a byte-based cap
+/// would panic when the cut falls in the middle of a multi-byte codepoint
+/// (e.g. emoji at byte offset 1023).
+const UNSTRUCTURED_SUMMARY_CHAR_CAP: usize = 1024;
+
 pub fn parse_submit_plan_input(text: &str, base: PlanDocument) -> SubmitPlanResult {
     let mut plan = base;
     let trimmed = text.trim();
-    plan.summary = if trimmed.len() > 1024 {
-        format!("{}…", &trimmed[..1024])
-    } else {
-        trimmed.to_string()
-    };
+    plan.summary = truncate_with_ellipsis(trimmed, UNSTRUCTURED_SUMMARY_CHAR_CAP);
     if plan.title.is_empty() {
         plan.title = trimmed
             .lines()
@@ -569,6 +652,21 @@ pub fn parse_submit_plan_input(text: &str, base: PlanDocument) -> SubmitPlanResu
 
 fn plan_unstructured_warning_text() -> Option<String> {
     Some("plan is unstructured: review carefully before approving".into())
+}
+
+/// Truncate `s` to at most `max_chars` Unicode scalar values, appending
+/// an ellipsis when truncation occurs. Operates on `char_indices` so the
+/// cut never falls inside a multi-byte UTF-8 codepoint.
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let mut indices = s.char_indices();
+    if let Some((cut, _)) = indices.nth(max_chars) {
+        let mut out = String::with_capacity(cut + 3);
+        out.push_str(&s[..cut]);
+        out.push('…');
+        out
+    } else {
+        s.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -802,6 +900,253 @@ mod tests {
     }
 
     #[tokio::test]
+    // SubmitPlan rejects a command_regex containing an inline flag group
+    // (`(?m)`, `(?s)`, etc.) at parse time. Defends against the
+    // newline-injection bypass where `(?m)` re-interprets the auto-
+    // anchored classifier wrapping as line anchors.
+    async fn submit_plan_rejects_inline_regex_flags() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "steps": [{
+                        "id": "1", "title": "x", "kind": "execute",
+                        "expected_commands": [{
+                            "command": "cargo test",
+                            "command_regex": "(?m)^cargo test$"
+                        }]
+                    }]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("inline flag groups") || msg.contains("(?"),
+                "expected flag-group rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects a bare-wildcard `tool_name: "*"` in
+    // `requested_tools`. A bare wildcard combined with the classifier's
+    // Ambiguous fallthrough would let any tool slip past plan scope.
+    async fn submit_plan_rejects_bare_wildcard_tool_name() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("wildcard"),
+                "expected wildcard rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan accepts a prefix-glob `tool_name: "ok_prefix*"`. Plans
+    // legitimately need to wildcard MCP tool families like
+    // `mcp__github__*`, so the validation rejects only bare/leading
+    // wildcards.
+    async fn submit_plan_accepts_prefix_wildcard_tool_name() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle.clone(), PlanningOptions::default());
+        let r = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "ok_prefix*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+        let snap = handle.snapshot().await.unwrap();
+        assert_eq!(snap.plan.requested_tools.len(), 1);
+        assert_eq!(snap.plan.requested_tools[0].tool_name, "ok_prefix*");
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects `tool_name: "?*"`; `?` matches any single char,
+    // so the pattern matches every non-empty tool name.
+    async fn submit_plan_rejects_question_mark_wildcard() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "?*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("glob metacharacters"),
+                "expected glob-meta rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects `tool_name: "[a-z]*"`; a leading char class is
+    // an unbounded wildcard equivalent to bare `*`.
+    async fn submit_plan_rejects_charclass_wildcard() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "[a-z]*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("glob metacharacters"),
+                "expected glob-meta rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects `tool_name: "{foo,bar}*"`; a leading
+    // alternation broadens the prefix beyond a single literal.
+    async fn submit_plan_rejects_brace_wildcard() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "{foo,bar}*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("glob metacharacters"),
+                "expected glob-meta rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects `tool_name: "?"`; a lone `?` is a glob
+    // metacharacter that matches any single-character tool name.
+    async fn submit_plan_rejects_lone_question_mark() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "?"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("glob metacharacters"),
+                "expected glob-meta rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects `tool_name: "mc?p_*"`; the literal prefix
+    // before the trailing `*` must itself be metacharacter-free.
+    async fn submit_plan_rejects_question_inside_prefix() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "mc?p_*"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("glob metacharacters"),
+                "expected glob-meta rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // SubmitPlan accepts an exact tool name with underscores like
+    // `Bash` — no glob metacharacters means exact-match only.
+    async fn submit_plan_accepts_exact_name_with_underscore() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle.clone(), PlanningOptions::default());
+        let r = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "requested_tools": [{"tool_name": "Bash"}],
+                    "steps": [{"id": "1", "title": "x", "kind": "execute"}]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+        let snap = handle.snapshot().await.unwrap();
+        assert_eq!(snap.plan.requested_tools.len(), 1);
+        assert_eq!(snap.plan.requested_tools[0].tool_name, "Bash");
+    }
+
+    #[tokio::test]
     // SubmitPlan rejects path traversal in expected files.
     async fn submit_plan_rejects_traversal() {
         let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
@@ -846,5 +1191,29 @@ mod tests {
         assert_eq!(r.plan.steps.len(), 1);
         assert_eq!(r.plan.status, PlanStatus::PendingApproval);
         assert!(r.plan.unstructured_warning.is_some());
+    }
+
+    #[test]
+    // Textual fallback summary truncation must not panic when the cap
+    // falls on a multi-byte UTF-8 codepoint boundary (e.g. an emoji).
+    // Pre-fix this panicked with "byte index 1024 is not a char boundary".
+    fn unstructured_fallback_multibyte_boundary_no_panic() {
+        // Build a string where a 4-byte emoji straddles the 1024-byte cap.
+        // 1023 ASCII bytes + one 4-byte emoji ("🦀") + trailing text means
+        // byte 1024 lands inside the emoji.
+        let mut text = String::with_capacity(2048);
+        for _ in 0..1023 {
+            text.push('a');
+        }
+        text.push('🦀');
+        text.push_str(" trailing tail content");
+
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "u");
+        let r = parse_submit_plan_input(&text, base);
+        // Must produce a valid UTF-8 String ending in the ellipsis sentinel.
+        assert!(r.plan.summary.ends_with('…'));
+        // And the summary must be valid UTF-8 (implicit since it's a String,
+        // but assert chars().count() works without panic on the result).
+        let _ = r.plan.summary.chars().count();
     }
 }

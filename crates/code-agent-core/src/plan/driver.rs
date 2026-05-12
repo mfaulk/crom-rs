@@ -503,8 +503,33 @@ impl PermissionCallback for PlanScopeCallback {
         }
         let decision = classify_tool_call(&plan, &options, &request.tool_name, &request.input);
         match decision {
-            PlanScopeDecision::InScope => self.inner.approve(request).await,
-            PlanScopeDecision::Ambiguous { .. } | PlanScopeDecision::NotApplicable => {
+            PlanScopeDecision::InScope | PlanScopeDecision::NotApplicable => {
+                self.inner.approve(request).await
+            }
+            PlanScopeDecision::Ambiguous { reason } => {
+                // Ambiguous means the tool was named in the plan but we
+                // have no structural constraint to enforce on its input.
+                // Approval semantics still fall through to the inner
+                // callback (which in headless runs is AlwaysAllow), but
+                // we record a deviation so operators can audit what was
+                // permitted without explicit constraint coverage.
+                let dev = PlanDeviation {
+                    plan_id: plan.id.clone(),
+                    step_id: plan
+                        .steps
+                        .iter()
+                        .find(|s| matches!(s.status, PlanStepStatus::Pending))
+                        .map(|s| s.id.clone()),
+                    tool_name: request.tool_name.clone(),
+                    requested_input: request.input.clone(),
+                    reason: format!("ambiguous plan-scope decision: {reason}"),
+                    severity: default_severity_for(&request.tool_name),
+                    occurred_at: OffsetDateTime::now_utc(),
+                };
+                {
+                    let mut s = self.scope.lock().await;
+                    s.deviations.push(dev);
+                }
                 self.inner.approve(request).await
             }
             PlanScopeDecision::OutOfScope { reason } => {
@@ -573,4 +598,82 @@ pub fn collect_policy_decisions(
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::PermissionKind;
+    use crate::plan::artifact::{
+        new_plan_id, PlanDocument, PlanRiskLevel, PlanStep, PlanStepKind, PlanToolUse,
+    };
+    use serde_json::json;
+
+    // An Ambiguous plan-scope decision (tool named in the plan but no
+    // structural constraint to enforce) must surface as a recorded
+    // deviation so headless operators can audit it, even though
+    // approval still falls through to the inner callback.
+    #[tokio::test]
+    async fn ambiguous_decision_records_deviation_and_approves() {
+        // Plan that names an MCP tool with no structural input
+        // constraint. classify_tool_call returns Ambiguous for any
+        // non-Bash/Edit/Write/Read tool that the plan names.
+        let mut plan = PlanDocument::new_draft(new_plan_id(), "t", "u");
+        plan.requested_tools.push(PlanToolUse {
+            tool_name: "mcp__github__create_issue".into(),
+            permission_kind: PermissionKind::External,
+            input_constraints: serde_json::Value::Null,
+            reason: None,
+        });
+        plan.steps.push(PlanStep {
+            id: "1".into(),
+            title: "do mcp".into(),
+            description: String::new(),
+            status: PlanStepStatus::Pending,
+            kind: PlanStepKind::Other,
+            expected_tools: vec![PlanToolUse {
+                tool_name: "mcp__github__create_issue".into(),
+                permission_kind: PermissionKind::External,
+                input_constraints: serde_json::Value::Null,
+                reason: None,
+            }],
+            expected_files: Vec::new(),
+            expected_commands: Vec::new(),
+            expected_outcome: None,
+            risk: PlanRiskLevel::Low,
+            requires_user_approval: false,
+            validation: None,
+        });
+
+        let scope_state = Arc::new(Mutex::new(ScopeState {
+            plan,
+            options: PlanningOptions::default(),
+            deviations: Vec::new(),
+        }));
+        let cb = PlanScopeCallback {
+            scope: scope_state.clone(),
+            inner: Arc::new(AlwaysAllow),
+            dev_callback: Arc::new(DenyAllDeviations),
+        };
+        let req = PermissionRequest {
+            tool_name: "mcp__github__create_issue".into(),
+            permission_kind: PermissionKind::External,
+            input: json!({"title": "hi"}),
+            summary: "mcp call".into(),
+            metadata: serde_json::Value::Null,
+        };
+        let decision = cb.approve(req).await;
+        // Approval semantics preserved: inner is AlwaysAllow.
+        assert_eq!(decision, PermissionDecision::AllowOnce);
+        // Observability: the ambiguous decision is recorded.
+        let snap = scope_state.lock().await;
+        assert_eq!(snap.deviations.len(), 1, "deviation must be recorded");
+        let dev = &snap.deviations[0];
+        assert_eq!(dev.tool_name, "mcp__github__create_issue");
+        assert!(
+            dev.reason.contains("ambiguous"),
+            "reason should label ambiguity, got: {}",
+            dev.reason
+        );
+    }
 }
