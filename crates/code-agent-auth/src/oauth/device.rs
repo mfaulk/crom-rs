@@ -41,8 +41,10 @@ fn default_interval() -> u64 {
 
 /// What the caller should display to the user before waiting on the
 /// token endpoint. Stays free of secrets — `device_code` is intentionally
-/// not exposed here.
-#[derive(Debug, Clone)]
+/// not exposed here, and the manual `Debug` impl also redacts the
+/// `verification_uri_complete` (which embeds the user code as a query
+/// parameter, effectively pre-authenticating anyone who sees it).
+#[derive(Clone)]
 pub struct DeviceCodeLogin {
     pub verification_uri: String,
     pub verification_uri_complete: Option<String>,
@@ -50,6 +52,27 @@ pub struct DeviceCodeLogin {
     pub expires_at: OffsetDateTime,
     pub interval: Duration,
     pub(crate) device_code: String,
+}
+
+impl std::fmt::Debug for DeviceCodeLogin {
+    // Manual Debug impl that redacts the device_code (RFC 8628 secret
+    // used to claim the token) and the verification_uri_complete
+    // (which embeds the user code in the URL). Display values like
+    // user_code and verification_uri stay visible because the user must
+    // be able to read them in the terminal anyway.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeLogin")
+            .field("verification_uri", &self.verification_uri)
+            .field(
+                "verification_uri_complete",
+                &self.verification_uri_complete.as_ref().map(|_| "***"),
+            )
+            .field("user_code", &self.user_code)
+            .field("expires_at", &self.expires_at)
+            .field("interval", &self.interval)
+            .field("device_code", &"***")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -421,6 +444,25 @@ mod tests {
         };
         let err = device_code_poll(&cfg(), &login, &transport, opts).unwrap_err();
         assert_eq!(err.kind, AuthErrorKind::OAuthTimeout);
+    }
+
+    #[test]
+    // Debug for DeviceCodeLogin redacts the device_code and the
+    // verification_uri_complete (both treat as secrets per RFC 8628 §6.1).
+    fn debug_redacts_device_code_and_complete_uri() {
+        let login = DeviceCodeLogin {
+            verification_uri: "https://example.test/v".into(),
+            verification_uri_complete: Some("https://example.test/v?user_code=ABCD".into()),
+            user_code: "ABCD".into(),
+            expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(60),
+            interval: Duration::from_secs(5),
+            device_code: "super-secret-device-code".into(),
+        };
+        let s = format!("{:?}", login);
+        assert!(!s.contains("super-secret-device-code"));
+        assert!(!s.contains("user_code=ABCD"));
+        // The bare user code is fine: it's displayed to the user anyway.
+        assert!(s.contains("ABCD"));
     }
 
     #[test]

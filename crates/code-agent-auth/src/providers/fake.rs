@@ -28,7 +28,7 @@ pub struct FakeProviderState {
     pub force_state_mismatch: Mutex<bool>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FakeTokenRecord {
     pub email: String,
     pub plan: String,
@@ -37,12 +37,41 @@ pub struct FakeTokenRecord {
     pub billing_mode: BillingMode,
 }
 
-#[derive(Clone, Debug)]
+impl std::fmt::Debug for FakeTokenRecord {
+    // Manual Debug impl that redacts every PII-bearing or secret-bearing
+    // field. The derived Debug would otherwise dump the raw access /
+    // refresh tokens (and the bound email) into tracing output and test
+    // failure logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeTokenRecord")
+            .field("email", &"***")
+            .field("plan", &self.plan)
+            .field("access_token", &"***")
+            .field("refresh_token", &"***")
+            .field("billing_mode", &self.billing_mode)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct FakeDeviceAuthorization {
     pub user_code: String,
     pub email: String,
     pub plan: String,
     pub authorized: bool,
+}
+
+impl std::fmt::Debug for FakeDeviceAuthorization {
+    // Manual Debug impl that redacts the bound email; the user_code and
+    // authorization flag are non-secret operational values.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeDeviceAuthorization")
+            .field("user_code", &self.user_code)
+            .field("email", &"***")
+            .field("plan", &self.plan)
+            .field("authorized", &self.authorized)
+            .finish()
+    }
 }
 
 impl FakeProviderState {
@@ -482,5 +511,39 @@ mod tests {
     // Form-decoder decodes a well-formed single-byte hex escape (pinning behavior).
     fn decode_decodes_single_byte_escape() {
         assert_eq!(decode("%41"), "A");
+    }
+
+    #[test]
+    // Debug for FakeTokenRecord redacts the email and access/refresh
+    // tokens so trace logs and test failure diffs cannot leak them.
+    fn debug_for_fake_token_record_redacts_secrets() {
+        let rec = FakeTokenRecord {
+            email: "victim@example.com".into(),
+            plan: "Plus".into(),
+            access_token: "ACCESS-XYZ".into(),
+            refresh_token: "REFRESH-XYZ".into(),
+            billing_mode: BillingMode::SubscriptionIncluded,
+        };
+        let s = format!("{:?}", rec);
+        assert!(!s.contains("victim@example.com"));
+        assert!(!s.contains("ACCESS-XYZ"));
+        assert!(!s.contains("REFRESH-XYZ"));
+        // Non-secret fields stay visible to aid debugging.
+        assert!(s.contains("Plus"));
+    }
+
+    #[test]
+    // Debug for FakeDeviceAuthorization redacts the email but keeps the
+    // user_code and authorization flag visible for operational tracing.
+    fn debug_for_fake_device_authorization_redacts_email() {
+        let auth = FakeDeviceAuthorization {
+            user_code: "USER-1".into(),
+            email: "victim@example.com".into(),
+            plan: "Pro".into(),
+            authorized: true,
+        };
+        let s = format!("{:?}", auth);
+        assert!(!s.contains("victim@example.com"));
+        assert!(s.contains("USER-1"));
     }
 }
