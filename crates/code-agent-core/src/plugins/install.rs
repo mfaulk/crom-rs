@@ -46,6 +46,16 @@ pub enum PluginInstallError {
     },
     #[error("plugin {name} is not installed in scope {scope:?}")]
     NotInstalled { name: String, scope: PluginScope },
+    #[error(
+        "install failed (primary: {primary}) and rollback also failed ({rollback}); \
+         previous version was preserved at {backup_path} — restore it manually"
+    )]
+    RollbackFailed {
+        #[source]
+        primary: std::io::Error,
+        rollback: std::io::Error,
+        backup_path: PathBuf,
+    },
 }
 
 /// Where the install/registry helpers expect to read and write plugin
@@ -195,7 +205,13 @@ pub fn install_to_cache(
         .canonicalize()
         .unwrap_or_else(|_| source_dir.to_path_buf());
     if let Err(e) = copy_dir_recursive(source_dir, &staging, &canonical_source) {
-        let _ = std::fs::remove_dir_all(&staging);
+        if let Err(cleanup_err) = std::fs::remove_dir_all(&staging) {
+            tracing::warn!(
+                path = %staging.display(),
+                error = %cleanup_err,
+                "plugin install: failed to clean up staging directory after copy error"
+            );
+        }
         return Err(PluginInstallError::Io {
             path: staging,
             source: e,
@@ -210,7 +226,13 @@ pub fn install_to_cache(
     let backup = staging_dir(&target.with_extension("backup"));
     let backup_existed = if target.exists() {
         if let Err(e) = std::fs::rename(&target, &backup) {
-            let _ = std::fs::remove_dir_all(&staging);
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&staging) {
+                tracing::warn!(
+                    path = %staging.display(),
+                    error = %cleanup_err,
+                    "plugin install: failed to clean up staging directory after backup rename error"
+                );
+            }
             return Err(PluginInstallError::Io {
                 path: target.clone(),
                 source: e,
@@ -222,18 +244,52 @@ pub fn install_to_cache(
     };
     if let Err(e) = std::fs::rename(&staging, &target) {
         // Try to roll back the backup so the previous install is
-        // restored.
+        // restored. If the rollback itself fails, surface a dedicated
+        // error variant so the operator can recover the previous
+        // install manually from the backup path.
         if backup_existed {
-            let _ = std::fs::rename(&backup, &target);
+            if let Err(rollback_err) = std::fs::rename(&backup, &target) {
+                tracing::error!(
+                    backup_path = %backup.display(),
+                    target = %target.display(),
+                    primary = %e,
+                    rollback = %rollback_err,
+                    "plugin install: rollback rename failed; previous version preserved at backup path"
+                );
+                if let Err(cleanup_err) = std::fs::remove_dir_all(&staging) {
+                    tracing::warn!(
+                        path = %staging.display(),
+                        error = %cleanup_err,
+                        "plugin install: failed to clean up staging directory after rollback error"
+                    );
+                }
+                return Err(PluginInstallError::RollbackFailed {
+                    primary: e,
+                    rollback: rollback_err,
+                    backup_path: backup,
+                });
+            }
         }
-        let _ = std::fs::remove_dir_all(&staging);
+        if let Err(cleanup_err) = std::fs::remove_dir_all(&staging) {
+            tracing::warn!(
+                path = %staging.display(),
+                error = %cleanup_err,
+                "plugin install: failed to clean up staging directory after rename error"
+            );
+        }
         return Err(PluginInstallError::Io {
             path: target.clone(),
             source: e,
         });
     }
     if backup_existed {
-        let _ = std::fs::remove_dir_all(&backup);
+        if let Err(e) = std::fs::remove_dir_all(&backup) {
+            tracing::warn!(
+                path = %backup.display(),
+                error = %e,
+                "plugin install: failed to remove backup directory after successful swap"
+            );
+        }
     }
     // Ensure the data dir exists once after install so plugins that rely
     // on `${CODE_AGENT_PLUGIN_DATA}` can find it on first run.
@@ -602,6 +658,54 @@ mod tests {
         );
         assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
         assert!(!layout.cache_root.join("my-plugin").join("9.9.9").exists());
+    }
+
+    #[test]
+    // Static assertion: the new RollbackFailed variant exists with the
+    // expected fields (primary, rollback, backup_path) and threads the
+    // primary `io::Error` through as the error `source()`. We can't
+    // easily simulate `rename(&backup, &target)` failing in a portable
+    // way, so construct the variant directly and verify shape +
+    // formatting + source chain.
+    fn rollback_failed_variant_carries_both_errors_and_backup_path() {
+        use std::error::Error;
+
+        let primary = std::io::Error::other("primary");
+        let rollback = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "rollback");
+        let backup_path = PathBuf::from("/tmp/some-backup");
+        let err = PluginInstallError::RollbackFailed {
+            primary,
+            rollback,
+            backup_path: backup_path.clone(),
+        };
+        // Display mentions the backup path so the operator knows where
+        // to recover from.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("/tmp/some-backup"),
+            "expected backup path in display; got: {rendered}"
+        );
+        assert!(rendered.contains("rollback also failed"));
+        // The `source()` chain exposes the primary IO error (per
+        // #[source] on `primary`).
+        let source = err.source().expect("expected source");
+        assert!(
+            source.to_string().contains("primary"),
+            "expected primary in source chain; got: {source}"
+        );
+    }
+
+    #[test]
+    // Happy-path install still works end-to-end after the rollback
+    // wiring changes (regression guard for #59).
+    fn install_to_cache_happy_path_with_rollback_wiring() {
+        let work = TempDir::new().unwrap();
+        let plugin_dir = write_plugin(work.path(), "my-plugin", Some("0.1.0"));
+        std::fs::write(plugin_dir.join("README.md"), "hi").unwrap();
+        let layout = PluginInstallLayout::project(work.path());
+        let manifest = parse_and_validate_source(&plugin_dir, false, false).unwrap();
+        let cache = install_to_cache(&plugin_dir, &layout, &manifest, false).unwrap();
+        assert!(cache.join("README.md").exists());
     }
 
     #[cfg(unix)]
