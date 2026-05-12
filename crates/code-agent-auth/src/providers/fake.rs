@@ -315,21 +315,25 @@ fn parse_form(body: &str) -> BTreeMap<String, String> {
 }
 
 fn decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    // Decode into raw bytes first so multi-byte UTF-8 percent sequences
+    // (e.g. `%C3%A9`) are reassembled as a single code point rather than
+    // one char per encoded byte.
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '+' {
-            out.push(' ');
+            out.push(b' ');
         } else if c == '%' {
             let hex: String = (0..2).filter_map(|_| chars.next()).collect();
             if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                out.push(b as char);
+                out.push(b);
             }
         } else {
-            out.push(c);
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -451,5 +455,20 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.token.access_token.starts_with("fake-device-at-"));
+    }
+
+    #[test]
+    // Form-decoder reassembles multi-byte UTF-8 percent sequences into a
+    // single Unicode scalar rather than one char per encoded byte.
+    fn decode_handles_multi_byte_utf8() {
+        let decoded = decode("%C3%A9");
+        assert_eq!(decoded, "é");
+        assert_eq!(decoded.chars().count(), 1);
+    }
+
+    #[test]
+    // Form-decoder translates %20 to a single space (pinning existing behavior).
+    fn decode_translates_percent20_to_space() {
+        assert_eq!(decode("hello%20world"), "hello world");
     }
 }

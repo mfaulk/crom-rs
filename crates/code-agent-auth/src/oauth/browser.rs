@@ -306,23 +306,27 @@ fn parse_callback_query(query: &str) -> CallbackParams {
 }
 
 fn url_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    // Decode into raw bytes first so multi-byte UTF-8 percent sequences
+    // (e.g. `%C3%A9`) are reassembled as a single code point rather than
+    // one char per encoded byte.
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '+' {
-            out.push(' ');
+            out.push(b' ');
         } else if c == '%' {
             let h = chars.next().unwrap_or(' ');
             let l = chars.next().unwrap_or(' ');
             let hex = format!("{h}{l}");
             if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                out.push(b as char);
+                out.push(b);
             }
         } else {
-            out.push(c);
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn wait_for_callback(listener: &TcpListener, timeout: Duration) -> Result<String, AuthError> {
@@ -581,5 +585,20 @@ mod tests {
             let dec = url_decode(&enc);
             assert_eq!(dec, s);
         }
+    }
+
+    #[test]
+    // url_decode reassembles multi-byte UTF-8 percent-encoded sequences
+    // into a single Unicode scalar, not one char per encoded byte.
+    fn url_decode_handles_multi_byte_utf8() {
+        let decoded = url_decode("%C3%A9");
+        assert_eq!(decoded, "é");
+        assert_eq!(decoded.chars().count(), 1);
+    }
+
+    #[test]
+    // url_decode translates %20 to a single space (pinning existing behavior).
+    fn url_decode_translates_percent20_to_space() {
+        assert_eq!(url_decode("hello%20world"), "hello world");
     }
 }
