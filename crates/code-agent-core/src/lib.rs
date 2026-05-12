@@ -142,11 +142,12 @@ pub use policy::{
 pub use provider::{ModelEvent, ModelProvider, ModelRequest};
 pub use run_id::RunId;
 pub use settings::{
-    AgentsSettingsConfig, AuthProviderEntry, AuthSettingsConfig, CheckpointRetentionConfig,
-    CheckpointingConfig, CompactionSettingsConfig, EnabledPluginEntry, HooksConfig,
-    ModelFallbackEntry, ModelSettingsConfig, PlanningSettingsConfig, PluginsSettingsConfig,
-    ProjectInstructionsMode, SettingSource, Settings, SettingsError, SettingsFile,
-    SkillsSettingsConfig, SlashCommandsSettingsConfig, ToolLimitsConfig, ValidationConfig,
+    merge_settings_file_into, AgentsSettingsConfig, AuthProviderEntry, AuthSettingsConfig,
+    CheckpointRetentionConfig, CheckpointingConfig, CompactionSettingsConfig, EnabledPluginEntry,
+    HooksConfig, ModelFallbackEntry, ModelSettingsConfig, PlanningSettingsConfig,
+    PluginsSettingsConfig, ProjectInstructionsMode, SettingSource, Settings, SettingsError,
+    SettingsFile, SkillsSettingsConfig, SlashCommandsSettingsConfig, ToolLimitsConfig,
+    ValidationConfig,
 };
 pub use skills::{
     compat_claude_skills_dir, filesystem_skills_dir, is_identifier_safe_skill_name,

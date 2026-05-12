@@ -624,10 +624,10 @@ pub fn load(cwd: &Path, source: SettingSource) -> Result<Settings, SettingsError
 
     // Apply user, then project (project overrides user on scalars).
     if let Some(u) = user_settings {
-        merge_into(&mut effective, u, true)?;
+        merge_settings_file_into(&mut effective, u)?;
     }
     if let Some(p) = project_settings {
-        merge_into(&mut effective, p, false)?;
+        merge_settings_file_into(&mut effective, p)?;
     }
 
     Ok(effective)
@@ -647,7 +647,17 @@ fn read_file(path: &Path) -> Result<SettingsFile, SettingsError> {
 
 /// Merge a `SettingsFile` into `dst`. List fields concatenate; scalars
 /// overwrite (caller controls precedence by call order).
-fn merge_into(dst: &mut Settings, src: SettingsFile, _is_user: bool) -> Result<(), SettingsError> {
+///
+/// This is the canonical merge helper used by both the settings loader
+/// and any CLI/external code path (such as `--config`) that needs to
+/// apply a `SettingsFile` on top of existing `Settings`. Keeping a
+/// single helper avoids drift between paths — in particular, prevents
+/// a `--config`-style overlay from silently overwriting list-typed
+/// fields the loader would extend.
+pub fn merge_settings_file_into(
+    dst: &mut Settings,
+    src: SettingsFile,
+) -> Result<(), SettingsError> {
     if let Some(m) = src.model {
         dst.model = Some(m);
     }
@@ -1383,5 +1393,56 @@ mod tests {
         fs::write(agent_dir.join("settings.json"), cfg.to_string()).unwrap();
         let err = load(dir.path(), SettingSource::Project).unwrap_err();
         assert!(matches!(err, SettingsError::BadToolSearch(_)));
+    }
+
+    #[test]
+    // Successive applications of merge_settings_file_into concatenate
+    // list-typed fields (allowed_tools, disallowed_tools) in call order,
+    // matching the loader's behaviour. This guards against a regression
+    // where an alternate code path (e.g. CLI `--config`) overwrites
+    // these lists instead of extending them — see issue #18.
+    fn merge_settings_file_into_extends_list_fields() {
+        let mut effective = Settings::default();
+
+        let base = SettingsFile {
+            allowed_tools: Some(vec![ToolRule::ExactTool("A".to_string())]),
+            disallowed_tools: Some(vec![ToolRule::ExactTool("X".to_string())]),
+            ..SettingsFile::default()
+        };
+        let override_file = SettingsFile {
+            allowed_tools: Some(vec![ToolRule::ExactTool("B".to_string())]),
+            disallowed_tools: Some(vec![ToolRule::ExactTool("Y".to_string())]),
+            ..SettingsFile::default()
+        };
+
+        merge_settings_file_into(&mut effective, base).unwrap();
+        merge_settings_file_into(&mut effective, override_file).unwrap();
+
+        let allowed: Vec<&str> = effective
+            .allowed_tools
+            .iter()
+            .map(|r| match r {
+                ToolRule::ExactTool(n) => n.as_str(),
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            allowed,
+            vec!["A", "B"],
+            "allowed_tools must extend in call order; got {allowed:?}"
+        );
+        let disallowed: Vec<&str> = effective
+            .disallowed_tools
+            .iter()
+            .map(|r| match r {
+                ToolRule::ExactTool(n) => n.as_str(),
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            disallowed,
+            vec!["X", "Y"],
+            "disallowed_tools must extend in call order; got {disallowed:?}"
+        );
     }
 }

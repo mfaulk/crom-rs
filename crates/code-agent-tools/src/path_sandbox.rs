@@ -12,6 +12,35 @@ use code_agent_core::ToolError;
 /// - When `false`, the parent directory must exist (or equal the root). The
 ///   filename component is appended back without canonicalization. This
 ///   supports tools like Write that create new files.
+///
+/// # TOCTOU notes
+///
+/// This function performs *path-based* sandboxing: it inspects the path
+/// with `symlink_metadata` and `canonicalize`, then returns a
+/// `PathBuf`. The caller subsequently issues a separate filesystem
+/// syscall (typically `open`, `read`, or `write`) against that
+/// `PathBuf`. The check and the use are not atomic, so there is a
+/// time-of-check / time-of-use (TOCTOU) window between them: a
+/// concurrent actor with write access to the workspace could swap a
+/// validated path for a symlink that escapes the workspace before the
+/// follow-up syscall runs.
+///
+/// The current threat model treats the LLM as a misaligned but
+/// **non-active** adversary — it can request paths, but it does not
+/// race the agent process against the filesystem. Operators sharing a
+/// workspace directory with untrusted local users get *no* additional
+/// guarantee from this function beyond best-effort path validation;
+/// they should rely on OS-level isolation (containers, user
+/// boundaries, read-only mounts) instead. This is explicitly a
+/// path-based sandbox, not a capability-based one.
+///
+/// The higher-cost follow-up is to switch to a capability-style API
+/// using a directory file descriptor pinned at the workspace root and
+/// `openat(..., O_NOFOLLOW | O_CLOEXEC)` (or equivalent) for every
+/// subsequent operation. That closes the TOCTOU window and removes
+/// the need to revalidate paths on each syscall, at the cost of
+/// threading a workspace `Dir` handle through every tool. Tracked as
+/// issue #15.
 pub fn resolve_within(
     cwd_root: &Path,
     requested: &str,

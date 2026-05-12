@@ -205,7 +205,10 @@ Sample `.agent/settings.json`:
 CLI flags:
 
 * `--settings none|project|user|user-and-project`
-* `--config PATH` — load a single explicit settings file
+* `--config PATH` — load a single explicit settings file (replaces
+  user/project discovery; merged via the same helper as the loader,
+  so list-typed fields extend rather than overwrite when combined
+  with CLI `--yes-to` / `--deny` overlays)
 * `--mcp-config PATH`, `--mcp-enabled true|false`, `--mcp-strict`,
   `--mcp-timeout SECONDS`
 * `--tool-loading eager|search|auto`

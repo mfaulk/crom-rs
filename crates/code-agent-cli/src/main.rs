@@ -1467,9 +1467,11 @@ async fn resolve_common(
     let source = parse_setting_source(&common.settings)?;
     let log_format = parse_log_format(&common.log_format)?;
 
-    // Load file settings.
+    // Load file settings. The `--config` path uses the same canonical
+    // merge helper as the settings loader so that list-typed fields
+    // (allowed_tools, disallowed_tools, mcp.servers, plugin lists, ...)
+    // extend rather than overwrite. See issue #18.
     let mut settings = if let Some(p) = &common.config {
-        // Explicit settings file overrides everything.
         let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
         let file: code_agent_core::SettingsFile =
             serde_json::from_slice(&bytes).with_context(|| format!("parse {}", p.display()))?;
@@ -1478,45 +1480,8 @@ async fn resolve_common(
             project_path: Some(p.clone()),
             ..Settings::default()
         };
-        // Merge using a borrowed helper from the settings module: easiest is
-        // to pass through SettingsFile via a temporary write/read; or just
-        // deserialize directly. We re-implement the same merge logic here.
-        if let Some(m) = file.model {
-            s.model = Some(m);
-        }
-        if let Some(pm) = file.permission_mode {
-            s.permission_mode = Some(
-                PermissionMode::from_str_lenient(&pm)
-                    .ok_or_else(|| anyhow!("invalid permission_mode in --config: {pm}"))?,
-            );
-        }
-        if let Some(rules) = file.allowed_tools {
-            s.allowed_tools = rules;
-        }
-        if let Some(rules) = file.disallowed_tools {
-            s.disallowed_tools = rules;
-        }
-        if let Some(lim) = file.tool_limits {
-            s.tool_limits = lim;
-        }
-        if let Some(h) = file.hooks {
-            s.hooks = h;
-        }
-        if let Some(t) = file.max_turns {
-            s.max_turns = Some(t);
-        }
-        if let Some(t) = file.max_tokens {
-            s.max_tokens = Some(t);
-        }
-        if let Some(m) = file.project_instructions_mode {
-            s.project_instructions_mode = m;
-        }
-        if let Some(mcp) = file.mcp {
-            s.mcp = Some(mcp);
-        }
-        if let Some(tool_search) = file.tool_search {
-            s.tool_search = tool_search;
-        }
+        code_agent_core::merge_settings_file_into(&mut s, file)
+            .with_context(|| format!("apply --config {}", p.display()))?;
         s
     } else {
         code_agent_core::settings::load(&cwd, source).context("load settings")?
@@ -4079,6 +4044,8 @@ async fn cmd_tools(args: ToolsCommand) -> Result<()> {
 async fn build_tools_catalog(common: &ToolsCommonArgs) -> Result<ToolsCatalogContext> {
     let cwd = common.cwd.canonicalize().context("--cwd")?;
     let source = parse_setting_source(&common.settings)?;
+    // See issue #18: `--config` must use the shared merge helper so list
+    // fields extend rather than overwrite, matching the loader.
     let mut settings = if let Some(path) = &common.config {
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         let file: code_agent_core::SettingsFile =
@@ -4088,18 +4055,8 @@ async fn build_tools_catalog(common: &ToolsCommonArgs) -> Result<ToolsCatalogCon
             project_path: Some(path.clone()),
             ..Settings::default()
         };
-        if let Some(rules) = file.allowed_tools {
-            s.allowed_tools = rules;
-        }
-        if let Some(rules) = file.disallowed_tools {
-            s.disallowed_tools = rules;
-        }
-        if let Some(mcp) = file.mcp {
-            s.mcp = Some(mcp);
-        }
-        if let Some(tool_search) = file.tool_search {
-            s.tool_search = tool_search;
-        }
+        code_agent_core::merge_settings_file_into(&mut s, file)
+            .with_context(|| format!("apply --config {}", path.display()))?;
         s
     } else {
         code_agent_core::settings::load(&cwd, source).context("load settings")?
