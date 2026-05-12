@@ -5211,20 +5211,69 @@ async fn cmd_rewind(args: RewindArgs) -> Result<()> {
 
 fn build_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
     let provider_id = resolve_active_provider(cfg);
-    match provider_id.as_str() {
-        "openai" => build_openai_provider(cfg),
-        "gemini" => build_gemini_provider(cfg),
-        "fake" => Ok(Arc::new(build_fake_provider())),
-        // Anthropic is the default. Bedrock/Vertex/Foundry are
-        // intentionally not wired in this milestone — `auth status` and
-        // doctor explain the support matrix.
-        _ => {
-            let acfg = AnthropicConfig::from_env()
-                .context("ANTHROPIC_API_KEY must be set to call the Anthropic API")?;
-            let provider = AnthropicProvider::new(acfg)?;
-            Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
-        }
+    match classify_provider_id(&provider_id) {
+        ProviderRoute::Anthropic => build_anthropic_provider(cfg),
+        ProviderRoute::OpenAi => build_openai_provider(cfg),
+        ProviderRoute::Gemini => build_gemini_provider(cfg),
+        ProviderRoute::Fake => Ok(Arc::new(build_fake_provider())),
+        ProviderRoute::Unknown => Err(anyhow!(unknown_provider_message(&provider_id))),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderRoute {
+    Anthropic,
+    OpenAi,
+    Gemini,
+    Fake,
+    Unknown,
+}
+
+/// Map a resolved provider id to a [`ProviderRoute`]. Bedrock/Vertex/
+/// Foundry are intentionally not wired in this milestone — `auth status`
+/// and doctor explain the support matrix. Anything else (typos,
+/// providers from `auth.active_provider` that are not yet implemented)
+/// returns `Unknown` so the caller can surface a clear error rather
+/// than silently dispatching to Anthropic.
+fn classify_provider_id(id: &str) -> ProviderRoute {
+    match id {
+        "anthropic" => ProviderRoute::Anthropic,
+        "openai" => ProviderRoute::OpenAi,
+        "gemini" => ProviderRoute::Gemini,
+        "fake" => ProviderRoute::Fake,
+        _ => ProviderRoute::Unknown,
+    }
+}
+
+fn unknown_provider_message(id: &str) -> String {
+    format!("unknown provider {id:?}; expected one of anthropic, openai, gemini, fake")
+}
+
+/// Build the Anthropic provider, preferring an M10 stored credential
+/// over the legacy `ANTHROPIC_API_KEY` env var. Falls back to
+/// `AnthropicConfig::from_env()` when no stored credential is present,
+/// so existing workflows keep working.
+fn build_anthropic_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
+    let credential = resolve_runtime_credential(cfg, code_agent_auth::ProviderId::Anthropic)
+        .unwrap_or(code_agent_auth::ResolvedCredential::None);
+    let acfg = match credential {
+        code_agent_auth::ResolvedCredential::ApiKey { key, .. } => {
+            let base_url = std::env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+            AnthropicConfig {
+                api_key: key.expose().to_string(),
+                base_url,
+                connect_timeout: StdDuration::from_secs(30),
+                read_timeout: StdDuration::from_secs(120),
+                max_retries: 2,
+            }
+        }
+        _ => AnthropicConfig::from_env().context(
+            "No Anthropic credential available; run `code-agent auth login anthropic --api-key` or set ANTHROPIC_API_KEY",
+        )?,
+    };
+    let provider = AnthropicProvider::new(acfg)?;
+    Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
 }
 
 /// Pick the provider name to use this run, in order of precedence:
@@ -7394,4 +7443,40 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
          use --snapshot for a preview frame or `--renderer plain`"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod provider_route_tests {
+    use super::*;
+
+    #[test]
+    // Known provider ids map to their dedicated routes.
+    fn known_providers_map_to_dedicated_routes() {
+        assert_eq!(classify_provider_id("anthropic"), ProviderRoute::Anthropic);
+        assert_eq!(classify_provider_id("openai"), ProviderRoute::OpenAi);
+        assert_eq!(classify_provider_id("gemini"), ProviderRoute::Gemini);
+        assert_eq!(classify_provider_id("fake"), ProviderRoute::Fake);
+    }
+
+    #[test]
+    // An unknown provider id is classified Unknown rather than silently
+    // routed to Anthropic — preventing a typo from masquerading as the
+    // default Anthropic flow.
+    fn unknown_provider_does_not_alias_to_anthropic() {
+        assert_eq!(classify_provider_id("bedrock"), ProviderRoute::Unknown);
+        assert_eq!(classify_provider_id("vertex_ai"), ProviderRoute::Unknown);
+        assert_eq!(classify_provider_id(""), ProviderRoute::Unknown);
+        assert_eq!(classify_provider_id("anthrop"), ProviderRoute::Unknown);
+    }
+
+    #[test]
+    // The error message for an unknown provider names the bad id and
+    // enumerates the supported ones so the operator can fix the config.
+    fn unknown_provider_message_is_actionable() {
+        let msg = unknown_provider_message("bedrock");
+        assert!(msg.contains("bedrock"));
+        assert!(msg.contains("anthropic"));
+        assert!(msg.contains("openai"));
+        assert!(msg.contains("gemini"));
+    }
 }
