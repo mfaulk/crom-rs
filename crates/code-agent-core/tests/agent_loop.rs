@@ -668,3 +668,123 @@ async fn multiple_tool_calls_run_in_parallel() {
 
     assert_eq!(final_result(&events).subtype, ResultSubtype::Success);
 }
+
+/// Permission callback that denies any tool call whose tool name matches the
+/// configured target. Used to force a specific call to short-circuit while
+/// other calls in the same turn run normally.
+struct DenyByName {
+    deny_tool: &'static str,
+}
+
+#[async_trait]
+impl PermissionCallback for DenyByName {
+    async fn approve(&self, req: PermissionRequest) -> PermissionDecision {
+        if req.tool_name == self.deny_tool {
+            PermissionDecision::Deny {
+                reason: format!("denied {}", self.deny_tool),
+            }
+        } else {
+            PermissionDecision::AllowOnce
+        }
+    }
+}
+
+#[tokio::test]
+// When a turn contains a mix of allowed and denied tool calls, the
+// `UserToolResult` events (i.e. the `tool_result` blocks sent back to the
+// model) must appear in input order. A regression where short-circuited
+// denials emit their result immediately while runnable calls emit later
+// reverses the order for `[allowed, denied]` turns, which violates the
+// Anthropic API's input-order invariant for tool_result blocks.
+async fn tool_results_preserve_input_order_when_some_calls_short_circuit() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ModelEvent::ToolCall(code_agent_core::ToolCall {
+                id: "t0".into(),
+                name: "AllowedExec".into(),
+                input: json!({}),
+            }),
+            ModelEvent::ToolCall(code_agent_core::ToolCall {
+                id: "t1".into(),
+                name: "DeniedExec".into(),
+                input: json!({}),
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ],
+        vec![
+            ModelEvent::TextDelta { text: "ok".into() },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            },
+        ],
+    ]));
+    let allowed_flag = Arc::new(Mutex::new(false));
+    let denied_flag = Arc::new(Mutex::new(false));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ExecToolNamed {
+        name: "AllowedExec",
+        flag: allowed_flag.clone(),
+    }));
+    tools.register(Arc::new(ExecToolNamed {
+        name: "DeniedExec",
+        flag: denied_flag.clone(),
+    }));
+    let opts = AgentOptions {
+        max_turns: Some(4),
+        allowed_tools: vec!["AllowedExec".into(), "DeniedExec".into()],
+        permission_mode: PermissionMode::Default,
+        permission_callback: Some(Arc::new(DenyByName {
+            deny_tool: "DeniedExec",
+        })),
+        ..AgentOptions::default()
+    };
+
+    let events = run(provider, opts, tools, "go").await;
+    let order: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::UserToolResult(r) => Some(r.tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["t0", "t1"],
+        "tool_result blocks must be emitted in input order; got {order:?}"
+    );
+    assert!(*allowed_flag.lock().unwrap(), "allowed tool should run");
+    assert!(!*denied_flag.lock().unwrap(), "denied tool must not run");
+}
+
+struct ExecToolNamed {
+    name: &'static str,
+    flag: Arc<Mutex<bool>>,
+}
+
+#[async_trait]
+impl Tool for ExecToolNamed {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        ""
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type": "object"})
+    }
+    fn permission_kind(&self) -> PermissionKind {
+        PermissionKind::Execution
+    }
+    async fn execute(
+        &self,
+        _: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        *self.flag.lock().unwrap() = true;
+        Ok(ToolResult::ok_text("ran"))
+    }
+}

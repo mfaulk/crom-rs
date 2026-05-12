@@ -1184,7 +1184,20 @@ pub(crate) async fn run_loop(
         // emission stay sequential for determinism. Results are paired
         // with their original `tool_use_id` so the conversation sees the
         // model's input order.
-        let mut tool_result_blocks: Vec<ContentBlock> = Vec::new();
+        //
+        // Per-call result body slotted by input position. Filled both by
+        // gate-loop short-circuits (denials) and by the post-execute
+        // pass. A final loop emits `UserToolResult` events and pushes
+        // `ContentBlock::ToolResult` blocks in input order so the
+        // Anthropic API invariant (tool_result blocks must follow
+        // tool_use blocks in input order) is preserved even when some
+        // calls deny before others have run.
+        struct PendingResult {
+            body: String,
+            is_error: bool,
+        }
+        let mut pending_results: Vec<Option<PendingResult>> =
+            (0..tool_calls.len()).map(|_| None).collect();
         // Stash per-call state captured during gating; consumed in the
         // post-execute pass after futures complete.
         struct PerCallState {
@@ -1240,17 +1253,10 @@ pub(crate) async fn run_loop(
                     }),
                 )
                 .await;
-                let body = format!("Tool denied: {}", reason);
-                push_tool_result_user(
-                    &tx,
-                    &session_sink,
-                    &session_id,
-                    &mut tool_result_blocks,
-                    call,
-                    &body,
-                    true,
-                )
-                .await;
+                pending_results[idx] = Some(PendingResult {
+                    body: format!("Tool denied: {}", reason),
+                    is_error: true,
+                });
                 continue;
             }
 
@@ -1269,17 +1275,10 @@ pub(crate) async fn run_loop(
                         }),
                     )
                     .await;
-                    let body = format!("Tool denied: {}", reason);
-                    push_tool_result_user(
-                        &tx,
-                        &session_sink,
-                        &session_id,
-                        &mut tool_result_blocks,
-                        call,
-                        &body,
-                        true,
-                    )
-                    .await;
+                    pending_results[idx] = Some(PendingResult {
+                        body: format!("Tool denied: {}", reason),
+                        is_error: true,
+                    });
                     continue;
                 }
             };
@@ -1344,17 +1343,10 @@ pub(crate) async fn run_loop(
                     }),
                 )
                 .await;
-                let body = format!("Tool denied: {}", reason);
-                push_tool_result_user(
-                    &tx,
-                    &session_sink,
-                    &session_id,
-                    &mut tool_result_blocks,
-                    call,
-                    &body,
-                    true,
-                )
-                .await;
+                pending_results[idx] = Some(PendingResult {
+                    body: format!("Tool denied: {}", reason),
+                    is_error: true,
+                });
                 continue;
             }
 
@@ -1404,17 +1396,10 @@ pub(crate) async fn run_loop(
                             }),
                         )
                         .await;
-                        let body = format!("Tool denied: {}", reason);
-                        push_tool_result_user(
-                            &tx,
-                            &session_sink,
-                            &session_id,
-                            &mut tool_result_blocks,
-                            call,
-                            &body,
-                            true,
-                        )
-                        .await;
+                        pending_results[idx] = Some(PendingResult {
+                            body: format!("Tool denied: {}", reason),
+                            is_error: true,
+                        });
                         continue;
                     }
                 } else {
@@ -1442,17 +1427,10 @@ pub(crate) async fn run_loop(
                             }),
                         )
                         .await;
-                        let body = format!("Tool denied: checkpoint capture failed ({})", reason);
-                        push_tool_result_user(
-                            &tx,
-                            &session_sink,
-                            &session_id,
-                            &mut tool_result_blocks,
-                            call,
-                            &body,
-                            true,
-                        )
-                        .await;
+                        pending_results[idx] = Some(PendingResult {
+                            body: format!("Tool denied: checkpoint capture failed ({})", reason),
+                            is_error: true,
+                        });
                         continue;
                     }
                 }
@@ -1532,13 +1510,7 @@ pub(crate) async fn run_loop(
             exec_futures.push((
                 idx,
                 Box::pin(async move { tool_arc.execute(effective_input_clone, ctx).await })
-                    as Pin<
-                        Box<
-                            dyn std::future::Future<
-                                    Output = Result<crate::tool::ToolResult, ToolError>,
-                                > + Send,
-                        >,
-                    >,
+                    as ExecFut,
             ));
             // Remember per-call bookkeeping for the post-execute pass.
             per_call_state[idx] = Some(PerCallState {
@@ -1760,17 +1732,35 @@ pub(crate) async fn run_loop(
                     .await;
                 }
 
-                push_tool_result_user(
-                    &tx,
-                    &session_sink,
-                    &session_id,
-                    &mut tool_result_blocks,
-                    call,
-                    &text,
+                pending_results[idx] = Some(PendingResult {
+                    body: text,
                     is_error,
-                )
-                .await;
+                });
             }
+        }
+
+        // Final pass: emit `UserToolResult` events and append tool_result
+        // blocks in input order. Buffering above (both for
+        // short-circuits and for runnable calls) guarantees the
+        // Anthropic API invariant that tool_result blocks follow their
+        // tool_use blocks in input order, even when a later call denies
+        // before an earlier call's future resolves.
+        let mut tool_result_blocks: Vec<ContentBlock> = Vec::with_capacity(tool_calls.len());
+        for (idx, call) in tool_calls.iter().enumerate() {
+            let pending = pending_results[idx].take().unwrap_or_else(|| PendingResult {
+                body: "Tool result missing".to_string(),
+                is_error: true,
+            });
+            push_tool_result_user(
+                &tx,
+                &session_sink,
+                &session_id,
+                &mut tool_result_blocks,
+                call,
+                &pending.body,
+                pending.is_error,
+            )
+            .await;
         }
 
         // PostToolBatch hook.
