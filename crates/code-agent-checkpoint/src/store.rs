@@ -153,6 +153,15 @@ pub struct LocalCheckpointStore {
     index_locks: tokio::sync::Mutex<
         std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
     >,
+    /// Per-(session, checkpoint) async mutexes that serialize manifest
+    /// read-modify-writes inside `capture_before_tool`. Without this,
+    /// two concurrent captures targeting the same checkpoint can both
+    /// read the manifest, each extend their own copy, and the second
+    /// writer overwrites the first writer's `files_tracked` entries.
+    /// Keyed by "<session_id>/<checkpoint_id>".
+    manifest_locks: tokio::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    >,
     /// Cached per-session total blob bytes, populated lazily so
     /// `capture_one_path` doesn't have to re-scan the blobs directory on
     /// every snapshot. We update incrementally when a new blob is
@@ -166,6 +175,7 @@ impl LocalCheckpointStore {
             root,
             limits: CheckpointLimits::default(),
             index_locks: tokio::sync::Mutex::new(Default::default()),
+            manifest_locks: tokio::sync::Mutex::new(Default::default()),
             storage_cache: tokio::sync::Mutex::new(Default::default()),
         }
     }
@@ -175,6 +185,7 @@ impl LocalCheckpointStore {
             root,
             limits,
             index_locks: tokio::sync::Mutex::new(Default::default()),
+            manifest_locks: tokio::sync::Mutex::new(Default::default()),
             storage_cache: tokio::sync::Mutex::new(Default::default()),
         }
     }
@@ -186,6 +197,22 @@ impl LocalCheckpointStore {
     ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         let mut g = self.index_locks.lock().await;
         g.entry(session_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Returns (and lazily creates) the per-(session, checkpoint) manifest
+    /// lock. `capture_before_tool` holds this for the read-modify-write
+    /// window so concurrent captures on the same checkpoint don't clobber
+    /// each other's `files_tracked` entries.
+    async fn manifest_lock_for(
+        &self,
+        session_id: &SessionId,
+        checkpoint_id: &CheckpointId,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{}/{}", session_id, checkpoint_id);
+        let mut g = self.manifest_locks.lock().await;
+        g.entry(key)
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -560,6 +587,19 @@ impl CheckpointStore for LocalCheckpointStore {
         request: CaptureBeforeToolRequest,
     ) -> Result<Vec<FileSnapshotKind>, CheckpointError> {
         self.ensure_dirs(&request.session_id).await?;
+
+        // Serialize the read-modify-write of this checkpoint's manifest
+        // against any other concurrent capture targeting the same
+        // checkpoint. Without this, two callers can both read the
+        // manifest, each extend their own copy, and the second writer
+        // overwrites the first writer's `files_tracked` entries. Blob
+        // writes inside `capture_one_path` are content-addressed and
+        // safe to interleave, but the duplicate-path check below reads
+        // `meta.files_tracked` and so must also stay inside the lock.
+        let lock = self
+            .manifest_lock_for(&request.session_id, &request.checkpoint_id)
+            .await;
+        let _g = lock.lock().await;
 
         let mut meta = self
             .read_manifest(&request.session_id, &request.checkpoint_id)
@@ -1229,6 +1269,62 @@ mod tests {
             list.iter().any(|e| e.checkpoint_id == id),
             "index entry must be kept after a failed unlink",
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // Two parallel capture_before_tool calls against the same checkpoint
+    // with different paths must both end up in files_tracked on disk; the
+    // read-modify-write of the manifest is serialized per checkpoint.
+    async fn concurrent_captures_preserve_both_entries() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(LocalCheckpointStore::new(dir.path().to_path_buf()));
+        let sid = SessionId::new();
+        let id = store
+            .create_checkpoint(CreateCheckpointRequest {
+                session_id: sid.clone(),
+                run_id: RunId::new(),
+                cwd: store.root().to_path_buf(),
+                description: None,
+                user_message_id: None,
+                git_state: None,
+            })
+            .await
+            .unwrap();
+
+        // Pre-create both files so the captures emit real ExistingFile
+        // snapshots rather than MissingBeforeChange placeholders.
+        std::fs::write(dir.path().join("a.txt"), b"AAAA").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"BBBB").unwrap();
+
+        let mk_req = |path: &str| CaptureBeforeToolRequest {
+            checkpoint_id: id.clone(),
+            session_id: sid.clone(),
+            run_id: RunId::new(),
+            cwd: store.root().to_path_buf(),
+            tool_name: "Edit".into(),
+            tool_input: serde_json::json!({}),
+            paths: vec![WorkspaceRelativePath(path.into())],
+        };
+
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let r1 = mk_req("a.txt");
+        let r2 = mk_req("b.txt");
+        let (res1, res2) = tokio::join!(
+            tokio::spawn(async move { s1.capture_before_tool(r1).await }),
+            tokio::spawn(async move { s2.capture_before_tool(r2).await }),
+        );
+        res1.unwrap().unwrap();
+        res2.unwrap().unwrap();
+
+        let meta = store.get_checkpoint(&sid, &id).await.unwrap();
+        let paths: std::collections::HashSet<String> = meta
+            .files_tracked
+            .iter()
+            .map(|s| s.path().as_str().to_string())
+            .collect();
+        assert!(paths.contains("a.txt"), "missing a.txt: {paths:?}");
+        assert!(paths.contains("b.txt"), "missing b.txt: {paths:?}");
     }
 
     #[tokio::test]
