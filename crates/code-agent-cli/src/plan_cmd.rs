@@ -414,8 +414,19 @@ async fn cmd_plans_diff(settings: &Settings, args: DiffArgs) -> Result<()> {
         .from_version
         .unwrap_or_else(|| to_v.saturating_sub(1).max(1));
     let dir = args.common.cwd.join(".agent").join("plans");
-    let from_path = dir.join(format!("{}.v{}.json", plan.id, from_v));
-    let to_path = dir.join(format!("{}.v{}.json", plan.id, to_v));
+    // Prefer the write-once `.approved.json` snapshot for either side when
+    // it exists. That preserves the body the reviewer approved even after
+    // the act driver has overwritten `.v<n>.json` with post-execution state.
+    let pick_snapshot = |v: u32| -> std::path::PathBuf {
+        let approved = dir.join(format!("{}.v{}.approved.json", plan.id, v));
+        if approved.exists() {
+            approved
+        } else {
+            dir.join(format!("{}.v{}.json", plan.id, v))
+        }
+    };
+    let from_path = pick_snapshot(from_v);
+    let to_path = pick_snapshot(to_v);
     let from_bytes = std::fs::read_to_string(&from_path)
         .with_context(|| format!("read {}", from_path.display()))?;
     let to_bytes =
