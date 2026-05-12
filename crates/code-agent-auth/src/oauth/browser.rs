@@ -306,27 +306,7 @@ fn parse_callback_query(query: &str) -> CallbackParams {
 }
 
 fn url_decode(s: &str) -> String {
-    // Decode into raw bytes first so multi-byte UTF-8 percent sequences
-    // (e.g. `%C3%A9`) are reassembled as a single code point rather than
-    // one char per encoded byte.
-    let mut out: Vec<u8> = Vec::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '+' {
-            out.push(b' ');
-        } else if c == '%' {
-            let h = chars.next().unwrap_or(' ');
-            let l = chars.next().unwrap_or(' ');
-            let hex = format!("{h}{l}");
-            if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                out.push(b);
-            }
-        } else {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    crate::oauth::token::url_decode(s)
 }
 
 fn wait_for_callback(
@@ -635,6 +615,36 @@ mod tests {
     // url_decode translates %20 to a single space (pinning existing behavior).
     fn url_decode_translates_percent20_to_space() {
         assert_eq!(url_decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    // url_decode preserves a trailing `%` with no following chars as a literal.
+    fn url_decode_preserves_lone_percent() {
+        assert_eq!(url_decode("%"), "%");
+    }
+
+    #[test]
+    // url_decode preserves `%` followed by a single trailing char as literals.
+    fn url_decode_preserves_percent_with_one_trailing_char() {
+        assert_eq!(url_decode("%A"), "%A");
+    }
+
+    #[test]
+    // url_decode preserves `%` followed by two non-hex chars as literals.
+    fn url_decode_preserves_percent_with_two_non_hex_chars() {
+        assert_eq!(url_decode("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    // url_decode preserves a malformed escape embedded in surrounding text.
+    fn url_decode_preserves_malformed_escape_in_context() {
+        assert_eq!(url_decode("a%Zb"), "a%Zb");
+    }
+
+    #[test]
+    // url_decode decodes a well-formed single-byte hex escape (pinning behavior).
+    fn url_decode_decodes_single_byte_escape() {
+        assert_eq!(url_decode("%41"), "A");
     }
 
     fn bind_local_listener() -> (TcpListener, u16) {

@@ -108,6 +108,56 @@ pub fn url_encode(s: &str) -> String {
     out
 }
 
+/// Decode an `application/x-www-form-urlencoded` string.
+///
+/// Inverse of [`url_encode`] for well-formed input. Malformed percent escapes
+/// (`%` without two following hex digits) are preserved as the literal `%`
+/// plus any consumed chars, rather than silently dropped, so callers see
+/// exactly what arrived on the wire. Multi-byte UTF-8 sequences are
+/// reassembled across percent escapes before the bytes are decoded as a
+/// string.
+pub(crate) fn url_decode(s: &str) -> String {
+    fn push_char(out: &mut Vec<u8>, c: char) {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '+' => out.push(b' '),
+            '%' => {
+                // Take two hex digits if and only if both are present and
+                // valid; otherwise emit the literal `%` and let the loop
+                // re-process the following chars normally.
+                let h = chars.peek().and_then(|c| c.to_digit(16));
+                if let Some(h) = h {
+                    // Tentatively consume the first hex digit.
+                    let h_char = chars.next().expect("peeked");
+                    let l = chars.peek().and_then(|c| c.to_digit(16));
+                    match l {
+                        Some(l) => {
+                            // Commit: consume the second digit too.
+                            chars.next();
+                            out.push(((h << 4) | l) as u8);
+                        }
+                        None => {
+                            // Roll back: emit `%` and the first char literally.
+                            out.push(b'%');
+                            push_char(&mut out, h_char);
+                        }
+                    }
+                } else {
+                    out.push(b'%');
+                }
+            }
+            other => push_char(&mut out, other),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

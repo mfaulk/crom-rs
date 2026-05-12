@@ -315,25 +315,7 @@ fn parse_form(body: &str) -> BTreeMap<String, String> {
 }
 
 fn decode(s: &str) -> String {
-    // Decode into raw bytes first so multi-byte UTF-8 percent sequences
-    // (e.g. `%C3%A9`) are reassembled as a single code point rather than
-    // one char per encoded byte.
-    let mut out: Vec<u8> = Vec::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '+' {
-            out.push(b' ');
-        } else if c == '%' {
-            let hex: String = (0..2).filter_map(|_| chars.next()).collect();
-            if let Ok(b) = u8::from_str_radix(&hex, 16) {
-                out.push(b);
-            }
-        } else {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    crate::oauth::token::url_decode(s)
 }
 
 #[cfg(test)]
@@ -470,5 +452,35 @@ mod tests {
     // Form-decoder translates %20 to a single space (pinning existing behavior).
     fn decode_translates_percent20_to_space() {
         assert_eq!(decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    // Form-decoder preserves a trailing `%` with no following chars as a literal.
+    fn decode_preserves_lone_percent() {
+        assert_eq!(decode("%"), "%");
+    }
+
+    #[test]
+    // Form-decoder preserves `%` followed by a single trailing char as literals.
+    fn decode_preserves_percent_with_one_trailing_char() {
+        assert_eq!(decode("%A"), "%A");
+    }
+
+    #[test]
+    // Form-decoder preserves `%` followed by two non-hex chars as literals.
+    fn decode_preserves_percent_with_two_non_hex_chars() {
+        assert_eq!(decode("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    // Form-decoder preserves a malformed escape embedded in surrounding text.
+    fn decode_preserves_malformed_escape_in_context() {
+        assert_eq!(decode("a%Zb"), "a%Zb");
+    }
+
+    #[test]
+    // Form-decoder decodes a well-formed single-byte hex escape (pinning behavior).
+    fn decode_decodes_single_byte_escape() {
+        assert_eq!(decode("%41"), "A");
     }
 }
