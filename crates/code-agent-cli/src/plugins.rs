@@ -982,12 +982,16 @@ async fn cmd_prune(args: PluginPruneArgs) -> Result<()> {
         })
         .unwrap_or_default();
     let mut removed = Vec::new();
-    removed.extend(prune_orphans(&project, &keep, args.dry_run)?);
-    removed.extend(prune_orphans(&local, &keep, args.dry_run)?);
-    if let Some(layout) = user.as_ref() {
-        removed.extend(prune_orphans(layout, &keep, args.dry_run)?);
+    let mut failed: Vec<(String, Option<String>, std::io::Error)> = Vec::new();
+    for layout in std::iter::once(&project)
+        .chain(std::iter::once(&local))
+        .chain(user.as_ref())
+    {
+        let outcome = prune_orphans(layout, &keep, args.dry_run)?;
+        removed.extend(outcome.removed);
+        failed.extend(outcome.failed);
     }
-    if removed.is_empty() {
+    if removed.is_empty() && failed.is_empty() {
         println!("[plugin] no orphans");
     } else {
         for (n, v) in &removed {
@@ -1002,6 +1006,21 @@ async fn cmd_prune(args: PluginPruneArgs) -> Result<()> {
                 v.as_deref().map(|s| format!("@{s}")).unwrap_or_default()
             );
         }
+        for (n, v, e) in &failed {
+            eprintln!(
+                "[plugin] failed to remove {}{}: {}",
+                n,
+                v.as_deref().map(|s| format!("@{s}")).unwrap_or_default(),
+                e
+            );
+        }
+    }
+    if !failed.is_empty() {
+        return Err(anyhow!(
+            "{} plugin cache entr{} could not be removed",
+            failed.len(),
+            if failed.len() == 1 { "y" } else { "ies" }
+        ));
     }
     Ok(())
 }

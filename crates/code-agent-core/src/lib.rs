@@ -131,8 +131,8 @@ pub use plugins::{
     PluginLoadOptions, PluginLoadedHook, PluginManifest, PluginManifestError,
     PluginMarketplaceOwner, PluginRegistry, PluginRuntimeBuild, PluginRuntimePaths, PluginScope,
     PluginSource, PluginStatus, PluginSubstError, PluginSummary, PluginValidationError,
-    PluginValidationFailure, PluginVarContext, COMPAT_PLUGIN_MANIFEST_PATH, MAX_PLUGIN_NAME_LEN,
-    PLUGIN_MANIFEST_PATH,
+    PluginValidationFailure, PluginVarContext, PruneOutcome, COMPAT_PLUGIN_MANIFEST_PATH,
+    MAX_PLUGIN_NAME_LEN, PLUGIN_MANIFEST_PATH,
 };
 pub use policy::{
     approval_key, ApprovalMemory, ApprovalMemorySnapshot, MemoryDecision, PolicyConfig,

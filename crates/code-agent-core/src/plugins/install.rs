@@ -384,16 +384,29 @@ pub fn remove_data_dir(layout: &PluginInstallLayout, name: &str) -> Result<(), P
     Ok(())
 }
 
+/// Outcome of a [`prune_orphans`] run. `removed` only contains entries
+/// whose deletion actually succeeded (or would have succeeded under
+/// `dry_run`). Entries whose `remove_dir_all`/`remove_dir` call returned
+/// an `io::Error` are reported in `failed` with the original error so
+/// callers can surface the failure to the operator instead of silently
+/// claiming the cache is clean.
+#[derive(Debug, Default)]
+pub struct PruneOutcome {
+    pub removed: Vec<(String, Option<String>)>,
+    pub failed: Vec<(String, Option<String>, std::io::Error)>,
+}
+
 /// Walk the cache directory and remove plugin entries that are not in
-/// `keep`. Returns the list of removed `(name, version)` pairs.
+/// `keep`. Returns the [`PruneOutcome`] partitioning successful removals
+/// from per-entry deletion failures.
 pub fn prune_orphans(
     layout: &PluginInstallLayout,
     keep: &[(String, Option<String>)],
     dry_run: bool,
-) -> Result<Vec<(String, Option<String>)>, PluginInstallError> {
-    let mut removed = Vec::new();
+) -> Result<PruneOutcome, PluginInstallError> {
+    let mut outcome = PruneOutcome::default();
     if !layout.cache_root.exists() {
-        return Ok(removed);
+        return Ok(outcome);
     }
     let entries = std::fs::read_dir(&layout.cache_root).map_err(|e| PluginInstallError::Io {
         path: layout.cache_root.clone(),
@@ -442,16 +455,32 @@ pub fn prune_orphans(
                 any_kept = true;
                 continue;
             }
-            removed.push((plugin_name.clone(), version_opt.clone()));
-            if !dry_run {
-                let _ = std::fs::remove_dir_all(&ver_path);
+            // Attempt the deletion FIRST so we only report what was
+            // actually removed. On dry_run we just record the intent.
+            if dry_run {
+                outcome.removed.push((plugin_name.clone(), version_opt));
+            } else {
+                match std::fs::remove_dir_all(&ver_path) {
+                    Ok(()) => {
+                        outcome.removed.push((plugin_name.clone(), version_opt));
+                    }
+                    Err(e) => {
+                        // Treat a failed delete as a "kept" entry so we
+                        // don't subsequently try to remove the parent
+                        // directory (which would also fail).
+                        any_kept = true;
+                        outcome.failed.push((plugin_name.clone(), version_opt, e));
+                    }
+                }
             }
         }
         if !dry_run && !any_kept {
-            let _ = std::fs::remove_dir(&plugin_path);
+            if let Err(e) = std::fs::remove_dir(&plugin_path) {
+                outcome.failed.push((plugin_name.clone(), None, e));
+            }
         }
     }
-    Ok(removed)
+    Ok(outcome)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path, canonical_root: &Path) -> std::io::Result<()> {
@@ -561,17 +590,58 @@ mod tests {
         install_to_cache(&plugin_dir, &layout, &manifest, false).unwrap();
         // Pretend a second version was previously installed.
         std::fs::create_dir_all(layout.cache_root.join("my-plugin").join("9.9.9")).unwrap();
-        let removed = prune_orphans(
+        let outcome = prune_orphans(
             &layout,
             &[("my-plugin".into(), Some("0.1.0".into()))],
             false,
         )
         .unwrap();
         assert_eq!(
-            removed,
+            outcome.removed,
             vec![("my-plugin".to_string(), Some("9.9.9".to_string()))]
         );
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
         assert!(!layout.cache_root.join("my-plugin").join("9.9.9").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // When `remove_dir_all` fails (here: the version dir's parent is
+    // chmod'd read+execute only so the inode cannot be unlinked), the
+    // entry must NOT appear in `outcome.removed`. It MUST appear in
+    // `outcome.failed` with the original IO error so the operator can
+    // see the cache state is not actually clean.
+    fn prune_reports_failed_removal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = TempDir::new().unwrap();
+        let layout = PluginInstallLayout::project(work.path());
+        // Build an orphan version dir manually so it has no special
+        // permission setup.
+        let parent = layout.cache_root.join("my-plugin");
+        let ver = parent.join("9.9.9");
+        std::fs::create_dir_all(&ver).unwrap();
+        std::fs::write(ver.join("file"), "x").unwrap();
+
+        // Lock the parent so `remove_dir_all` on `ver` fails (can't
+        // unlink children when the parent is not writable).
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = prune_orphans(&layout, &[], false).unwrap();
+
+        // Restore perms so TempDir can clean up at drop time.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            outcome.removed.is_empty(),
+            "should not have claimed to remove anything: {:?}",
+            outcome.removed
+        );
+        assert_eq!(outcome.failed.len(), 1, "{:?}", outcome.failed);
+        let (n, v, _err) = &outcome.failed[0];
+        assert_eq!(n, "my-plugin");
+        assert_eq!(v.as_deref(), Some("9.9.9"));
+        assert!(ver.exists(), "the version dir should still exist on disk");
     }
 
     #[test]

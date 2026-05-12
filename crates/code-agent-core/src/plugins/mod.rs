@@ -18,6 +18,7 @@ pub mod vars;
 pub use install::{
     discover_manifest_path, install_to_cache, make_install, parse_and_validate_source,
     prune_orphans, remove_data_dir, uninstall_cache, PluginInstallError, PluginInstallLayout,
+    PruneOutcome,
 };
 pub use loader::{
     load_plugin_components, LoadedPluginComponents, PluginComponentFailure, PluginHookCommand,
