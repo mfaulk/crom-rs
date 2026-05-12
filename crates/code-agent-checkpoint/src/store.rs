@@ -55,6 +55,9 @@ pub enum CheckpointError {
         current_cwd: PathBuf,
     },
 
+    #[error("invalid checkpoint configuration: {0}")]
+    InvalidConfig(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -551,6 +554,35 @@ impl CheckpointStore for LocalCheckpointStore {
                 );
                 entries.insert(0, oldest);
                 break;
+            }
+        }
+
+        // Age-based retention: drop entries older than max_age_days. The
+        // count-based trim above only protects against unbounded growth;
+        // long-idle sessions could otherwise hoard expired checkpoints
+        // forever. We honor a stable `now` so the cutoff is consistent
+        // across this method.
+        if let Some(days) = self.limits.max_age_days {
+            let cutoff = OffsetDateTime::now_utc() - time::Duration::days(days as i64);
+            let aged: Vec<CheckpointId> = entries
+                .iter()
+                .filter(|e| e.created_at < cutoff)
+                .map(|e| e.checkpoint_id.clone())
+                .collect();
+            for cid in aged {
+                if let Err(err) = self
+                    .delete_checkpoint_locked(&request.session_id, &cid)
+                    .await
+                {
+                    tracing::warn!(
+                        session_id = %request.session_id,
+                        checkpoint_id = %cid,
+                        error = %err,
+                        "checkpoint age-based trim failed; keeping entry in index",
+                    );
+                    break;
+                }
+                entries.retain(|e| e.checkpoint_id != cid);
             }
         }
 
@@ -1325,6 +1357,101 @@ mod tests {
             .collect();
         assert!(paths.contains("a.txt"), "missing a.txt: {paths:?}");
         assert!(paths.contains("b.txt"), "missing b.txt: {paths:?}");
+    }
+
+    #[test]
+    // CheckpointLimits validator rejects zero values that would crash the
+    // retention trim or instantly expire every checkpoint.
+    fn limits_validate_rejects_zero_count_and_zero_age() {
+        let bad = CheckpointLimits {
+            max_checkpoints_per_session: 0,
+            ..Default::default()
+        };
+        let err = bad.validate().unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::InvalidConfig(_)),
+            "got {err:?}",
+        );
+
+        let bad_age = CheckpointLimits {
+            max_age_days: Some(0),
+            ..Default::default()
+        };
+        let err = bad_age.validate().unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::InvalidConfig(_)),
+            "got {err:?}",
+        );
+
+        CheckpointLimits::default()
+            .validate()
+            .expect("defaults must validate");
+    }
+
+    #[tokio::test]
+    // An index entry older than max_age_days is pruned when the next
+    // checkpoint is created.
+    async fn create_checkpoint_prunes_entries_past_max_age() {
+        let dir = TempDir::new().unwrap();
+        let limits = CheckpointLimits {
+            max_age_days: Some(7),
+            ..Default::default()
+        };
+        let store = LocalCheckpointStore::with_limits(dir.path().to_path_buf(), limits);
+        let sid = SessionId::new();
+        store.ensure_dirs(&sid).await.unwrap();
+
+        // Hand-write an index entry whose `created_at` is 30 days in the
+        // past plus a matching manifest. This avoids depending on system
+        // time / a real clock injection.
+        let old_id = CheckpointId::new();
+        let old_run = RunId::new();
+        let old_created = OffsetDateTime::now_utc() - time::Duration::days(30);
+        let old_entry = IndexEntry {
+            checkpoint_id: old_id.clone(),
+            session_id: sid.clone(),
+            run_id: old_run.clone(),
+            created_at: old_created,
+            description: None,
+            files_tracked_count: 0,
+        };
+        let old_meta = CheckpointMetadata {
+            checkpoint_id: old_id.clone(),
+            session_id: sid.clone(),
+            run_id: old_run,
+            user_message_id: None,
+            cwd: dir.path().to_path_buf(),
+            created_at: old_created,
+            description: None,
+            files_tracked: Vec::new(),
+            git_state: None,
+        };
+        store.write_manifest(&sid, &old_meta).await.unwrap();
+        store.append_index(&sid, &old_entry).await.unwrap();
+
+        let list = store.list_checkpoints(&sid).await.unwrap();
+        assert_eq!(list.len(), 1, "precondition: aged entry present");
+
+        // Creating a new checkpoint should prune the 30-day-old entry.
+        let new_id = store
+            .create_checkpoint(CreateCheckpointRequest {
+                session_id: sid.clone(),
+                run_id: RunId::new(),
+                cwd: dir.path().to_path_buf(),
+                description: None,
+                user_message_id: None,
+                git_state: None,
+            })
+            .await
+            .unwrap();
+
+        let list = store.list_checkpoints(&sid).await.unwrap();
+        let ids: Vec<_> = list.iter().map(|c| c.checkpoint_id.clone()).collect();
+        assert!(
+            !ids.contains(&old_id),
+            "aged entry should be pruned, got {ids:?}"
+        );
+        assert!(ids.contains(&new_id), "new entry should be present");
     }
 
     #[tokio::test]
