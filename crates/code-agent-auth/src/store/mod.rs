@@ -114,6 +114,16 @@ pub trait SecretBackend: Send + Sync {
 }
 
 /// Combined account + secret store.
+///
+/// The in-process `Mutex` serializes read-modify-write cycles against
+/// `index_path` for callers that share this `CredentialStore` (or any
+/// clone of it). It does NOT guard against a second process — e.g. the
+/// CLI and the TUI running side by side — racing on the same index
+/// file: each process loads a snapshot at `build` time, mutates its
+/// copy, and writes via `tempfile::persist`. The last writer wins and
+/// earlier in-flight updates from the other process can be lost.
+/// Tightening this with an advisory file lock requires adding a
+/// dependency such as `fs2` / `fs4` and is intentionally deferred.
 #[derive(Clone)]
 pub struct CredentialStore {
     pub mode: CredentialStoreMode,
@@ -283,18 +293,7 @@ impl CredentialStore {
         let bytes = serde_json::to_vec_pretty(idx).map_err(|e| {
             AuthError::new(AuthErrorKind::Unknown, format!("serialize index: {}", e))
         })?;
-        std::fs::write(path, bytes).map_err(|e| {
-            AuthError::new(
-                AuthErrorKind::CredentialStoreUnavailable,
-                format!("write index {}: {}", path.display(), e),
-            )
-        })?;
-        // Tighten permissions on Unix: 0600.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
+        file::write_secret_file(path, &bytes)?;
         Ok(())
     }
 }
@@ -538,5 +537,55 @@ mod tests {
             },
         );
         assert!(res.is_err());
+    }
+
+    #[test]
+    // Two threads concurrently writing different accounts through a
+    // shared `CredentialStore` must not lose updates: the in-process
+    // mutex serializes the read-modify-write of the on-disk index, and
+    // both accounts must be present after both joins.
+    fn concurrent_puts_do_not_lose_updates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = CredentialStore::build(
+            CredentialStoreMode::File,
+            true,
+            Some(dir.path().join("index.json")),
+        )
+        .unwrap();
+        let a = sample_account(ProviderId::Anthropic, "concurrent-a");
+        let b = sample_account(ProviderId::OpenAi, "concurrent-b");
+        let secret = StoredCredentialSecret {
+            api_key: Some(SecretString::new("k".into())),
+            ..Default::default()
+        };
+
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let a_clone = a.clone();
+        let b_clone = b.clone();
+        let secret1 = secret.clone();
+        let secret2 = secret.clone();
+        let t1 = std::thread::spawn(move || s1.put(a_clone, &secret1).unwrap());
+        let t2 = std::thread::spawn(move || s2.put(b_clone, &secret2).unwrap());
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // Reload from disk to ensure the persisted index — not just the
+        // in-memory copy — contains both accounts.
+        let reloaded = CredentialStore::build(
+            CredentialStoreMode::File,
+            true,
+            Some(dir.path().join("index.json")),
+        )
+        .unwrap();
+        let snap = reloaded.snapshot_index();
+        assert!(
+            snap.get(&a.provider, &a.account_id).is_some(),
+            "account A missing from reloaded index"
+        );
+        assert!(
+            snap.get(&b.provider, &b.account_id).is_some(),
+            "account B missing from reloaded index"
+        );
     }
 }
