@@ -24,6 +24,13 @@
 //! the reviewer approved, even after the driver mutates the same version
 //! during execution. Diff / compare paths prefer `.approved.json` over
 //! `.v<n>.json` for an approved version.
+//!
+//! Retention: `max_plan_revisions` (from `PlanningOptions`) is a soft cap
+//! on `.v<n>.json` snapshots. After each successful revision write the
+//! oldest versioned snapshots are GC'd until at most that many remain.
+//! `.approved.json` snapshots are skipped by the GC sweep. The plan's
+//! `version` counter itself is unbounded; only on-disk snapshot
+//! retention is capped.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -260,12 +267,10 @@ impl FsPlanStore {
                 limit: self.options.max_plan_steps,
             });
         }
-        if plan.version as usize > self.options.max_plan_revisions {
-            return Err(PlanError::TooManyRevisions {
-                got: plan.version,
-                limit: self.options.max_plan_revisions,
-            });
-        }
+        // `max_plan_revisions` is enforced as a soft cap via GC in
+        // `gc_old_version_snapshots` after a successful write, not as a
+        // hard error. The version counter is allowed to grow without
+        // bound — only on-disk snapshot retention is capped.
         let bytes = serde_json::to_vec_pretty(plan).map_err(|e| PlanError::Parse {
             path: self.root.clone(),
             source: e,
@@ -277,6 +282,66 @@ impl FsPlanStore {
             });
         }
         Ok(bytes)
+    }
+
+    /// Soft-cap retention for `<id>.v<n>.json` snapshots. Lists the
+    /// versioned snapshots for `id`, sorts by version number, and deletes
+    /// the oldest until at most `max_plan_revisions` remain.
+    /// `<id>.v<n>.approved.json` snapshots are never touched — they are
+    /// the write-once approval audit record.
+    fn gc_old_version_snapshots(&self, id: &PlanId) {
+        let limit = self.options.max_plan_revisions;
+        if limit == 0 {
+            return;
+        }
+        let prefix = format!("{}.v", id.0);
+        let suffix = ".json";
+        let read = match std::fs::read_dir(&self.root) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut versioned: Vec<(u32, PathBuf)> = Vec::new();
+        for entry in read.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if !name.starts_with(&prefix) || !name.ends_with(suffix) {
+                continue;
+            }
+            // Exclude `<id>.v<n>.approved.json` — preserve write-once snapshots.
+            if name.ends_with(".approved.json") {
+                continue;
+            }
+            let middle = &name[prefix.len()..name.len() - suffix.len()];
+            // `middle` must be a bare version number for `<id>.v<n>.json`.
+            // Anything else (future-suffixed variants) is skipped.
+            let v: u32 = match middle.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            versioned.push((v, entry.path()));
+        }
+        if versioned.len() <= limit {
+            return;
+        }
+        versioned.sort_by_key(|(v, _)| *v);
+        let to_remove = versioned.len() - limit;
+        for (v, path) in versioned.into_iter().take(to_remove) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::debug!(
+                    plan_id = %id.0,
+                    version = v,
+                    "plan store GC: removed old version snapshot"
+                ),
+                Err(e) => tracing::debug!(
+                    plan_id = %id.0,
+                    version = v,
+                    error = %e,
+                    "plan store GC: failed to remove old version snapshot"
+                ),
+            }
+        }
     }
 }
 
@@ -399,6 +464,11 @@ impl PlanStore for FsPlanStore {
             // place — that's the audit record.
             let _ = self.write_approved_snapshot(&approved, &bytes);
         }
+
+        // Soft retention cap: trim the oldest `.v<n>.json` snapshots so
+        // their count never exceeds `max_plan_revisions`. Approved
+        // snapshots are skipped — they are write-once audit records.
+        self.gc_old_version_snapshots(&plan.id);
 
         self.append_index(&IndexEntry {
             timestamp: now_iso(),
@@ -999,5 +1069,76 @@ mod tests {
             .filter(|l| l.contains("\"event\":\"revised\""))
             .collect();
         assert_eq!(revised.len(), n as usize);
+    }
+
+    #[tokio::test]
+    // Revising a plan well past `max_plan_revisions` must succeed and the
+    // store must GC the oldest versioned snapshots so exactly
+    // `max_plan_revisions` `.v<n>.json` files remain. Any
+    // `.approved.json` snapshot must be preserved through the sweep.
+    async fn save_revision_soft_caps_with_gc() {
+        let tmp = TempDir::new().unwrap();
+        let limit: usize = 5;
+        let s = FsPlanStore::new(
+            tmp.path(),
+            PlanningOptions {
+                max_plan_revisions: limit,
+                ..PlanningOptions::default()
+            },
+        );
+        let p = small_plan();
+        let id = p.id.clone();
+        let v0 = p.version;
+        s.create(p).await.unwrap();
+        s.approve(PlanApprovalRequest {
+            plan_id: id.clone(),
+            approved_by: PlanApprover::TestHarness,
+            approved_version: v0,
+            scope: PlanApprovalScope::FullPlan,
+            notes: None,
+        })
+        .await
+        .unwrap();
+        let approved_path = s.root.join(format!("{}.v{}.approved.json", id.0, v0));
+        assert!(approved_path.exists());
+
+        // Revise the plan limit + 5 times. Should never error.
+        let extras: u32 = 5;
+        for i in 0..(limit as u32 + extras) {
+            let mut rev = s.load(&id).await.unwrap();
+            rev.version = v0 + 1 + i;
+            rev.created_by = PlanCreatedBy::RevisedByUser;
+            rev.title = format!("rev-{i}");
+            s.save_revision(rev).await.expect("save must not error");
+        }
+
+        // Count `.v<n>.json` snapshots (not `.approved.json`).
+        let mut versions: Vec<u32> = Vec::new();
+        for entry in std::fs::read_dir(&s.root).unwrap().flatten() {
+            let name = entry.file_name().into_string().unwrap();
+            let prefix = format!("{}.v", id.0);
+            if !name.starts_with(&prefix) || !name.ends_with(".json") {
+                continue;
+            }
+            if name.ends_with(".approved.json") {
+                continue;
+            }
+            let middle = &name[prefix.len()..name.len() - ".json".len()];
+            if let Ok(v) = middle.parse::<u32>() {
+                versions.push(v);
+            }
+        }
+        assert_eq!(
+            versions.len(),
+            limit,
+            "snapshot count {} must equal limit {limit}",
+            versions.len()
+        );
+
+        // The approved snapshot must survive the GC sweep.
+        assert!(
+            approved_path.exists(),
+            "approved snapshot must be preserved by GC"
+        );
     }
 }
