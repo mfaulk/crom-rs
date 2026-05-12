@@ -175,6 +175,16 @@ fn classify_bash(
             break;
         }
         if let Some(re) = c.command_regex.as_deref() {
+            // Defense-in-depth: refuse to use a planned regex that
+            // contains an inline flag group like `(?m)`. The SubmitPlan
+            // parser already rejects these, but a plan loaded from
+            // older stores or another path could still contain one,
+            // and `(?m)` together with our `^…$` wrapping would re-
+            // interpret the anchors as line anchors and authorize
+            // newline-smuggled commands.
+            if re.contains("(?") {
+                continue;
+            }
             // SAFETY: anchor the planned regex so a pattern like
             // `cargo test` does not silently authorize `echo hacked &&
             // cargo test`. We auto-prepend `^` and append `$` if the
@@ -562,6 +572,62 @@ mod tests {
             &json!({"command": "cargo test; rm -rf /"}),
         );
         assert!(matches!(evil2, PlanScopeDecision::OutOfScope { .. }));
+    }
+
+    #[test]
+    // Pins the underlying bypass: an inline `(?m)` flag turns the
+    // auto-anchored `^…$` wrapping into line anchors, so a plain
+    // regex::Regex would match a newline-smuggled command. This test
+    // is the upstream proof of the bug, alongside the SubmitPlan-parser
+    // rejection test in `plan::tools`.
+    fn anchored_multiline_flag_matches_newline_smuggled_command() {
+        let bypass = regex::Regex::new("^(?m)^cargo test$$").unwrap();
+        assert!(bypass.is_match("cargo test\nrm -rf ~/"));
+    }
+
+    #[test]
+    // Defense-in-depth: even if a plan somehow carries a `(?m)`
+    // regex (e.g. loaded from disk pre-fix), `classify_bash` must
+    // refuse to authorize via that regex. The exact `cargo test`
+    // string is still allowed via the structural `command` field.
+    fn classify_bash_skips_flag_group_regex() {
+        let mut p = plan_with_edit();
+        p.steps[0].expected_commands.push(PlanCommand {
+            command: "cargo test".into(),
+            command_regex: Some("(?m)^cargo test$".into()),
+            cwd: None,
+            reason: None,
+        });
+        p.requested_tools.push(PlanToolUse {
+            tool_name: "Bash".into(),
+            permission_kind: PermissionKind::Execution,
+            input_constraints: serde_json::Value::Null,
+            reason: None,
+        });
+        p.steps[0].expected_tools.push(PlanToolUse {
+            tool_name: "Bash".into(),
+            permission_kind: PermissionKind::Execution,
+            input_constraints: serde_json::Value::Null,
+            reason: None,
+        });
+        let opt = PlanningOptions::default();
+        // Exact `cargo test` still matches the literal `command` field.
+        assert_eq!(
+            classify_tool_call(&p, &opt, "Bash", &json!({"command": "cargo test"})),
+            PlanScopeDecision::InScope
+        );
+        // Newline-smuggled form is NOT authorized: the regex is
+        // skipped, and the literal command does not match.
+        let smuggled = classify_tool_call(
+            &p,
+            &opt,
+            "Bash",
+            &json!({"command": "cargo test\nrm -rf ~/"}),
+        );
+        assert!(
+            !matches!(smuggled, PlanScopeDecision::InScope),
+            "newline-smuggled command must not be in-scope, got {smuggled:?}"
+        );
     }
 
     #[test]

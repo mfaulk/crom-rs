@@ -477,6 +477,19 @@ fn parse_commands(raws: Vec<RawCommand>) -> Result<Vec<PlanCommand>, PlanError> 
     let mut out = Vec::with_capacity(raws.len());
     for r in raws {
         if let Some(re) = &r.command_regex {
+            // Reject inline flag groups (e.g. `(?m)`, `(?s)`, `(?x)`).
+            // Defense against newline-injection bypass: a planned
+            // `(?m)^cargo test$` paired with the classifier's anchoring
+            // becomes `^(?m)^cargo test$$`, which matches
+            // `cargo test\nrm -rf ~/` because `(?m)` re-interprets the
+            // anchors as line anchors. Plan authors don't need flag
+            // groups; reject any occurrence of `(?` to keep the rule
+            // simple and broad.
+            if re.contains("(?") {
+                return Err(PlanError::Invalid(format!(
+                    "command_regex must not contain inline flag groups (`(?`): {re}"
+                )));
+            }
             // Validate regex eagerly so invalid expressions are surfaced now,
             // not at deviation-classification time.
             regex::Regex::new(re)
@@ -816,6 +829,40 @@ mod tests {
         let snap = handle.snapshot().await.unwrap();
         assert_eq!(snap.plan.steps.len(), 2);
         assert_eq!(snap.plan.status, PlanStatus::PendingApproval);
+    }
+
+    #[tokio::test]
+    // SubmitPlan rejects a command_regex containing an inline flag group
+    // (`(?m)`, `(?s)`, etc.) at parse time. Defends against the
+    // newline-injection bypass where `(?m)` re-interprets the auto-
+    // anchored classifier wrapping as line anchors.
+    async fn submit_plan_rejects_inline_regex_flags() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle, PlanningOptions::default());
+        let err = tool
+            .execute(
+                json!({
+                    "title": "t",
+                    "steps": [{
+                        "id": "1", "title": "x", "kind": "execute",
+                        "expected_commands": [{
+                            "command": "cargo test",
+                            "command_regex": "(?m)^cargo test$"
+                        }]
+                    }]
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidInput(msg) => assert!(
+                msg.contains("inline flag groups") || msg.contains("(?"),
+                "expected flag-group rejection, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
