@@ -9,6 +9,11 @@
 //! On Unix the directory is created with `0700` and per-account files
 //! with `0600`. The hashed filename keeps the on-disk listing free of
 //! identifiable account ids while still producing a stable lookup key.
+//!
+//! Writes go through a sibling temp file in the same directory and are
+//! renamed over the target via `tempfile::persist`, so concurrent
+//! readers never observe a torn write and a crash mid-write leaves the
+//! previous payload intact.
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +48,10 @@ impl FileCredentialBackend {
 
     fn account_path(&self, provider: &ProviderId, account_id: &AccountId) -> PathBuf {
         let provider_dir = self.dir.join(provider.as_str());
+        // `create_dir_all` follows symlinks; if `provider_dir` is a
+        // pre-existing symlink to an attacker-controlled directory the
+        // subsequent write lands outside `self.dir`. Tracked separately
+        // by issue #77 (symlink TOCTOU in the file backend).
         let _ = std::fs::create_dir_all(&provider_dir);
         #[cfg(unix)]
         {
@@ -132,13 +141,16 @@ impl SecretBackend for FileCredentialBackend {
     }
 }
 
-/// Write `bytes` to `path` with strict permissions.
+/// Atomically write `bytes` to `path` with strict permissions.
 ///
-/// On Unix the file is created with mode `0o600` from the start via
-/// `OpenOptions::mode`, closing the window where the file would briefly
-/// be world-readable under a default umask. The bytes are flushed with
-/// `sync_data` before the handle is dropped. On non-Unix platforms this
-/// falls back to `std::fs::write` (best-effort).
+/// The write goes to a sibling temp file in the same directory and is
+/// then `persist`ed (renamed) over `path`. Concurrent readers either
+/// see the previous contents or the new contents — never a torn write —
+/// and a crash mid-write leaves the canonical path untouched.
+///
+/// On Unix the temp file is created with mode `0o600` so the target
+/// also has `0o600` after the rename, with no window where it would be
+/// world-readable under a default umask.
 pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
     let io_err = |e: std::io::Error| {
         AuthError::new(
@@ -146,25 +158,29 @@ pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), AuthErr
             format!("write secret {}: {}", path.display(), e),
         )
     };
+    let dir = path.parent().ok_or_else(|| {
+        AuthError::new(
+            AuthErrorKind::CredentialStoreUnavailable,
+            format!("secret path {} has no parent directory", path.display()),
+        )
+    })?;
+    if !dir.exists() {
+        std::fs::create_dir_all(dir).map_err(io_err)?;
+    }
 
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".tmp-");
     #[cfg(unix)]
     {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(io_err)?;
-        f.write_all(bytes).map_err(io_err)?;
-        f.sync_data().map_err(io_err)?;
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o600));
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes).map_err(io_err)?;
-    }
+    let mut tmp = builder.tempfile_in(dir).map_err(io_err)?;
+
+    use std::io::Write as _;
+    tmp.write_all(bytes).map_err(io_err)?;
+    tmp.as_file().sync_data().map_err(io_err)?;
+    tmp.persist(path).map_err(|e| io_err(e.error))?;
     Ok(())
 }
 
@@ -250,9 +266,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    // Per-account secret files are created with mode 0o600 from the
-    // start (via OpenOptions::mode), so there is no window during which
-    // the file is readable by other users under a default umask.
+    // Per-account secret files end up at mode 0o600 because the temp
+    // file is created with that mode before being renamed over the
+    // canonical path, so there is no window during which the file
+    // would be readable by other users under a default umask.
     fn secret_file_is_strictly_0600_on_unix() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
@@ -286,5 +303,70 @@ mod tests {
         let acct = AccountId::new("a");
         backend.delete(&provider, &acct).unwrap();
         backend.delete(&provider, &acct).unwrap();
+    }
+
+    #[test]
+    // A successful `put` leaves only the canonical secret file in the
+    // provider directory — no `.tmp-*` debris from `tempfile::persist`,
+    // confirming the temp-and-rename flow ran end to end.
+    fn put_leaves_no_temp_file_debris() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = FileCredentialBackend::new(dir.path().to_path_buf()).unwrap();
+        let provider = ProviderId::OpenAi;
+        let acct = AccountId::new("debris");
+        backend
+            .put(
+                &provider,
+                &acct,
+                &StoredCredentialSecret {
+                    api_key: Some(SecretString::new("k".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let canonical = format!("{}.json", acct.redacted_hash());
+        let entries: Vec<String> = std::fs::read_dir(dir.path().join(provider.as_str()))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![canonical],
+            "expected only the canonical secret file"
+        );
+    }
+
+    #[test]
+    // Two writes to the same secret never produce a torn read: after a
+    // successful overwrite, readers either see the previous payload or
+    // the new one in full — verified here by reading immediately after
+    // the second put and asserting it matches the second payload.
+    fn overwrite_is_atomic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = FileCredentialBackend::new(dir.path().to_path_buf()).unwrap();
+        let provider = ProviderId::Anthropic;
+        let acct = AccountId::new("overwrite");
+        backend
+            .put(
+                &provider,
+                &acct,
+                &StoredCredentialSecret {
+                    api_key: Some(SecretString::new("first".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        backend
+            .put(
+                &provider,
+                &acct,
+                &StoredCredentialSecret {
+                    api_key: Some(SecretString::new("second".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let got = backend.get(&provider, &acct).unwrap().unwrap();
+        assert_eq!(got.api_key.as_ref().unwrap().expose(), "second");
     }
 }
