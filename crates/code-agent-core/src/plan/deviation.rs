@@ -233,6 +233,23 @@ fn classify_bash(
     }
 }
 
+/// Map a tool name to the `PlanFileAccess` it implies, or `None` if the
+/// tool is not a known file-touching tool. Returning `None` lets callers
+/// fail safely (treat as Ambiguous) instead of panicking when a future
+/// file tool is added without a matching mapping.
+///
+/// LINT: when adding a new file-touching tool, extend both this match
+/// and the dispatch arm in [`classify_tool_call`] (`"Edit" | "Write" |
+/// "Read"` branch). The two must stay in sync.
+pub(crate) fn access_for_file_tool(tool_name: &str) -> Option<PlanFileAccess> {
+    match tool_name {
+        "Read" => Some(PlanFileAccess::Read),
+        "Edit" => Some(PlanFileAccess::Edit),
+        "Write" => Some(PlanFileAccess::Write),
+        _ => None,
+    }
+}
+
 fn classify_file_tool(
     plan: &PlanDocument,
     options: &PlanningOptions,
@@ -246,11 +263,23 @@ fn classify_file_tool(
         };
     }
 
-    let want = match tool_name {
-        "Read" => PlanFileAccess::Read,
-        "Edit" => PlanFileAccess::Edit,
-        "Write" => PlanFileAccess::Write,
-        _ => unreachable!(),
+    // LINT: keep this arm in sync with the dispatch in `classify_tool_call`
+    // (`"Edit" | "Write" | "Read"` branch). When adding a new file-touching
+    // tool here, also extend the dispatch arm and the corresponding
+    // PlanFileAccess variant. Returning `None` for an unknown tool name
+    // routes the call into the conservative Ambiguous fallthrough below
+    // rather than panicking — but the contract is that every entry in the
+    // dispatch arm has a matching entry here.
+    let want = match access_for_file_tool(tool_name) {
+        Some(a) => a,
+        None => {
+            return PlanScopeDecision::Ambiguous {
+                reason: format!(
+                    "file tool `{tool_name}` has no structured access mapping; \
+                     classifier cannot enforce a constraint"
+                ),
+            };
+        }
     };
 
     let mut all_files: Vec<&PlanFileRef> = Vec::new();
@@ -771,5 +800,57 @@ mod tests {
     fn matches_tool_name_accepts_exact_name() {
         assert!(super::matches_tool_name("Bash", "Bash"));
         assert!(!super::matches_tool_name("Bash", "Edit"));
+    }
+
+    #[test]
+    // access_for_file_tool returns None for an unknown tool name (no
+    // panic). Maintenance contract: when a new file tool is added to the
+    // dispatch arm in `classify_tool_call`, this map must learn it too.
+    fn access_for_file_tool_returns_none_for_unknown_name() {
+        assert_eq!(
+            super::access_for_file_tool("Read"),
+            Some(PlanFileAccess::Read)
+        );
+        assert_eq!(
+            super::access_for_file_tool("Edit"),
+            Some(PlanFileAccess::Edit)
+        );
+        assert_eq!(
+            super::access_for_file_tool("Write"),
+            Some(PlanFileAccess::Write)
+        );
+        // Unknown future tool: must NOT panic and must return None so
+        // callers can treat it as Ambiguous.
+        assert_eq!(super::access_for_file_tool("FutureDelete"), None);
+        assert_eq!(super::access_for_file_tool("MoveFile"), None);
+        assert_eq!(super::access_for_file_tool(""), None);
+    }
+
+    #[test]
+    // classify_file_tool routes an unknown file-tool name through the
+    // Ambiguous fallback instead of panicking. Pins #81: the prior
+    // `unreachable!()` in the match would have crashed if the dispatch
+    // arm in classify_tool_call ever grew without updating this match.
+    fn classify_file_tool_unknown_tool_is_ambiguous_not_panic() {
+        let p = plan_with_edit();
+        let opt = PlanningOptions::default();
+        // Call the helper directly so we exercise the previously-
+        // unreachable arm without having to extend `classify_tool_call`'s
+        // dispatch in the test.
+        let d = super::classify_file_tool(
+            &p,
+            &opt,
+            "FutureDelete",
+            &json!({"file_path": "src/parser.rs"}),
+        );
+        match d {
+            PlanScopeDecision::Ambiguous { reason } => {
+                assert!(
+                    reason.contains("FutureDelete"),
+                    "ambiguous reason should name the offending tool, got: {reason}"
+                );
+            }
+            other => panic!("expected Ambiguous for unknown file tool, got: {other:?}"),
+        }
     }
 }
