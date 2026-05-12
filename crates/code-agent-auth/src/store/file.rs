@@ -13,7 +13,10 @@
 //! Writes go through a sibling temp file in the same directory and are
 //! renamed over the target via `tempfile::persist`, so concurrent
 //! readers never observe a torn write and a crash mid-write leaves the
-//! previous payload intact.
+//! previous payload intact. On Unix the parent directory is `fsync`ed
+//! after the rename so the new directory entry is durable across power
+//! loss; on other platforms only the file payload is fsynced before the
+//! rename.
 
 use std::path::{Path, PathBuf};
 
@@ -150,7 +153,12 @@ impl SecretBackend for FileCredentialBackend {
 ///
 /// On Unix the temp file is created with mode `0o600` so the target
 /// also has `0o600` after the rename, with no window where it would be
-/// world-readable under a default umask.
+/// world-readable under a default umask. After the rename the parent
+/// directory itself is opened and `sync_all`ed so the new directory
+/// entry is durable across power loss — without this step the rename
+/// can return success but the entry may be lost on crash. Windows does
+/// not expose (or need) a directory fsync for this guarantee, so the
+/// directory sync is `#[cfg(unix)]`-gated.
 pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
     let io_err = |e: std::io::Error| {
         AuthError::new(
@@ -181,6 +189,16 @@ pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), AuthErr
     tmp.write_all(bytes).map_err(io_err)?;
     tmp.as_file().sync_data().map_err(io_err)?;
     tmp.persist(path).map_err(|e| io_err(e.error))?;
+
+    // Persist the rename itself: without an fsync on the parent
+    // directory the new directory entry may not survive a crash even
+    // though `persist` returned `Ok`.
+    #[cfg(unix)]
+    {
+        let dir_file = std::fs::File::open(dir).map_err(io_err)?;
+        dir_file.sync_all().map_err(io_err)?;
+    }
+
     Ok(())
 }
 
@@ -368,5 +386,27 @@ mod tests {
             .unwrap();
         let got = backend.get(&provider, &acct).unwrap().unwrap();
         assert_eq!(got.api_key.as_ref().unwrap().expose(), "second");
+    }
+
+    // True crash-durability cannot be observed from a process-level
+    // unit test — verifying that the directory entry survives a real
+    // power loss would require either kernel-level fault injection or
+    // a refactor that mocks the sync call (per codex P1 review). The
+    // test below is a pragmatic sanity check: it drives
+    // `write_secret_file` end to end against a real tempdir and
+    // asserts the call returns `Ok`, which is enough to confirm the
+    // post-rename parent-directory `sync_all` path is exercised on
+    // Unix without panicking or returning an error on a normal
+    // filesystem. A regression that removed the directory sync would
+    // not be caught here directly, but the doc comment on
+    // `write_secret_file` documents the guarantee and the codex
+    // finding.
+    #[test]
+    fn write_secret_file_succeeds_against_real_tempdir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("secret.json");
+        write_secret_file(&path, b"{\"api_key\":\"k\"}").unwrap();
+        let read_back = std::fs::read(&path).unwrap();
+        assert_eq!(read_back, b"{\"api_key\":\"k\"}");
     }
 }
