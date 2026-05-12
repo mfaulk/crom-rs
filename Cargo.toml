@@ -12,6 +12,7 @@ members = [
     "crates/code-agent-auth",
     "crates/code-agent-provider-openai",
     "crates/code-agent-provider-gemini",
+    "crates/code-agent-sdk",
 ]
 exclude = [
     "examples/bugfix-demo",
@@ -22,6 +23,7 @@ exclude = [
     "examples/skills-demo",
     "examples/beta-demo",
     "examples/planning-demo",
+    "examples/headless-sdk-demo",
 ]
 
 [workspace.package]
@@ -67,6 +69,7 @@ code-agent-mcp = { path = "crates/code-agent-mcp", version = "0.1.0" }
 code-agent-auth = { path = "crates/code-agent-auth", version = "0.1.0" }
 code-agent-provider-openai = { path = "crates/code-agent-provider-openai", version = "0.1.0" }
 code-agent-provider-gemini = { path = "crates/code-agent-provider-gemini", version = "0.1.0" }
+code-agent-sdk = { path = "crates/code-agent-sdk", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3
