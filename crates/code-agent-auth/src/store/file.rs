@@ -554,8 +554,10 @@ mod tests {
         let provider_dir = dir.path().join(provider.as_str());
         std::fs::create_dir_all(&provider_dir).unwrap();
         let legacy_path = provider_dir.join(format!("{}.json", acct.redacted_hash()));
-        let salted_path =
-            provider_dir.join(format!("{}.json", acct.redacted_hash_with_salt(provider.as_str())));
+        let salted_path = provider_dir.join(format!(
+            "{}.json",
+            acct.redacted_hash_with_salt(provider.as_str())
+        ));
         assert_ne!(legacy_path, salted_path);
         std::fs::write(&legacy_path, br#"{"api_key":"old"}"#).unwrap();
 

@@ -7532,7 +7532,10 @@ mod provider_route_tests {
     fn unknown_provider_does_not_alias_to_anthropic() {
         assert_eq!(classify_provider_id(""), ProviderRoute::Unknown);
         assert_eq!(classify_provider_id("anthrop"), ProviderRoute::Unknown);
-        assert_eq!(classify_provider_id("not-a-real-provider"), ProviderRoute::Unknown);
+        assert_eq!(
+            classify_provider_id("not-a-real-provider"),
+            ProviderRoute::Unknown
+        );
     }
 
     #[test]
