@@ -5168,20 +5168,103 @@ async fn cmd_rewind(args: RewindArgs) -> Result<()> {
 
 fn build_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
     let provider_id = resolve_active_provider(cfg);
-    match provider_id.as_str() {
-        "openai" => build_openai_provider(cfg),
-        "gemini" => build_gemini_provider(cfg),
-        "fake" => Ok(Arc::new(build_fake_provider())),
-        // Anthropic is the default. Bedrock/Vertex/Foundry are
-        // intentionally not wired in this milestone — `auth status` and
-        // doctor explain the support matrix.
-        _ => {
-            let acfg = AnthropicConfig::from_env()
-                .context("ANTHROPIC_API_KEY must be set to call the Anthropic API")?;
-            let provider = AnthropicProvider::new(acfg)?;
-            Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
+    match classify_provider_id(&provider_id) {
+        ProviderRoute::Anthropic => build_anthropic_provider(cfg),
+        ProviderRoute::OpenAi | ProviderRoute::Codex => build_openai_provider(cfg),
+        ProviderRoute::Gemini => build_gemini_provider(cfg),
+        ProviderRoute::Fake => Ok(Arc::new(build_fake_provider())),
+        ProviderRoute::Unimplemented(canonical) => {
+            Err(anyhow!(unimplemented_provider_message(&canonical)))
         }
+        ProviderRoute::Unknown => Err(anyhow!(unknown_provider_message(&provider_id))),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderRoute {
+    Anthropic,
+    OpenAi,
+    /// Codex shares the OpenAI runtime path (chat-completions over the
+    /// OpenAI transport) but stays a distinct routing variant so a
+    /// future Codex-specific provider can be swapped in without
+    /// re-aliasing the id.
+    Codex,
+    Gemini,
+    Fake,
+    /// A `ProviderId` that the rest of the workspace recognizes (e.g.
+    /// `vertex_ai`, `bedrock`, `foundry`) but for which no runtime
+    /// provider is wired up yet. Carries the canonical id so the error
+    /// message can name it accurately, even if the user typed
+    /// `vertex-ai` and we canonicalized to `vertex_ai`.
+    Unimplemented(String),
+    Unknown,
+}
+
+/// Map a resolved provider id to a [`ProviderRoute`] by routing through
+/// the canonical [`ProviderId::parse`] so the set of known providers
+/// cannot drift between the auth crate and the CLI runtime dispatch.
+///
+/// Each first-party variant maps to its dedicated runtime when one
+/// exists, or to `Unimplemented(canonical)` when the provider is
+/// recognized but not yet wired up (Vertex AI / Bedrock / Foundry).
+/// `ProviderId::Custom` — strings the auth crate didn't recognize — is
+/// the only path that returns `Unknown`, so a typo and a known-but-
+/// unimplemented provider never share an error message.
+fn classify_provider_id(id: &str) -> ProviderRoute {
+    use code_agent_auth::ProviderId;
+    match ProviderId::parse(id) {
+        ProviderId::Anthropic => ProviderRoute::Anthropic,
+        ProviderId::OpenAi => ProviderRoute::OpenAi,
+        ProviderId::Codex => ProviderRoute::Codex,
+        ProviderId::Gemini => ProviderRoute::Gemini,
+        ProviderId::Fake => ProviderRoute::Fake,
+        p @ (ProviderId::VertexAi | ProviderId::Bedrock | ProviderId::Foundry) => {
+            ProviderRoute::Unimplemented(p.as_str().to_string())
+        }
+        ProviderId::Custom(_) => ProviderRoute::Unknown,
+    }
+}
+
+fn unknown_provider_message(id: &str) -> String {
+    format!(
+        "unknown provider {id:?}; expected one of anthropic, openai, codex, gemini, fake \
+         (recognized-but-not-yet-implemented: vertex_ai, bedrock, foundry)"
+    )
+}
+
+fn unimplemented_provider_message(canonical_id: &str) -> String {
+    format!(
+        "provider {canonical_id:?} is recognized but not yet supported by this build; \
+         choose anthropic, openai, codex, gemini, or fake — \
+         see `code-agent auth status` for the current support matrix"
+    )
+}
+
+/// Build the Anthropic provider, preferring an M10 stored credential
+/// over the legacy `ANTHROPIC_API_KEY` env var. Falls back to
+/// `AnthropicConfig::from_env()` when no stored credential is present,
+/// so existing workflows keep working.
+fn build_anthropic_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
+    let credential = resolve_runtime_credential(cfg, code_agent_auth::ProviderId::Anthropic)
+        .unwrap_or(code_agent_auth::ResolvedCredential::None);
+    let acfg = match credential {
+        code_agent_auth::ResolvedCredential::ApiKey { key, .. } => {
+            let base_url = std::env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+            AnthropicConfig {
+                api_key: key.expose().to_string(),
+                base_url,
+                connect_timeout: StdDuration::from_secs(30),
+                read_timeout: StdDuration::from_secs(120),
+                max_retries: 2,
+            }
+        }
+        _ => AnthropicConfig::from_env().context(
+            "No Anthropic credential available; run `code-agent auth login anthropic --api-key` or set ANTHROPIC_API_KEY",
+        )?,
+    };
+    let provider = AnthropicProvider::new(acfg)?;
+    Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
 }
 
 /// Pick the provider name to use this run, in order of precedence:
@@ -7355,4 +7438,88 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
          use --snapshot for a preview frame or `--renderer plain`"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod provider_route_tests {
+    use super::*;
+
+    #[test]
+    // Known provider ids map to their dedicated routes (codex shares
+    // the openai runtime but stays a distinct variant).
+    fn known_providers_map_to_dedicated_routes() {
+        assert_eq!(classify_provider_id("anthropic"), ProviderRoute::Anthropic);
+        assert_eq!(classify_provider_id("openai"), ProviderRoute::OpenAi);
+        assert_eq!(classify_provider_id("codex"), ProviderRoute::Codex);
+        // `chatgpt` is a canonical alias of codex via ProviderId::parse.
+        assert_eq!(classify_provider_id("chatgpt"), ProviderRoute::Codex);
+        assert_eq!(classify_provider_id("gemini"), ProviderRoute::Gemini);
+        assert_eq!(classify_provider_id("fake"), ProviderRoute::Fake);
+    }
+
+    #[test]
+    // Recognized-but-not-yet-implemented providers route to
+    // `Unimplemented(canonical_id)` so they get a distinct error path
+    // from genuinely unknown ids.
+    fn recognized_unimplemented_providers_carry_canonical_id() {
+        assert_eq!(
+            classify_provider_id("vertex_ai"),
+            ProviderRoute::Unimplemented("vertex_ai".into())
+        );
+        // Alias canonicalization: `vertex-ai` and `vertex` collapse to
+        // the same canonical id.
+        assert_eq!(
+            classify_provider_id("vertex-ai"),
+            ProviderRoute::Unimplemented("vertex_ai".into())
+        );
+        assert_eq!(
+            classify_provider_id("vertex"),
+            ProviderRoute::Unimplemented("vertex_ai".into())
+        );
+        assert_eq!(
+            classify_provider_id("bedrock"),
+            ProviderRoute::Unimplemented("bedrock".into())
+        );
+        assert_eq!(
+            classify_provider_id("foundry"),
+            ProviderRoute::Unimplemented("foundry".into())
+        );
+    }
+
+    #[test]
+    // An unknown provider id is classified Unknown rather than silently
+    // routed to Anthropic — preventing a typo from masquerading as the
+    // default Anthropic flow.
+    fn unknown_provider_does_not_alias_to_anthropic() {
+        assert_eq!(classify_provider_id(""), ProviderRoute::Unknown);
+        assert_eq!(classify_provider_id("anthrop"), ProviderRoute::Unknown);
+        assert_eq!(
+            classify_provider_id("not-a-real-provider"),
+            ProviderRoute::Unknown
+        );
+    }
+
+    #[test]
+    // The error message for an unknown provider names the bad id and
+    // enumerates the supported ones so the operator can fix the config.
+    fn unknown_provider_message_is_actionable() {
+        let msg = unknown_provider_message("nope");
+        assert!(msg.contains("nope"));
+        assert!(msg.contains("anthropic"));
+        assert!(msg.contains("openai"));
+        assert!(msg.contains("codex"));
+        assert!(msg.contains("gemini"));
+    }
+
+    #[test]
+    // The unimplemented-provider message distinguishes "recognized but
+    // not yet wired" from "completely unknown" so users see a
+    // diagnosable hint instead of a misleading "expected one of …".
+    fn unimplemented_provider_message_differs_from_unknown() {
+        let unimpl = unimplemented_provider_message("vertex_ai");
+        let unknown = unknown_provider_message("vertex_ai");
+        assert!(unimpl.contains("not yet supported"));
+        assert!(unimpl.contains("vertex_ai"));
+        assert_ne!(unimpl, unknown);
+    }
 }

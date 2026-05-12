@@ -78,7 +78,7 @@ impl AuthProvider for AnthropicAuthProvider {
             );
         }
         let account = StoredAccount {
-            account_id: AccountId::new("anthropic-api-key"),
+            account_id: AccountId::from_api_key("anthropic", key.expose()),
             provider: ProviderId::Anthropic,
             login_method: LoginMethodKind::ApiKey,
             display_email: None,
@@ -165,6 +165,33 @@ mod tests {
             result.secret.api_key.as_ref().unwrap().expose(),
             "sk-test-1234"
         );
+        assert!(result
+            .account
+            .account_id
+            .as_str()
+            .starts_with("anthropic-apikey-"));
+    }
+
+    #[tokio::test]
+    // Two distinct API keys produce two distinct account ids, so a second
+    // login does not silently overwrite the first stored credential.
+    async fn distinct_api_keys_yield_distinct_account_ids() {
+        let provider = AnthropicAuthProvider;
+        let a = provider
+            .login(
+                LoginRequest::api_key(LoginMethodKind::ApiKey, "sk-aaa"),
+                AuthContext::default(),
+            )
+            .await
+            .unwrap();
+        let b = provider
+            .login(
+                LoginRequest::api_key(LoginMethodKind::ApiKey, "sk-bbb"),
+                AuthContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(a.account.account_id, b.account.account_id);
     }
 
     #[tokio::test]

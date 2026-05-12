@@ -36,13 +36,22 @@ pub struct DeviceAuthorizationResponse {
 }
 
 fn default_interval() -> u64 {
-    5
+    MIN_POLL_INTERVAL_SECONDS
 }
+
+/// RFC 8628 §3.5 default polling interval, also used as the floor for
+/// any caller-supplied interval. A server that returns `interval: 0`
+/// (or omits the field entirely) would otherwise drive the poll loop
+/// into a busy spin against the token endpoint, exceeding `slow_down`
+/// guidance and risking IP-level rate limiting.
+const MIN_POLL_INTERVAL_SECONDS: u64 = 5;
 
 /// What the caller should display to the user before waiting on the
 /// token endpoint. Stays free of secrets — `device_code` is intentionally
-/// not exposed here.
-#[derive(Debug, Clone)]
+/// not exposed here, and the manual `Debug` impl also redacts the
+/// `verification_uri_complete` (which embeds the user code as a query
+/// parameter, effectively pre-authenticating anyone who sees it).
+#[derive(Clone)]
 pub struct DeviceCodeLogin {
     pub verification_uri: String,
     pub verification_uri_complete: Option<String>,
@@ -50,6 +59,27 @@ pub struct DeviceCodeLogin {
     pub expires_at: OffsetDateTime,
     pub interval: Duration,
     pub(crate) device_code: String,
+}
+
+impl std::fmt::Debug for DeviceCodeLogin {
+    // Manual Debug impl that redacts the device_code (RFC 8628 secret
+    // used to claim the token) and the verification_uri_complete
+    // (which embeds the user code in the URL). Display values like
+    // user_code and verification_uri stay visible because the user must
+    // be able to read them in the terminal anyway.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeLogin")
+            .field("verification_uri", &self.verification_uri)
+            .field(
+                "verification_uri_complete",
+                &self.verification_uri_complete.as_ref().map(|_| "***"),
+            )
+            .field("user_code", &self.user_code)
+            .field("expires_at", &self.expires_at)
+            .field("interval", &self.interval)
+            .field("device_code", &"***")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,12 +136,15 @@ pub fn request_device_code(
             )
         })?;
     let expires_at = OffsetDateTime::now_utc() + time::Duration::seconds(parsed.expires_in.max(1));
+    // Floor the server-supplied interval at MIN_POLL_INTERVAL_SECONDS
+    // so a 0 (or otherwise tiny) value cannot induce a hot poll loop.
+    let interval_secs = parsed.interval.max(MIN_POLL_INTERVAL_SECONDS);
     Ok(DeviceCodeLogin {
         verification_uri: parsed.verification_uri,
         verification_uri_complete: parsed.verification_uri_complete,
         user_code: parsed.user_code,
         expires_at,
-        interval: Duration::from_secs(parsed.interval),
+        interval: Duration::from_secs(interval_secs),
         device_code: parsed.device_code,
     })
 }
@@ -147,7 +180,12 @@ pub fn device_code_poll(
     let sleeper: std::sync::Arc<dyn DeviceCodeSleeper> = options
         .sleeper
         .unwrap_or_else(|| std::sync::Arc::new(StdSleeper));
-    let mut interval = login.interval;
+    // Defensive floor: even if a caller constructs DeviceCodeLogin with a
+    // sub-minimum interval (the parser already clamps, but bare-struct
+    // construction in tests/integrations doesn't), make sure the poll
+    // loop never spins faster than MIN_POLL_INTERVAL_SECONDS.
+    let min_interval = Duration::from_secs(MIN_POLL_INTERVAL_SECONDS);
+    let mut interval = login.interval.max(min_interval);
     let max_polls = options.max_polls.unwrap_or(usize::MAX);
     let mut polls = 0usize;
     loop {
@@ -175,7 +213,7 @@ pub fn device_code_poll(
                 sleeper.sleep(interval);
             }
             DeviceCodePollStep::SlowDown => {
-                interval += Duration::from_secs(5);
+                interval = (interval + Duration::from_secs(5)).max(min_interval);
                 sleeper.sleep(interval);
             }
             DeviceCodePollStep::Expired => {
@@ -324,13 +362,45 @@ mod tests {
     }
 
     #[test]
-    // Device authorization request returns user code, verification URI, and interval.
+    // Device authorization request returns user code, verification URI, and
+    // interval. A server-supplied interval below the RFC 8628 floor is
+    // clamped to MIN_POLL_INTERVAL_SECONDS to prevent a hot poll loop.
     fn device_authorization_returns_login() {
         let transport = ScriptedTransport::new(vec![device_resp()]);
         let login = request_device_code(&cfg(), &transport).unwrap();
         assert_eq!(login.user_code, "UC");
         assert_eq!(login.verification_uri, "https://example.test/v");
-        assert_eq!(login.interval, Duration::from_secs(1));
+        assert_eq!(
+            login.interval,
+            Duration::from_secs(MIN_POLL_INTERVAL_SECONDS)
+        );
+    }
+
+    #[test]
+    // A device-authorization response with interval=0 still produces a
+    // sane minimum polling interval rather than 0s.
+    fn device_authorization_interval_zero_is_floored() {
+        let transport = ScriptedTransport::new(vec![HttpResponse {
+            status: 200,
+            body: r#"{"device_code":"DC","user_code":"UC","verification_uri":"https://example.test/v","expires_in":600,"interval":0}"#.into(),
+        }]);
+        let login = request_device_code(&cfg(), &transport).unwrap();
+        assert!(login.interval >= Duration::from_secs(MIN_POLL_INTERVAL_SECONDS));
+    }
+
+    #[test]
+    // A device-authorization response that omits `interval` defaults to
+    // the RFC 8628 minimum (5s) rather than 0s.
+    fn device_authorization_interval_default_is_floor() {
+        let transport = ScriptedTransport::new(vec![HttpResponse {
+            status: 200,
+            body: r#"{"device_code":"DC","user_code":"UC","verification_uri":"https://example.test/v","expires_in":600}"#.into(),
+        }]);
+        let login = request_device_code(&cfg(), &transport).unwrap();
+        assert_eq!(
+            login.interval,
+            Duration::from_secs(MIN_POLL_INTERVAL_SECONDS)
+        );
     }
 
     #[test]
@@ -357,9 +427,39 @@ mod tests {
 
         let calls = sleeper.calls.lock().unwrap().clone();
         // Two waits before success; second one extended by slow_down.
+        // Both must respect the RFC 8628 minimum polling interval —
+        // even though the login was constructed with interval=1s, the
+        // poll loop clamps it to MIN_POLL_INTERVAL_SECONDS.
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], Duration::from_secs(1));
-        assert!(calls[1] >= Duration::from_secs(6));
+        assert!(calls[0] >= Duration::from_secs(MIN_POLL_INTERVAL_SECONDS));
+        assert!(calls[1] >= Duration::from_secs(MIN_POLL_INTERVAL_SECONDS + 5));
+    }
+
+    #[test]
+    // A login built with `interval = 0` (e.g. constructed by a caller
+    // that bypassed the parser) still polls no faster than the RFC 8628
+    // minimum, so no hot loop is possible.
+    fn poll_floor_applies_when_login_interval_is_zero() {
+        let transport = ScriptedTransport::new(vec![pending_resp(), token_resp()]);
+        let sleeper = Arc::new(CountingSleeper::default());
+        let login = DeviceCodeLogin {
+            verification_uri: "x".into(),
+            verification_uri_complete: None,
+            user_code: "u".into(),
+            expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(60),
+            interval: Duration::from_secs(0),
+            device_code: "DC".into(),
+        };
+        let opts = DeviceCodePollOptions {
+            max_polls: Some(5),
+            sleeper: Some(sleeper.clone()),
+        };
+        let _ = device_code_poll(&cfg(), &login, &transport, opts).unwrap();
+        let calls = sleeper.calls.lock().unwrap().clone();
+        assert!(!calls.is_empty());
+        for c in calls {
+            assert!(c >= Duration::from_secs(MIN_POLL_INTERVAL_SECONDS));
+        }
     }
 
     #[test]
@@ -421,6 +521,25 @@ mod tests {
         };
         let err = device_code_poll(&cfg(), &login, &transport, opts).unwrap_err();
         assert_eq!(err.kind, AuthErrorKind::OAuthTimeout);
+    }
+
+    #[test]
+    // Debug for DeviceCodeLogin redacts the device_code and the
+    // verification_uri_complete (both treat as secrets per RFC 8628 §6.1).
+    fn debug_redacts_device_code_and_complete_uri() {
+        let login = DeviceCodeLogin {
+            verification_uri: "https://example.test/v".into(),
+            verification_uri_complete: Some("https://example.test/v?user_code=ABCD".into()),
+            user_code: "ABCD".into(),
+            expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(60),
+            interval: Duration::from_secs(5),
+            device_code: "super-secret-device-code".into(),
+        };
+        let s = format!("{:?}", login);
+        assert!(!s.contains("super-secret-device-code"));
+        assert!(!s.contains("user_code=ABCD"));
+        // The bare user code is fine: it's displayed to the user anyway.
+        assert!(s.contains("ABCD"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Shared token-endpoint types.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +10,13 @@ use crate::error::{AuthError, AuthErrorKind};
 /// Token-endpoint response. Tolerates either standard OAuth 2.0 fields
 /// (`access_token`, `refresh_token`, `expires_in`) or fields commonly
 /// emitted by AI-platform identity providers (e.g. `id_token`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Debug` is implemented by hand because deriving it would dump the
+/// raw `access_token` / `refresh_token` / `id_token` into any
+/// `tracing::debug!` or `{:?}` format string, including indirectly
+/// through containing types like `DeviceCodeOutcome` or
+/// `BrowserLoginOutcome`.
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -23,6 +30,22 @@ pub struct TokenResponse {
     pub expires_in: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+}
+
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redact every bearer-equivalent field. The metadata fields
+        // (`token_type`, `expires_in`, `scope`) are safe to surface and
+        // useful for diagnostics.
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"***")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
+            .field("id_token", &self.id_token.as_ref().map(|_| "***"))
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 /// Standard OAuth 2.0 error envelope.
@@ -186,5 +209,57 @@ mod tests {
     fn url_encode_handles_unreserved_and_reserved() {
         assert_eq!(url_encode("foo-bar.baz~123"), "foo-bar.baz~123");
         assert_eq!(url_encode("a/b?c"), "a%2Fb%3Fc");
+    }
+
+    #[test]
+    // {:?} on a TokenResponse must never reveal the raw access /
+    // refresh / id tokens, because tracing::debug! and accidental
+    // log statements would otherwise dump live bearer secrets.
+    fn token_response_debug_redacts_bearer_fields() {
+        let tr = TokenResponse {
+            access_token: "secret-access-123".into(),
+            refresh_token: Some("secret-refresh-456".into()),
+            id_token: Some("secret-id-789".into()),
+            token_type: Some("Bearer".into()),
+            expires_in: Some(3600),
+            scope: Some("read write".into()),
+        };
+        let dbg = format!("{:?}", tr);
+        assert!(
+            !dbg.contains("secret-access-123"),
+            "access_token leaked in Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("secret-refresh-456"),
+            "refresh_token leaked in Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("secret-id-789"),
+            "id_token leaked in Debug: {dbg}"
+        );
+        // Metadata fields are still legible — they are not secrets and
+        // are useful for diagnosing token-endpoint problems.
+        assert!(dbg.contains("Bearer"));
+        assert!(dbg.contains("3600"));
+        assert!(dbg.contains("read write"));
+    }
+
+    #[test]
+    // Debug redaction transitively holds when TokenResponse is wrapped
+    // in a containing type that derives Debug, such as
+    // DeviceCodeOutcome / BrowserLoginOutcome.
+    fn token_response_debug_redacts_through_container() {
+        use crate::oauth::device::DeviceCodeOutcome;
+        let outcome = DeviceCodeOutcome {
+            token: TokenResponse {
+                access_token: "container-secret".into(),
+                ..Default::default()
+            },
+        };
+        let dbg = format!("{:?}", outcome);
+        assert!(
+            !dbg.contains("container-secret"),
+            "access_token leaked through container: {dbg}"
+        );
     }
 }

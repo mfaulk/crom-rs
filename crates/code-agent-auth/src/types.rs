@@ -89,10 +89,41 @@ impl AccountId {
         &self.0
     }
 
-    /// Stable, redacted hash form suitable for logs/telemetry.
-    pub fn redacted_hash(&self) -> String {
+    /// Build a synthetic account id for an API-key login. The id embeds a
+    /// 32-hex-char (128-bit) prefix of `sha256(api_key)` so two distinct
+    /// API keys produce distinct ids — preventing the credential-store
+    /// upsert from silently replacing a previous key under the same
+    /// `(provider, account_id)` tuple. 128 bits puts the birthday
+    /// collision boundary at ~2^64 keys, comfortably above any realistic
+    /// fleet. The raw key is never serialized; only the hash prefix
+    /// appears in metadata.
+    pub fn from_api_key(provider_slug: &str, api_key: &str) -> Self {
         use sha2::Digest;
-        let digest = sha2::Sha256::digest(self.0.as_bytes());
+        let digest = sha2::Sha256::digest(api_key.as_bytes());
+        let prefix = &hex::encode(digest)[..32];
+        Self(format!("{provider_slug}-apikey-{prefix}"))
+    }
+
+    /// Stable, redacted hash form suitable for logs/telemetry and for the
+    /// on-disk filename used by the file credential backend. A poor-man's
+    /// salt is supplied by including the provider id in the input so the
+    /// same email under different providers does not hash to the same
+    /// filename. A truly random per-store salt is tracked as a follow-up.
+    pub fn redacted_hash(&self) -> String {
+        self.redacted_hash_with_salt("")
+    }
+
+    /// Variant of [`Self::redacted_hash`] that mixes in a caller-supplied
+    /// salt prefix. Used by the file credential backend to bind the
+    /// hash to a provider, defending against rainbow-table attacks
+    /// against well-known email addresses.
+    pub fn redacted_hash_with_salt(&self, salt: &str) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(salt.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.0.as_bytes());
+        let digest = hasher.finalize();
         format!("acct_{}", &hex::encode(digest)[..12])
     }
 }
@@ -647,6 +678,53 @@ mod tests {
         assert_eq!(h1, h2);
         assert!(h1.starts_with("acct_"));
         assert!(!h1.contains("user"));
+    }
+
+    #[test]
+    // AccountId::from_api_key returns distinct ids for distinct API keys.
+    fn from_api_key_returns_distinct_ids_for_distinct_keys() {
+        let a = AccountId::from_api_key("anthropic", "sk-aaa");
+        let b = AccountId::from_api_key("anthropic", "sk-bbb");
+        assert_ne!(a, b);
+        // The synthetic id encodes a hash prefix, not the key itself.
+        assert!(!a.as_str().contains("sk-aaa"));
+        assert!(!b.as_str().contains("sk-bbb"));
+        assert!(a.as_str().starts_with("anthropic-apikey-"));
+        // Deterministic for the same key.
+        assert_eq!(a, AccountId::from_api_key("anthropic", "sk-aaa"));
+    }
+
+    #[test]
+    // The hash-prefix carried in the synthetic account id is at least
+    // 128 bits (32 hex chars) so birthday-collision risk is negligible
+    // even across very large fleets. An 8-hex-char (32-bit) prefix
+    // collides at ~65k keys, which is unsafe.
+    fn from_api_key_hash_prefix_is_at_least_128_bits() {
+        let id = AccountId::from_api_key("anthropic", "sk-some-test-key");
+        let suffix = id
+            .as_str()
+            .strip_prefix("anthropic-apikey-")
+            .expect("expected anthropic-apikey- prefix");
+        assert!(
+            suffix.len() >= 32,
+            "expected >= 32 hex chars (128 bits), got {}: {suffix}",
+            suffix.len()
+        );
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "expected pure hex suffix, got {suffix}"
+        );
+    }
+
+    #[test]
+    // redacted_hash_with_salt produces different hashes for the same
+    // account id under different salts.
+    fn redacted_hash_with_salt_is_salt_sensitive() {
+        let a = AccountId::new("user@example.com");
+        let h_anthropic = a.redacted_hash_with_salt("anthropic");
+        let h_openai = a.redacted_hash_with_salt("openai");
+        assert_ne!(h_anthropic, h_openai);
+        assert!(h_anthropic.starts_with("acct_"));
     }
 
     #[test]

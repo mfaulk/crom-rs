@@ -68,7 +68,7 @@ impl AuthProvider for GeminiAuthProvider {
             ));
         }
         let account = StoredAccount {
-            account_id: AccountId::new("gemini-api-key"),
+            account_id: AccountId::from_api_key("gemini", key.expose()),
             provider: ProviderId::Gemini,
             login_method: LoginMethodKind::ApiKey,
             display_email: None,
@@ -153,6 +153,29 @@ mod tests {
             result.secret.api_key.as_ref().unwrap().expose(),
             "AI-test-gemini"
         );
+    }
+
+    #[tokio::test]
+    // Two distinct Gemini API keys produce two distinct synthetic account
+    // ids so a second login does not silently overwrite the first.
+    async fn distinct_api_keys_yield_distinct_account_ids() {
+        let provider = GeminiAuthProvider;
+        let a = provider
+            .login(
+                LoginRequest::api_key(LoginMethodKind::ApiKey, "AI-gemini-a"),
+                AuthContext::default(),
+            )
+            .await
+            .unwrap();
+        let b = provider
+            .login(
+                LoginRequest::api_key(LoginMethodKind::ApiKey, "AI-gemini-b"),
+                AuthContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(a.account.account_id, b.account.account_id);
+        assert!(a.account.account_id.as_str().starts_with("gemini-apikey-"));
     }
 
     #[test]

@@ -377,7 +377,31 @@ pub async fn cmd_auth_use(
     let provider_id = resolve_provider(&provider);
     let idx = store.snapshot_index();
     let chosen = match account {
-        Some(a) => code_agent_auth::AccountId::new(a),
+        Some(a) => {
+            let candidate = code_agent_auth::AccountId::new(a);
+            // The active pointer must reference an account that is
+            // actually in the index — writing an arbitrary id would
+            // silently break the next `auth status` for this provider.
+            if idx.get(&provider_id, &candidate).is_none() {
+                let available: Vec<String> = idx
+                    .list_for(&provider_id)
+                    .iter()
+                    .map(|a| a.account_id.to_string())
+                    .collect();
+                let listing = if available.is_empty() {
+                    "(none stored)".to_string()
+                } else {
+                    available.join(", ")
+                };
+                return Err(anyhow!(
+                    "no stored account {} for {}; available: {}",
+                    candidate,
+                    provider_id,
+                    listing
+                ));
+            }
+            candidate
+        }
         None => idx
             .list_for(&provider_id)
             .first()
@@ -953,6 +977,58 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
         assert_eq!(v["provider"].as_str(), Some("openai"));
+    }
+
+    #[tokio::test]
+    // `auth use <provider> <account>` rejects an account id that is not
+    // in the credential index, instead of writing a dangling active
+    // pointer that would break the next `auth status` call.
+    async fn auth_use_rejects_unknown_account() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _ = handle_login_slash("fake --api-key=demo", dir.path(), true)
+            .await
+            .unwrap();
+        let common = AuthCommonArgs {
+            cwd: dir.path().to_path_buf(),
+            json: false,
+            allow_file_store: true,
+        };
+        let err = cmd_auth_use("fake".into(), Some("does-not-exist".into()), common)
+            .await
+            .expect_err("expected unknown-account error");
+        let msg = err.to_string();
+        assert!(msg.contains("does-not-exist"), "msg = {msg}");
+        assert!(msg.contains("available"), "msg = {msg}");
+    }
+
+    #[tokio::test]
+    // `auth use <provider> <account>` accepts an account id that is
+    // present in the credential index and writes the active pointer.
+    async fn auth_use_accepts_known_account() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _ = handle_login_slash("fake --api-key=demo", dir.path(), true)
+            .await
+            .unwrap();
+        let store = build_store(dir.path(), true).unwrap();
+        let stored = store
+            .snapshot_index()
+            .list_for(&ProviderId::Fake)
+            .first()
+            .map(|a| a.account_id.clone())
+            .unwrap();
+        let common = AuthCommonArgs {
+            cwd: dir.path().to_path_buf(),
+            json: false,
+            allow_file_store: true,
+        };
+        cmd_auth_use("fake".into(), Some(stored.to_string()), common)
+            .await
+            .unwrap();
+        let reloaded = build_store(dir.path(), true).unwrap();
+        assert_eq!(
+            reloaded.snapshot_index().active_for(&ProviderId::Fake),
+            Some(&stored)
+        );
     }
 
     #[tokio::test]

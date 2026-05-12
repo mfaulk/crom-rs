@@ -9,6 +9,17 @@
 //! On Unix the directory is created with `0700` and per-account files
 //! with `0600`. The hashed filename keeps the on-disk listing free of
 //! identifiable account ids while still producing a stable lookup key.
+//! The hash input is `sha256(<provider_id> || 0x00 || <account_id>)` so
+//! the same email under two providers maps to two different filenames,
+//! making a single rainbow table built from a list of plain emails
+//! useless. A truly random per-store salt is tracked as a follow-up.
+//!
+//! Before the salted layout, the filename was the unsalted
+//! `acct_<sha256(account_id)[..12]>.json`. To avoid silently logging
+//! existing users out across that upgrade, `get` and `delete` fall back
+//! to the legacy unsalted filename when the salted file is absent, and
+//! `put` removes the legacy file after writing the salted file so the
+//! store self-migrates on the next credential refresh or login.
 //!
 //! Writes go through a sibling temp file in the same directory and are
 //! renamed over the target via `tempfile::persist`, so concurrent
@@ -46,23 +57,142 @@ impl FileCredentialBackend {
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
 
+        // After create_dir_all returns the directory still needs to be
+        // audited: a pre-existing symlink that pointed at an
+        // attacker-controlled directory, or an entry owned by another
+        // uid, would otherwise capture the next secret we write.
+        verify_secrets_dir(&dir)?;
+
         Ok(Self { dir })
     }
 
-    fn account_path(&self, provider: &ProviderId, account_id: &AccountId) -> PathBuf {
+    fn account_path(
+        &self,
+        provider: &ProviderId,
+        account_id: &AccountId,
+    ) -> Result<PathBuf, AuthError> {
+        let provider_dir = self.provider_dir(provider)?;
+        // Mix the provider id into the hash as a poor-man's salt so a
+        // directory listing across providers cannot be cracked with a
+        // single rainbow table keyed on plain email. A truly random
+        // per-store salt (persisted as `.salt`, 0o600) is tracked as a
+        // follow-up — the provider-id salt is zero-migration and
+        // strictly better than the previous unsalted hash.
+        Ok(provider_dir.join(format!(
+            "{}.json",
+            account_id.redacted_hash_with_salt(provider.as_str())
+        )))
+    }
+
+    /// Path the previous (pre-salt) layout would have used for
+    /// `(provider, account_id)`. Read-only fallback: used by `get` and
+    /// `delete` so an upgrade from the unsalted layout does not silently
+    /// log the user out. `put` migrates the file to the new path on
+    /// next write by writing to [`Self::account_path`] and removing the
+    /// legacy path.
+    fn legacy_account_path(
+        &self,
+        provider: &ProviderId,
+        account_id: &AccountId,
+    ) -> Result<PathBuf, AuthError> {
+        let provider_dir = self.provider_dir(provider)?;
+        Ok(provider_dir.join(format!("{}.json", account_id.redacted_hash())))
+    }
+
+    fn provider_dir(&self, provider: &ProviderId) -> Result<PathBuf, AuthError> {
         let provider_dir = self.dir.join(provider.as_str());
-        // `create_dir_all` follows symlinks; if `provider_dir` is a
-        // pre-existing symlink to an attacker-controlled directory the
-        // subsequent write lands outside `self.dir`. Tracked separately
-        // by issue #77 (symlink TOCTOU in the file backend).
-        let _ = std::fs::create_dir_all(&provider_dir);
+        // Create the per-provider subdirectory and then audit it. The
+        // audit catches the case where the parent is fine but a
+        // provider subdirectory was pre-planted as a symlink to an
+        // attacker-controlled location between `new` and this call.
+        std::fs::create_dir_all(&provider_dir).map_err(|e| {
+            AuthError::new(
+                AuthErrorKind::CredentialStoreUnavailable,
+                format!("create provider dir {}: {}", provider_dir.display(), e),
+            )
+        })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&provider_dir, std::fs::Permissions::from_mode(0o700));
         }
-        provider_dir.join(format!("{}.json", account_id.redacted_hash()))
+        verify_secrets_dir(&provider_dir)?;
+        Ok(provider_dir)
     }
+}
+
+/// Verify that `dir` is a real directory the current user owns and that
+/// no other user has write access to. Rejects symlinks (regardless of
+/// where they point) so a pre-planted symlink cannot redirect secret
+/// writes to an attacker-controlled location. On Unix the mode is
+/// forced to `0o700` if it is not already, and ownership is checked
+/// against the current uid. The check is a no-op on non-Unix targets
+/// because the file-store path is mostly used in CI and local dev there;
+/// the keychain is preferred elsewhere.
+fn verify_secrets_dir(dir: &Path) -> Result<(), AuthError> {
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+        AuthError::new(
+            AuthErrorKind::CredentialStoreUnavailable,
+            format!("stat secrets dir {}: {}", dir.display(), e),
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(AuthError::new(
+            AuthErrorKind::CredentialStoreUnavailable,
+            format!(
+                "refusing to use secrets dir {}: path is a symlink",
+                dir.display()
+            ),
+        ));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(AuthError::new(
+            AuthErrorKind::CredentialStoreUnavailable,
+            format!(
+                "refusing to use secrets dir {}: not a directory",
+                dir.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: libc::getuid is always-safe (returns the real uid of
+        // the calling process; cannot fail). We avoid pulling in `nix`
+        // just for this one call.
+        let current_uid = unsafe { libc::getuid() };
+        let dir_uid = meta.uid();
+        if dir_uid != current_uid {
+            return Err(AuthError::new(
+                AuthErrorKind::CredentialStoreUnavailable,
+                format!(
+                    "refusing to use secrets dir {}: owned by uid {} but current uid is {}",
+                    dir.display(),
+                    dir_uid,
+                    current_uid
+                ),
+            ));
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            // Try to tighten in place — common case is an inherited
+            // 0o755 from `create_dir_all` on a system with a tight
+            // umask. If chmod itself fails the directory is unsafe.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+                AuthError::new(
+                    AuthErrorKind::CredentialStoreUnavailable,
+                    format!(
+                        "refusing to use secrets dir {}: mode is {:o} (expected 0o700) and chmod failed: {}",
+                        dir.display(),
+                        mode,
+                        e,
+                    ),
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -88,7 +218,7 @@ impl SecretBackend for FileCredentialBackend {
         account_id: &AccountId,
         secret: &StoredCredentialSecret,
     ) -> Result<(), AuthError> {
-        let path = self.account_path(provider, account_id);
+        let path = self.account_path(provider, account_id)?;
         let dst = OnDiskSecret {
             access_token: secret.access_token.as_ref().map(|s| s.expose().to_string()),
             refresh_token: secret
@@ -102,6 +232,14 @@ impl SecretBackend for FileCredentialBackend {
             AuthError::new(AuthErrorKind::Unknown, format!("serialize secret: {}", e))
         })?;
         write_secret_file(&path, &bytes)?;
+        // Migrate-on-write: if a legacy (unsalted) record exists for the
+        // same (provider, account_id) tuple, remove it now that the
+        // canonical salted file has been written. Tolerate a missing
+        // legacy file — the migration is best-effort.
+        let legacy = self.legacy_account_path(provider, account_id)?;
+        if legacy != path && legacy.exists() {
+            let _ = std::fs::remove_file(&legacy);
+        }
         Ok(())
     }
 
@@ -110,14 +248,26 @@ impl SecretBackend for FileCredentialBackend {
         provider: &ProviderId,
         account_id: &AccountId,
     ) -> Result<Option<StoredCredentialSecret>, AuthError> {
-        let path = self.account_path(provider, account_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(&path).map_err(|e| {
+        let path = self.account_path(provider, account_id)?;
+        let resolved = if path.exists() {
+            path
+        } else {
+            // Fallback: an upgrade across the unsalted-to-salted layout
+            // would otherwise read `None` here and quietly log the user
+            // out. Try the legacy filename so existing on-disk records
+            // remain reachable. `put` migrates to the new path next time
+            // a write happens.
+            let legacy = self.legacy_account_path(provider, account_id)?;
+            if legacy.exists() {
+                legacy
+            } else {
+                return Ok(None);
+            }
+        };
+        let bytes = std::fs::read(&resolved).map_err(|e| {
             AuthError::new(
                 AuthErrorKind::CredentialStoreUnavailable,
-                format!("read secret {}: {}", path.display(), e),
+                format!("read secret {}: {}", resolved.display(), e),
             )
         })?;
         let on_disk: OnDiskSecret = serde_json::from_slice(&bytes)
@@ -131,12 +281,23 @@ impl SecretBackend for FileCredentialBackend {
     }
 
     fn delete(&self, provider: &ProviderId, account_id: &AccountId) -> Result<(), AuthError> {
-        let path = self.account_path(provider, account_id);
+        let path = self.account_path(provider, account_id)?;
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| {
                 AuthError::new(
                     AuthErrorKind::CredentialStoreUnavailable,
                     format!("remove secret {}: {}", path.display(), e),
+                )
+            })?;
+        }
+        // Also clear any legacy unsalted record so a stale credential is
+        // not left behind on disk after a logout.
+        let legacy = self.legacy_account_path(provider, account_id)?;
+        if legacy != path && legacy.exists() {
+            std::fs::remove_file(&legacy).map_err(|e| {
+                AuthError::new(
+                    AuthErrorKind::CredentialStoreUnavailable,
+                    format!("remove legacy secret {}: {}", legacy.display(), e),
                 )
             })?;
         }
@@ -256,6 +417,50 @@ mod tests {
     }
 
     #[test]
+    // The on-disk filename for the same account id under two different
+    // providers must differ, so a directory listing cannot be cracked
+    // with a single rainbow table keyed on a plain email. This is the
+    // observable consequence of mixing the provider id into the hash
+    // input as a poor-man's salt.
+    fn filename_differs_across_providers_for_same_account_id() {
+        let dir1 = tempfile::TempDir::new().unwrap();
+        let dir2 = tempfile::TempDir::new().unwrap();
+        let backend1 = FileCredentialBackend::new(dir1.path().to_path_buf()).unwrap();
+        let backend2 = FileCredentialBackend::new(dir2.path().to_path_buf()).unwrap();
+        let acct = AccountId::new("user@example.com");
+        let secret = StoredCredentialSecret {
+            api_key: Some(SecretString::new("k".into())),
+            ..Default::default()
+        };
+        backend1
+            .put(&ProviderId::Anthropic, &acct, &secret)
+            .unwrap();
+        backend2.put(&ProviderId::OpenAi, &acct, &secret).unwrap();
+        let name1 = std::fs::read_dir(dir1.path().join(ProviderId::Anthropic.as_str()))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        let name2 = std::fs::read_dir(dir2.path().join(ProviderId::OpenAi.as_str()))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        assert_ne!(
+            name1, name2,
+            "same email under two providers must hash to different filenames"
+        );
+        assert!(name1.starts_with("acct_"));
+        assert!(name2.starts_with("acct_"));
+    }
+
+    #[test]
     // Filename uses the redacted hash, not the raw account id, so a
     // directory listing does not reveal user identifiers.
     fn filename_uses_hashed_account_id() {
@@ -304,12 +509,92 @@ mod tests {
                 },
             )
             .unwrap();
-        let path = dir
-            .path()
-            .join(provider.as_str())
-            .join(format!("{}.json", acct.redacted_hash()));
+        let path = dir.path().join(provider.as_str()).join(format!(
+            "{}.json",
+            acct.redacted_hash_with_salt(provider.as_str())
+        ));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secret file must be 0o600 on unix");
+    }
+
+    #[test]
+    // `get` falls back to the legacy unsalted filename when no
+    // salted-layout file exists, so upgrading across the salting
+    // change does not silently log existing users out.
+    fn get_falls_back_to_legacy_unsalted_filename() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = FileCredentialBackend::new(dir.path().to_path_buf()).unwrap();
+        let provider = ProviderId::Anthropic;
+        let acct = AccountId::new("legacy-user@example.com");
+        // Manually pre-populate the directory with a legacy unsalted
+        // record under the OLD filename, exactly as a previous version
+        // of the backend would have written it.
+        let provider_dir = dir.path().join(provider.as_str());
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let legacy_path = provider_dir.join(format!("{}.json", acct.redacted_hash()));
+        let payload = br#"{"api_key":"legacy-secret"}"#;
+        std::fs::write(&legacy_path, payload).unwrap();
+
+        let got = backend
+            .get(&provider, &acct)
+            .unwrap()
+            .expect("legacy record should be visible to get()");
+        assert_eq!(got.api_key.as_ref().unwrap().expose(), "legacy-secret");
+    }
+
+    #[test]
+    // `put` migrates an existing legacy unsalted file to the new
+    // salted layout by writing the new path and removing the old one
+    // on the next write.
+    fn put_migrates_legacy_unsalted_file_to_salted_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = FileCredentialBackend::new(dir.path().to_path_buf()).unwrap();
+        let provider = ProviderId::Anthropic;
+        let acct = AccountId::new("migrating@example.com");
+        let provider_dir = dir.path().join(provider.as_str());
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let legacy_path = provider_dir.join(format!("{}.json", acct.redacted_hash()));
+        let salted_path = provider_dir.join(format!(
+            "{}.json",
+            acct.redacted_hash_with_salt(provider.as_str())
+        ));
+        assert_ne!(legacy_path, salted_path);
+        std::fs::write(&legacy_path, br#"{"api_key":"old"}"#).unwrap();
+
+        backend
+            .put(
+                &provider,
+                &acct,
+                &StoredCredentialSecret {
+                    api_key: Some(SecretString::new("new".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(salted_path.exists(), "salted file should be written");
+        assert!(
+            !legacy_path.exists(),
+            "legacy file should be removed after migration write"
+        );
+    }
+
+    #[test]
+    // `delete` removes a legacy unsalted file as well, so a logout
+    // does not leave a stale credential behind on disk during the
+    // upgrade window.
+    fn delete_removes_legacy_unsalted_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = FileCredentialBackend::new(dir.path().to_path_buf()).unwrap();
+        let provider = ProviderId::OpenAi;
+        let acct = AccountId::new("deleting@example.com");
+        let provider_dir = dir.path().join(provider.as_str());
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let legacy_path = provider_dir.join(format!("{}.json", acct.redacted_hash()));
+        std::fs::write(&legacy_path, br#"{"api_key":"x"}"#).unwrap();
+
+        backend.delete(&provider, &acct).unwrap();
+        assert!(!legacy_path.exists());
     }
 
     #[test]
@@ -342,7 +627,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let canonical = format!("{}.json", acct.redacted_hash());
+        let canonical = format!("{}.json", acct.redacted_hash_with_salt(provider.as_str()));
         let entries: Vec<String> = std::fs::read_dir(dir.path().join(provider.as_str()))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -408,5 +693,82 @@ mod tests {
         write_secret_file(&path, b"{\"api_key\":\"k\"}").unwrap();
         let read_back = std::fs::read(&path).unwrap();
         assert_eq!(read_back, b"{\"api_key\":\"k\"}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // The directory audit rejects a path that is a symlink, even one
+    // pointing at a perfectly valid directory the current user owns.
+    // This is the defense against a pre-planted symlink swap during
+    // first-time creation of `<secrets_dir>/`.
+    fn new_rejects_symlink_secrets_dir() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let target = parent.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = match FileCredentialBackend::new(link.clone()) {
+            Ok(_) => panic!("expected symlink rejection"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, AuthErrorKind::CredentialStoreUnavailable);
+        assert!(
+            err.message.contains("symlink"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // The directory audit chmods a too-permissive existing directory
+    // back to 0o700 instead of failing outright, so a fresh secrets
+    // dir created under a loose umask still ends up locked down.
+    fn new_tightens_loose_directory_mode_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::TempDir::new().unwrap();
+        let dir = parent.path().join("secrets");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = FileCredentialBackend::new(dir.clone()).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // A per-provider subdirectory that turns into a symlink between
+    // `new` and the first write is rejected at write time, so the
+    // secret is never persisted to the attacker-controlled target.
+    fn put_rejects_symlinked_provider_subdir() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let dir = parent.path().join("secrets");
+        std::fs::create_dir(&dir).unwrap();
+        let backend = FileCredentialBackend::new(dir.clone()).unwrap();
+        // Pre-plant a symlink at <dir>/<provider> pointing somewhere
+        // outside the secrets root.
+        let evil_target = parent.path().join("attacker-controlled");
+        std::fs::create_dir(&evil_target).unwrap();
+        std::os::unix::fs::symlink(&evil_target, dir.join(ProviderId::Anthropic.as_str())).unwrap();
+        let err = backend
+            .put(
+                &ProviderId::Anthropic,
+                &AccountId::new("a"),
+                &StoredCredentialSecret {
+                    api_key: Some(SecretString::new("k".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, AuthErrorKind::CredentialStoreUnavailable);
+        assert!(
+            err.message.contains("symlink"),
+            "unexpected error: {}",
+            err.message
+        );
+        // And the attacker-controlled directory must still be empty:
+        // the audit fired before any write.
+        let attacker_entries: Vec<_> = std::fs::read_dir(&evil_target).unwrap().collect();
+        assert!(attacker_entries.is_empty());
     }
 }

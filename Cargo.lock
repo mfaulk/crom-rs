@@ -246,6 +246,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "hex",
+ "libc",
  "rand 0.8.6",
  "serde",
  "serde_json",
