@@ -239,10 +239,18 @@ impl PlanRiskLevel {
     }
 }
 
-// LINT: keep variants in sync with `access_for_file_tool` in
-// `plan::deviation`. Only access kinds with a concrete tool mapping
-// belong here — adding a variant that no tool can produce silently
-// turns those operations into `Ambiguous` deviations.
+// LINT: keep the active variants (Read/Write/Edit/Create) in sync with
+// `access_for_file_tool` in `plan::deviation`. Only access kinds with a
+// concrete tool mapping belong in the active set — adding a variant
+// that no tool can produce silently turns those operations into
+// `Ambiguous` deviations.
+//
+// `Unsupported` is the deserialization-compat catch-all and intentionally
+// has no tool mapping. It exists so plans persisted before a variant was
+// removed (e.g. the legacy `delete`/`remove` access strings; see #82)
+// still load. The runtime treats it as non-mutating and non-satisfying:
+// it never authorizes a file operation, and `is_mutating` returns false
+// so callers don't accidentally interpret it as a write-side intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanFileAccess {
@@ -250,6 +258,12 @@ pub enum PlanFileAccess {
     Write,
     Edit,
     Create,
+    /// Catch-all for legacy or unknown access strings. Lets pre-removal
+    /// plans (e.g. `access: "delete"`) still deserialize. Treated as
+    /// inert at runtime — see [`PlanFileAccess::is_mutating`] and the
+    /// `file_access_satisfies` arm in `plan::deviation`.
+    #[serde(other)]
+    Unsupported,
 }
 
 impl PlanFileAccess {
@@ -264,7 +278,11 @@ impl PlanFileAccess {
     }
 
     pub fn is_mutating(self) -> bool {
-        !matches!(self, Self::Read)
+        // `Unsupported` is intentionally classified as non-mutating: we
+        // do not know what the original access value meant, so refusing
+        // to claim mutation keeps the classifier from authorizing a
+        // mutating operation against an unrecognized access kind.
+        matches!(self, Self::Write | Self::Edit | Self::Create)
     }
 }
 
@@ -670,6 +688,52 @@ mod tests {
         assert!(PlanFileAccess::from_str_lenient("create").is_some());
         assert!(PlanFileAccess::from_str_lenient("delete").is_none());
         assert!(PlanFileAccess::from_str_lenient("remove").is_none());
+    }
+
+    #[test]
+    // A persisted plan JSON containing the legacy `delete` access value
+    // (or `remove`) must still deserialize successfully so users can
+    // load and edit pre-#82 plans. The deserialized value must NOT
+    // authorize a delete-style action at runtime: it lands in a non-
+    // mutating, non-satisfying `Unsupported` variant so the classifier
+    // treats the file ref as inert. Pins the resolution for Finding 2.
+    fn plan_file_access_deserializes_legacy_delete_as_unsupported() {
+        let read: PlanFileAccess = serde_json::from_str("\"read\"").unwrap();
+        assert_eq!(read, PlanFileAccess::Read);
+        // Legacy values: must deserialize, must not be mutating.
+        let delete: PlanFileAccess = serde_json::from_str("\"delete\"")
+            .expect("legacy `delete` must still deserialize for plan-store compat");
+        assert_eq!(delete, PlanFileAccess::Unsupported);
+        assert!(!delete.is_mutating(), "Unsupported must not claim mutation");
+        let remove: PlanFileAccess = serde_json::from_str("\"remove\"")
+            .expect("legacy `remove` must still deserialize for plan-store compat");
+        assert_eq!(remove, PlanFileAccess::Unsupported);
+        // A completely novel unknown access string also lands here.
+        let novel: PlanFileAccess = serde_json::from_str("\"sideways-write\"")
+            .expect("unknown access strings must deserialize via the catch-all");
+        assert_eq!(novel, PlanFileAccess::Unsupported);
+    }
+
+    #[test]
+    // A plan document carrying a file ref with legacy `access: "delete"`
+    // round-trips through the JSON deserializer and lands the variant
+    // on the parsed PlanFileRef. End-to-end pin so the plan-store load
+    // path is exercised, not just the bare enum.
+    fn plan_document_with_legacy_delete_access_loads() {
+        let mut p = PlanDocument::new_draft(new_plan_id(), "T", "u");
+        p.files.push(PlanFileRef {
+            path: WorkspaceRelativePath::try_new("src/old.rs").unwrap(),
+            access: PlanFileAccess::Read,
+            reason: None,
+        });
+        // Emit the plan, then surgically replace the access string with
+        // the legacy `delete` value so we exercise the deserialize path.
+        let raw = serde_json::to_string(&p).unwrap();
+        let raw_legacy = raw.replace("\"access\":\"read\"", "\"access\":\"delete\"");
+        let parsed: PlanDocument = serde_json::from_str(&raw_legacy)
+            .expect("plan with legacy `delete` access must still load");
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].access, PlanFileAccess::Unsupported);
     }
 
     #[test]

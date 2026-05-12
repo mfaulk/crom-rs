@@ -359,6 +359,12 @@ fn file_paths_equal(planned: &WorkspaceRelativePath, actual: &str) -> bool {
 
 fn file_access_satisfies(planned: PlanFileAccess, requested: PlanFileAccess) -> bool {
     use PlanFileAccess as A;
+    // `Unsupported` is the legacy/deserialization catch-all and never
+    // authorizes anything. Reject up front so the `(a, b) if a == b`
+    // arm doesn't accidentally satisfy an Unsupported<->Unsupported pair.
+    if matches!(planned, A::Unsupported) || matches!(requested, A::Unsupported) {
+        return false;
+    }
     match (planned, requested) {
         // Exact match always satisfies.
         (a, b) if a == b => true,
@@ -379,6 +385,7 @@ fn access_label(a: PlanFileAccess) -> &'static str {
         PlanFileAccess::Write => "write",
         PlanFileAccess::Edit => "edit",
         PlanFileAccess::Create => "create",
+        PlanFileAccess::Unsupported => "unsupported",
     }
 }
 
