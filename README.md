@@ -1,277 +1,76 @@
 # code-agent
 
-A headless coding-agent library and minimal CLI for Rust, with an Anthropic
-Messages API provider. Targets approximate architectural parity with the
-public surface of Anthropic's Agent SDK while staying small enough to read in
-one sitting.
+A headless coding agent for Rust. Ships as the `code-agent` CLI binary and a
+set of embeddable crates (provider adapters, tool registry, MCP client, SDK
+runtime). The library targets approximate architectural parity with the
+public surface of Anthropic's Agent SDK while staying small enough to read
+in one sitting.
 
-This is **Milestone 5: Tool Search + Deferred Tool Loading Alpha**. M5 adds
-a central tool catalog, approximate tool-definition budget accounting,
-provider-agnostic lexical tool search, the built-in `SearchTools` tool, and
-deferred loading for large local + MCP catalogs. MCP tools are deferred by
-default in search mode, local coding tools stay eager, and tool loading never
-bypasses hooks, policy, approvals, sessions, telemetry, or checkpointing.
+## Quickstart
 
-## Workspace layout
+### Install
 
-```
-crates/
-  code-agent-core/             types, agent loop, AgentClient, hooks, policy, settings, telemetry
-  code-agent-anthropic/        Messages API streaming provider
-  code-agent-tools/            Read, Write, Edit, Glob, Grep, Bash, TodoWrite
-  code-agent-session/          JSONL store + continue/fork/show/export helpers
-  code-agent-checkpoint/       M3: LocalCheckpointStore, CheckpointHandle, validation
-  code-agent-mcp/              M4: MCP client config, protocol, stdio/http transports
-  code-agent-tui/              M9: terminal UI (fullscreen ratatui + plain renderer)
-  code-agent-auth/             M10: provider login, OAuth (PKCE + device-code),
-                               credential store, model registry, CI policy
-  code-agent-provider-openai/  M10: OpenAI Chat Completions adapter
-  code-agent-provider-gemini/  M10: Google AI Studio (Gemini) adapter
-  code-agent-cli/              `code-agent` binary (run, resume, continue, fork, chat,
-                               sessions, checkpoint, mcp, tools, tui, login, auth,
-                               provider, model)
-examples/
-  bugfix-demo/                 tiny crate with a deliberately failing test (M1 demo)
-  policy-demo/                 tiny crate plus .agent/settings.json policy + hooks (M2 demo)
-  checkpoint-demo/             tiny crate exercising checkpoint + rewind + validation (M3 demo)
-  mcp-demo/                    offline fake MCP server and demo project (M4 demo)
-  tool-search-demo/            large fake MCP catalog for deferred loading (M5 demo)
-  subagent-demo/               subagent orchestration demo (M6)
-  skills-demo/                 Skills + slash commands demo (M7)
-  plugin-demo/                 plugin system demo (M8)
-  beta-demo/                   terminal UX / TUI demo (M9)
-  auth-demo/                   provider login + credential store demo (M10)
-```
-
-`examples/bugfix-demo`, `examples/policy-demo`, `examples/checkpoint-demo`,
-`examples/mcp-demo`, and `examples/tool-search-demo` are **excluded** from
-the workspace. Run them from their own directories.
-
-## Quick start
+`code-agent` is not published to crates.io yet. Install the CLI from this
+repository:
 
 ```sh
-# Build everything.
-cargo build --workspace
+git clone https://github.com/mfaulk/code-agent.git
+cd code-agent
+cargo install --path crates/code-agent-cli
+```
 
-# Run unit and integration tests for all crates.
-cargo test --workspace
+`cargo install` puts the `code-agent` binary on your `PATH` (usually
+`~/.cargo/bin/code-agent`).
 
-# Run the CLI against a local repository. Requires ANTHROPIC_API_KEY.
-export ANTHROPIC_API_KEY=...
-cargo run -p code-agent-cli -- run "What files are here?" \
-    --allowed-tools Read,Glob \
-    --permission-mode default
+### Authenticate
 
-# Resume a session by id.
-cargo run -p code-agent-cli -- resume <SESSION_ID> "and now run the tests" \
-    --permission-mode acceptEdits
+Log in once and the credential is stored in the OS keychain (or a clearly
+opt-in file backend if no keychain is available). Pick whichever provider
+you want to use:
 
-# Continue the latest session for the current cwd.
-cargo run -p code-agent-cli -- continue "and now run the tests"
+```sh
+code-agent login anthropic --api-key=sk-ant-...
+code-agent login openai    --api-key-stdin < ./openai.key
+code-agent login gemini    --api-key=AI-...
 
-# Fork a session into a new id and steer it.
-cargo run -p code-agent-cli -- fork <SESSION_ID> "try a different fix"
+code-agent auth status
+```
 
-# Live interactive chat (multiple prompts in one process).
-cargo run -p code-agent-cli -- chat --show-usage
+You can also export `ANTHROPIC_API_KEY` (or the provider equivalent) in your
+shell and skip `code-agent login` entirely.
 
-# List, summarize, and export sessions.
-cargo run -p code-agent-cli -- sessions list --cwd .
-cargo run -p code-agent-cli -- sessions show <SESSION_ID>
-cargo run -p code-agent-cli -- sessions export <SESSION_ID> --format json
+### Run the agent
 
-# Checkpointing (M3): on by default for the CLI when mutating tools are
-# enabled. Pass --validate to add post-run gates and
-# --rewind-on-validation-failure to rewind automatically.
-cargo run -p code-agent-cli -- run "Refactor parser and add a test" \
-    --checkpointing on \
+```sh
+# One-shot run.
+code-agent run "Find the bug in src/lib.rs, fix it, and re-run cargo test" \
+    --allowed-tools Read,Glob,Grep,Edit,Bash \
     --permission-mode acceptEdits \
-    --validate "cargo test"
+    --max-turns 8
 
-# Inspect, diff, and rewind checkpoints.
-cargo run -p code-agent-cli -- checkpoints list
-cargo run -p code-agent-cli -- checkpoints diff <CHECKPOINT_ID>
-cargo run -p code-agent-cli -- rewind <CHECKPOINT_ID> --dry-run
-cargo run -p code-agent-cli -- rewind <CHECKPOINT_ID> --yes
+# Interactive chat (multiple prompts in one process).
+code-agent chat --show-usage
 
-# MCP inspection and direct calls (no Anthropic key needed with the demo).
-cd examples/mcp-demo
-cargo run -p code-agent-cli --manifest-path ../../Cargo.toml -- mcp status
-cargo run -p code-agent-cli --manifest-path ../../Cargo.toml -- mcp tools fake
-cargo run -p code-agent-cli --manifest-path ../../Cargo.toml -- \
-    mcp call fake list_issues --args-json '{}' --yes
-
-# Tool catalog inspection and search (no Anthropic key needed with the demo).
-cd ../tool-search-demo
-../../target/debug/code-agent tools stats --mcp-config .agent/mcp.json
-../../target/debug/code-agent tools search "github issue bug" --mcp-config .agent/mcp.json
-../../target/debug/code-agent tools explain-loading --mcp-config .agent/mcp.json
+# Resume the latest session in this directory.
+code-agent continue "and now add a regression test"
 ```
 
-Session ids supplied to `resume`, `fork`, `sessions show`, and
-`sessions export` must match `[A-Za-z0-9_-]+` (UUIDs minted by
-`code-agent` satisfy this). Other inputs are rejected so a crafted id
-cannot escape `<cwd>/.agent/sessions/`.
+`code-agent --help` lists every subcommand; `code-agent <subcommand> --help`
+shows flags for each one.
 
-The CLI prints:
+## Adding an MCP server
 
-```
-[init] session 01J...
-[assistant] I'll inspect the tests first.
-[tool] Bash: cargo test
-[tool-result] Bash (1342ms)
-...
-[result] Fixed token parsing bug. All tests pass. (turns=4, subtype=Success)
-```
-
-## Built-in tools
-
-| Tool      | Permission | Notes                                                  |
-|-----------|-----------|---------------------------------------------------------|
-| Read      | ReadOnly  | UTF-8 files inside cwd; max 1 MiB by default            |
-| Write     | Mutating  | Creates parents; sandboxed to cwd                       |
-| Edit      | Mutating  | Single exact-string replacement; errors on 0 or >1 hits |
-| Glob      | ReadOnly  | Honors `.gitignore`; max 500 results by default         |
-| Grep      | ReadOnly  | Regex over UTF-8 files; max 500 hits                    |
-| Bash      | Execution | 30s timeout, 64 KiB stdout/stderr cap, stdin closed     |
-| TodoWrite | ReadOnly  | Replaces the agent's task list and emits `TodoUpdate`   |
-| SearchTools | ReadOnly | Search and load deferred tools in search mode          |
-
-All filesystem tools resolve paths relative to the workspace root, refuse
-parent-traversal escapes, and reject symlinks whose target is outside the
-root.
-
-## Hooks, policy, and settings (M2)
-
-Hooks observe and influence the loop at well-defined events:
-
-| Event                | Fires                                  | Useful outputs           |
-|----------------------|----------------------------------------|--------------------------|
-| `UserPromptSubmit`   | After each user message                | `AddContext`, `Deny`     |
-| `PreToolUse`         | Before each tool call                  | `Allow{updated_input}`, `Deny`, `Ask` |
-| `PostToolUse`        | After a successful tool call           | `Continue`               |
-| `PostToolUseFailure` | After a failed tool call               | `Continue`               |
-| `PostToolBatch`      | After all tools in a turn              | `Continue`               |
-| `Stop`               | At completion / max-turns / cancel     | `Continue`               |
-
-Decisions merge with priority `Deny > Ask > Allow > AddContext > Continue`.
-Built-in hooks live in `code_agent_core::builtin_hooks`:
-`BlockEnvFileWritesHook`, `BlockDangerousBashHook`, `MaxPatchSizeHook`,
-`AuditLogHook`, `SecretRedactionHook`, plus MCP-specific hooks such as
-`BlockMcpServerHook`, `BlockMcpToolNameHook`, `BlockMcpWriteLikeToolHook`,
-`McpAuditLogHook`, `McpResultSizeLimitHook`, and `McpSecretRedactionHook`.
-
-The permission policy engine evaluates each tool call as:
-
-```
-hooks → disallow rules → permission mode → allow rules → callback → default deny
-```
-
-Allow / disallow rules are typed (`ToolRule`):
-
-* `"Read"` — exact tool by name
-* `"Edit*"` — glob over tool names
-* `"mcp__github__list_issues"` or `"mcp__github__*"` — MCP tools by exact name or glob
-* `{"tool": "Bash", "command_regex": "^cargo (test|check|fmt|clippy)"}`
-* `{"tool": "Edit", "path_glob": "**/.env*"}`
-* `{"server": "github", "tool_glob": "list_*"}` — MCP server/tool glob
-
-Settings come from `<cwd>/.agent/settings.json` (project) and
-`$CODE_AGENT_CONFIG_HOME/settings.json` (or `~/.config/code-agent/`,
-user). Project overrides user on scalars; list-typed fields concatenate.
-
-Sample `.agent/settings.json`:
-
-```json
-{
-  "model": "claude-sonnet-4-6",
-  "permission_mode": "default",
-  "allowed_tools": [
-    "Read", "Glob", "Grep", "Edit", "Write", "TodoWrite",
-    {"tool": "Bash", "command_regex": "^cargo (test|check|fmt|clippy)"}
-  ],
-  "disallowed_tools": [
-    {"tool": "Edit", "path_glob": "**/.env*"},
-    {"tool": "Bash", "command_regex": "rm\\s+-rf|sudo|curl\\s+.*\\|\\s*sh"}
-  ],
-  "hooks": {
-    "block_env_file_writes": true,
-    "block_dangerous_bash": true,
-    "max_patch_size_bytes": 200000
-  }
-}
-```
-
-CLI flags:
-
-* `--settings none|project|user|user-and-project`
-* `--config PATH` — load a single explicit settings file (replaces
-  user/project discovery; merged via the same helper as the loader,
-  so list-typed fields extend rather than overwrite when combined
-  with CLI `--yes-to` / `--deny` overlays)
-* `--mcp-config PATH`, `--mcp-enabled true|false`, `--mcp-strict`,
-  `--mcp-timeout SECONDS`
-* `--tool-loading eager|search|auto`
-* `--tool-search-strategy regex|bm25|hybrid`
-* `--native-tool-search off|anthropic-regex|anthropic-bm25|auto`
-* `--tool-search-threshold N`, `--max-tool-search-results N`
-* `--max-loaded-tools N`, `--max-loaded-tool-tokens N`
-* `--always-load "Read,Grep,SearchTools"`, `--defer-tools "mcp__*"`,
-  `--disable-tools "mcp__github__delete_*"`
-* `--yes-to "Bash:^cargo test$"` (repeatable)
-* `--deny "Edit:**/.env*"` (repeatable)
-* `--log-format pretty|json`, `--show-usage`, `--quiet`, `--verbose`
-
-## Approval UX (M2)
-
-The approval prompt offers a richer menu:
-
-```
-[approval] mode=Default
-  Tool: Bash
-  Command: cargo test
-  Working directory: /repo
-  Timeout: 30s
-  Risk: Low
-  Reason: ...
-    [y] allow once
-    [s] allow for session
-    [a] allow for project
-    [n] deny once
-    [d] deny for session
-    [v] view full input
-```
-
-For `Edit` and `Write` the prompt shows the file path, whether the file
-is being created or modified, a unified-diff preview (via `similar`),
-and the byte size of the change.
-
-## Permission modes
-
-| Mode         | Read-only | Mutating       | Execution   |
-|--------------|-----------|----------------|-------------|
-| `default`    | run       | ask            | ask         |
-| `acceptEdits`| run       | run            | ask         |
-| `plan`       | (no tool execution; first turn becomes the result)        |
-| `dontAsk`    | run only tools that appear in `--allowed-tools`           |
-
-`bypassPermissions` is intentionally not implemented in M1.
-
-## MCP Client (M4)
-
-MCP is disabled by default in the library API. The CLI loads MCP when
-`.agent/mcp.json` exists, when `.agent/settings.json` enables it, or when
-`--mcp-config PATH` is passed.
-
-Example `.agent/mcp.json`:
+`code-agent` is an MCP client. To expose an MCP server's tools to the agent,
+drop an `mcp.json` file at `.agent/mcp.json` in your project root:
 
 ```json
 {
   "mcpServers": {
-    "fake": {
+    "github": {
       "type": "stdio",
-      "command": "cargo",
-      "args": ["run", "-p", "fake-mcp-server", "--quiet"],
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_..." },
       "startup_timeout_seconds": 10,
       "request_timeout_seconds": 60
     }
@@ -279,601 +78,75 @@ Example `.agent/mcp.json`:
 }
 ```
 
-MCP settings can also live under `.agent/settings.json`:
+HTTP transports are also supported (`"type": "http"` with a `"url"` field).
 
-```json
-{
-  "mcp": {
-    "enabled": true,
-    "config_file": ".agent/mcp.json",
-    "max_servers": 10,
-    "max_tools_per_server": 200,
-    "max_tool_result_bytes": 262144,
-    "external_effect_policy": "require_explicit_allow_rule"
-  },
-  "allowed_tools": ["Read", "Grep", "mcp__fake__list_issues"]
-}
-```
-
-Supported commands:
+Allow the MCP tools on the run:
 
 ```sh
-code-agent mcp list --cwd .
-code-agent mcp status --cwd . --mcp-config .agent/mcp.json
-code-agent mcp tools fake --cwd . --mcp-config .agent/mcp.json
-code-agent mcp call fake list_issues --args-json '{}' --yes
-code-agent mcp resources fake
-code-agent mcp resource read fake fake://docs/parser
-code-agent mcp prompts fake
+code-agent run "Triage the three oldest open issues" \
+    --allowed-tools "Read,Grep,mcp__github__list_issues,mcp__github__get_issue"
 ```
 
-Agent runs can expose MCP tools through the existing tool allowlist:
+Inspect what each server exposes before granting access:
 
 ```sh
-code-agent run "Summarize open fake issues" \
-  --mcp-config .agent/mcp.json \
-  --allowed-tools "Read,Grep,mcp__fake__list_issues,mcp__fake__get_issue"
+code-agent mcp list          # show configured servers
+code-agent mcp status        # connect and report each server's health
+code-agent mcp tools github  # list the tools the github server exposes
+code-agent mcp call github list_issues --args-json '{}' --yes
 ```
 
-With M5 search mode, expose a broad MCP namespace without sending every MCP
-schema to the model on the first turn:
+MCP tools use `PermissionKind::External`. `acceptEdits` does *not* approve
+them, `dontAsk` denies any unresolved MCP tool, and the default
+external-effect policy requires an explicit allow rule. Live MCP effects are
+not covered by workspace rewind — approve them deliberately.
+
+For larger catalogs, enable search-mode tool loading so MCP schemas are not
+all sent to the model on turn one:
 
 ```sh
 code-agent run "Find the parser bug issue and inspect the likely source" \
-  --mcp-config .agent/mcp.json \
-  --tool-loading search \
-  --allowed-tools "Read,Grep,Glob,SearchTools,mcp__fake__*"
+    --tool-loading search \
+    --allowed-tools "Read,Grep,Glob,SearchTools,mcp__github__*"
 ```
 
-MCP tools use `PermissionKind::External`. `acceptEdits` does not approve
-them, `dontAsk` denies unresolved MCP tools, disallow rules override allow
-rules, and the default external-effect policy requires explicit allow rules.
-The approval prompt warns that MCP effects are external and not covered by
-workspace rewind; mutating-looking tool names get a stronger warning.
+A fully offline MCP walkthrough lives in `examples/mcp-demo/` (a fake stdio
+server bundled in-tree, no external services required).
 
-## Tool Search and Deferred Loading (M5)
+## Examples
 
-The agent builds a deterministic catalog from local tools and discovered MCP
-tools. Loading modes are:
+The `examples/` directory contains runnable demos for every major feature —
+bugfix loop, policy + hooks, workspace checkpointing, MCP, tool search,
+subagents, skills, plugins, auth, planning, and the headless SDK. See
+[examples/README.md](examples/README.md) for what each one does and how to
+run it.
 
-* `eager` — send all permitted tool definitions, preserving M1-M4 behavior.
-* `search` — send always-loaded tools plus tools discovered by `SearchTools`.
-* `auto` — use eager for small catalogs and search when tool count or
-  estimated tool-definition tokens exceed the configured threshold.
-
-`SearchTools` accepts:
-
-```json
-{
-  "query": "github issue search repository bugs",
-  "limit": 5,
-  "source_filter": "mcp:fake",
-  "include_risky": false
-}
-```
-
-Search supports regex, BM25-like lexical ranking, and hybrid ranking over tool
-name, MCP server name, description, schema property names/descriptions, tags,
-aliases, and category. Search results are filtered through the same allow and
-deny rules used by tool invocation. Loading a tool only makes its definition
-available on the next turn; the actual call still runs through policy, hooks,
-approvals, and MCP external-effect checks.
-
-Tool-search settings live under `.agent/settings.json`:
-
-```json
-{
-  "tool_search": {
-    "enabled": true,
-    "mode": "auto",
-    "strategy": "hybrid",
-    "native_provider_mode": "auto",
-    "activation_threshold_percent": 10,
-    "min_tool_count": 10,
-    "max_results": 5,
-    "max_loaded_tools": 20,
-    "max_loaded_tool_tokens": 12000,
-    "always_loaded": ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite", "SearchTools"],
-    "deferred": ["mcp__*"],
-    "disabled": [],
-    "include_schema_arguments": true,
-    "include_tool_category_hints": true,
-    "persist_discovered_tools": true
-  }
-}
-```
-
-Catalog inspection commands:
+## Developing
 
 ```sh
-code-agent tools list --cwd . --mcp-config .agent/mcp.json --all
-code-agent tools list --cwd . --mcp-config .agent/mcp.json --loaded
-code-agent tools list --cwd . --mcp-config .agent/mcp.json --deferred
-code-agent tools search "github issues" --cwd . --mcp-config .agent/mcp.json --limit 5
-code-agent tools show mcp__fake__github_list_issues --cwd . --mcp-config .agent/mcp.json
-code-agent tools stats --cwd . --mcp-config .agent/mcp.json
-code-agent tools explain-loading --cwd . --mcp-config .agent/mcp.json
-```
+# Build everything.
+cargo build --workspace
 
-The `tools` subcommands mirror the agent's runtime semantics: `allowed_tools`
-from settings (or `--allowed-tools`) narrows the registry the same way the
-agent does, and `--permission-mode` (or `permissionMode` in settings) is
-honored when computing search visibility.
+# Run unit and integration tests for all crates. No API key required.
+cargo test --workspace
 
-M5 emits `ToolCatalogBuilt`, `ToolLoadingModeResolved`,
-`ToolContextBudgetUpdated`, `ToolSearchStarted`, `ToolSearchCompleted`,
-`ToolLoaded`, `ToolDeferred`, `ToolDisabled`, and `ToolSearchFailed` events
-to the normal event stream and session JSONL. JSON log mode serializes these
-as valid JSON lines.
-
-## Subagents (M6)
-
-The parent agent can delegate focused subtasks to *subagents* through a new
-built-in `Agent` tool. Subagents run in fresh, isolated conversations with
-their own scoped tools, permission policy, MCP scope, and child session
-JSONL — they do not pollute the parent's conversation. Subagents cannot
-recursively invoke `Agent`.
-
-Define subagents either programmatically:
-
-```rust
-use code_agent_core::{AgentClient, AgentDefinition, PermissionMode, ToolRule};
-
-let security = AgentDefinition {
-    name: "security-reviewer".into(),
-    description: "Reviews code for input validation and secret handling.".into(),
-    prompt: "You are a security-focused Rust code reviewer.".into(),
-    tools: Some(vec![
-        ToolRule::ExactTool("Read".into()),
-        ToolRule::ExactTool("Grep".into()),
-        ToolRule::ExactTool("Glob".into()),
-    ]),
-    disallowed_tools: vec![
-        ToolRule::ExactTool("Edit".into()),
-        ToolRule::ExactTool("Write".into()),
-        ToolRule::ExactTool("Bash".into()),
-    ],
-    permission_mode: Some(PermissionMode::DontAsk),
-    ..Default::default()
-};
-
-let client = AgentClient::builder()
-    .agent(security)?
-    .allowed_tools(["Read", "Grep", "Glob", "Agent"])
-    .build()
-    .await?;
-```
-
-Or as project-local files in `.agent/agents/<name>.md`:
-
-```yaml
----
-name: security-reviewer
-description: Reviews Rust code for security vulnerabilities.
-tools:
-  - Read
-  - Grep
-  - Glob
-disallowed_tools:
-  - Edit
-  - Write
-  - Bash
-model: claude-sonnet-4-6
-max_turns: 8
-permission_mode: dontAsk
----
-
-You are a security-focused Rust code reviewer.
-...
-```
-
-Subagent settings live in `.agent/settings.json`:
-
-```json
-{
-  "agents": {
-    "enabled": true,
-    "path": ".agent/agents",
-    "allow_filesystem_agents": true,
-    "max_concurrent_subagents": 3,
-    "subagent_timeout_seconds": 300,
-    "persist_subagent_transcripts": true,
-    "event_visibility": "summary_only",
-    "checkpoint_policy": "required_for_mutating_tools",
-    "inherit_mcp_servers": false,
-    "inherit_approval_memory": false
-  }
-}
-```
-
-The `Agent` tool itself is not surfaced unless explicitly allowed. Even
-under `acceptEdits`, the parent must allow `Agent` (or be allowed once
-through the approval callback) before any subagent runs. Subagents always
-run with `Agent` stripped from their own tool registry, so M6 forbids
-recursive subagent spawning.
-
-CLI commands:
-
-```sh
-code-agent agents list --cwd .
-code-agent agents show security-reviewer --cwd .
-code-agent agents validate --cwd .
-code-agent agents run security-reviewer "Review src/auth.rs" --cwd .
-
-code-agent run "Review this crate for security, tests, and API design." \
-    --allowed-tools "Read,Grep,Glob,Bash,Agent" \
-    --agents .agent/agents \
-    --show-subagent-events
-
-code-agent sessions children <PARENT_SESSION_ID> --cwd .
-code-agent sessions show-child <SUBAGENT_SESSION_ID> --cwd .
-code-agent sessions export-child <SUBAGENT_SESSION_ID> --format json --cwd .
-```
-
-Subagent transcripts are persisted under
-`.agent/sessions/children/<parent>/<child>.jsonl`. The parent only sees
-`SubagentStart`, `SubagentStop`, `SubagentFailed`, `SubagentCancelled`,
-and `SubagentTimedOut` events by default — child intermediate events stay
-in the child JSONL unless `--show-subagent-events` is set.
-
-The full demo is at `examples/subagent-demo/` and is exercised offline by
-`examples/m6-subagent-demo.sh`.
-
-## Session persistence
-
-Sessions are stored as JSONL at `<cwd>/.agent/sessions/<id>.jsonl`. Each line
-is a `SessionRecord` containing a timestamp, cwd, session id, and either a
-user prompt or an `AgentEvent`. `code-agent resume <SESSION_ID>` reconstructs
-the prior conversation from this file and continues from where it left off.
-
-## Project memory
-
-If `<cwd>/AGENTS.md` exists at session start, its contents are injected as
-project instructions into the system prompt. `CLAUDE.md` is **not** loaded in
-M1.
-
-## Demo: policy-demo (M2)
-
-A second demo at `examples/policy-demo` exercises the full policy + hooks
-surface. It ships with a failing test, a `.env` file the agent must not
-modify, an `AGENTS.md`, and a `.agent/settings.json` configuring policy
-and hooks.
-
-```sh
-cd examples/policy-demo
-cargo test                     # one test fails by design
-ANTHROPIC_API_KEY=… code-agent chat \
-    --cwd . --permission-mode default --show-usage
-```
-
-The settings file disallows reading or writing any `.env*` file and
-limits Bash to `cargo test|check|fmt|clippy`. Both the `.agent` policy
-and the `BlockEnvFileWritesHook` block any attempt to modify `.env`.
-
-### Full M2 end-to-end walkthrough
-
-`examples/m2-e2e-demo.sh` is a single non-interactive script that drives
-`examples/policy-demo` through every M2 surface in one run:
-
-* loads `.agent/settings.json` (typed allow/disallow `ToolRule`s + built-in
-  hook flags),
-* fixes the failing test under `--permission-mode dontAsk` with
-  `Read,Glob,Grep,Edit,Bash,TodoWrite`,
-* lists / shows / exports the resulting session,
-* appends a follow-up turn via `code-agent continue`,
-* branches the run via `code-agent fork` with `--log-format json` and
-  prints the AgentEvent type histogram from the JSON telemetry,
-* drives a live policy denial — the agent attempts to read `.env`, the
-  `Read:**/.env*` disallow rule fires, and the script asserts the file
-  hash never changed.
-
-```sh
-export ANTHROPIC_API_KEY=...
-./examples/m2-e2e-demo.sh
-```
-
-The script is idempotent — Step 1 restores `examples/policy-demo/src/lib.rs`
-to its committed (buggy) state and clears `.agent/sessions/` on every run.
-
-## Checkpointing and rewind (M3)
-
-When checkpointing is on, the CLI snapshots the workspace before each
-`Write`/`Edit` mutation and stores the result under
-`<cwd>/.agent/checkpoints/<session-id>/`:
-
-```
-checkpoints/<session-id>/
-  checkpoints.jsonl       # index of checkpoints
-  manifests/<id>.json     # per-checkpoint metadata + tracked files
-  blobs/<sha256>          # content-addressed file contents
-```
-
-The agent loop captures snapshots **after** policy approval and **before**
-mutation. The default `failure_mode: strict` denies the mutating call
-when capture fails (e.g. file-too-large, storage cap, symlink escape) so
-the workspace is never modified without a recovery path. Set
-`failure_mode: best_effort` to demote to a warning.
-
-`Bash` is intentionally **not** checkpointed — there's no portable way
-to know what files a shell command touched. The configured
-`bash_policy` decides what to do:
-
-| Policy                            | Behavior                                                        |
-|-----------------------------------|-----------------------------------------------------------------|
-| `allow_with_warning`              | Run normally, emit a `bash_warning` event                       |
-| `require_explicit_approval` (default) | Deny unless approval came from the callback or stored memory |
-| `deny_likely_mutating_commands`   | Deny commands like `sed -i`, `mv`, `rm`, `cargo fmt`, redirects |
-
-Validation gates run after the agent completes:
-
-```sh
-code-agent run "Refactor the parser" \
-    --checkpointing on \
-    --validate "cargo test" \
-    --rewind-on-validation-failure
-```
-
-If any validation command exits non-zero (or times out), the workspace
-is rewound to the start-of-run checkpoint. **Conversation history is
-not rewound** — the next turn will continue from the existing chat,
-with files restored.
-
-Settings:
-
-```json
-{
-  "checkpointing": {
-    "enabled": true,
-    "failure_mode": "strict",
-    "create_on_user_message": true,
-    "max_checkpoint_bytes_per_file": 5242880,
-    "max_total_checkpoint_bytes_per_session": 104857600,
-    "retention": {
-      "max_checkpoints_per_session": 50,
-      "max_age_days": 14
-    },
-    "bash_policy": "require_explicit_approval"
-  },
-  "validation": {
-    "commands": ["cargo test"],
-    "timeout_seconds": 60,
-    "rewind_on_failure": false
-  }
-}
-```
-
-CLI flags:
-
-* `--checkpointing on|off` — overrides settings
-* `--validate "cargo test"` (repeatable) — post-run validation commands
-* `--validation-timeout <SECS>` — per-command timeout
-* `--rewind-on-validation-failure` — auto-rewind when validation fails
-
-`code-agent` subcommands:
-
-* `code-agent checkpoint create [DESCRIPTION]` — manual checkpoint
-* `code-agent checkpoints list [--session ID]`
-* `code-agent checkpoints show <CHECKPOINT_ID>`
-* `code-agent checkpoints diff <CHECKPOINT_ID>` — unified diff vs current files
-* `code-agent rewind <CHECKPOINT_ID> [--yes] [--dry-run] [--force-cwd]`
-
-`AgentClient` exposes the same operations programmatically:
-`create_checkpoint`, `list_checkpoints`, `diff_checkpoint`, `rewind_files`.
-
-The `examples/checkpoint-demo` directory has a one-test crate set up to
-walk through the entire flow.
-
-### Full M3 end-to-end walkthrough
-
-`examples/m3-e2e-demo.sh` is a single non-interactive script that drives
-`examples/checkpoint-demo` through every M3 surface in one run:
-
-* runs the agent under `--checkpointing on` with a `--validate "cargo test"`
-  gate and asserts the start-of-run checkpoint, per-mutation snapshots, and
-  `[validation] passed` events all fire,
-* lists / shows / diffs checkpoints via `code-agent checkpoints …`,
-* creates a manual checkpoint via `code-agent checkpoint …`,
-* previews then performs a rewind (`rewind --dry-run`, then `rewind --yes`)
-  and verifies `src/lib.rs` is restored byte-for-byte to the buggy starting
-  state while conversation history is left intact,
-* exercises auto-rewind: `--validate "false" --rewind-on-validation-failure`
-  forces the post-run gate to fail and verifies the agent's edit is
-  reverted automatically,
-* counts `[warning]` events from the `bash_policy: allow_with_warning`
-  setting so shell tool calls are visible as not-checkpointed,
-* prints the on-disk content-addressed layout under
-  `.agent/checkpoints/<session-id>/{checkpoints.jsonl, manifests/, blobs/}`.
-
-```sh
-# Either export ANTHROPIC_API_KEY or add ANTHROPIC_API_KEY=... to repo-root .env.
-./examples/m3-e2e-demo.sh
-```
-
-The script is idempotent — Step 1 runs `git checkout HEAD -- .` and
-`git clean -fd -- .` inside `examples/checkpoint-demo` to restore every
-tracked file and drop every untracked non-ignored file (`target/` and
-`.agent/sessions/`/`.agent/checkpoints/` are gitignored, so they
-survive `git clean`; the script wipes the latter two explicitly).
-
-For a smaller, no-API-key smoke test of just the checkpoint subcommands
-and rewind preview, see `examples/m3-checkpoint-demo.sh`.
-
-## Demo: bugfix-demo
-
-Quickest path:
-
-```sh
-cd examples/bugfix-demo
-cargo test          # fails: parse_token has an off-by-one bug
-code-agent run "Run the tests, find the bug, fix it, and run the tests again" \
-    --allowed-tools Read,Glob,Grep,Edit,Bash \
-    --permission-mode acceptEdits \
-    --max-turns 8
-cargo test          # passes after the agent's edit
-```
-
-The demo's `AGENTS.md` instructs the agent to edit only `src/lib.rs`.
-
-### Full end-to-end walkthrough
-
-`examples/e2e-demo.sh` is a single script that exercises every M1 surface in
-one run:
-
-* `code-agent run` with `Read`, `Edit`, `Bash` (under `dontAsk`, so it runs
-  unattended) to fix the bug in `examples/bugfix-demo`,
-* `code-agent sessions list` and a peek at the JSONL under `.agent/sessions/`,
-* `code-agent resume <id>` with `Write`, `Glob`, `Grep` for a follow-up that
-  produces `SUMMARY.md`,
-* `AGENTS.md` project memory scoping both turns.
-
-```sh
-export ANTHROPIC_API_KEY=...
-./examples/e2e-demo.sh
-```
-
-The script is idempotent — it resets `examples/bugfix-demo/src/lib.rs` to the
-buggy state and clears `.agent/sessions/` on every run.
-
-## Library use
-
-```rust
-use std::sync::Arc;
-use code_agent_core::{query, AgentOptions, PermissionMode, ToolRegistry};
-use code_agent_anthropic::{AnthropicConfig, AnthropicProvider};
-use code_agent_tools::register_builtin;
-use futures::StreamExt;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let provider = Arc::new(AnthropicProvider::new(AnthropicConfig::from_env()?)?);
-    let mut tools = ToolRegistry::new();
-    register_builtin(&mut tools);
-
-    let opts = AgentOptions {
-        cwd: std::env::current_dir()?,
-        permission_mode: PermissionMode::AcceptEdits,
-        max_turns: Some(8),
-        ..AgentOptions::default()
-    };
-
-    let mut events = query("Find and fix the bug", opts, provider, tools).await?;
-    while let Some(ev) = events.next().await {
-        println!("{ev:?}");
-    }
-    Ok(())
-}
-```
-
-For finer control (custom session sinks, resumed history, custom permission
-callbacks) construct an `Agent` via `code_agent_core::AgentBuilder`.
-
-### Long-lived `AgentClient` (M2)
-
-```rust
-use std::sync::Arc;
-use code_agent_core::{AgentClient, AgentEvent, PermissionMode};
-
-let mut client = AgentClient::builder()
-    .cwd(std::env::current_dir()?)
-    .model("claude-sonnet-4-6")
-    .permission_mode(PermissionMode::Default)
-    .allowed_tools(["Read", "Glob", "Grep", "Edit", "Write", "Bash", "TodoWrite"])
-    .provider(provider)
-    .tools(tools)
-    .build()
-    .await?;
-
-client.send_user_message("Fix the failing tests").await?;
-while let Some(ev) = client.next_event().await? {
-    if matches!(ev, AgentEvent::Result(_)) { break; }
-    println!("{ev:?}");
-}
-client.send_user_message("Now run them again").await?; // queued or interleaved
-```
-
-`AgentClient` supports `interrupt()`, `set_permission_mode(...)`, queued
-messages while busy, and clean shutdown.
-
-### Hooks and policy
-
-```rust
-use std::sync::Arc;
-use code_agent_core::{
-    BlockDangerousBashHook, BlockEnvFileWritesHook, Hooks, ToolRule,
-};
-
-// Tool-pattern registration methods return `Result<Self, HookError>` so that
-// a typo'd pattern fails loudly instead of silently widening to "match
-// every tool".
-let hooks = Hooks::new()
-    .pre_tool_use("Edit|Write", Arc::new(BlockEnvFileWritesHook::default()))?
-    .pre_tool_use("Bash", Arc::new(BlockDangerousBashHook::default()))?;
-
-let opts = code_agent_core::AgentOptions {
-    allowed_tool_rules: vec![
-        ToolRule::BashCommandRegex("^cargo (test|check|fmt|clippy)".into()),
-    ],
-    disallowed_tool_rules: vec![
-        ToolRule::FilePathGlob { tool: "Edit".into(), pattern: "**/.env*".into() },
-    ],
-    ..code_agent_core::AgentOptions::default()
-};
-```
-
-## Provider login (M10)
-
-Pick a provider, log in once, and the CLI/TUI both pull the credential
-from a unified store rather than from `ANTHROPIC_API_KEY` only.
-
-```sh
-# Provider selector — also explains visible-but-unsupported subscription
-# branches (Claude / Gemini OAuth, Codex subscription) and the supported
-# alternative for each.
-code-agent login
-
-# API-key login. `--api-key=<KEY>` or `--api-key-stdin` for scripts;
-# bare `--api-key` prompts on a real TTY.
-code-agent login anthropic --api-key=sk-ant-...
-code-agent login openai    --api-key-stdin < ./openai.key
-code-agent login gemini    --api-key=AI-...
-
-# Inspect / manage credentials.
-code-agent auth status
-code-agent auth list
-code-agent auth use anthropic
-code-agent auth refresh
-code-agent auth logout openai
-code-agent auth doctor
-
-# Provider + model picker.
-code-agent provider list
-code-agent provider use openai
-code-agent model list
-code-agent model use anthropic/claude-sonnet-4-6
-```
-
-Credential storage defaults to `auto`: prefer the OS keychain when one
-is available, otherwise fall back to a clearly opt-in file backend
-(`auth.allow_file_credential_store = true`). Tokens, OAuth codes, and
-API keys are never written to settings JSON or logs.
-
-The same surface is wired as slash commands (`/login`, `/logout`,
-`/auth`, `/provider`, `/model`) for the TUI and `code-agent chat`.
-
-See `examples/auth-demo/run.sh` for a fully offline walk-through that
-drives the fake provider end-to-end.
-
-## Testing
-
-```sh
-cargo test --workspace        # unit + integration tests, no API key required
+# Lint + format.
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
+
+# Run the CLI without installing.
+cargo run -p code-agent-cli -- run "What files are here?" \
+    --allowed-tools Read,Glob \
+    --permission-mode default
 ```
 
-Live Anthropic API tests are kept out of the default suite. `ANTHROPIC_API_KEY`
-is only needed when actually running the CLI (or wiring `AnthropicProvider`
-into your own integration test).
+The `cargo run -p code-agent-cli -- <args>` form is the easiest way to
+iterate on the CLI while developing — every CLI subcommand documented above
+works after `--`.
+
+Live provider tests are kept out of the default suite. `ANTHROPIC_API_KEY`
+(or the equivalent for OpenAI / Gemini) is only needed when actually running
+the agent against a real model.
 
 ## CI
 
