@@ -116,7 +116,8 @@ fn side_panel_view(state: &TuiAppState) -> PaneView {
         | SidePanelMode::Auth
         | SidePanelMode::Model
         | SidePanelMode::Provider
-        | SidePanelMode::Diagnostics => inspector_body(state, mode),
+        | SidePanelMode::Diagnostics
+        | SidePanelMode::Activity => inspector_body(state, mode),
         other => side_panel_body(other),
     };
     PaneView {
@@ -312,6 +313,14 @@ fn inspector_body(state: &TuiAppState, mode: SidePanelMode) -> Vec<String> {
                 )
             })
             .collect(),
+        // M13 Phase H: the activity log is a flat ring buffer of
+        // status strings already used in the bottom diagnostics
+        // strip. The Activity panel makes it scrollable / browsable.
+        SidePanelMode::Activity => state
+            .activity
+            .iter()
+            .map(|line| truncate(line, 96))
+            .collect(),
         _ => Vec::new(),
     };
     if rows.is_empty() {
@@ -421,26 +430,8 @@ fn modal_view_for(state: &TuiAppState, modal: &TuiModal) -> ModalView {
             lines.push(format!("{visible} of {total} cards match"));
             return ModalView { title, body: lines };
         }
-        TuiModal::Help => vec![
-            "Keyboard shortcuts".to_string(),
-            "".to_string(),
-            "  Tab / Shift+Tab    cycle pane focus".to_string(),
-            "  Esc                close this modal".to_string(),
-            "  Ctrl+C             cancel run / exit when idle".to_string(),
-            "  Ctrl+D             exit when composer empty".to_string(),
-            "".to_string(),
-            "Slash commands".to_string(),
-            "".to_string(),
-            "  /plan /changes /files /tools /sessions".to_string(),
-            "  /diagnostics /agents /mcp /plugins /skills".to_string(),
-            "  /usage /auth /model /provider".to_string(),
-            "  /help /keys /palette /search /history".to_string(),
-            "  /toggle-side /toggle-detail".to_string(),
-        ],
-        TuiModal::CommandPalette => vec![
-            "Command palette".to_string(),
-            "(content arrives in Phase H)".to_string(),
-        ],
+        TuiModal::Help => help_modal_body(),
+        TuiModal::CommandPalette => return palette_modal_view(state),
         TuiModal::PromptHistory => vec![
             "Prompt history".to_string(),
             "(content arrives in Phase D)".to_string(),
@@ -448,6 +439,103 @@ fn modal_view_for(state: &TuiAppState, modal: &TuiModal) -> ModalView {
         TuiModal::Custom { body, .. } => body.clone(),
     };
     ModalView { title, body }
+}
+
+/// Phase H: build the expanded help-modal body with sectioned
+/// shortcuts. Kept as a single flat Vec<String> so the existing
+/// modal renderer doesn't need to learn section semantics.
+fn help_modal_body() -> Vec<String> {
+    vec![
+        "Global navigation".to_string(),
+        String::new(),
+        "  Tab / Shift+Tab    cycle pane focus".to_string(),
+        "  Esc                close the topmost modal".to_string(),
+        "  Ctrl+C             cancel active run / exit when idle".to_string(),
+        "  Ctrl+D             exit when composer is empty".to_string(),
+        String::new(),
+        "Composer".to_string(),
+        String::new(),
+        "  Enter              submit (or commit slash command)".to_string(),
+        "  Tab                accept completion (when popup open)".to_string(),
+        "  / @                trigger slash / context completion".to_string(),
+        "  //                 escape: send a literal leading `/`".to_string(),
+        String::new(),
+        "Transcript".to_string(),
+        String::new(),
+        "  j / k / ↓ / ↑      move selection".to_string(),
+        "  g / G              jump to first / last visible card".to_string(),
+        "  e / Enter          toggle expansion of selected card".to_string(),
+        "  n / N              next / prev search match".to_string(),
+        String::new(),
+        "Side panel (inspector modes)".to_string(),
+        String::new(),
+        "  j / k / ↓ / ↑      move selection".to_string(),
+        "  g / G              jump to first / last row".to_string(),
+        String::new(),
+        "Approval modal".to_string(),
+        String::new(),
+        "  y / s              allow / allow-for-session".to_string(),
+        "  n / r / Esc        deny / deny with feedback / dismiss".to_string(),
+        String::new(),
+        "Slash commands".to_string(),
+        String::new(),
+        "  Side panels:       /plan /changes /files /tools /sessions".to_string(),
+        "                     /diagnostics /agents /mcp /plugins /skills".to_string(),
+        "                     /usage /auth /model /provider /activity".to_string(),
+        "  Modals:            /help /keys /palette /search /history".to_string(),
+        "  Toggles:           /toggle-side /toggle-detail".to_string(),
+        String::new(),
+        "  Tip:               `/palette` opens an interactive picker".to_string(),
+    ]
+}
+
+/// Phase H: render the command palette modal. The body shows the
+/// in-progress input, the filtered candidate list (capped so a
+/// short terminal doesn't overflow), a `›` selection marker, and a
+/// short footer key legend.
+fn palette_modal_view(state: &TuiAppState) -> ModalView {
+    let input = state
+        .palette
+        .as_ref()
+        .map(|p| p.input.as_str())
+        .unwrap_or("");
+    let selected = state.palette.as_ref().map(|p| p.selected).unwrap_or(0);
+    let candidates = state.palette_candidates();
+    let mut body = vec![format!("> {input}_")];
+    body.push(String::new());
+    if candidates.is_empty() {
+        body.push("  (no matches)".to_string());
+    } else {
+        // Cap to a sensible window so a terminal as small as ~20 rows
+        // still shows the input + footer. 15 leaves room for the
+        // bordered modal chrome.
+        const PALETTE_WINDOW: usize = 15;
+        let view_start = selected.saturating_sub(PALETTE_WINDOW / 2);
+        for (i, cmd) in candidates
+            .iter()
+            .enumerate()
+            .skip(view_start)
+            .take(PALETTE_WINDOW)
+        {
+            if i == selected {
+                body.push(format!("› /{cmd}"));
+            } else {
+                body.push(format!("  /{cmd}"));
+            }
+        }
+        if candidates.len() > view_start + PALETTE_WINDOW {
+            body.push(format!(
+                "  … ({} more)",
+                candidates.len() - view_start - PALETTE_WINDOW
+            ));
+        }
+    }
+    body.push(String::new());
+    body.push("  [Enter] run  [↑/↓] navigate  [Esc] cancel".to_string());
+    ModalView {
+        title: format!("Command palette · {} match(es)", candidates.len()),
+        body,
+    }
 }
 
 /// Phase B placeholder content for each [`SidePanelMode`]. Real content
@@ -468,6 +556,11 @@ fn side_panel_body(mode: SidePanelMode) -> Vec<String> {
         | SidePanelMode::Provider => "Phase G",
         SidePanelMode::Diagnostics => "Phase G",
         SidePanelMode::Usage => "Phase H",
+        // Activity is handled by inspector_body; this placeholder
+        // path is never reached for it. Keep the arm to satisfy
+        // exhaustiveness so future variants surface as compile
+        // errors.
+        SidePanelMode::Activity => "Phase H",
     };
     vec![
         format!("{} panel", mode.label()),

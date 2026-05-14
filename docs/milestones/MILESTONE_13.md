@@ -20,8 +20,8 @@ phase has merged and the acceptance checklist at the bottom is satisfied.
 | D | Composer popup: slash / `@token` autocomplete, batched-paste handling, popup overlay renderer | PR #111 (merged) |
 | E | Diff / approval workbench + plan dashboard wired to SDK events | PR #112 (merged) |
 | F | Inspectors: tools, MCP, agents, skills, plugins | PR #113 (merged) |
-| G | Session browser, recovery flow, auth / model / provider selectors, diagnostics panel, live approval callback | in progress |
-| H | Command palette, help overlay, keybindings, accessibility, activity panel | planned |
+| G | Session browser, recovery flow, auth / model / provider selectors, diagnostics panel, live approval callback | PR #114 (merged) |
+| H | Command palette, help overlay, keybindings, activity panel, accessibility | in progress |
 | I | New CLI subcommands, `examples/tui-demo`, UI telemetry events | planned |
 
 ## Phase A — Live SDK-driven app shell
@@ -497,3 +497,43 @@ After the initial Phase G commit, a Codex review surfaced two critical bugs and 
 * Detail panel for inspectors — selecting a session / account / model and seeing the full record. The `Phase G` detail panel still uses the Phase B placeholders for these modes.
 * `RequestRevision` as a first-class SDK decision — currently mapped to `Deny { reason }` because the SDK doesn't model revision. A future SDK extension can fold it in.
 * Diagnostic detail (location, metadata, full suggestion text) — the inspector shows a one-line summary only; the Phase E detail-panel `RawJson` mode can render the full record once Phase H surfaces it.
+
+## Phase H — Command palette, help overlay, activity panel
+
+### What's new
+
+| Module | Purpose |
+|--------|---------|
+| `layout.rs` | New `SidePanelMode::Activity` variant (rounded out by `label` / `config_key` / `from_config_key`). |
+| `completion.rs` | `SLASH_COMMANDS` catalog gains `activity`. |
+| `state.rs` | New `PaletteState { input, selected }` and `palette: Option<PaletteState>`; `activity_selection: Option<usize>` joins the per-panel selection set. `inspector_list_len` / `inspector_selected_index` / `set_inspector_selection` extended for the Activity mode. `apply_slash_command` now seeds palette state on `/palette`. New `palette_candidates()` returns the case-insensitive substring filter over `SLASH_COMMANDS`. `apply_modal_key` gains `CommandPalette` arms: `Char` → input, `Backspace` → pop, `Up`/`Down` → selection, `Enter` → close + run the highlighted command, `Esc` → close + clear palette state. |
+| `view.rs` | New `palette_modal_view` renders the input prompt, the windowed (max 15) filtered list with a `›` selection glyph, an overflow summary when the candidate list is larger than the window, and a one-line key legend. The Activity arm of `inspector_body` renders the bounded activity log as a scrollable list. The Help modal now uses a sectioned body (`help_modal_body`) grouped by Global navigation / Composer / Transcript / Side panel / Approval modal / Slash commands. |
+
+### Keyboard (Phase H additions)
+
+| Key | Action |
+|-----|--------|
+| (palette open) `Char` | Append to filter; reset selection to 0 |
+| (palette open) `Backspace` | Pop one char from filter |
+| (palette open) `Up` / `Down` | Move selection |
+| (palette open) `Enter` | Close palette, run the highlighted slash command |
+| (palette open) `Esc` | Close palette, clear input |
+| `/activity` | Switch the side panel to the Activity log |
+
+### Tests
+
+`state.rs` adds 4 reducer tests:
+`palette_slash_opens_modal_and_seeds_state`,
+`palette_filter_navigate_and_enter`,
+`palette_backspace_and_esc_reset`,
+`activity_panel_is_inspector_mode`.
+
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` are clean.
+
+### Out of scope for Phase H
+
+* Free-text input modal for the `r`-revise approval path — still deferred. The palette infrastructure is the right home but requires a routing primitive that returns text to the caller; Phase I picks that up if it shows value.
+* Accessibility-mode toggles (no-emoji, plain-text-only, high-contrast palette) — would require renderer changes in `fullscreen.rs` and a settings key; deferred behind a user request.
+* A central keybinding registry that consolidates the per-pane key handlers in `state.rs` — large refactor. The expanded `help_modal_body` documents the existing scheme.
+* Prompt history modal (`/history`) — would share machinery with the palette but needs the composer's `PromptHistory` ring buffer surfaced. Defer to Phase I.
+* `@file` workspace candidates for the composer popup — still deferred to Phase I when the workspace scanner lands alongside the demo example.

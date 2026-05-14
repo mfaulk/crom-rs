@@ -219,6 +219,21 @@ pub struct TuiAppState {
     /// `None`-initialized-then-seeds-to-0 semantics as the inspector
     /// cursors.
     pub diagnostic_selection: Option<usize>,
+    /// Phase H: selection cursor for the Activity panel.
+    pub activity_selection: Option<usize>,
+    /// Phase H: state carried by the command palette modal.
+    /// `None` when the palette is closed.
+    pub palette: Option<PaletteState>,
+}
+
+/// Phase H: state carried by the command palette modal. The reducer
+/// rebuilds the filtered candidate list on demand from `input`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaletteState {
+    /// Current input buffer (the substring filter).
+    pub input: String,
+    /// Highlighted row in the filtered candidate list.
+    pub selected: usize,
 }
 
 /// Phase G: TUI-local mirror of [`code_agent_sdk::error::Diagnostic`].
@@ -314,6 +329,8 @@ impl TuiAppState {
             inspector_selection: InspectorSelection::default(),
             diagnostics: Vec::new(),
             diagnostic_selection: None,
+            activity_selection: None,
+            palette: None,
         }
     }
 
@@ -342,6 +359,7 @@ impl TuiAppState {
             SidePanelMode::Model => Some(self.inspectors.models.len()),
             SidePanelMode::Provider => Some(self.inspectors.providers.len()),
             SidePanelMode::Diagnostics => Some(self.diagnostics.len()),
+            SidePanelMode::Activity => Some(self.activity.len()),
             _ => None,
         }
     }
@@ -366,6 +384,7 @@ impl TuiAppState {
             SidePanelMode::Model => self.inspector_selection.models,
             SidePanelMode::Provider => self.inspector_selection.providers,
             SidePanelMode::Diagnostics => self.diagnostic_selection,
+            SidePanelMode::Activity => self.activity_selection,
             _ => return None,
         }
         .unwrap_or(0);
@@ -399,6 +418,7 @@ impl TuiAppState {
             SidePanelMode::Model => self.inspector_selection.models = value,
             SidePanelMode::Provider => self.inspector_selection.providers = value,
             SidePanelMode::Diagnostics => self.diagnostic_selection = value,
+            SidePanelMode::Activity => self.activity_selection = value,
             _ => {}
         }
     }
@@ -822,6 +842,9 @@ impl TuiAppState {
                 let _ = self.layout.pop_modal();
                 // Cancelling search clears the in-progress input.
                 self.search_input.clear();
+                // Phase H: also clear palette state so a re-open
+                // starts from a blank input.
+                self.palette = None;
                 Vec::new()
             }
             (_, KeyEvent::CtrlC) => match self.run_status {
@@ -863,8 +886,70 @@ impl TuiAppState {
             (TuiModal::Custom { id, .. }, KeyEvent::Char(c)) if id == PLAN_APPROVAL_MODAL_ID => {
                 self.handle_plan_approval_key(c)
             }
+            // M13 Phase H: command palette interactivity.
+            (TuiModal::CommandPalette, KeyEvent::Char(c)) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.input.push(c);
+                    p.selected = 0;
+                }
+                Vec::new()
+            }
+            (TuiModal::CommandPalette, KeyEvent::Backspace) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.input.pop();
+                    p.selected = 0;
+                }
+                Vec::new()
+            }
+            (TuiModal::CommandPalette, KeyEvent::Up) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.selected = p.selected.saturating_sub(1);
+                }
+                Vec::new()
+            }
+            (TuiModal::CommandPalette, KeyEvent::Down) => {
+                let len = self.palette_candidates().len();
+                if let Some(p) = self.palette.as_mut() {
+                    if len > 0 {
+                        p.selected = (p.selected + 1).min(len - 1);
+                    }
+                }
+                Vec::new()
+            }
+            (TuiModal::CommandPalette, KeyEvent::Enter) => {
+                let candidates = self.palette_candidates();
+                let picked = self
+                    .palette
+                    .as_ref()
+                    .and_then(|p| candidates.get(p.selected).copied())
+                    .map(str::to_string);
+                let _ = self.layout.pop_modal();
+                self.palette = None;
+                if let Some(cmd) = picked {
+                    self.apply_slash_command(&cmd);
+                }
+                Vec::new()
+            }
             _ => Vec::new(),
         }
+    }
+
+    /// Phase H: filter the canonical slash-command list by the
+    /// palette's current input substring (case-insensitive).
+    /// Returns an empty list when the palette is closed.
+    pub fn palette_candidates(&self) -> Vec<&'static str> {
+        let input = match &self.palette {
+            Some(p) => p.input.trim().to_ascii_lowercase(),
+            None => return Vec::new(),
+        };
+        if input.is_empty() {
+            return SLASH_COMMANDS.to_vec();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|c| c.to_ascii_lowercase().contains(&input))
+            .collect()
     }
 
     fn handle_approval_key(&mut self, c: char) -> Vec<TuiAction> {
@@ -1080,6 +1165,10 @@ impl TuiAppState {
                 self.layout.push_modal(TuiModal::Help);
             }
             "palette" => {
+                // Phase H: open the palette with a fresh input
+                // buffer. The reducer rebuilds the filtered list on
+                // every keypress from `slash_candidates`.
+                self.palette = Some(PaletteState::default());
                 self.layout.push_modal(TuiModal::CommandPalette);
             }
             "search" => {
@@ -2627,6 +2716,86 @@ mod tests {
         assert_eq!(s.inspector_list_len(SidePanelMode::Model), Some(1));
         assert_eq!(s.inspector_list_len(SidePanelMode::Provider), Some(1));
         assert_eq!(s.inspector_list_len(SidePanelMode::Diagnostics), Some(1));
+    }
+
+    #[test]
+    // Phase H: /palette opens the palette modal and seeds an empty
+    // PaletteState.
+    fn palette_slash_opens_modal_and_seeds_state() {
+        let mut s = fresh_state();
+        s.apply_slash_command("palette");
+        assert!(matches!(
+            s.layout.current_modal(),
+            Some(TuiModal::CommandPalette)
+        ));
+        assert!(s.palette.is_some());
+        assert!(s.palette.as_ref().unwrap().input.is_empty());
+    }
+
+    #[test]
+    // Phase H: typing into the palette filters the candidate list
+    // case-insensitively; arrow keys move selection; Enter executes
+    // the highlighted command (closing the modal).
+    fn palette_filter_navigate_and_enter() {
+        let mut s = fresh_state();
+        s.apply_slash_command("palette");
+        // Type "AC" — should filter to commands containing "ac"
+        // case-insensitively (e.g. `activity`).
+        s.apply(TuiInbound::Key(KeyEvent::Char('A')));
+        s.apply(TuiInbound::Key(KeyEvent::Char('c')));
+        let candidates = s.palette_candidates();
+        assert!(
+            candidates.contains(&"activity"),
+            "expected `activity` in candidates: {candidates:?}"
+        );
+        // Navigate to last and execute — `Enter` closes the palette
+        // and runs the picked slash command.
+        let target_idx = candidates.iter().position(|c| *c == "activity").unwrap();
+        for _ in 0..target_idx {
+            s.apply(TuiInbound::Key(KeyEvent::Down));
+        }
+        s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(s.layout.current_modal().is_none(), "palette should close");
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Activity);
+    }
+
+    #[test]
+    // Phase H: Backspace deletes from input and resets selection.
+    // Esc clears palette state so a re-open starts blank.
+    fn palette_backspace_and_esc_reset() {
+        let mut s = fresh_state();
+        s.apply_slash_command("palette");
+        for c in "help".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        assert_eq!(s.palette.as_ref().unwrap().input, "help");
+        s.apply(TuiInbound::Key(KeyEvent::Backspace));
+        assert_eq!(s.palette.as_ref().unwrap().input, "hel");
+        s.apply(TuiInbound::Key(KeyEvent::Esc));
+        assert!(s.palette.is_none());
+        assert!(s.layout.current_modal().is_none());
+    }
+
+    #[test]
+    // Phase H: the Activity side panel is an inspector mode with
+    // selection driven by inspector_list_len + selected_index over
+    // the bounded activity log.
+    fn activity_panel_is_inspector_mode() {
+        let mut s = fresh_state();
+        s.push_activity("alpha".to_string());
+        s.push_activity("beta".to_string());
+        assert_eq!(s.inspector_list_len(SidePanelMode::Activity), Some(2));
+        // Resize to Full so /activity actually focuses the panel.
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        s.apply_slash_command("activity");
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Activity);
+        assert_eq!(s.layout.focus, FocusPane::SidePanel);
+        // 'G' jumps to last row.
+        s.apply(TuiInbound::Key(KeyEvent::Char('G')));
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Activity), Some(1));
     }
 
     #[test]
