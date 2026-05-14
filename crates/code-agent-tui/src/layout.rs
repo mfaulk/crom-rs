@@ -447,6 +447,7 @@ mod tests {
             SidePanelMode::Auth,
             SidePanelMode::Model,
             SidePanelMode::Provider,
+            SidePanelMode::Activity,
         ] {
             let key = mode.config_key();
             assert_eq!(SidePanelMode::from_config_key(key), Some(mode));

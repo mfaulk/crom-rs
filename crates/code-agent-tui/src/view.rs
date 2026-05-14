@@ -132,7 +132,12 @@ fn side_panel_view(state: &TuiAppState) -> PaneView {
 /// reads "(none configured)" so a user who turns on `/tools` on a
 /// fresh project sees something more useful than placeholder text.
 fn inspector_body(state: &TuiAppState, mode: SidePanelMode) -> Vec<String> {
-    let selected = state.inspector_selected_index(mode);
+    let global_selected = state.inspector_selected_index(mode);
+    // `window_start` tracks the offset applied by per-mode windowing
+    // (currently only Activity) so the selection glyph hits the right
+    // *rendered* row after slicing. Other modes don't window, so the
+    // offset is 0.
+    let mut window_start: usize = 0;
     let rows: Vec<String> = match mode {
         SidePanelMode::Tools => state
             .inspectors
@@ -315,12 +320,22 @@ fn inspector_body(state: &TuiAppState, mode: SidePanelMode) -> Vec<String> {
             .collect(),
         // M13 Phase H: the activity log is a flat ring buffer of
         // status strings already used in the bottom diagnostics
-        // strip. The Activity panel makes it scrollable / browsable.
-        SidePanelMode::Activity => state
-            .activity
-            .iter()
-            .map(|line| truncate(line, 96))
-            .collect(),
+        // strip. The Activity panel makes it browsable; we window
+        // the rendered slice around the current selection so the
+        // selection glyph stays visible (the renderer itself is a
+        // plain List with no offset).
+        SidePanelMode::Activity => {
+            const ACTIVITY_WINDOW: usize = 12;
+            let len = state.activity.len();
+            let sel = global_selected.unwrap_or(0);
+            let start = sel.saturating_sub(ACTIVITY_WINDOW / 2);
+            let end = (start + ACTIVITY_WINDOW).min(len);
+            window_start = start;
+            state.activity[start..end]
+                .iter()
+                .map(|line| truncate(line, 96))
+                .collect()
+        }
         _ => Vec::new(),
     };
     if rows.is_empty() {
@@ -329,9 +344,14 @@ fn inspector_body(state: &TuiAppState, mode: SidePanelMode) -> Vec<String> {
             "(none configured)".to_string(),
         ];
     }
+    // Translate the global selection index into a per-rendered-row
+    // index by subtracting any window offset applied by the per-mode
+    // arm above. For non-windowed modes `window_start` stays 0, so
+    // this is identity.
+    let selected_in_rows = global_selected.and_then(|g| g.checked_sub(window_start));
     let mut out = Vec::with_capacity(rows.len());
     for (i, row) in rows.into_iter().enumerate() {
-        if Some(i) == selected {
+        if Some(i) == selected_in_rows {
             out.push(format!("› {row}"));
         } else {
             out.push(format!("  {row}"));
@@ -445,47 +465,28 @@ fn modal_view_for(state: &TuiAppState, modal: &TuiModal) -> ModalView {
 /// shortcuts. Kept as a single flat Vec<String> so the existing
 /// modal renderer doesn't need to learn section semantics.
 fn help_modal_body() -> Vec<String> {
+    // Trimmed to ~16 lines so the body fits within the
+    // `centered_rect(70, 60, area)` modal viewport on a 24-row
+    // terminal (60% ≈ 14 inner rows after borders + title).
+    // `/palette` is the discoverable surface for the full command
+    // catalog, so this overlay is a quick-reference card.
     vec![
-        "Global navigation".to_string(),
+        "Navigation:   Tab/Shift+Tab cycle panes · Esc close modal".to_string(),
+        "              Ctrl+C cancel run / exit · Ctrl+D exit if composer empty".to_string(),
         String::new(),
-        "  Tab / Shift+Tab    cycle pane focus".to_string(),
-        "  Esc                close the topmost modal".to_string(),
-        "  Ctrl+C             cancel active run / exit when idle".to_string(),
-        "  Ctrl+D             exit when composer is empty".to_string(),
+        "Composer:     Enter submit · Tab accept popup · / @ trigger completions".to_string(),
+        "              // sends a literal leading slash".to_string(),
         String::new(),
-        "Composer".to_string(),
+        "Transcript:   j/k/↓/↑ move · g/G first/last · e/Enter expand · n/N matches".to_string(),
+        "Inspectors:   j/k/↓/↑ move · g/G first/last".to_string(),
         String::new(),
-        "  Enter              submit (or commit slash command)".to_string(),
-        "  Tab                accept completion (when popup open)".to_string(),
-        "  / @                trigger slash / context completion".to_string(),
-        "  //                 escape: send a literal leading `/`".to_string(),
+        "Approval:     y allow · s allow-session · n deny · r request-revision · Esc dismiss"
+            .to_string(),
         String::new(),
-        "Transcript".to_string(),
-        String::new(),
-        "  j / k / ↓ / ↑      move selection".to_string(),
-        "  g / G              jump to first / last visible card".to_string(),
-        "  e / Enter          toggle expansion of selected card".to_string(),
-        "  n / N              next / prev search match".to_string(),
-        String::new(),
-        "Side panel (inspector modes)".to_string(),
-        String::new(),
-        "  j / k / ↓ / ↑      move selection".to_string(),
-        "  g / G              jump to first / last row".to_string(),
-        String::new(),
-        "Approval modal".to_string(),
-        String::new(),
-        "  y / s              allow / allow-for-session".to_string(),
-        "  n / r / Esc        deny / deny with feedback / dismiss".to_string(),
-        String::new(),
-        "Slash commands".to_string(),
-        String::new(),
-        "  Side panels:       /plan /changes /files /tools /sessions".to_string(),
-        "                     /diagnostics /agents /mcp /plugins /skills".to_string(),
-        "                     /usage /auth /model /provider /activity".to_string(),
-        "  Modals:            /help /keys /palette /search /history".to_string(),
-        "  Toggles:           /toggle-side /toggle-detail".to_string(),
-        String::new(),
-        "  Tip:               `/palette` opens an interactive picker".to_string(),
+        "Slash:        /palette opens the full picker. Common commands:".to_string(),
+        "  /plan /changes /files /tools /sessions /diagnostics /activity".to_string(),
+        "  /agents /mcp /plugins /skills /usage /auth /model /provider".to_string(),
+        "  /help /search /history /toggle-side /toggle-detail".to_string(),
     ]
 }
 

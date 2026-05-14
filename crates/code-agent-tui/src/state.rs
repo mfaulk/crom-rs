@@ -441,7 +441,7 @@ impl TuiAppState {
             body: vec![
                 summary,
                 String::new(),
-                "  [y] yes  [s] yes-for-session  [n] no/Esc  [r] deny-with-feedback".to_string(),
+                "  [y] yes  [s] yes-for-session  [n] no/Esc  [r] request-revision".to_string(),
             ],
         });
     }
@@ -695,28 +695,37 @@ impl TuiAppState {
         // focus, so the composer never sees them. Cycling focus away
         // from the composer also closes any stale completion popup
         // so navigation keys in the new pane aren't ambiguous.
-        match k {
-            KeyEvent::Tab => {
-                self.layout.focus = self.layout.focus.next(
-                    self.layout.side_panel_rendered(),
-                    self.layout.detail_panel_rendered(),
-                );
-                if !matches!(self.layout.focus, FocusPane::Composer) {
-                    self.composer_popup = None;
+        //
+        // Phase H: when the command palette is the active modal,
+        // Tab is a palette-accept key (matches the composer popup's
+        // Tab-to-accept convention). Route modal keys *before* the
+        // global Tab cycle for that case so the cycle doesn't fire
+        // behind the modal.
+        let palette_active = matches!(self.layout.current_modal(), Some(TuiModal::CommandPalette));
+        if !palette_active {
+            match k {
+                KeyEvent::Tab => {
+                    self.layout.focus = self.layout.focus.next(
+                        self.layout.side_panel_rendered(),
+                        self.layout.detail_panel_rendered(),
+                    );
+                    if !matches!(self.layout.focus, FocusPane::Composer) {
+                        self.composer_popup = None;
+                    }
+                    return Vec::new();
                 }
-                return Vec::new();
-            }
-            KeyEvent::ShiftTab => {
-                self.layout.focus = self.layout.focus.prev(
-                    self.layout.side_panel_rendered(),
-                    self.layout.detail_panel_rendered(),
-                );
-                if !matches!(self.layout.focus, FocusPane::Composer) {
-                    self.composer_popup = None;
+                KeyEvent::ShiftTab => {
+                    self.layout.focus = self.layout.focus.prev(
+                        self.layout.side_panel_rendered(),
+                        self.layout.detail_panel_rendered(),
+                    );
+                    if !matches!(self.layout.focus, FocusPane::Composer) {
+                        self.composer_popup = None;
+                    }
+                    return Vec::new();
                 }
-                return Vec::new();
+                _ => {}
             }
-            _ => {}
         }
         // When a modal is open, route keys to the modal-specific
         // handler. The SearchTranscript modal accumulates an input
@@ -916,15 +925,18 @@ impl TuiAppState {
                 }
                 Vec::new()
             }
-            (TuiModal::CommandPalette, KeyEvent::Enter) => {
+            // Phase H: both Enter and Tab accept the highlighted
+            // palette entry — Tab matches the composer popup's
+            // accept-key convention so users have one muscle memory.
+            (TuiModal::CommandPalette, KeyEvent::Enter)
+            | (TuiModal::CommandPalette, KeyEvent::Tab) => {
                 let candidates = self.palette_candidates();
                 let picked = self
                     .palette
                     .as_ref()
                     .and_then(|p| candidates.get(p.selected).copied())
                     .map(str::to_string);
-                let _ = self.layout.pop_modal();
-                self.palette = None;
+                self.close_palette();
                 if let Some(cmd) = picked {
                     self.apply_slash_command(&cmd);
                 }
@@ -932,6 +944,27 @@ impl TuiAppState {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Phase H: open the command palette modal *and* seed the
+    /// `palette` state in one step. The invariant is "palette modal
+    /// open ⇔ `state.palette` is Some" — callers should prefer this
+    /// helper over raw `push_modal(CommandPalette)`.
+    pub fn open_palette(&mut self) {
+        self.palette = Some(PaletteState::default());
+        self.layout.push_modal(TuiModal::CommandPalette);
+    }
+
+    /// Phase H: close the command palette modal *and* clear the
+    /// `palette` state. Counterpart to [`Self::open_palette`].
+    pub fn close_palette(&mut self) {
+        // Remove just the palette modal if it sits on the stack; we
+        // intentionally don't pop blindly because another modal may
+        // have layered on top.
+        self.layout
+            .modal_stack
+            .retain(|m| !matches!(m, TuiModal::CommandPalette));
+        self.palette = None;
     }
 
     /// Phase H: filter the canonical slash-command list by the
@@ -1165,11 +1198,7 @@ impl TuiAppState {
                 self.layout.push_modal(TuiModal::Help);
             }
             "palette" => {
-                // Phase H: open the palette with a fresh input
-                // buffer. The reducer rebuilds the filtered list on
-                // every keypress from `slash_candidates`.
-                self.palette = Some(PaletteState::default());
-                self.layout.push_modal(TuiModal::CommandPalette);
+                self.open_palette();
             }
             "search" => {
                 self.layout.push_modal(TuiModal::SearchTranscript);
@@ -2793,9 +2822,52 @@ mod tests {
         s.apply_slash_command("activity");
         assert_eq!(s.layout.side_panel.mode, SidePanelMode::Activity);
         assert_eq!(s.layout.focus, FocusPane::SidePanel);
-        // 'G' jumps to last row.
+        // Switching panels itself appends an activity entry, so the
+        // log has 3 rows now ("alpha" / "beta" / the side-panel
+        // log line). 'G' jumps to the last index.
+        let last = s.activity.len() - 1;
         s.apply(TuiInbound::Key(KeyEvent::Char('G')));
-        assert_eq!(s.inspector_selected_index(SidePanelMode::Activity), Some(1));
+        assert_eq!(
+            s.inspector_selected_index(SidePanelMode::Activity),
+            Some(last)
+        );
+    }
+
+    #[test]
+    // Phase H review-fix: Tab in the open palette accepts the
+    // highlighted entry rather than cycling pane focus.
+    fn palette_tab_accepts_like_enter() {
+        let mut s = fresh_state();
+        s.open_palette();
+        // Type `tools` to filter to a single candidate.
+        for c in "tools".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        assert!(s.palette.is_none(), "palette should close on Tab accept");
+        assert!(s.layout.current_modal().is_none());
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Tools);
+    }
+
+    #[test]
+    // Phase H review-fix: open_palette / close_palette maintain the
+    // "modal open ⇔ palette state Some" invariant. close_palette
+    // removes only the CommandPalette modal from the stack, even
+    // when other modals are layered on top.
+    fn open_close_palette_maintain_invariant() {
+        let mut s = fresh_state();
+        s.open_palette();
+        assert!(s.palette.is_some());
+        assert!(matches!(
+            s.layout.current_modal(),
+            Some(TuiModal::CommandPalette)
+        ));
+        // Layer a Help modal on top.
+        s.layout.push_modal(TuiModal::Help);
+        s.close_palette();
+        assert!(s.palette.is_none());
+        // Help modal survives.
+        assert!(matches!(s.layout.current_modal(), Some(TuiModal::Help)));
     }
 
     #[test]

@@ -522,13 +522,26 @@ After the initial Phase G commit, a Codex review surfaced two critical bugs and 
 
 ### Tests
 
-`state.rs` adds 4 reducer tests:
+`state.rs` adds 6 reducer tests:
 `palette_slash_opens_modal_and_seeds_state`,
 `palette_filter_navigate_and_enter`,
 `palette_backspace_and_esc_reset`,
-`activity_panel_is_inspector_mode`.
+`activity_panel_is_inspector_mode`,
+`palette_tab_accepts_like_enter`,
+`open_close_palette_maintain_invariant`.
 
-All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` are clean.
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (1029 tests total) are clean.
+
+### Review fixes
+
+After the initial Phase H commit, a Codex review surfaced four important issues and two nits. All addressed in a follow-up:
+
+1. **Help modal clipped** on a 24-row terminal because the renderer is a stateless `List` with no scroll and the body was ~40 lines. Trimmed the body to ~16 lines so it fits the `centered_rect(70, 60, ...)` viewport; `/palette` remains the discoverable home for the full command catalog.
+2. **Activity panel not actually scrollable** — selection moved past the visible area silently. The Activity arm of `inspector_body` now slices a 12-row window around the global selection (the inspector wrapper translates `global_selected` through `window_start` so the `›` glyph still lands on the right rendered row).
+3. **Palette invariant leak**: `push_modal(CommandPalette)` without seeding `palette` was a silent no-op. Added `open_palette()` / `close_palette()` helpers that maintain "modal open ⇔ palette Some" and `apply_slash_command("palette")` now calls `open_palette`. `close_palette` removes only the palette modal (other layered modals survive).
+4. **`Tab` in the palette** cycled pane focus behind the modal. The global Tab/Shift+Tab handler now skips when the palette is the active modal, and `apply_modal_key` accepts the highlighted entry on `Tab` (matches the composer popup's accept-key convention).
+5. **Nit**: the approval modal body labeled `r` as `deny-with-feedback` while the reducer maps it to a fixed `"user requested revision"` Deny. Relabeled to `[r] request-revision` so the UI matches what the SDK actually sees.
+6. **Nit**: added `SidePanelMode::Activity` to the `config_key` round-trip test in `layout.rs`.
 
 ### Out of scope for Phase H
 
