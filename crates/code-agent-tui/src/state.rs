@@ -2298,6 +2298,35 @@ mod tests {
     }
 
     #[test]
+    // Phase F: non-nav keys in an inspector-focused side panel are
+    // also swallowed (don't escape into the composer). Locking in
+    // the behavior so a typo against a stale or empty inspector
+    // doesn't accidentally compose a prompt.
+    fn inspector_nonnav_key_does_not_modify_composer() {
+        use crate::inspectors::{InspectorTool, Inspectors};
+        let mut s = fresh_state().with_inspectors(Inspectors {
+            tools: vec![InspectorTool {
+                name: "Bash".into(),
+                ..Default::default()
+            }],
+            ..Inspectors::default()
+        });
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        s.apply_slash_command("tools");
+        assert_eq!(s.layout.focus, FocusPane::SidePanel);
+        // 'x' isn't a nav key; with the side panel focused on an
+        // inspector mode it must be swallowed, not appended to the
+        // composer.
+        let before = s.composer.buffer.clone();
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Char('x')));
+        assert!(actions.is_empty());
+        assert_eq!(s.composer.buffer, before, "composer must not change");
+    }
+
+    #[test]
     // Phase F: when a stale snapshot has a selection index that is now
     // out of bounds (e.g. a hot reload trimmed the list), the
     // `inspector_selected_index` clamp returns the last valid index
