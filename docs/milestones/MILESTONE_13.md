@@ -14,8 +14,8 @@ phase has merged and the acceptance checklist at the bottom is satisfied.
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| A | Live SDK-driven app shell: event loop, composer, transcript, status line; fake-provider end-to-end; `cmd_tui` no longer a stub | in progress |
-| B | `TuiAppState` layout primitives, side / detail panel infra, modal stack | planned |
+| A | Live SDK-driven app shell: event loop, composer, transcript, status line; fake-provider end-to-end; `cmd_tui` no longer a stub | PR #103 (under review) |
+| B | `TuiAppState` layout primitives, side / detail panel infra, modal stack, multi-pane renderer, slash routing | in progress |
 | C | Virtualized timeline, event grouping, comprehensive renderers, search / navigation | planned |
 | D | Composer maturity: slash / `@file` / context completions, history search, multiline | planned |
 | E | Diff / approval workbench + plan dashboard + deviation modal | planned |
@@ -133,6 +133,62 @@ All M1–M12 tests continue to pass.
 
 * Multi-pane layout (side / detail panel, modal stack) — Phase B.
 * Event grouping, virtualized scrollback, transcript search — Phase C.
+
+## Phase B — Layout primitives, side / detail panels, modal stack
+
+### What's new
+
+| Module | Purpose |
+|--------|---------|
+| `layout.rs` | Pure layout state: `FocusPane`, `SidePanelMode` (14 variants), `DetailPanelMode` (10 variants), `SidePanelState`, `DetailPanelState`, `TuiModal`, `LayoutMode` (Full / Compact / Tiny), `LayoutState`. Reducer-friendly types only — content rendering lives in `view.rs`. |
+| `view.rs` | Adapter that builds a `UiFrame` from `TuiAppState`. Each `SidePanelMode` / `DetailPanelMode` resolves to a placeholder pane title + body for Phase B; later phases (E, F, G, H) replace the placeholder bodies with real plan / inspector / session / palette content. |
+| `fullscreen.rs` | Extended `UiFrame` with `layout_mode`, `side_panel`, `detail_panel`, `modal`, `composer_focused`, `transcript_focused`. The renderer paints a responsive multi-pane layout: transcript + sidebar across the top, detail panel below (Full); single-column M9 layout (Compact); transcript + composer only (Tiny). Modal overlays paint last, centered via a `Clear` + bordered `List`. |
+| `state.rs` | Now owns a `LayoutState`. The reducer intercepts `Tab` / `Shift+Tab` for pane cycling, pops the topmost modal on `Esc` when one is open, and routes `/foo` slash commands into the layout state instead of submitting a prompt. New helpers: `set_side_panel`, `set_detail_panel`, `push_modal`, `pop_modal`. |
+| `composer.rs` | New `KeyEvent::ShiftTab` variant (no-op in the composer, consumed before composer dispatch by the reducer). |
+
+### Slash commands (Phase B scope)
+
+| Command | Action |
+|---------|--------|
+| `/plan` `/changes` `/files` `/tools` `/sessions` `/diagnostics` `/agents` (alias `/subagents`) `/mcp` `/plugins` `/skills` `/usage` `/auth` `/model` `/provider` | Switch the side panel mode and focus it. |
+| `/help` `/keys` | Open the Help modal. |
+| `/palette` | Open the Command Palette modal (content arrives in Phase H). |
+| `/search` | Open the Transcript Search modal (content arrives in Phase C). |
+| `/history` | Open the Prompt History modal (content arrives in Phase D). |
+| `/toggle-side` `/side` | Toggle side panel visibility. |
+| `/toggle-detail` `/detail` | Toggle detail panel visibility. |
+| Unknown `/foo` | Logged to the activity panel; no prompt is submitted. |
+
+### Responsive layout thresholds
+
+| Mode | Min width × height | Renders |
+|------|---------------------|---------|
+| Full | 100 × 18 | status + (transcript ┃ side) + detail + diagnostics + composer + footer |
+| Compact | 60 × 10 | status + transcript + diagnostics + composer + footer (no side/detail) |
+| Tiny | smaller | transcript + composer only (no status, footer, or panels) |
+
+The renderer additionally re-evaluates the responsive mode against the actual terminal `Rect` so a state that says "Full" still degrades gracefully if the terminal shrinks between resize events.
+
+### Keyboard
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Focus the next visible pane. |
+| `Shift+Tab` | Focus the previous visible pane. |
+| `Esc` | Close the topmost modal if one is open. (Composer Esc stays a no-op.) |
+
+### Tests
+
+`layout.rs` adds 6 unit tests (responsive thresholds, resize preserves selection, focus skip-invisible cycle, side-panel mode round-trip, modal stack LIFO, panel suppression in compact/tiny). `state.rs` adds 6 reducer tests (Tab/Shift+Tab cycle, Esc modal pop, slash panel switch, /help, unknown-slash diagnostic, resize-recomputes-mode). `view.rs` adds 4 tests (default state → Plan side panel, hidden panel omits pane, modal title stability, detail placeholder bodies non-empty). `fullscreen.rs` adds 4 snapshot tests (full multi-pane render, modal overlay, Tiny drops chrome, Full-on-tiny-terminal degrades safely). The existing M9 + M13 Phase A tests continue to pass.
+
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (958 tests total) are clean.
+
+### Out of scope for Phase B
+
+* Real content for any side / detail panel — those land in their owning phase (E, F, G, H).
+* Real command palette content — Phase H.
+* Transcript search behavior beyond opening the modal — Phase C.
+* `@file` autocomplete in the composer — Phase D.
 * Slash / `@file` / context-insertion autocomplete — Phase D.
 * Diff / approval workbench, plan dashboard — Phase E.
 * Tools / MCP / agents / skills / plugins inspectors — Phase F.

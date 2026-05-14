@@ -10,9 +10,7 @@ use std::sync::Arc;
 use code_agent_core::{ComposerConfig, StatusLineContext};
 use code_agent_sdk::fake_provider::EchoFakeProvider;
 use code_agent_sdk::{AgentRuntime, ProviderConfig};
-use code_agent_tui::{
-    drive_single_prompt, fullscreen, ApprovalContext, ComposerState, RunStatus, TuiAppState,
-};
+use code_agent_tui::{drive_single_prompt, fullscreen, ComposerState, RunStatus, TuiAppState};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -102,15 +100,7 @@ async fn frame_renders_user_and_agent_text() {
 
     let backend = TestBackend::new(80, 16);
     let mut term = Terminal::new(backend).unwrap();
-    let frame = fullscreen::UiFrame {
-        status_template: &state.status_template,
-        status_ctx: state.status_ctx.clone(),
-        diagnostics: state.activity.clone(),
-        transcript: state.transcript.clone(),
-        composer: state.composer.buffer.as_str(),
-        footer: "[?] help",
-        approval: None::<ApprovalContext<'_>>,
-    };
+    let frame = code_agent_tui::build_ui_frame(&state, "[?] help");
     fullscreen::draw(&mut term, frame).unwrap();
     let dump = buffer_to_string(&term);
     assert!(dump.contains("live-shell-test"), "{dump}");

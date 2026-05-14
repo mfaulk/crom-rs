@@ -31,9 +31,8 @@ use tokio::sync::mpsc;
 
 use code_agent_sdk::{AgentRequest, AgentRun, AgentRuntime, AgentSdkError, SdkEvent};
 
-use crate::approval::ApprovalContext;
 use crate::composer::KeyEvent;
-use crate::fullscreen::{draw, UiFrame};
+use crate::fullscreen::draw;
 use crate::state::{TuiAction, TuiAppState, TuiInbound};
 
 /// Errors raised by the live TUI loop.
@@ -216,15 +215,7 @@ impl TuiApp {
     }
 
     fn draw(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), TuiAppError> {
-        let frame = UiFrame {
-            status_template: &self.state.status_template,
-            status_ctx: self.state.status_ctx.clone(),
-            diagnostics: self.state.activity.clone(),
-            transcript: self.state.transcript.clone(),
-            composer: self.state.composer.buffer.as_str(),
-            footer: &self.footer,
-            approval: None::<ApprovalContext<'_>>,
-        };
+        let frame = crate::view::build_ui_frame(&self.state, &self.footer);
         draw(terminal, frame)?;
         Ok(())
     }
@@ -306,7 +297,14 @@ fn decode_key(k: crossterm::event::KeyEvent) -> Option<KeyEvent> {
             }
         }
         KeyCode::Backspace => Some(KeyEvent::Backspace),
-        KeyCode::Tab => Some(KeyEvent::Tab),
+        KeyCode::Tab => {
+            if shift {
+                Some(KeyEvent::ShiftTab)
+            } else {
+                Some(KeyEvent::Tab)
+            }
+        }
+        KeyCode::BackTab => Some(KeyEvent::ShiftTab),
         KeyCode::Up => Some(KeyEvent::Up),
         KeyCode::Down => Some(KeyEvent::Down),
         KeyCode::Left => Some(KeyEvent::Left),
