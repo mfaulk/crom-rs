@@ -22,6 +22,7 @@ use crate::completion::{
 };
 use crate::composer::{ComposerState, KeyAction, KeyEvent};
 use crate::event_adapter::map_sdk_event;
+use crate::inspectors::Inspectors;
 use crate::layout::{DetailPanelMode, FocusPane, LayoutState, SidePanelMode, TuiModal};
 use crate::transcript::EventCard;
 
@@ -198,6 +199,29 @@ pub struct TuiAppState {
     /// Phase E: most recent proposed patch (the diff workbench's
     /// payload). Populated from `SdkEvent::PatchProposed`.
     pub last_patch: Option<PatchSet>,
+    /// Phase F: snapshot of host registries (tools / MCP / subagents /
+    /// skills / plugins) for the side-panel inspectors. The reducer
+    /// only reads from this; the host populates it before
+    /// constructing `TuiAppState`. Defaults to empty.
+    pub inspectors: Inspectors,
+    /// Phase F: per-inspector selection index. Each field tracks the
+    /// row a user has selected in that panel; `None` means
+    /// uninitialized (first nav key seeds it to 0). Indices may point
+    /// at a stale row if the host hot-reloads the snapshot; the
+    /// renderer clamps to the visible range.
+    pub inspector_selection: InspectorSelection,
+}
+
+/// Per-inspector selection cursor. Kept as a small named struct
+/// rather than five loose fields so reducer code can pattern-match
+/// against the active side-panel mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectorSelection {
+    pub tools: Option<usize>,
+    pub mcp: Option<usize>,
+    pub subagents: Option<usize>,
+    pub skills: Option<usize>,
+    pub plugins: Option<usize>,
 }
 
 /// Phase E: the minimal pending-approval record the TUI needs to
@@ -243,6 +267,78 @@ impl TuiAppState {
             current_plan: None,
             pending_approval: None,
             last_patch: None,
+            inspectors: Inspectors::empty(),
+            inspector_selection: InspectorSelection::default(),
+        }
+    }
+
+    /// Replace the inspector snapshot. Convenience for callers that
+    /// pre-build the registries (e.g. CLI startup) and want to hand
+    /// them to a freshly-constructed `TuiAppState`. Returns `self` so
+    /// it composes with [`Self::with_initial_side_panel`].
+    pub fn with_inspectors(mut self, inspectors: Inspectors) -> Self {
+        self.inspectors = inspectors;
+        self
+    }
+
+    /// Return the inspector list length for the active side panel
+    /// mode, or `None` if the mode is not an inspector mode. Helper
+    /// for tests and the renderer.
+    pub fn inspector_list_len(&self, mode: SidePanelMode) -> Option<usize> {
+        match mode {
+            SidePanelMode::Tools => Some(self.inspectors.tools.len()),
+            SidePanelMode::Mcp => Some(self.inspectors.mcp.len()),
+            SidePanelMode::Subagents => Some(self.inspectors.subagents.len()),
+            SidePanelMode::Skills => Some(self.inspectors.skills.len()),
+            SidePanelMode::Plugins => Some(self.inspectors.plugins.len()),
+            _ => None,
+        }
+    }
+
+    /// Return the selected row index for the active side panel mode,
+    /// clamped to a valid index when the snapshot is non-empty.
+    /// Returns `None` when the snapshot is empty or the mode is not
+    /// an inspector mode.
+    pub fn inspector_selected_index(&self, mode: SidePanelMode) -> Option<usize> {
+        let len = self.inspector_list_len(mode)?;
+        if len == 0 {
+            return None;
+        }
+        let raw = match mode {
+            SidePanelMode::Tools => self.inspector_selection.tools,
+            SidePanelMode::Mcp => self.inspector_selection.mcp,
+            SidePanelMode::Subagents => self.inspector_selection.subagents,
+            SidePanelMode::Skills => self.inspector_selection.skills,
+            SidePanelMode::Plugins => self.inspector_selection.plugins,
+            _ => return None,
+        }
+        .unwrap_or(0);
+        Some(raw.min(len - 1))
+    }
+
+    /// Mutate the selection cursor for the given inspector mode.
+    /// Saturates at the list bounds; no-op when the mode is not an
+    /// inspector mode or when the list is empty.
+    fn move_inspector_selection(&mut self, mode: SidePanelMode, delta: isize) {
+        let Some(len) = self.inspector_list_len(mode) else {
+            return;
+        };
+        if len == 0 {
+            return;
+        }
+        let cur = self.inspector_selected_index(mode).unwrap_or(0) as isize;
+        let next = (cur + delta).clamp(0, len as isize - 1) as usize;
+        self.set_inspector_selection(mode, Some(next));
+    }
+
+    fn set_inspector_selection(&mut self, mode: SidePanelMode, value: Option<usize>) {
+        match mode {
+            SidePanelMode::Tools => self.inspector_selection.tools = value,
+            SidePanelMode::Mcp => self.inspector_selection.mcp = value,
+            SidePanelMode::Subagents => self.inspector_selection.subagents = value,
+            SidePanelMode::Skills => self.inspector_selection.skills = value,
+            SidePanelMode::Plugins => self.inspector_selection.plugins = value,
+            _ => {}
         }
     }
 
@@ -529,6 +625,35 @@ impl TuiAppState {
             // into the composer and randomly trigger `g`/`e`/`n`.
             return Vec::new();
         }
+        // Phase F: when the side panel is focused on an inspector
+        // mode, j/k/Up/Down/g/G drive selection through the inspector
+        // rows. Other keys are swallowed so a user navigating the
+        // inspector doesn't accidentally type into the composer.
+        //
+        // Non-inspector side-panel modes (Plan, Changes, Files,
+        // Sessions, etc.) intentionally fall through to the composer
+        // so users can still type slash commands while the side panel
+        // is the focused pane — matches pre-Phase-F behavior.
+        if matches!(self.layout.focus, FocusPane::SidePanel)
+            && self
+                .inspector_list_len(self.layout.side_panel.mode)
+                .is_some()
+        {
+            match k {
+                KeyEvent::CtrlC => {
+                    return match self.run_status {
+                        RunStatus::Running => vec![TuiAction::CancelRun],
+                        RunStatus::Idle => vec![TuiAction::Exit],
+                    };
+                }
+                KeyEvent::CtrlD => return vec![TuiAction::Exit],
+                _ => {}
+            }
+            if let Some(actions) = self.apply_inspector_nav_key(k) {
+                return actions;
+            }
+            return Vec::new();
+        }
         let action = self.composer.handle_key(k);
         // Anything that may have mutated the composer buffer requires
         // a popup refresh. Submit (which clears the buffer) closes the
@@ -727,6 +852,49 @@ impl TuiAppState {
                     let new = current.saturating_sub(1);
                     self.selected_card_id = Some(self.transcript[visible[new]].id);
                 }
+                Some(Vec::new())
+            }
+            _ => None,
+        }
+    }
+
+    /// Phase F: side-panel inspector navigation. Returns `Some(actions)`
+    /// when the key was handled (so the caller should NOT also forward
+    /// it to the composer), `None` otherwise. Only fires while
+    /// `FocusPane::SidePanel` is the focus and the panel mode is one
+    /// of the inspector modes.
+    fn apply_inspector_nav_key(&mut self, k: KeyEvent) -> Option<Vec<TuiAction>> {
+        let mode = self.layout.side_panel.mode;
+        let len = self.inspector_list_len(mode)?;
+        if len == 0 {
+            // No rows to navigate. Swallow nav keys silently so they
+            // don't fall through to a composer write.
+            return matches!(
+                k,
+                KeyEvent::Char('j')
+                    | KeyEvent::Char('k')
+                    | KeyEvent::Char('g')
+                    | KeyEvent::Char('G')
+                    | KeyEvent::Up
+                    | KeyEvent::Down
+            )
+            .then(Vec::new);
+        }
+        match k {
+            KeyEvent::Char('j') | KeyEvent::Down => {
+                self.move_inspector_selection(mode, 1);
+                Some(Vec::new())
+            }
+            KeyEvent::Char('k') | KeyEvent::Up => {
+                self.move_inspector_selection(mode, -1);
+                Some(Vec::new())
+            }
+            KeyEvent::Char('g') => {
+                self.set_inspector_selection(mode, Some(0));
+                Some(Vec::new())
+            }
+            KeyEvent::Char('G') => {
+                self.set_inspector_selection(mode, Some(len - 1));
                 Some(Vec::new())
             }
             _ => None,
@@ -1973,6 +2141,178 @@ mod tests {
         )));
         assert!(s.last_patch.is_some());
         assert_eq!(s.layout.detail_panel.mode, DetailPanelMode::Diff);
+    }
+
+    #[test]
+    // Phase F: with_inspectors replaces the snapshot and the
+    // per-mode length getters reflect the new data.
+    fn with_inspectors_replaces_snapshot() {
+        use crate::inspectors::{InspectorPlugin, InspectorTool, Inspectors};
+        let s = fresh_state().with_inspectors(Inspectors {
+            tools: vec![InspectorTool {
+                name: "Bash".to_string(),
+                description: "run a shell command".to_string(),
+                permission: "execute_bash".to_string(),
+            }],
+            plugins: vec![InspectorPlugin {
+                name: "x".to_string(),
+                version: Some("0.1".to_string()),
+                enabled: true,
+                scope: "user".to_string(),
+                status: "loaded".to_string(),
+                component_total: 3,
+            }],
+            ..Inspectors::default()
+        });
+        assert_eq!(s.inspector_list_len(SidePanelMode::Tools), Some(1));
+        assert_eq!(s.inspector_list_len(SidePanelMode::Plugins), Some(1));
+        assert_eq!(s.inspector_list_len(SidePanelMode::Mcp), Some(0));
+        // Non-inspector modes report None so the renderer can short-circuit.
+        assert_eq!(s.inspector_list_len(SidePanelMode::Plan), None);
+    }
+
+    #[test]
+    // Phase F: j/Down/k/Up walk inspector selection inside the
+    // focused side-panel when the panel mode is an inspector mode.
+    fn inspector_j_k_navigates_selection() {
+        use crate::inspectors::{InspectorTool, Inspectors};
+        let tools = vec![
+            InspectorTool {
+                name: "Bash".into(),
+                description: "shell".into(),
+                permission: "execute_bash".into(),
+            },
+            InspectorTool {
+                name: "Read".into(),
+                description: "read a file".into(),
+                permission: "read_only".into(),
+            },
+            InspectorTool {
+                name: "Write".into(),
+                description: "write a file".into(),
+                permission: "write_fs".into(),
+            },
+        ];
+        let mut s = fresh_state().with_inspectors(Inspectors {
+            tools,
+            ..Inspectors::default()
+        });
+        // Need Full layout for the side panel to render, otherwise
+        // apply_slash_command keeps focus on the composer.
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        // Switch to Tools panel and focus it.
+        s.apply_slash_command("tools");
+        assert_eq!(s.layout.focus, FocusPane::SidePanel);
+        // Initial state: no selection key has been pressed yet.
+        assert!(s.inspector_selection.tools.is_none());
+        // First `j` initializes selection at 0 then moves to 1.
+        // The reducer seeds the starting cursor at 0, so a single
+        // `j` moves to index 1. Two `j`s pin at 2 (last index).
+        s.apply(TuiInbound::Key(KeyEvent::Char('j')));
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(1));
+        s.apply(TuiInbound::Key(KeyEvent::Char('j')));
+        s.apply(TuiInbound::Key(KeyEvent::Char('j'))); // saturate
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(2));
+        // k moves up; saturates at 0.
+        s.apply(TuiInbound::Key(KeyEvent::Char('k')));
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(1));
+        s.apply(TuiInbound::Key(KeyEvent::Char('k')));
+        s.apply(TuiInbound::Key(KeyEvent::Char('k')));
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(0));
+        // G jumps to last; g jumps to first.
+        s.apply(TuiInbound::Key(KeyEvent::Char('G')));
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(2));
+        s.apply(TuiInbound::Key(KeyEvent::Char('g')));
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(0));
+    }
+
+    #[test]
+    // Phase F: when the inspector list is empty, navigation keys are
+    // swallowed silently and never escape into the composer buffer.
+    fn inspector_nav_on_empty_list_is_inert() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        s.apply_slash_command("mcp");
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Mcp);
+        assert_eq!(s.layout.focus, FocusPane::SidePanel);
+        // 'j' on an empty MCP list does not move selection or fall
+        // through to the composer.
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Char('j')));
+        assert!(actions.is_empty());
+        assert!(s.composer.buffer.is_empty());
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Mcp), None);
+    }
+
+    #[test]
+    // Phase F: switching panels preserves the per-mode selection so a
+    // user can flick between Tools and Skills and find their cursor
+    // where they left it.
+    fn inspector_selection_is_per_mode() {
+        use crate::inspectors::{InspectorSkill, InspectorTool, Inspectors};
+        let mut s = fresh_state().with_inspectors(Inspectors {
+            tools: vec![
+                InspectorTool {
+                    name: "a".into(),
+                    ..Default::default()
+                },
+                InspectorTool {
+                    name: "b".into(),
+                    ..Default::default()
+                },
+            ],
+            skills: vec![
+                InspectorSkill {
+                    name: "x".into(),
+                    ..Default::default()
+                },
+                InspectorSkill {
+                    name: "y".into(),
+                    ..Default::default()
+                },
+                InspectorSkill {
+                    name: "z".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Inspectors::default()
+        });
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        s.apply_slash_command("tools");
+        s.apply(TuiInbound::Key(KeyEvent::Char('G')));
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(1));
+        s.apply_slash_command("skills");
+        s.apply(TuiInbound::Key(KeyEvent::Char('j')));
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Skills), Some(1));
+        // Switch back: Tools selection survived.
+        s.apply_slash_command("tools");
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(1));
+    }
+
+    #[test]
+    // Phase F: when a stale snapshot has a selection index that is now
+    // out of bounds (e.g. a hot reload trimmed the list), the
+    // `inspector_selected_index` clamp returns the last valid index
+    // rather than panicking on the renderer.
+    fn inspector_selection_clamps_to_visible_range() {
+        use crate::inspectors::{InspectorTool, Inspectors};
+        let mut s = fresh_state().with_inspectors(Inspectors {
+            tools: vec![InspectorTool {
+                name: "only".into(),
+                ..Default::default()
+            }],
+            ..Inspectors::default()
+        });
+        s.inspector_selection.tools = Some(42);
+        assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(0));
     }
 
     #[test]
