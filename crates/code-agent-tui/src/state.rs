@@ -84,7 +84,12 @@ pub enum RunStatus {
 /// Top-level TUI state. Phase B added `layout` for the multi-pane
 /// cockpit; Phase C adds transcript navigation + search state.
 /// Later phases extend without breaking this surface.
+///
+/// `#[non_exhaustive]` reserves the right to add private fields in
+/// future phases without forcing every literal construction to update.
+/// Internal code in this crate constructs the type via [`Self::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TuiAppState {
     pub composer: ComposerState,
     pub transcript: Vec<EventCard>,
@@ -113,6 +118,12 @@ pub struct TuiAppState {
     /// Input buffer for the in-progress search modal (filled when the
     /// SearchTranscript modal is open).
     pub search_input: String,
+    /// Cached visible indices for the active `search_query`. Recomputed
+    /// only when the query or transcript content changes, so the
+    /// renderer's per-frame call to `visible_card_indices` is cheap
+    /// even for large transcripts with case-insensitive substring
+    /// matching.
+    visible_cache: Option<Vec<usize>>,
 }
 
 impl TuiAppState {
@@ -141,13 +152,26 @@ impl TuiAppState {
             expanded_card_ids: HashSet::new(),
             search_query: None,
             search_input: String::new(),
+            visible_cache: None,
         }
     }
 
     /// Return the indices into `self.transcript` for the cards that
     /// pass the current search filter. With no filter active, returns
     /// `0..transcript.len()`.
+    ///
+    /// Uses an internal cache so a repeated call in the same draw
+    /// cycle is O(visible). The cache is invalidated by
+    /// `push_transcript` and by any mutation of `search_query` that
+    /// goes through the reducer's modal path.
     pub fn visible_card_indices(&self) -> Vec<usize> {
+        if let Some(cached) = &self.visible_cache {
+            return cached.clone();
+        }
+        self.compute_visible_indices()
+    }
+
+    fn compute_visible_indices(&self) -> Vec<usize> {
         match &self.search_query {
             Some(q) if !q.is_empty() => self
                 .transcript
@@ -157,6 +181,14 @@ impl TuiAppState {
                 .collect(),
             _ => (0..self.transcript.len()).collect(),
         }
+    }
+
+    fn invalidate_search_cache(&mut self) {
+        self.visible_cache = None;
+    }
+
+    fn refresh_search_cache(&mut self) {
+        self.visible_cache = Some(self.compute_visible_indices());
     }
 
     /// Is the given card expanded? An expanded card with empty
@@ -246,13 +278,31 @@ impl TuiAppState {
         if let Some(modal) = self.layout.current_modal().cloned() {
             return self.apply_modal_key(modal, k);
         }
-        // Transcript-focused navigation. Only fires when the user is
-        // browsing the transcript pane; the composer pane gets the
-        // key otherwise.
+        // Transcript-focused navigation. While the transcript pane is
+        // focused, the composer is intentionally read-only: typing
+        // characters does not modify its buffer, and unmapped keys are
+        // swallowed. Only global exits (Ctrl+C / Ctrl+D) escape this
+        // mode without first cycling focus back to the composer.
         if matches!(self.layout.focus, FocusPane::Transcript) {
+            match k {
+                KeyEvent::CtrlC => {
+                    return match self.run_status {
+                        RunStatus::Running => vec![TuiAction::CancelRun],
+                        RunStatus::Idle => vec![TuiAction::Exit],
+                    };
+                }
+                KeyEvent::CtrlD => return vec![TuiAction::Exit],
+                _ => {}
+            }
             if let Some(actions) = self.apply_transcript_nav_key(k) {
                 return actions;
             }
+            // Any other key (including unmapped chars and Up/Down when
+            // visible_card_indices is empty) is swallowed — the
+            // composer never sees it. Without this guard, typing
+            // "agent" while focused on the transcript would write "at"
+            // into the composer and randomly trigger `g`/`e`/`n`.
+            return Vec::new();
         }
         match self.composer.handle_key(k) {
             KeyAction::Submit(prompt) => {
@@ -319,6 +369,10 @@ impl TuiAppState {
                 self.search_query = if q.is_empty() { None } else { Some(q) };
                 self.search_input.clear();
                 let _ = self.layout.pop_modal();
+                // Search filter changed; recompute the cached visible
+                // set eagerly so the per-frame `visible_card_indices`
+                // call is cheap even for long transcripts.
+                self.refresh_search_cache();
                 // Jump selection to the first visible match.
                 let first = self
                     .visible_card_indices()
@@ -365,12 +419,16 @@ impl TuiAppState {
                 Some(Vec::new())
             }
             KeyEvent::Char('e') | KeyEvent::Enter => {
-                if let Some(id) = self.selected_card_id {
-                    if self.expanded_card_ids.contains(&id) {
-                        self.expanded_card_ids.remove(&id);
-                    } else {
-                        self.expanded_card_ids.insert(id);
-                    }
+                // Resolve to the currently-visible cursor in case
+                // `selected_card_id` points at a card that aged out of
+                // the ring buffer. Toggling a vanished id silently
+                // mutates state that's not rendered.
+                let cursor_id = self.transcript[visible[current]].id;
+                self.selected_card_id = Some(cursor_id);
+                if self.expanded_card_ids.contains(&cursor_id) {
+                    self.expanded_card_ids.remove(&cursor_id);
+                } else {
+                    self.expanded_card_ids.insert(cursor_id);
                 }
                 Some(Vec::new())
             }
@@ -585,14 +643,22 @@ impl TuiAppState {
         card.id = self.next_card_id;
         self.next_card_id = self.next_card_id.wrapping_add(1);
         self.transcript.push(card);
-        // Bounded ring buffer; oldest cards drop first. Any selection
-        // or expansion pointing at an evicted id is preserved as-is —
-        // helpers (`is_card_expanded`, selection navigation) ignore
-        // ids that no longer correspond to a visible card.
+        // Bounded ring buffer; oldest cards drop first. As we evict,
+        // drop their ids from the expansion set and clear the
+        // selection cursor if it points at an evicted card. Without
+        // this, `expanded_card_ids` would grow unboundedly across a
+        // long session.
         if self.transcript.len() > TRANSCRIPT_CAP {
             let excess = self.transcript.len() - TRANSCRIPT_CAP;
-            self.transcript.drain(..excess);
+            for evicted in self.transcript.drain(..excess) {
+                self.expanded_card_ids.remove(&evicted.id);
+                if self.selected_card_id == Some(evicted.id) {
+                    self.selected_card_id = None;
+                }
+            }
         }
+        // Search results may have changed; invalidate cache.
+        self.invalidate_search_cache();
     }
 
     fn push_activity(&mut self, label: String) {
@@ -1199,6 +1265,119 @@ mod tests {
         assert_eq!(s.selected_card_id, Some(2));
         s.apply(TuiInbound::Key(KeyEvent::Char('N')));
         assert_eq!(s.selected_card_id, Some(0));
+    }
+
+    #[test]
+    // Typing characters while the transcript pane is focused is
+    // swallowed — they must not leak into the composer buffer.
+    fn transcript_focused_swallows_unmapped_chars() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        push_user_card(&mut s, "anchor");
+        // Focus transcript.
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        assert_eq!(s.layout.focus, FocusPane::Transcript);
+        for c in "agent".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        assert!(
+            s.composer.buffer.is_empty(),
+            "composer absorbed transcript-focused keystrokes: {:?}",
+            s.composer.buffer
+        );
+    }
+
+    #[test]
+    // With the transcript pane focused and an empty visible set
+    // (e.g. zero matches), Up/Down still must not leak to composer.
+    fn transcript_focused_empty_visible_swallows_arrows() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        // Focus transcript with nothing in it.
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        s.apply(TuiInbound::Key(KeyEvent::Down));
+        s.apply(TuiInbound::Key(KeyEvent::Up));
+        s.apply(TuiInbound::Key(KeyEvent::Char('j')));
+        assert!(s.composer.buffer.is_empty());
+    }
+
+    #[test]
+    // Ctrl+C and Ctrl+D still escape from transcript focus.
+    fn transcript_focused_ctrl_c_and_d_still_global() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        // Ctrl+D from transcript focus with empty composer exits.
+        assert_eq!(
+            s.apply(TuiInbound::Key(KeyEvent::CtrlD)),
+            vec![TuiAction::Exit]
+        );
+        // Ctrl+C with a running run cancels rather than exiting.
+        s.run_status = RunStatus::Running;
+        assert_eq!(
+            s.apply(TuiInbound::Key(KeyEvent::CtrlC)),
+            vec![TuiAction::CancelRun]
+        );
+    }
+
+    #[test]
+    // Evicting old cards drops their ids from expanded_card_ids and
+    // clears the selection cursor if it pointed at one of them.
+    fn ring_buffer_eviction_cleans_orphan_ids() {
+        let mut s = fresh_state();
+        // Fill the transcript right up to its cap and expand the
+        // first three cards.
+        for i in 0..TRANSCRIPT_CAP {
+            push_user_card(&mut s, &format!("c{i}"));
+            if i < 3 {
+                s.expanded_card_ids.insert(i as u64);
+            }
+        }
+        // Point selection at the card that is about to be evicted.
+        s.selected_card_id = Some(0);
+        // Push one more card — id 0 is now drained.
+        push_user_card(&mut s, "tail");
+        assert!(!s.expanded_card_ids.contains(&0));
+        assert!(s.selected_card_id.is_none());
+        // Push two more to drain ids 1 and 2 → their expansion bits
+        // also clear.
+        push_user_card(&mut s, "tail2");
+        push_user_card(&mut s, "tail3");
+        assert!(!s.expanded_card_ids.contains(&1));
+        assert!(!s.expanded_card_ids.contains(&2));
+    }
+
+    #[test]
+    // Pressing `e` while selection points at an evicted card
+    // resolves to the visible cursor and toggles its expansion
+    // instead.
+    fn expand_resolves_evicted_selection_to_cursor() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        push_user_card(&mut s, "a");
+        push_user_card(&mut s, "b");
+        // Pretend selection points at a card that no longer exists.
+        s.selected_card_id = Some(99);
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        s.apply(TuiInbound::Key(KeyEvent::Char('e')));
+        // Selection now points at the visible cursor (most recent),
+        // and that card is expanded.
+        let new_selected = s.selected_card_id.unwrap();
+        assert!(s.is_card_expanded(new_selected));
+        // The vanished id was not toggled.
+        assert!(!s.is_card_expanded(99));
     }
 
     #[test]
