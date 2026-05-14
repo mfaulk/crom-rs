@@ -7490,16 +7490,376 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
     let status_ctx =
         m9::build_default_status_ctx(&cwd, &settings, args.session.as_deref(), None, false);
     let composer = code_agent_tui::ComposerState::new(settings.ui.composer.clone());
-    let state = code_agent_tui::TuiAppState::new(
+    // Phase F: pre-load read-only snapshots of the host registries
+    // (tools, MCP, agents, skills, plugins) so the side-panel
+    // inspectors have real content. Failures are best-effort: a
+    // missing skill directory or unreadable plugin entry leaves that
+    // category empty rather than aborting TUI startup; diagnostics
+    // are surfaced to the activity panel instead of stderr so the
+    // user can see why an inspector is empty.
+    let (inspectors, diagnostics) = build_inspector_snapshot_for_tui(&cwd, &settings);
+    let mut state = code_agent_tui::TuiAppState::new(
         composer,
         settings.ui.status_line.template.clone(),
         status_ctx,
-    );
+    )
+    .with_inspectors(inspectors);
+    for diag in diagnostics {
+        state.push_activity(diag);
+    }
     let app = code_agent_tui::TuiApp::new(runtime, state);
     app.run()
         .await
         .map_err(|e| anyhow!("tui exited with error: {e}"))?;
     Ok(())
+}
+
+/// Phase F: assemble an [`code_agent_tui::Inspectors`] snapshot from
+/// the host's real registries, honoring the user's settings flags
+/// and merging plugin-supplied components so the inspectors match
+/// what a real `code-agent run` would see. Returns the snapshot
+/// plus a list of human-readable diagnostics (one per loader
+/// failure or registration warning) that the caller seeds into the
+/// activity panel.
+fn build_inspector_snapshot_for_tui(
+    cwd: &std::path::Path,
+    settings: &code_agent_core::Settings,
+) -> (code_agent_tui::Inspectors, Vec<String>) {
+    use code_agent_tui::{
+        InspectorMcp, InspectorPlugin, InspectorSkill, InspectorSubagent, InspectorTool, Inspectors,
+    };
+
+    let mut snapshot = Inspectors::empty();
+    let mut diagnostics: Vec<String> = Vec::new();
+
+    // --- Tools: built-in tool registry. Cheap (no I/O).
+    let mut tools = code_agent_core::ToolRegistry::new();
+    code_agent_tools::register_builtin_with_limits(
+        &mut tools,
+        code_agent_tools::ToolLimits::default(),
+    );
+    for t in tools.iter() {
+        snapshot.tools.push(InspectorTool {
+            name: t.name().to_string(),
+            description: t.description().to_string(),
+            permission: permission_kind_label(t.permission_kind()).to_string(),
+        });
+    }
+
+    // --- Skills: respect `settings.skills.enabled`; an explicit
+    // `false` produces an empty inspector (parity with the run path).
+    let skills_enabled = settings
+        .skills
+        .as_ref()
+        .and_then(|s| s.enabled)
+        .unwrap_or(true);
+    let mut skill_registry = code_agent_core::SkillRegistry::new();
+    if skills_enabled {
+        match load_skill_registry_for_tui(cwd, settings) {
+            Ok(reg) => skill_registry = reg,
+            Err(e) => diagnostics.push(format!("skills load failed: {e}")),
+        }
+    }
+
+    // --- Subagents: respect `settings.agents.enabled`,
+    // `allow_filesystem_agents`, `builtins`, and `path`.
+    let mut agent_registry = code_agent_core::AgentRegistry::new();
+    let agents_enabled = settings
+        .agents
+        .as_ref()
+        .and_then(|s| s.enabled)
+        .unwrap_or(true);
+    if agents_enabled {
+        load_agent_registry_for_tui(cwd, settings, &mut agent_registry, &mut diagnostics);
+    }
+
+    // --- MCP: configured servers. The handshake itself is reserved
+    // for Phase G+.
+    let mut mcp_options = match code_agent_mcp::load_mcp_options(
+        cwd,
+        settings.mcp.as_ref(),
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(opts) => opts,
+        Err(e) => {
+            diagnostics.push(format!("mcp options load failed: {e}"));
+            code_agent_mcp::McpOptions::default()
+        }
+    };
+
+    // --- Plugins: build runtime then merge plugin-contributed
+    // components into the skills/agents/mcp registries so the
+    // inspector matches what the run path would see. The TUI
+    // doesn't yet accept --plugin-dir / --no-plugins (Phase I).
+    let plugin_build = plugins::build_for_invocation(cwd, settings, Vec::new(), false);
+    let mut slash_defs: Vec<code_agent_core::CustomSlashCommandDefinition> = Vec::new();
+    let (plugin_registry, warnings) = plugins::apply_to_registries(
+        plugin_build,
+        &mut skill_registry,
+        &mut slash_defs,
+        &mut agent_registry,
+        &mut mcp_options,
+    );
+    for w in warnings {
+        diagnostics.push(format!("plugin merge: {w}"));
+    }
+
+    // --- Project the merged registries into the snapshot ----------
+
+    for (name, cfg) in &mcp_options.servers {
+        let (transport, endpoint, entries) = match cfg {
+            code_agent_mcp::McpServerConfig::Stdio(c) => (
+                "stdio".to_string(),
+                redacted_stdio_endpoint(&c.command, c.args.len()),
+                c.env.len(),
+            ),
+            code_agent_mcp::McpServerConfig::StreamableHttp(c) => (
+                "http".to_string(),
+                redacted_http_endpoint(&c.url),
+                c.headers.len(),
+            ),
+        };
+        snapshot.mcp.push(InspectorMcp {
+            name: name.clone(),
+            transport,
+            endpoint,
+            config_entries: entries,
+        });
+    }
+
+    for summary in agent_registry.list() {
+        snapshot.subagents.push(InspectorSubagent {
+            name: summary.name,
+            description: summary.description,
+            model: summary.model,
+            max_turns: summary.max_turns,
+            tool_count: summary.tool_count,
+        });
+    }
+
+    for summary in skill_registry.list() {
+        snapshot.skills.push(InspectorSkill {
+            name: summary.name,
+            description: summary.description,
+            source: summary.source.as_str().to_string(),
+            resource_count: summary.resource_count,
+        });
+    }
+
+    for summary in plugin_registry.summaries() {
+        let status = match &summary.status {
+            code_agent_core::PluginStatus::Loaded => "loaded".to_string(),
+            code_agent_core::PluginStatus::Disabled => "disabled".to_string(),
+            code_agent_core::PluginStatus::Error { reason } => {
+                format!("error: {}", truncate(reason, 40))
+            }
+        };
+        snapshot.plugins.push(InspectorPlugin {
+            name: summary.name,
+            version: summary.version,
+            scope: summary.scope.as_str().to_string(),
+            enabled: summary.enabled,
+            status,
+            component_total: summary.component_summary.total(),
+        });
+    }
+
+    (snapshot, diagnostics)
+}
+
+fn permission_kind_label(kind: code_agent_core::permission::PermissionKind) -> &'static str {
+    use code_agent_core::permission::PermissionKind::*;
+    match kind {
+        ReadOnly => "read_only",
+        Mutating => "mutating",
+        Execution => "execution",
+        External => "external",
+        Orchestration => "orchestration",
+    }
+}
+
+/// Build a redacted endpoint string for a stdio MCP server. We
+/// emit the command only — arg strings often carry tokens or
+/// secret flags, so the inspector shows a count instead.
+fn redacted_stdio_endpoint(command: &str, args_len: usize) -> String {
+    if args_len == 0 {
+        command.to_string()
+    } else {
+        format!("{command} (+{args_len} args)")
+    }
+}
+
+/// Build a redacted endpoint string for an HTTP MCP server. Strips
+/// `userinfo`, `query`, and `fragment` segments because they can
+/// carry bearer tokens or session keys. We avoid pulling in a URL
+/// parser dependency for this — a hand-strip is sufficient.
+fn redacted_http_endpoint(url: &str) -> String {
+    let raw = url.trim();
+    let (scheme, rest) = match raw.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => return raw.to_string(),
+    };
+    // Strip user:pass@ if present.
+    let rest = match rest.split_once('@') {
+        Some((_, after)) => after,
+        None => rest,
+    };
+    // Drop query / fragment.
+    let stop = rest.find(['?', '#']).unwrap_or(rest.len());
+    format!("{scheme}://{}", &rest[..stop])
+}
+
+/// Phase F: populate a subagent registry from settings + filesystem,
+/// honoring `agents.allow_filesystem_agents`, `agents.builtins`, and
+/// `agents.path`. Each per-file error is pushed to `diagnostics` so
+/// the user sees it in the activity panel.
+fn load_agent_registry_for_tui(
+    cwd: &std::path::Path,
+    settings: &code_agent_core::Settings,
+    registry: &mut code_agent_core::AgentRegistry,
+    diagnostics: &mut Vec<String>,
+) {
+    let agents_cfg = settings.agents.as_ref();
+    // Optional built-in starter set.
+    if let Some(builtin_names) = agents_cfg.and_then(|s| s.builtins.as_ref()) {
+        let starters = code_agent_core::builtin_starter_definitions();
+        for name in builtin_names {
+            if let Some(d) = starters.iter().find(|d| &d.name == name) {
+                if let Err(e) = registry.register_builtin(d.clone()) {
+                    diagnostics.push(format!("agent builtin {name}: {e}"));
+                }
+            }
+        }
+    }
+    // Filesystem definitions: enabled by default; user can disable.
+    let allow_filesystem = agents_cfg
+        .and_then(|s| s.allow_filesystem_agents)
+        .unwrap_or(true);
+    if !allow_filesystem {
+        return;
+    }
+    let dir = if let Some(p) = agents_cfg.and_then(|s| s.path.clone()) {
+        if p.is_absolute() {
+            p
+        } else {
+            cwd.join(p)
+        }
+    } else {
+        code_agent_core::filesystem_agents_dir(cwd)
+    };
+    if !dir.is_dir() {
+        return;
+    }
+    let (defs, errors) = code_agent_core::load_filesystem_agents(&dir);
+    for d in defs {
+        if let Err(e) = registry.register_filesystem(d) {
+            diagnostics.push(format!("agent register: {e}"));
+        }
+    }
+    for e in errors {
+        diagnostics.push(format!("agent load: {e}"));
+    }
+}
+
+/// Phase F: build a skill registry for inspector listing. Honors
+/// `settings.skills.allow_filesystem_skills`, `compat_claude_skills`,
+/// and discovery limits.
+fn load_skill_registry_for_tui(
+    cwd: &std::path::Path,
+    settings: &code_agent_core::Settings,
+) -> Result<code_agent_core::SkillRegistry> {
+    let cfg = settings.skills.clone().unwrap_or_default();
+    let project_dir = if let Some(p) = &cfg.project_path {
+        if p.is_absolute() {
+            p.clone()
+        } else {
+            cwd.join(p)
+        }
+    } else {
+        code_agent_core::filesystem_skills_dir(cwd)
+    };
+    let mut paths = vec![code_agent_core::SkillDiscoveryPath {
+        source: code_agent_core::SkillSource::Project,
+        path: project_dir,
+    }];
+    if let Some(user) = cfg.user_path.clone() {
+        let user_path = if user.is_absolute() {
+            user
+        } else {
+            cwd.join(user)
+        };
+        paths.push(code_agent_core::SkillDiscoveryPath {
+            source: code_agent_core::SkillSource::User,
+            path: user_path,
+        });
+    }
+    if cfg.compat_claude_skills.unwrap_or(false) {
+        paths.push(code_agent_core::SkillDiscoveryPath {
+            source: code_agent_core::SkillSource::CompatibilityClaude,
+            path: code_agent_core::compat_claude_skills_dir(cwd),
+        });
+    }
+    let mut opts = code_agent_core::SkillDiscoveryOptions::default();
+    if let Some(v) = cfg.allow_filesystem_skills {
+        opts.allow_filesystem_skills = v;
+    }
+    if let Some(v) = cfg.max_skill_md_bytes {
+        opts.max_skill_md_bytes = v;
+    }
+    if let Some(v) = cfg.max_resource_bytes_per_skill {
+        opts.max_resource_bytes_per_skill = v;
+    }
+    if let Some(v) = cfg.max_loaded_skills_per_run {
+        opts.max_loaded_skills_per_run = v;
+    }
+    opts.compat_claude_skills = cfg.compat_claude_skills.unwrap_or(false);
+    code_agent_core::SkillRegistry::discover(&paths, &opts)
+        .map_err(|e| anyhow!("skills discover: {e}"))
+}
+
+#[cfg(test)]
+mod tui_inspector_helpers_tests {
+    use super::*;
+
+    // Stdio endpoints never carry the actual args — they could contain
+    // secrets. Only the command name and arg count are exposed.
+    #[test]
+    fn stdio_endpoint_redacts_args() {
+        assert_eq!(redacted_stdio_endpoint("uvx", 0), "uvx");
+        assert_eq!(
+            redacted_stdio_endpoint("uvx", 3),
+            "uvx (+3 args)".to_string()
+        );
+    }
+
+    // HTTP endpoints strip query, fragment, and userinfo because all
+    // three commonly carry bearer tokens.
+    #[test]
+    fn http_endpoint_strips_query_fragment_and_userinfo() {
+        assert_eq!(
+            redacted_http_endpoint("https://api.example.com/v1"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            redacted_http_endpoint("https://api.example.com/v1?token=secret"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            redacted_http_endpoint("https://api.example.com/v1#frag"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            redacted_http_endpoint("https://user:pass@api.example.com/v1"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            redacted_http_endpoint("https://user:pass@api.example.com/v1?k=v#x"),
+            "https://api.example.com/v1"
+        );
+    }
 }
 
 fn build_tui_provider_config(args: &TuiArgs) -> Result<Option<code_agent_sdk::ProviderConfig>> {
