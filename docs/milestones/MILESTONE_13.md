@@ -17,8 +17,8 @@ phase has merged and the acceptance checklist at the bottom is satisfied.
 | A | Live SDK-driven app shell: event loop, composer, transcript, status line; fake-provider end-to-end; `cmd_tui` no longer a stub | PR #103 (under review) |
 | B | `TuiAppState` layout primitives, side / detail panel infra, modal stack, multi-pane renderer, slash routing | PR #104 (under review) |
 | C | Card identity, selection + expansion + transcript search, n/N match navigation | PR #105 (under review) |
-| D | Composer popup: slash / `@token` autocomplete, batched-paste handling, popup overlay renderer | in progress |
-| E | Diff / approval workbench + plan dashboard + deviation modal | planned |
+| D | Composer popup: slash / `@token` autocomplete, batched-paste handling, popup overlay renderer | PR #106 (under review) |
+| E | Diff / approval workbench + plan dashboard wired to SDK events | in progress |
 | F | Inspectors: tools, MCP, agents, skills, plugins | planned |
 | G | Session browser, recovery flow, auth / model / provider selectors, diagnostics panel | planned |
 | H | Command palette, help overlay, keybindings, accessibility, activity panel | planned |
@@ -298,3 +298,49 @@ All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --
 * Real provider routing in `code-agent tui` beyond fake / Anthropic-API-key.
 * OpenTelemetry export, theme system, VS Code / JetBrains / web / desktop
   surfaces (excluded for the whole milestone).
+
+## Phase E — Diff / approval workbench + plan dashboard
+
+### What's new
+
+| Module | Purpose |
+|--------|---------|
+| `state.rs` | New `TuiAppState` fields `current_plan: Option<PlanDocument>`, `pending_approval: Option<PendingApproval>`, `last_patch: Option<PatchSet>`. New `TuiAction` variants: `ResolveApproval(ApprovalDecisionAction)`, `ApprovePlan(PlanId)`, `RejectPlan { plan_id, reason }`, `RevisePlan { plan_id, hint }`. New constants `APPROVAL_MODAL_ID` and `PLAN_APPROVAL_MODAL_ID` identify the Phase E modals. `apply_sdk_event` now branches into `apply_phase_e_workbench_event` to pull SDK payloads (PlanCreated / PlanApproved / ApprovalRequired / ApprovalResolved / PatchProposed) into reducer state and steer the side / detail panels. `apply_modal_key` recognizes the two modal ids and routes `y` / `s` / `n` / `r` (tool approval) and `a` / `r` / `u` (plan approval) into the corresponding actions. |
+| `view.rs` | The Plan side-panel now renders the M9 `format_plan_panel(current_plan)` when a plan is loaded; otherwise the Phase B placeholder. The Approval detail-panel renders the pending approval's tool + summary + key legend. The Diff detail-panel renders the `PatchSet` summary (files +N ~M -K, lines +N -M) followed by the SDK-provided `unified_diff` capped at 200 lines. |
+| `app.rs` | Handles the new `TuiAction` variants. For Phase E they log to the activity panel; live wiring of the SDK `ApprovalCallback` is a small Phase G follow-up since the EchoFakeProvider never triggers an approval and the integration is testable only via synthetic events. |
+
+### SDK event → reducer effects
+
+| SdkEvent | Effect |
+|----------|--------|
+| `PlanCreated { plan }` | Stores `plan`, switches side panel to `Plan`, opens the `plan-approval` modal with `[a] approve [r] reject [u] revise`. |
+| `PlanApproved` | Pops the plan-approval modal if still open. |
+| `ApprovalRequired { tool_name, summary }` | Stores `pending_approval`, switches detail panel to `Approval`, opens the `approval` modal with `[y] yes [s] yes-for-session [n] no [r] revise`. |
+| `ApprovalResolved` | Clears `pending_approval`, pops the approval modal. |
+| `PatchProposed { patch }` | Stores `last_patch`, switches detail panel to `Diff`. |
+
+### Keyboard
+
+| Modal | Key | Action |
+|-------|-----|--------|
+| Approval | `y` | `ResolveApproval(Allow)` |
+| Approval | `s` | `ResolveApproval(AllowForSession)` |
+| Approval | `n` | `ResolveApproval(Deny { reason: "denied by user" })` |
+| Approval | `r` | `ResolveApproval(RequestRevision)` |
+| Plan approval | `a` | `ApprovePlan(plan_id)` |
+| Plan approval | `r` | `RejectPlan { plan_id, reason: None }` |
+| Plan approval | `u` | `RevisePlan { plan_id, hint: "" }` |
+
+### Tests
+
+`state.rs` adds 3 reducer tests covering the SDK→state transitions for ApprovalRequired and PatchProposed, plus the `y`-key path through the approval modal.
+
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` are clean.
+
+### Out of scope for Phase E
+
+* Live wiring of `ResolveApproval` back through the SDK's `ApprovalCallback` — Phase G follow-up; Phase E's surface is testable via synthetic events.
+* Free-form input collection for the `r`-revise and `u`-revise paths (modal text input) — Phase H when the command palette ships a generic input modal.
+* Per-hunk / per-file partial approval — spec explicitly says full approval first; partial approval is "not yet supported".
+* Side-by-side diff mode — `ui.diff.mode = side_by_side` setting wiring lands later.
+* Plan revision diff between two `PlanDocument`s — the M9 `format_plan_diff` helper exists; surfacing it in the UI is Phase F/G work.

@@ -11,7 +11,9 @@
 
 use std::collections::HashSet;
 
+use code_agent_core::plan::{PlanDocument, PlanId};
 use code_agent_core::StatusLineContext;
+use code_agent_sdk::patch::PatchSet;
 use code_agent_sdk::SdkEvent;
 
 use crate::completion::{
@@ -22,6 +24,14 @@ use crate::composer::{ComposerState, KeyAction, KeyEvent};
 use crate::event_adapter::map_sdk_event;
 use crate::layout::{DetailPanelMode, FocusPane, LayoutState, SidePanelMode, TuiModal};
 use crate::transcript::EventCard;
+
+/// Modal-id prefix used by Phase E to mark the approval modal that
+/// hovers over the workbench. Lets the modal-key handler distinguish
+/// it from generic Custom modals.
+pub const APPROVAL_MODAL_ID: &str = "phase-e-approval";
+
+/// Modal-id prefix used by Phase E to mark the plan-approval modal.
+pub const PLAN_APPROVAL_MODAL_ID: &str = "phase-e-plan-approval";
 
 /// Max bytes accepted in a single paste before the reducer truncates
 /// and surfaces a warning. Phase D ceiling; later phases can wire
@@ -57,6 +67,36 @@ pub enum TuiAction {
     CancelRun,
     /// Exit the TUI cleanly.
     Exit,
+    /// M13 Phase E: forward an approval decision to the host so it can
+    /// resolve the SDK's `ApprovalCallback` callback. The host is
+    /// responsible for matching this back to the pending
+    /// `ApprovalRequired` request id; the reducer does not own that
+    /// channel.
+    ResolveApproval(ApprovalDecisionAction),
+    /// M13 Phase E: approve the current plan. Host forwards to the
+    /// SDK's plan-approval surface.
+    ApprovePlan(PlanId),
+    /// M13 Phase E: reject the current plan with an optional reason.
+    RejectPlan {
+        plan_id: PlanId,
+        reason: Option<String>,
+    },
+    /// M13 Phase E: request a plan revision. Phase E does not yet
+    /// collect free-form input; the host receives the action with an
+    /// empty hint and may decide how to gather more.
+    RevisePlan { plan_id: PlanId, hint: String },
+}
+
+/// Reducer-side mirror of the SDK's `ApprovalDecision`. We don't depend
+/// on the SDK type directly here so the reducer stays
+/// transport-agnostic; the host translates this to whatever its
+/// `ApprovalCallback` expects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalDecisionAction {
+    Allow,
+    AllowForSession,
+    Deny { reason: String },
+    RequestRevision,
 }
 
 /// Events the reducer consumes.
@@ -146,6 +186,30 @@ pub struct TuiAppState {
     /// rebuilt by `refresh_composer_popup` after every key that
     /// mutates the composer buffer.
     pub composer_popup: Option<CompletionPopup>,
+    /// Phase E: the most recently created plan document, if any. The
+    /// plan dashboard renders this when the side panel is in `Plan`
+    /// mode. Cleared when a new plan supersedes it.
+    pub current_plan: Option<PlanDocument>,
+    /// Phase E: pending approval request (tool name + summary) pulled
+    /// from an `SdkEvent::ApprovalRequired` event. The detail panel's
+    /// `Approval` mode and the approval modal render this. Cleared
+    /// when the corresponding `ApprovalResolved` event fires.
+    pub pending_approval: Option<PendingApproval>,
+    /// Phase E: most recent proposed patch (the diff workbench's
+    /// payload). Populated from `SdkEvent::PatchProposed`.
+    pub last_patch: Option<PatchSet>,
+}
+
+/// Phase E: the minimal pending-approval record the TUI needs to
+/// render the approval modal + detail-panel card. We keep this
+/// reducer-local so it doesn't depend on the SDK event types
+/// directly (the reducer is otherwise SDK-event agnostic outside the
+/// `event_adapter`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingApproval {
+    pub tool_name: String,
+    pub summary: String,
 }
 
 impl TuiAppState {
@@ -176,6 +240,9 @@ impl TuiAppState {
             search_input: String::new(),
             visible_cache: None,
             composer_popup: None,
+            current_plan: None,
+            pending_approval: None,
+            last_patch: None,
         }
     }
 
@@ -546,8 +613,64 @@ impl TuiAppState {
                 }
                 Vec::new()
             }
+            // M13 Phase E: tool-approval modal keys.
+            (TuiModal::Custom { id, .. }, KeyEvent::Char(c)) if id == APPROVAL_MODAL_ID => {
+                self.handle_approval_key(c)
+            }
+            // M13 Phase E: plan-approval modal keys.
+            (TuiModal::Custom { id, .. }, KeyEvent::Char(c)) if id == PLAN_APPROVAL_MODAL_ID => {
+                self.handle_plan_approval_key(c)
+            }
             _ => Vec::new(),
         }
+    }
+
+    fn handle_approval_key(&mut self, c: char) -> Vec<TuiAction> {
+        let decision = match c.to_ascii_lowercase() {
+            'y' => ApprovalDecisionAction::Allow,
+            's' => ApprovalDecisionAction::AllowForSession,
+            'n' => ApprovalDecisionAction::Deny {
+                reason: "denied by user".to_string(),
+            },
+            'r' => ApprovalDecisionAction::RequestRevision,
+            _ => return Vec::new(),
+        };
+        // The approval flow is the host's responsibility to forward
+        // to the SDK callback. Pop the modal so the user gets
+        // immediate visual feedback; the host's action handler can
+        // later surface the decision result.
+        if let Some(TuiModal::Custom { id, .. }) = self.layout.current_modal() {
+            if id == APPROVAL_MODAL_ID {
+                let _ = self.layout.pop_modal();
+            }
+        }
+        self.pending_approval = None;
+        vec![TuiAction::ResolveApproval(decision)]
+    }
+
+    fn handle_plan_approval_key(&mut self, c: char) -> Vec<TuiAction> {
+        let plan_id = match &self.current_plan {
+            Some(p) => p.id.clone(),
+            None => return Vec::new(),
+        };
+        let action = match c.to_ascii_lowercase() {
+            'a' => TuiAction::ApprovePlan(plan_id),
+            'r' => TuiAction::RejectPlan {
+                plan_id,
+                reason: None,
+            },
+            'u' => TuiAction::RevisePlan {
+                plan_id,
+                hint: String::new(),
+            },
+            _ => return Vec::new(),
+        };
+        if let Some(TuiModal::Custom { id, .. }) = self.layout.current_modal() {
+            if id == PLAN_APPROVAL_MODAL_ID {
+                let _ = self.layout.pop_modal();
+            }
+        }
+        vec![action]
     }
 
     /// Transcript-focused navigation. Returns `Some(actions)` when the
@@ -759,6 +882,70 @@ impl TuiAppState {
             self.run_status = RunStatus::Running;
             self.status_ctx.set("run_status", "running");
         }
+        // M13 Phase E: pull plan / approval / patch payloads out of
+        // the SDK event stream into reducer state so the workbench
+        // panels can render them.
+        self.apply_phase_e_workbench_event(ev);
+    }
+
+    fn apply_phase_e_workbench_event(&mut self, ev: &SdkEvent) {
+        match ev {
+            SdkEvent::PlanCreated(p) => {
+                self.current_plan = Some(p.plan.clone());
+                // Route the plan dashboard into view and offer an
+                // approval modal so the user can act on it.
+                self.layout.side_panel.mode = SidePanelMode::Plan;
+                self.layout.side_panel.visible = true;
+                self.layout.push_modal(TuiModal::Custom {
+                    id: PLAN_APPROVAL_MODAL_ID.to_string(),
+                    title: "Plan ready for approval".to_string(),
+                    body: vec![
+                        format!("Plan: {}", p.plan.title.clone()),
+                        String::new(),
+                        "  [a] approve  [r] reject  [u] revise".to_string(),
+                    ],
+                });
+            }
+            SdkEvent::PlanApproved(_) => {
+                // Close the plan-approval modal if it's still up.
+                if let Some(TuiModal::Custom { id, .. }) = self.layout.current_modal() {
+                    if id == PLAN_APPROVAL_MODAL_ID {
+                        let _ = self.layout.pop_modal();
+                    }
+                }
+            }
+            SdkEvent::ApprovalRequired(a) => {
+                self.pending_approval = Some(PendingApproval {
+                    tool_name: a.tool_name.clone(),
+                    summary: a.summary.clone(),
+                });
+                self.layout.detail_panel.mode = DetailPanelMode::Approval;
+                self.layout.detail_panel.visible = true;
+                self.layout.push_modal(TuiModal::Custom {
+                    id: APPROVAL_MODAL_ID.to_string(),
+                    title: format!("Approve {}?", a.tool_name),
+                    body: vec![
+                        a.summary.clone(),
+                        String::new(),
+                        "  [y] yes  [s] yes-for-session  [n] no  [r] revise".to_string(),
+                    ],
+                });
+            }
+            SdkEvent::ApprovalResolved(_) => {
+                self.pending_approval = None;
+                if let Some(TuiModal::Custom { id, .. }) = self.layout.current_modal() {
+                    if id == APPROVAL_MODAL_ID {
+                        let _ = self.layout.pop_modal();
+                    }
+                }
+            }
+            SdkEvent::PatchProposed(p) => {
+                self.last_patch = Some(p.patch.clone());
+                self.layout.detail_panel.mode = DetailPanelMode::Diff;
+                self.layout.detail_panel.visible = true;
+            }
+            _ => {}
+        }
     }
 
     fn coalesce_assistant_delta(&mut self, delta: &str) {
@@ -824,7 +1011,11 @@ impl TuiAppState {
         self.invalidate_search_cache();
     }
 
-    fn push_activity(&mut self, label: String) {
+    /// Append a one-line entry to the bounded activity log. The log
+    /// is shown in the bottom-status area of the renderer. Public so
+    /// the host loop (`app.rs`) can record action-handling
+    /// diagnostics (Phase E: approval / plan decisions).
+    pub fn push_activity(&mut self, label: String) {
         self.activity.push(label);
         if self.activity.len() > ACTIVITY_CAP {
             let excess = self.activity.len() - ACTIVITY_CAP;
@@ -1692,6 +1883,67 @@ mod tests {
         s.layout.push_modal(TuiModal::Help);
         s.apply(TuiInbound::Paste("should be ignored".to_string()));
         assert!(s.composer.buffer.is_empty());
+    }
+
+    #[test]
+    // ApprovalRequired event populates pending_approval, opens the
+    // approval modal, and routes the detail panel to Approval mode.
+    fn approval_event_opens_modal_and_detail_panel() {
+        use code_agent_sdk::event::ApprovalRequiredEvent;
+        let mut s = fresh_state();
+        s.apply(TuiInbound::sdk(SdkEvent::ApprovalRequired(
+            ApprovalRequiredEvent {
+                run_id: rid(),
+                tool_name: "Bash".to_string(),
+                summary: "cargo test".to_string(),
+            },
+        )));
+        let pending = s.pending_approval.as_ref().unwrap();
+        assert_eq!(pending.tool_name, "Bash");
+        assert!(matches!(
+            s.layout.current_modal(),
+            Some(TuiModal::Custom { .. })
+        ));
+        assert_eq!(s.layout.detail_panel.mode, DetailPanelMode::Approval);
+    }
+
+    #[test]
+    // `y` in the approval modal emits ResolveApproval(Allow), pops
+    // the modal, and clears pending_approval.
+    fn approval_y_key_emits_allow_and_clears_state() {
+        use code_agent_sdk::event::ApprovalRequiredEvent;
+        let mut s = fresh_state();
+        s.apply(TuiInbound::sdk(SdkEvent::ApprovalRequired(
+            ApprovalRequiredEvent {
+                run_id: rid(),
+                tool_name: "Bash".to_string(),
+                summary: "cargo test".to_string(),
+            },
+        )));
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Char('y')));
+        assert_eq!(
+            actions,
+            vec![TuiAction::ResolveApproval(ApprovalDecisionAction::Allow)]
+        );
+        assert!(s.pending_approval.is_none());
+        assert!(s.layout.current_modal().is_none());
+    }
+
+    #[test]
+    // PatchProposed populates last_patch and routes the detail
+    // panel to Diff mode.
+    fn patch_event_routes_to_diff_panel() {
+        use code_agent_sdk::event::PatchProposedEvent;
+        use code_agent_sdk::patch::PatchSet;
+        let mut s = fresh_state();
+        s.apply(TuiInbound::sdk(SdkEvent::PatchProposed(
+            PatchProposedEvent {
+                run_id: rid(),
+                patch: PatchSet::default(),
+            },
+        )));
+        assert!(s.last_patch.is_some());
+        assert_eq!(s.layout.detail_panel.mode, DetailPanelMode::Diff);
     }
 
     #[test]
