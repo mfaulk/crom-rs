@@ -330,6 +330,18 @@ impl LayoutState {
     pub fn current_modal(&self) -> Option<&TuiModal> {
         self.modal_stack.last()
     }
+
+    /// Remove every `TuiModal::Custom` whose `id` matches `target_id`,
+    /// regardless of stack position. Phase E uses this so a delayed
+    /// `ApprovalResolved` / `PlanApproved` clears its modal even when
+    /// the user has layered another modal on top in the meantime.
+    /// Returns the number of modals removed.
+    pub fn remove_custom_modals_by_id(&mut self, target_id: &str) -> usize {
+        let before = self.modal_stack.len();
+        self.modal_stack
+            .retain(|m| !matches!(m, TuiModal::Custom { id, .. } if id == target_id));
+        before - self.modal_stack.len()
+    }
 }
 
 #[cfg(test)]

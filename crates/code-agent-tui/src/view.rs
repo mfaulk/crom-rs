@@ -103,7 +103,7 @@ fn side_panel_view(state: &TuiAppState) -> PaneView {
             .current_plan
             .as_ref()
             .map(crate::plan_view::format_plan_panel)
-            .unwrap_or_else(|| side_panel_body(state.layout.side_panel.mode)),
+            .unwrap_or_else(|| vec!["No active plan.".to_string()]),
         other => side_panel_body(other),
     };
     PaneView {
@@ -161,10 +161,14 @@ fn diff_body_lines(patch: &code_agent_sdk::patch::PatchSet) -> Vec<String> {
         patch.summary.added_lines, patch.summary.removed_lines
     ));
     lines.push(String::new());
-    for line in patch.unified_diff.lines().take(200) {
+    // Single-pass truncation: keep iterating after `take(200)` to see
+    // if there's at least one more line, then drop the iterator.
+    // Avoids a second full scan via `.count()` on huge patches.
+    let mut iter = patch.unified_diff.lines();
+    for line in iter.by_ref().take(200) {
         lines.push(line.to_string());
     }
-    if patch.unified_diff.lines().count() > 200 {
+    if iter.next().is_some() {
         lines.push("  ... (diff truncated at 200 lines)".to_string());
     }
     lines
