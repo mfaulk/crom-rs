@@ -15,6 +15,7 @@ use code_agent_core::plan::{PlanDocument, PlanId};
 use code_agent_core::StatusLineContext;
 use code_agent_sdk::patch::PatchSet;
 use code_agent_sdk::SdkEvent;
+use tracing::debug;
 
 use crate::completion::{
     context_token_candidates, detect_trigger, slash_candidates, CompletionKind, CompletionPopup,
@@ -953,6 +954,7 @@ impl TuiAppState {
     pub fn open_palette(&mut self) {
         self.palette = Some(PaletteState::default());
         self.layout.push_modal(TuiModal::CommandPalette);
+        debug!(target: "code_agent_tui", "palette_open");
     }
 
     /// Phase H: close the command palette modal *and* clear the
@@ -1010,6 +1012,7 @@ impl TuiAppState {
         // still processing the decision, and could strand the user if
         // the callback round-trips slowly.
         let _ = self.layout.remove_custom_modals_by_id(APPROVAL_MODAL_ID);
+        debug!(target: "code_agent_tui", decision = ?decision, "approval_decision");
         vec![TuiAction::ResolveApproval(decision)]
     }
 
@@ -1165,6 +1168,7 @@ impl TuiAppState {
         });
         self.run_status = RunStatus::Running;
         self.last_error = None;
+        debug!(target: "code_agent_tui", prompt_bytes = prompt.len(), "submit_prompt");
         vec![TuiAction::SubmitPrompt(prompt)]
     }
 
@@ -1190,6 +1194,10 @@ impl TuiAppState {
                 self.layout.focus = FocusPane::SidePanel;
             }
             self.push_activity(format!("side panel → {}", mode.label()));
+            // M13 Phase I: telemetry for panel switches. Stays at
+            // `debug` so a default `RUST_LOG=info` keeps the TUI
+            // silent unless the operator opts in.
+            debug!(target: "code_agent_tui", panel = %mode.label(), "side_panel_switch");
             self.clamp_focus();
             return;
         }
@@ -2868,6 +2876,28 @@ mod tests {
         assert!(s.palette.is_none());
         // Help modal survives.
         assert!(matches!(s.layout.current_modal(), Some(TuiModal::Help)));
+    }
+
+    #[test]
+    // Phase I: telemetry events fire as `debug!` records on the
+    // `code_agent_tui` target. We can't capture them without a
+    // tracing subscriber here, so as a stand-in we just verify the
+    // surrounding side-effects (activity entry, panel switch) still
+    // happen — i.e., the tracing calls don't perturb reducer
+    // behavior.
+    fn telemetry_does_not_perturb_state() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        s.apply_slash_command("tools");
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Tools);
+        assert!(s
+            .activity
+            .last()
+            .map(|a| a.contains("side panel"))
+            .unwrap_or(false));
     }
 
     #[test]

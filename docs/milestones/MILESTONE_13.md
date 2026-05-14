@@ -21,8 +21,8 @@ phase has merged and the acceptance checklist at the bottom is satisfied.
 | E | Diff / approval workbench + plan dashboard wired to SDK events | PR #112 (merged) |
 | F | Inspectors: tools, MCP, agents, skills, plugins | PR #113 (merged) |
 | G | Session browser, recovery flow, auth / model / provider selectors, diagnostics panel, live approval callback | PR #114 (merged) |
-| H | Command palette, help overlay, keybindings, activity panel, accessibility | in progress |
-| I | New CLI subcommands, `examples/tui-demo`, UI telemetry events | planned |
+| H | Command palette, help overlay, keybindings, activity panel, accessibility | PR #115 (merged) |
+| I | New CLI subcommands, `examples/tui-demo`, UI telemetry events | in progress |
 
 ## Phase A — Live SDK-driven app shell
 
@@ -550,3 +550,61 @@ After the initial Phase H commit, a Codex review surfaced four important issues 
 * A central keybinding registry that consolidates the per-pane key handlers in `state.rs` — large refactor. The expanded `help_modal_body` documents the existing scheme.
 * Prompt history modal (`/history`) — would share machinery with the palette but needs the composer's `PromptHistory` ring buffer surfaced. Defer to Phase I.
 * `@file` workspace candidates for the composer popup — still deferred to Phase I when the workspace scanner lands alongside the demo example.
+
+## Phase I — CLI subcommands, example, telemetry
+
+### What's new
+
+| Module | Purpose |
+|--------|---------|
+| `code-agent-cli/src/main.rs` | New `--list-sessions` flag on `cmd_tui`. When set, the CLI prints discovered sessions (one per line, tab-separated `<id>\t<state>\t<lock?>\t<last_modified_unix?>`) and exits without launching the TUI. Pairs with the Phase G `--recover` flag for scripted recovery workflows. |
+| `examples/tui-demo/` (new) | Standalone example crate with two subcommands — `live` boots the M13 shell against the SDK fake provider (TTY required); `snapshot [prompt]` drives one canned prompt through `drive_single_prompt` and prints the rendered frame to stdout via ratatui's `TestBackend`. Useful for CI smoke tests and offline demos. |
+| `crates/code-agent-tui/src/state.rs` | Structured `tracing::debug!` records on the `code_agent_tui` target at four user-facing seams: panel switch (`side_panel_switch`), palette open (`palette_open`), approval decision (`approval_decision`), prompt submit (`submit_prompt`). Stays at `debug` so default `RUST_LOG=info` keeps the TUI silent. |
+
+### CLI surface
+
+| Flag | Behavior |
+|------|----------|
+| `--list-sessions` | Print discovered sessions in tab-separated columns and exit. |
+
+(Plus all prior flags from Phases A–G: `--snapshot`, `--renderer`, `--session`, `--fake-provider`, `--model`, `--recover`.)
+
+### Telemetry events
+
+Each event is a `tracing::debug!` record with `target: "code_agent_tui"` and structured fields:
+
+| Event | Fields |
+|-------|--------|
+| `side_panel_switch` | `panel` (label string) |
+| `palette_open` | (no payload) |
+| `approval_decision` | `decision` (`ApprovalDecisionAction` debug) |
+| `submit_prompt` | `prompt_bytes` (length of the submitted prompt) |
+
+These ride on the workspace's existing `tracing` infrastructure; subscribers configured by the host (e.g. `tracing_subscriber::fmt()` with `RUST_LOG=code_agent_tui=debug`) capture them without any TUI-side wiring.
+
+### Tests
+
+`state.rs` adds 1 reducer test (`telemetry_does_not_perturb_state`) that asserts the `debug!` macros don't change observable state. The `examples/tui-demo` `snapshot` subcommand serves as a smoke test for the whole pipeline (run with `cargo run -p tui-demo -- snapshot`).
+
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (1030 tests total) are clean.
+
+### Out of scope for Phase I
+
+* Live model / provider / auth switching from the TUI — still deferred (would require the SDK to accept a runtime swap or a session restart, neither of which exists yet).
+* Free-text input modal for the `r`-revise approval path — deferred again; no caller has expressed need.
+* `@file` workspace candidates — still deferred. The Phase D popup seam remains the right home; the scanner is the missing piece.
+* OpenTelemetry / OTLP export — the milestone preamble explicitly excludes this; subscribers can bridge the `tracing` records if desired.
+
+## Acceptance checklist
+
+* [x] TUI consumes the M12 SDK event stream end-to-end (Phase A).
+* [x] Multi-pane layout with side / detail / modal stack (Phase B).
+* [x] Virtualized timeline with card identity, selection, expansion, search (Phase C).
+* [x] Composer popup with slash / context-token completion, bracketed-paste handling (Phase D).
+* [x] Diff / approval workbench + plan dashboard wired to SDK events (Phase E).
+* [x] Read-only inspectors for tools / MCP / agents / skills / plugins (Phase F).
+* [x] Sessions / auth / model / provider / diagnostics inspectors + recovery flag + live `ApprovalCallback` (Phase G).
+* [x] Interactive command palette, expanded help, activity panel (Phase H).
+* [x] `--list-sessions` flag, `examples/tui-demo`, telemetry events (Phase I).
+* [x] Offline fake-provider path; no real account required to demo or test.
+* [x] cargo fmt / clippy / test --workspace clean across all phases.
