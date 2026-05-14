@@ -96,20 +96,148 @@ fn projected_transcript(state: &TuiAppState) -> Vec<crate::transcript::EventCard
 
 fn side_panel_view(state: &TuiAppState) -> PaneView {
     // M13 Phase E: when the Plan side-panel is selected and a plan
-    // exists, render the M9 plan dashboard. Otherwise fall back to
-    // the Phase B placeholder.
-    let body = match state.layout.side_panel.mode {
+    // exists, render the M9 plan dashboard.
+    // M13 Phase F: the five inspector modes (Tools, Mcp, Subagents,
+    // Skills, Plugins) render real rows from `state.inspectors`
+    // instead of the Phase B placeholder.
+    let mode = state.layout.side_panel.mode;
+    let body = match mode {
         SidePanelMode::Plan => state
             .current_plan
             .as_ref()
             .map(crate::plan_view::format_plan_panel)
             .unwrap_or_else(|| vec!["No active plan.".to_string()]),
+        SidePanelMode::Tools
+        | SidePanelMode::Mcp
+        | SidePanelMode::Subagents
+        | SidePanelMode::Skills
+        | SidePanelMode::Plugins => inspector_body(state, mode),
         other => side_panel_body(other),
     };
     PaneView {
         title: state.layout.side_panel.mode.label().to_string(),
         body,
         focused: matches!(state.layout.focus, FocusPane::SidePanel),
+    }
+}
+
+/// Phase F: render the rows for one inspector side panel mode. The
+/// active selection (if any) is marked with `›`; the empty state
+/// reads "(none configured)" so a user who turns on `/tools` on a
+/// fresh project sees something more useful than placeholder text.
+fn inspector_body(state: &TuiAppState, mode: SidePanelMode) -> Vec<String> {
+    let selected = state.inspector_selected_index(mode);
+    let rows: Vec<String> = match mode {
+        SidePanelMode::Tools => state
+            .inspectors
+            .tools
+            .iter()
+            .map(|t| {
+                if t.permission.is_empty() {
+                    format!("{} — {}", t.name, truncate(&t.description, 64))
+                } else {
+                    format!(
+                        "{} [{}] — {}",
+                        t.name,
+                        t.permission,
+                        truncate(&t.description, 56)
+                    )
+                }
+            })
+            .collect(),
+        SidePanelMode::Mcp => state
+            .inspectors
+            .mcp
+            .iter()
+            .map(|m| {
+                if m.config_entries == 0 {
+                    format!("{} [{}] {}", m.name, m.transport, truncate(&m.endpoint, 48))
+                } else {
+                    format!(
+                        "{} [{}] {} ({} entries)",
+                        m.name,
+                        m.transport,
+                        truncate(&m.endpoint, 40),
+                        m.config_entries
+                    )
+                }
+            })
+            .collect(),
+        SidePanelMode::Subagents => state
+            .inspectors
+            .subagents
+            .iter()
+            .map(|s| {
+                let model = s.model.as_deref().unwrap_or("(inherit)");
+                let tools = s
+                    .tool_count
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(inherit)".to_string());
+                format!(
+                    "{} [{} | tools: {}] — {}",
+                    s.name,
+                    model,
+                    tools,
+                    truncate(&s.description, 40)
+                )
+            })
+            .collect(),
+        SidePanelMode::Skills => state
+            .inspectors
+            .skills
+            .iter()
+            .map(|sk| {
+                format!(
+                    "{} [{}] — {} ({} resources)",
+                    sk.name,
+                    sk.source,
+                    truncate(&sk.description, 40),
+                    sk.resource_count
+                )
+            })
+            .collect(),
+        SidePanelMode::Plugins => state
+            .inspectors
+            .plugins
+            .iter()
+            .map(|p| {
+                let ver = p.version.as_deref().unwrap_or("?");
+                let enabled = if p.enabled { "on" } else { "off" };
+                format!(
+                    "{} v{} [{} | {} | {}] — {} components",
+                    p.name, ver, p.scope, enabled, p.status, p.component_total
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if rows.is_empty() {
+        return vec![
+            format!("{} inspector", mode.label()),
+            "(none configured)".to_string(),
+        ];
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, row) in rows.into_iter().enumerate() {
+        if Some(i) == selected {
+            out.push(format!("› {row}"));
+        } else {
+            out.push(format!("  {row}"));
+        }
+    }
+    out
+}
+
+/// Trim a string for inline rendering inside a one-line inspector
+/// row. Adds an ellipsis when truncated. Conservative budgets per
+/// field are chosen so a typical 100-column side panel still fits.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -312,6 +440,107 @@ mod tests {
             let v = modal_view_for(&state, &modal);
             assert!(!v.title.is_empty());
             assert!(!v.body.is_empty());
+        }
+    }
+
+    #[test]
+    // Phase F: inspector panels render real rows from the snapshot
+    // and mark the selected one with `›`.
+    fn inspector_body_renders_real_rows_with_selection_glyph() {
+        use crate::inspectors::{InspectorTool, Inspectors};
+        let mut s = fresh_state().with_inspectors(Inspectors {
+            tools: vec![
+                InspectorTool {
+                    name: "Bash".into(),
+                    description: "shell".into(),
+                    permission: "execute_bash".into(),
+                },
+                InspectorTool {
+                    name: "Read".into(),
+                    description: "read a file".into(),
+                    permission: "read_only".into(),
+                },
+            ],
+            ..Inspectors::default()
+        });
+        s.set_side_panel(SidePanelMode::Tools, true);
+        s.inspector_selection.tools = Some(1);
+        let body = inspector_body(&s, SidePanelMode::Tools);
+        assert_eq!(body.len(), 2);
+        assert!(body[0].starts_with("  Bash"), "first row not selected");
+        assert!(
+            body[1].starts_with("› Read"),
+            "second row should carry the selection glyph"
+        );
+        // Permission tag is interpolated into the row text.
+        assert!(body[1].contains("[read_only]"));
+    }
+
+    #[test]
+    // Phase F: when an inspector mode has no entries, the panel
+    // renders an informative empty-state body (not a Phase B
+    // placeholder).
+    fn inspector_body_empty_state_is_informative() {
+        let s = fresh_state(); // empty Inspectors
+        let body = inspector_body(&s, SidePanelMode::Plugins);
+        assert!(body.iter().any(|l| l.contains("Plugins inspector")));
+        assert!(body.iter().any(|l| l.contains("(none configured)")));
+    }
+
+    #[test]
+    // Phase F: each of the five inspector modes uses the inspector
+    // renderer (not the Phase B placeholder) so populated snapshots
+    // produce the real row format.
+    fn all_inspector_modes_render_real_rows_when_populated() {
+        use crate::inspectors::{
+            InspectorMcp, InspectorPlugin, InspectorSkill, InspectorSubagent, InspectorTool,
+            Inspectors,
+        };
+        let s = fresh_state().with_inspectors(Inspectors {
+            tools: vec![InspectorTool {
+                name: "T".into(),
+                ..Default::default()
+            }],
+            mcp: vec![InspectorMcp {
+                name: "M".into(),
+                transport: "stdio".into(),
+                endpoint: "echo".into(),
+                config_entries: 0,
+            }],
+            subagents: vec![InspectorSubagent {
+                name: "A".into(),
+                description: "desc".into(),
+                ..Default::default()
+            }],
+            skills: vec![InspectorSkill {
+                name: "S".into(),
+                description: "desc".into(),
+                source: "project".into(),
+                resource_count: 2,
+            }],
+            plugins: vec![InspectorPlugin {
+                name: "P".into(),
+                enabled: true,
+                scope: "user".into(),
+                status: "loaded".into(),
+                component_total: 4,
+                ..Default::default()
+            }],
+        });
+        for mode in [
+            SidePanelMode::Tools,
+            SidePanelMode::Mcp,
+            SidePanelMode::Subagents,
+            SidePanelMode::Skills,
+            SidePanelMode::Plugins,
+        ] {
+            let body = inspector_body(&s, mode);
+            assert_eq!(body.len(), 1, "{mode:?} should render 1 row");
+            // Empty-state placeholder would say "(none configured)".
+            assert!(
+                !body.iter().any(|l| l.contains("(none configured)")),
+                "{mode:?} should not show empty state"
+            );
         }
     }
 

@@ -19,7 +19,7 @@ phase has merged and the acceptance checklist at the bottom is satisfied.
 | C | Card identity, selection + expansion + transcript search, n/N match navigation | PR #105 (under review) |
 | D | Composer popup: slash / `@token` autocomplete, batched-paste handling, popup overlay renderer | PR #106 (under review) |
 | E | Diff / approval workbench + plan dashboard wired to SDK events | in progress |
-| F | Inspectors: tools, MCP, agents, skills, plugins | planned |
+| F | Inspectors: tools, MCP, agents, skills, plugins | in progress |
 | G | Session browser, recovery flow, auth / model / provider selectors, diagnostics panel | planned |
 | H | Command palette, help overlay, keybindings, accessibility, activity panel | planned |
 | I | New CLI subcommands, `examples/tui-demo`, UI telemetry events | planned |
@@ -344,3 +344,76 @@ All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --
 * Per-hunk / per-file partial approval — spec explicitly says full approval first; partial approval is "not yet supported".
 * Side-by-side diff mode — `ui.diff.mode = side_by_side` setting wiring lands later.
 * Plan revision diff between two `PlanDocument`s — the M9 `format_plan_diff` helper exists; surfacing it in the UI is Phase F/G work.
+
+## Phase F — Inspectors
+
+### What's new
+
+| Module | Purpose |
+|--------|---------|
+| `inspectors.rs` (new) | Pure read-only record types — `InspectorTool`, `InspectorMcp`, `InspectorSubagent`, `InspectorSkill`, `InspectorPlugin` — and the `Inspectors` snapshot that owns the five vectors. Plain `String` / `usize` / `Option<u32>` fields so the renderer doesn't depend on `code-agent-core` / `code-agent-mcp` enum types. |
+| `state.rs` | New `TuiAppState` field `inspectors: Inspectors` and `inspector_selection: InspectorSelection { tools, mcp, subagents, skills, plugins: Option<usize> }`. New builder method `with_inspectors(inspectors)`. New helpers `inspector_list_len(mode)` / `inspector_selected_index(mode)` and the private `move_inspector_selection` / `set_inspector_selection` mutators. The reducer's side-panel key path intercepts `j`/`k`/`Up`/`Down`/`g`/`G` only when the panel is focused **and** the mode is one of the five inspector modes — non-inspector modes (Plan, Changes, Files, Sessions, …) continue to fall through to the composer so typed slash commands still work. |
+| `view.rs` | New `inspector_body(state, mode)` builds the side-panel body from the snapshot rows. Rows render with a leading `›` for the active selection and `  ` otherwise. Empty categories render `<Mode> inspector` / `(none configured)` instead of the Phase B placeholder. Long descriptions are truncated with `…` so a single row fits a ~80-column side panel. |
+| `code-agent-cli/src/main.rs` | `cmd_tui` now calls a new `build_inspector_snapshot_for_tui(cwd, settings)` before constructing `TuiAppState`, then chains `.with_inspectors(snapshot)`. The snapshot is built best-effort: each category that fails to load (missing dir, parse error, etc.) is left empty. Loaders: `code_agent_tools::register_builtin_with_limits` for tools, `code_agent_mcp::load_mcp_options` for MCP, `code_agent_core::agents::loader::load_filesystem_agents` for subagents, a TUI-local skill discoverer for skills, `plugins::build_for_invocation` for plugins. |
+
+### Inspector rows
+
+| Mode | Row shape |
+|------|-----------|
+| Tools | `name [permission] — description` |
+| MCP | `name [transport] endpoint (N entries)` |
+| Subagents | `name [model | tools: N] — description` |
+| Skills | `name [source] — description (N resources)` |
+| Plugins | `name vX.Y [scope | on/off | status] — N components` |
+
+Permission tags come from `PermissionKind` via a snake_case label
+(`read_only`, `mutating`, `execution`, `external`, `orchestration`).
+Skill source labels match `SkillSource::as_str`
+(`project` / `user` / `compat-claude` / `builtin`). Plugin scopes /
+statuses match `PluginScope::as_str` / `PluginStatus`.
+
+### Keyboard
+
+| Key | Action |
+|-----|--------|
+| `j` / `Down` | Move selection down within the focused inspector. |
+| `k` / `Up` | Move selection up. |
+| `g` | Jump to first row. |
+| `G` | Jump to last row. |
+| `Ctrl+C` | Cancel run / exit when idle (mirrors transcript-pane behavior). |
+| `Ctrl+D` | Exit. |
+
+Selection is per-mode and persists when toggling between panels via
+slash commands. A stale snapshot index (e.g. after a hot reload that
+trims rows) is silently clamped to the last valid row by
+`inspector_selected_index` so the renderer never reads past the
+backing vector.
+
+### Tests
+
+`inspectors.rs` adds 2 unit tests (`default_is_empty`, `record_defaults_are_blank`).
+
+`state.rs` adds 5 reducer tests:
+`with_inspectors_replaces_snapshot`,
+`inspector_j_k_navigates_selection` (j/k/g/G against a 3-row list),
+`inspector_nav_on_empty_list_is_inert` (nav keys swallowed without
+falling through to the composer),
+`inspector_selection_is_per_mode` (per-mode persistence across
+panel switches),
+`inspector_selection_clamps_to_visible_range` (out-of-range
+selection clamps to last row).
+
+`view.rs` adds 3 renderer tests:
+`inspector_body_renders_real_rows_with_selection_glyph`,
+`inspector_body_empty_state_is_informative`,
+`all_inspector_modes_render_real_rows_when_populated`.
+
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (1011 tests total) are clean.
+
+### Out of scope for Phase F
+
+* Detail-panel "inspect this row" view — selecting a tool / skill / plugin and pressing `Enter` to show its full schema / manifest / instructions. The detail panel's `ToolDetails` / `FilePreview` modes were stubbed in Phase B; populating them lands when Phase G adds the diagnostics workbench since the two share the same detail-pane real estate.
+* Live MCP server status (connected / failed / tool count) — needs a connection attempt; deferred so `code-agent tui` startup stays fast. The Phase F MCP inspector only lists *configured* servers, not running ones.
+* Plugin marketplace browsing / install / enable-disable actions — Phase F is read-only.
+* File-system `@file` autocomplete candidates (the Phase D `CompletionKind::File` empty-list seam) — needs a workspace scanner; Phase F's host has the cwd and a workspace handle but the actual scanner and candidate sort are deferred to Phase H so the candidate model can share the command-palette infrastructure.
+* Hot-reload of the inspector snapshot when the user runs `/plugins reload` or edits a SKILL.md — Phase H+.

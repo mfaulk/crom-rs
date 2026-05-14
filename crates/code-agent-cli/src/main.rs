@@ -7490,16 +7490,207 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
     let status_ctx =
         m9::build_default_status_ctx(&cwd, &settings, args.session.as_deref(), None, false);
     let composer = code_agent_tui::ComposerState::new(settings.ui.composer.clone());
+    // Phase F: pre-load read-only snapshots of the host registries
+    // (tools, MCP, agents, skills, plugins) so the side-panel
+    // inspectors have real content. Failures are best-effort: a
+    // missing skill directory or unreadable plugin entry leaves that
+    // category empty rather than aborting TUI startup.
+    let inspectors = build_inspector_snapshot_for_tui(&cwd, &settings);
     let state = code_agent_tui::TuiAppState::new(
         composer,
         settings.ui.status_line.template.clone(),
         status_ctx,
-    );
+    )
+    .with_inspectors(inspectors);
     let app = code_agent_tui::TuiApp::new(runtime, state);
     app.run()
         .await
         .map_err(|e| anyhow!("tui exited with error: {e}"))?;
     Ok(())
+}
+
+/// Phase F: assemble an [`code_agent_tui::Inspectors`] snapshot from
+/// the host's real registries. Best-effort: every category that
+/// fails to load is left empty so a TUI session never blocks on a
+/// stale config or unreadable directory.
+fn build_inspector_snapshot_for_tui(
+    cwd: &std::path::Path,
+    settings: &code_agent_core::Settings,
+) -> code_agent_tui::Inspectors {
+    use code_agent_tui::{
+        InspectorMcp, InspectorPlugin, InspectorSkill, InspectorSubagent, InspectorTool, Inspectors,
+    };
+
+    let mut snapshot = Inspectors::empty();
+
+    // --- Tools: built-in tool registry. Cheap (no I/O).
+    let mut tools = code_agent_core::ToolRegistry::new();
+    code_agent_tools::register_builtin_with_limits(
+        &mut tools,
+        code_agent_tools::ToolLimits::default(),
+    );
+    for t in tools.iter() {
+        snapshot.tools.push(InspectorTool {
+            name: t.name().to_string(),
+            description: t.description().to_string(),
+            permission: permission_kind_label(t.permission_kind()).to_string(),
+        });
+    }
+
+    // --- MCP: read from settings; the actual stdio/http handshake
+    // is reserved for live connection (Phase G+) — the inspector
+    // just lists configured servers.
+    let mcp_options =
+        code_agent_mcp::load_mcp_options(cwd, settings.mcp.as_ref(), None, None, None, None)
+            .unwrap_or_default();
+    for (name, cfg) in &mcp_options.servers {
+        let (transport, endpoint, entries) = match cfg {
+            code_agent_mcp::McpServerConfig::Stdio(c) => {
+                let endpoint = if c.args.is_empty() {
+                    c.command.clone()
+                } else {
+                    format!("{} {}", c.command, c.args.join(" "))
+                };
+                ("stdio".to_string(), endpoint, c.env.len())
+            }
+            code_agent_mcp::McpServerConfig::StreamableHttp(c) => {
+                ("http".to_string(), c.url.clone(), c.headers.len())
+            }
+        };
+        snapshot.mcp.push(InspectorMcp {
+            name: name.clone(),
+            transport,
+            endpoint,
+            config_entries: entries,
+        });
+    }
+
+    // --- Subagents: filesystem-loaded registry under cwd. Best-effort.
+    if let Ok(registry) = load_agent_registry_for_tui(cwd, settings) {
+        for summary in registry.list() {
+            snapshot.subagents.push(InspectorSubagent {
+                name: summary.name,
+                description: summary.description,
+                model: summary.model,
+                max_turns: summary.max_turns,
+                tool_count: summary.tool_count,
+            });
+        }
+    }
+
+    // --- Skills: project + user + (optional) compat-claude.
+    if let Ok(registry) = load_skill_registry_for_tui(cwd, settings) {
+        for summary in registry.list() {
+            snapshot.skills.push(InspectorSkill {
+                name: summary.name,
+                description: summary.description,
+                source: summary.source.as_str().to_string(),
+                resource_count: summary.resource_count,
+            });
+        }
+    }
+
+    // --- Plugins: registry built from settings + dev-plugin dirs.
+    // The TUI doesn't currently accept --plugin-dir or --no-plugins
+    // (those land in Phase I CLI work); pass empty defaults.
+    let build = plugins::build_for_invocation(cwd, settings, Vec::new(), false);
+    for summary in build.registry.summaries() {
+        let status = match &summary.status {
+            code_agent_core::PluginStatus::Loaded => "loaded".to_string(),
+            code_agent_core::PluginStatus::Disabled => "disabled".to_string(),
+            code_agent_core::PluginStatus::Error { reason } => {
+                format!("error: {}", truncate(reason, 40))
+            }
+        };
+        snapshot.plugins.push(InspectorPlugin {
+            name: summary.name,
+            version: summary.version,
+            scope: summary.scope.as_str().to_string(),
+            enabled: summary.enabled,
+            status,
+            component_total: summary.component_summary.total(),
+        });
+    }
+
+    snapshot
+}
+
+fn permission_kind_label(kind: code_agent_core::permission::PermissionKind) -> &'static str {
+    use code_agent_core::permission::PermissionKind::*;
+    match kind {
+        ReadOnly => "read_only",
+        Mutating => "mutating",
+        Execution => "execution",
+        External => "external",
+        Orchestration => "orchestration",
+    }
+}
+
+/// Phase F: build a subagent registry suitable for inspector
+/// listing. Loads filesystem subagents under `<cwd>/.agent/agents/`
+/// best-effort; any per-file load error is silently dropped because
+/// the TUI just enumerates and the user can fix the file later.
+fn load_agent_registry_for_tui(
+    cwd: &std::path::Path,
+    _settings: &code_agent_core::Settings,
+) -> Result<code_agent_core::AgentRegistry> {
+    let mut registry = code_agent_core::AgentRegistry::new();
+    let dir = code_agent_core::agents::loader::filesystem_agents_dir(cwd);
+    if !dir.is_dir() {
+        return Ok(registry);
+    }
+    let (definitions, _errors) = code_agent_core::agents::loader::load_filesystem_agents(&dir);
+    for def in definitions {
+        let _ = registry.register_filesystem(def);
+    }
+    Ok(registry)
+}
+
+/// Phase F: build a skill registry for inspector listing. Skips
+/// failures so a broken SKILL.md doesn't keep the rest of the
+/// inspector from rendering.
+fn load_skill_registry_for_tui(
+    cwd: &std::path::Path,
+    settings: &code_agent_core::Settings,
+) -> Result<code_agent_core::SkillRegistry> {
+    let cfg = settings.skills.clone().unwrap_or_default();
+    let project_dir = if let Some(p) = &cfg.project_path {
+        if p.is_absolute() {
+            p.clone()
+        } else {
+            cwd.join(p)
+        }
+    } else {
+        code_agent_core::filesystem_skills_dir(cwd)
+    };
+    let mut paths = vec![code_agent_core::SkillDiscoveryPath {
+        source: code_agent_core::SkillSource::Project,
+        path: project_dir,
+    }];
+    if let Some(user) = cfg.user_path.clone() {
+        let user_path = if user.is_absolute() {
+            user
+        } else {
+            cwd.join(user)
+        };
+        paths.push(code_agent_core::SkillDiscoveryPath {
+            source: code_agent_core::SkillSource::User,
+            path: user_path,
+        });
+    }
+    if cfg.compat_claude_skills.unwrap_or(false) {
+        paths.push(code_agent_core::SkillDiscoveryPath {
+            source: code_agent_core::SkillSource::CompatibilityClaude,
+            path: code_agent_core::compat_claude_skills_dir(cwd),
+        });
+    }
+    let mut opts = code_agent_core::SkillDiscoveryOptions::default();
+    if let Some(v) = cfg.allow_filesystem_skills {
+        opts.allow_filesystem_skills = v;
+    }
+    opts.compat_claude_skills = cfg.compat_claude_skills.unwrap_or(false);
+    code_agent_core::SkillRegistry::discover(&paths, &opts)
+        .map_err(|e| anyhow!("skills discover: {e}"))
 }
 
 fn build_tui_provider_config(args: &TuiArgs) -> Result<Option<code_agent_sdk::ProviderConfig>> {

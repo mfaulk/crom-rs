@@ -19,6 +19,7 @@ pub mod composer;
 pub mod diff_view;
 pub mod event_adapter;
 pub mod fullscreen;
+pub mod inspectors;
 pub mod layout;
 pub mod plain;
 pub mod plan_view;
@@ -40,6 +41,9 @@ pub use composer::{
 };
 pub use diff_view::{render_change_summary, render_diff_card, ChangeSummary, DiffEntry};
 pub use event_adapter::{map_sdk_event, SdkEventOutcome};
+pub use inspectors::{
+    InspectorMcp, InspectorPlugin, InspectorSkill, InspectorSubagent, InspectorTool, Inspectors,
+};
 pub use layout::{
     DetailPanelMode, DetailPanelState, FocusPane, LayoutMode, LayoutState, SidePanelMode,
     SidePanelState, TuiModal,
