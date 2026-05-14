@@ -66,7 +66,7 @@ pub struct TuiApp {
     /// When the SDK calls the bridge's `approve()`, the request lands
     /// here. `None` if the host didn't wire a bridge — in that case
     /// `ResolveApproval` actions only log to the activity panel.
-    bridge_rx: Option<mpsc::UnboundedReceiver<BridgeRequest>>,
+    bridge_rx: Option<mpsc::Receiver<BridgeRequest>>,
     /// Phase G: oneshot resolver for the in-flight approval, if any.
     /// Set when the bridge forwards a request; cleared and consumed
     /// when the user resolves the approval modal.
@@ -95,7 +95,7 @@ impl TuiApp {
     /// Phase G: register an approval-bridge receiver so the SDK's
     /// `ApprovalCallback` round-trips through the TUI modal. Pair
     /// with [`crate::approval_bridge::new_bridge_pair`].
-    pub fn with_approval_bridge(mut self, rx: mpsc::UnboundedReceiver<BridgeRequest>) -> Self {
+    pub fn with_approval_bridge(mut self, rx: mpsc::Receiver<BridgeRequest>) -> Self {
         self.bridge_rx = Some(rx);
         self
     }
@@ -183,20 +183,30 @@ impl TuiApp {
 
                 // Phase G: bridge-borne approval requests from the SDK.
                 // The `if` guard disables the branch when no bridge is
-                // wired. On receive: stash the resolver so the next
-                // `TuiAction::ResolveApproval` can answer it. The
-                // matching `SdkEvent::ApprovalRequired` is what drives
-                // the modal — the bridge only carries the resolver
-                // channel, not the UI state.
+                // wired. On receive we:
+                // 1. Synthesize the approval modal directly via
+                //    `open_approval_modal` so the user always sees a
+                //    prompt — relying on `SdkEvent::ApprovalRequired`
+                //    arriving separately would deadlock the SDK if
+                //    the runtime suppresses the event (e.g. embedded
+                //    hosts that wire only the callback).
+                // 2. Stash the resolver so the next
+                //    `TuiAction::ResolveApproval` can answer it. With
+                //    a capacity-1 bridge channel the SDK back-
+                //    pressures on concurrent approvals, but we
+                //    defensively deny any stale resolver so a stuck
+                //    `pending_resolver` (e.g. after a panic-recovered
+                //    handler) never strands the SDK.
                 Some(bridge_req) = recv_bridge(self.bridge_rx.as_mut()), if self.bridge_rx.is_some() => {
                     if let Some(old) = self.pending_resolver.take() {
-                        // Should not happen (TUI handles approvals
-                        // serially) but be defensive: deny the stale
-                        // resolver so the SDK side doesn't hang.
                         let _ = old.send(ApprovalDecision::Deny {
                             reason: "superseded by a new approval".to_string(),
                         });
                     }
+                    self.state.open_approval_modal(
+                        bridge_req.request.tool_name.clone(),
+                        bridge_req.request.summary.clone(),
+                    );
                     self.pending_resolver = Some(bridge_req.decision_tx);
                     self.state
                         .push_activity(format!("approval requested: {}", bridge_req.request.tool_name));
@@ -412,9 +422,7 @@ async fn next_run_event(run: Option<&mut AgentRun>) -> Option<RunEvent> {
 /// optional receiver. Returning `None` indicates the channel was
 /// closed (the bridge `Arc` was dropped), which the caller treats as
 /// a permanent disable.
-async fn recv_bridge(
-    rx: Option<&mut mpsc::UnboundedReceiver<BridgeRequest>>,
-) -> Option<BridgeRequest> {
+async fn recv_bridge(rx: Option<&mut mpsc::Receiver<BridgeRequest>>) -> Option<BridgeRequest> {
     rx?.recv().await
 }
 

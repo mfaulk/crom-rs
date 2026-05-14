@@ -7535,8 +7535,9 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
         if interrupted.is_empty() {
             state.push_activity("recover: no interrupted sessions found".to_string());
         } else {
-            let mut body =
-                vec!["Interrupted sessions detected. Choose how to proceed:".to_string()];
+            let mut body = vec![
+                "Recovery available. The following sessions did not exit cleanly:".to_string(),
+            ];
             body.push(String::new());
             for s in &interrupted {
                 body.push(format!(
@@ -7547,7 +7548,11 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
                 ));
             }
             body.push(String::new());
-            body.push("  Press Esc to dismiss. Resume support lands in a later phase.".to_string());
+            body.push(
+                "  This is informational only; resume action lands in a later phase. \
+                 Press Esc to dismiss."
+                    .to_string(),
+            );
             state.push_modal(code_agent_tui::TuiModal::Custom {
                 id: "phase-g-recovery".to_string(),
                 title: format!("Recovery — {} session(s)", interrupted.len()),
@@ -7833,7 +7838,15 @@ fn is_current_provider(p: &code_agent_auth::ProviderId, fake_provider: bool) -> 
     use code_agent_auth::ProviderId::*;
     match p {
         Fake => fake_provider,
-        Anthropic => !fake_provider && std::env::var("ANTHROPIC_API_KEY").is_ok(),
+        // Mirror `build_tui_provider_config`: an empty env var is
+        // treated as "not configured" so the inspector's "current"
+        // mark matches what the runtime actually uses.
+        Anthropic => {
+            !fake_provider
+                && std::env::var("ANTHROPIC_API_KEY")
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+        }
         _ => false,
     }
 }

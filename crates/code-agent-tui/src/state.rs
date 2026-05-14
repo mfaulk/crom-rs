@@ -403,18 +403,44 @@ impl TuiAppState {
         }
     }
 
+    /// Phase G: synthesize the tool-approval modal directly. Used by
+    /// both the `SdkEvent::ApprovalRequired` event arm and the
+    /// approval-bridge path so a TUI host that receives the callback
+    /// before the matching event (or where the event is suppressed)
+    /// still renders the modal and stores `pending_approval`.
+    pub fn open_approval_modal(&mut self, tool_name: String, summary: String) {
+        self.pending_approval = Some(PendingApproval {
+            tool_name: tool_name.clone(),
+            summary: summary.clone(),
+        });
+        self.layout.detail_panel.mode = DetailPanelMode::Approval;
+        self.layout.detail_panel.visible = true;
+        self.layout.push_modal(TuiModal::Custom {
+            id: APPROVAL_MODAL_ID.to_string(),
+            title: format!("Approve {tool_name}?"),
+            body: vec![
+                summary,
+                String::new(),
+                "  [y] yes  [s] yes-for-session  [n] no/Esc  [r] deny-with-feedback".to_string(),
+            ],
+        });
+    }
+
     /// Phase G: append a diagnostic to the bounded ring buffer. Drops
     /// the oldest entry once [`DIAGNOSTIC_CAP`] is exceeded. Selection
     /// indices for the Diagnostics panel are unaffected; the renderer
-    /// clamps to the new bounds.
+    /// clamps to the new bounds. Only `warning` / `error` severities
+    /// mirror to the activity log — `info` would churn the 16-entry
+    /// activity panel without adding signal, since the
+    /// `event_adapter` already produces a transcript card for every
+    /// diagnostic.
     pub fn push_diagnostic(&mut self, entry: DiagnosticEntry) {
-        // Mirror to the activity log so a brief one-line summary is
-        // visible in the bottom status area even when the Diagnostics
-        // side panel isn't focused.
-        self.push_activity(format!(
-            "{}: {} — {}",
-            entry.severity, entry.code, entry.message
-        ));
+        if matches!(entry.severity.as_str(), "warning" | "error") {
+            self.push_activity(format!(
+                "{}: {} — {}",
+                entry.severity, entry.code, entry.message
+            ));
+        }
         self.diagnostics.push(entry);
         if self.diagnostics.len() > DIAGNOSTIC_CAP {
             let excess = self.diagnostics.len() - DIAGNOSTIC_CAP;
@@ -781,6 +807,17 @@ impl TuiAppState {
     /// Enter.
     fn apply_modal_key(&mut self, modal: TuiModal, k: KeyEvent) -> Vec<TuiAction> {
         match (modal, k) {
+            // Phase G: Esc on the tool-approval modal must also
+            // resolve the SDK callback with a Deny — silently popping
+            // the modal would strand the SDK awaiting a decision that
+            // never comes. Match this branch before the generic Esc
+            // arm.
+            (TuiModal::Custom { id, .. }, KeyEvent::Esc) if id == APPROVAL_MODAL_ID => {
+                let _ = self.layout.remove_custom_modals_by_id(APPROVAL_MODAL_ID);
+                vec![TuiAction::ResolveApproval(ApprovalDecisionAction::Deny {
+                    reason: "dismissed without decision".to_string(),
+                })]
+            }
             (_, KeyEvent::Esc) => {
                 let _ = self.layout.pop_modal();
                 // Cancelling search clears the in-progress input.
@@ -837,7 +874,15 @@ impl TuiAppState {
             'n' => ApprovalDecisionAction::Deny {
                 reason: "denied by user".to_string(),
             },
-            'r' => ApprovalDecisionAction::RequestRevision,
+            // Phase G: `r` (request revision) was listed in the
+            // Phase E modal body, but the SDK has no first-class
+            // revision variant. Until that lands, `r` maps to a
+            // descriptive Deny rather than promising a flow we can't
+            // honor. The modal copy was also dropped to avoid
+            // misleading users.
+            'r' => ApprovalDecisionAction::Deny {
+                reason: "user requested revision".to_string(),
+            },
             _ => return Vec::new(),
         };
         // Pop the modal so the user gets immediate visual feedback.
@@ -1159,21 +1204,7 @@ impl TuiAppState {
                     .remove_custom_modals_by_id(PLAN_APPROVAL_MODAL_ID);
             }
             SdkEvent::ApprovalRequired(a) => {
-                self.pending_approval = Some(PendingApproval {
-                    tool_name: a.tool_name.clone(),
-                    summary: a.summary.clone(),
-                });
-                self.layout.detail_panel.mode = DetailPanelMode::Approval;
-                self.layout.detail_panel.visible = true;
-                self.layout.push_modal(TuiModal::Custom {
-                    id: APPROVAL_MODAL_ID.to_string(),
-                    title: format!("Approve {}?", a.tool_name),
-                    body: vec![
-                        a.summary.clone(),
-                        String::new(),
-                        "  [y] yes  [s] yes-for-session  [n] no  [r] revise".to_string(),
-                    ],
-                });
+                self.open_approval_modal(a.tool_name.clone(), a.summary.clone());
             }
             SdkEvent::ApprovalResolved(_) => {
                 self.pending_approval = None;
@@ -2434,6 +2465,78 @@ mod tests {
         });
         s.inspector_selection.tools = Some(42);
         assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(0));
+    }
+
+    #[test]
+    // Phase G fix: Esc on the tool-approval modal must resolve the
+    // SDK callback with a Deny, not silently dismiss. The reducer
+    // emits a ResolveApproval(Deny) action so app.rs can send it
+    // through the bridge resolver and prevent SDK hang.
+    fn approval_modal_esc_emits_deny_action() {
+        let mut s = fresh_state();
+        s.open_approval_modal("Bash".to_string(), "rm -rf target".to_string());
+        assert!(s.pending_approval.is_some());
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Esc));
+        match actions.first() {
+            Some(TuiAction::ResolveApproval(ApprovalDecisionAction::Deny { reason })) => {
+                assert!(reason.contains("dismissed"));
+            }
+            other => panic!("expected ResolveApproval(Deny), got {other:?}"),
+        }
+        // Modal popped, but pending_approval is preserved until the
+        // SDK confirms via ApprovalResolved (matches Phase E
+        // semantics).
+        assert!(s.layout.current_modal().is_none());
+        assert!(s.pending_approval.is_some());
+    }
+
+    #[test]
+    // Phase G: open_approval_modal sets pending_approval and pushes
+    // the modal whether or not an SdkEvent::ApprovalRequired ever
+    // arrives. Used by the approval-bridge path so a callback-only
+    // SDK still surfaces a prompt.
+    fn open_approval_modal_directly() {
+        let mut s = fresh_state();
+        s.open_approval_modal("Bash".to_string(), "echo hi".to_string());
+        assert_eq!(
+            s.pending_approval.as_ref().unwrap().tool_name,
+            "Bash".to_string()
+        );
+        match s.layout.current_modal() {
+            Some(TuiModal::Custom { id, title, .. }) => {
+                assert_eq!(id, APPROVAL_MODAL_ID);
+                assert!(title.contains("Bash"));
+            }
+            _ => panic!("expected approval modal on top"),
+        }
+    }
+
+    #[test]
+    // Phase G: info-severity diagnostics are NOT mirrored to the
+    // activity log (avoid churning the 16-entry panel with low-signal
+    // entries). Warning / error still mirror.
+    fn info_diagnostic_skips_activity_mirror() {
+        let mut s = fresh_state();
+        s.push_diagnostic(DiagnosticEntry {
+            severity: "info".into(),
+            code: "ok".into(),
+            message: "nothing to see here".into(),
+            suggestion: None,
+        });
+        assert_eq!(s.diagnostics.len(), 1);
+        // No mirror for info.
+        assert!(s
+            .activity
+            .iter()
+            .all(|a| !a.contains("nothing to see here")));
+        // Warning DOES mirror.
+        s.push_diagnostic(DiagnosticEntry {
+            severity: "warning".into(),
+            code: "x".into(),
+            message: "look here".into(),
+            suggestion: None,
+        });
+        assert!(s.activity.iter().any(|a| a.contains("look here")));
     }
 
     #[test]

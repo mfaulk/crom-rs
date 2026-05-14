@@ -46,11 +46,17 @@ pub struct BridgeRequest {
 /// SDK-side [`ApprovalCallback`]. Construct one with
 /// [`new_bridge_pair`] and pass the `Arc<ApprovalBridge>` to
 /// `AgentRuntimeBuilder::approval_callback`; pass the
-/// `UnboundedReceiver<BridgeRequest>` to
+/// `Receiver<BridgeRequest>` to
 /// [`TuiApp::with_approval_bridge`](crate::app::TuiApp::with_approval_bridge).
+///
+/// The bridge uses a bounded channel with capacity 1 to enforce
+/// single-flight semantics: if a second approval is requested while
+/// one is already pending, the SDK side back-pressures (its
+/// `approve()` await blocks on the channel send) instead of stacking
+/// up approvals that the single TUI modal cannot service.
 #[derive(Debug, Clone)]
 pub struct ApprovalBridge {
-    tx: mpsc::UnboundedSender<BridgeRequest>,
+    tx: mpsc::Sender<BridgeRequest>,
 }
 
 #[async_trait]
@@ -61,7 +67,7 @@ impl ApprovalCallback for ApprovalBridge {
             request,
             decision_tx,
         };
-        if self.tx.send(req).is_err() {
+        if self.tx.send(req).await.is_err() {
             return Err(AgentSdkError::new(
                 AgentSdkErrorKind::Internal,
                 "approval bridge: receiver dropped before approval could be requested",
@@ -77,9 +83,11 @@ impl ApprovalCallback for ApprovalBridge {
 }
 
 /// Construct a paired bridge. Move the `Arc<ApprovalBridge>` into the
-/// SDK runtime builder and the receiver into the TUI app.
-pub fn new_bridge_pair() -> (Arc<ApprovalBridge>, mpsc::UnboundedReceiver<BridgeRequest>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+/// SDK runtime builder and the receiver into the TUI app. The
+/// channel capacity is 1 so the SDK back-pressures on the rare case
+/// of a second concurrent approval request rather than stacking.
+pub fn new_bridge_pair() -> (Arc<ApprovalBridge>, mpsc::Receiver<BridgeRequest>) {
+    let (tx, rx) = mpsc::channel(1);
     (Arc::new(ApprovalBridge { tx }), rx)
 }
 

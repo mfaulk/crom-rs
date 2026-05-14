@@ -475,7 +475,19 @@ Selection navigation in the 5 new panels works identically to the Phase F inspec
 
 `state.rs` adds 3 reducer tests: `sdk_diagnostic_pushes_into_ring_buffer`, `diagnostics_ring_buffer_is_bounded`, `phase_g_inspector_modes_report_lengths`.
 
-All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (1020 tests total) are clean.
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (1023 tests total) are clean.
+
+### Review fixes
+
+After the initial Phase G commit, a Codex review surfaced two critical bugs and several smaller issues. All addressed in a follow-up:
+
+1. **Critical**: live approvals could hang because the bridge stashed the resolver but relied on a matching `SdkEvent::ApprovalRequired` to drive the modal. Synthesize the modal state directly from the bridge request via the new `TuiAppState::open_approval_modal(...)` so callback-only SDK paths still render the prompt.
+2. **Critical**: `Esc` on the approval modal silently popped without resolving the SDK callback. Now `Esc` on the approval modal emits `ResolveApproval(Deny { reason: "dismissed without decision" })` so the SDK never hangs on a dismissed prompt.
+3. **Important**: the approval bridge now uses a bounded `mpsc::channel(1)` instead of `unbounded_channel`. The SDK back-pressures on a second concurrent approval rather than stacking them up against a single-resolver modal.
+4. **Nit**: info-severity diagnostics no longer mirror to the activity log; only warning / error mirror. Removes churn on the 16-entry panel.
+5. **Nit**: `is_current_provider` treats an empty `ANTHROPIC_API_KEY` as not-current, matching `build_tui_provider_config`.
+6. **Nit**: the recovery modal copy now reads "Recovery available. The following sessions did not exit cleanly:" and explicitly labels the modal as informational.
+7. **Nit**: the `[r] revise` modal option is replaced with `[r] deny-with-feedback` so the label matches what the SDK actually receives.
 
 ### Out of scope for Phase G
 
