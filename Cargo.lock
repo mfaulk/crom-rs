@@ -454,6 +454,7 @@ dependencies = [
 name = "code-agent-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "code-agent-core",
  "code-agent-sdk",
  "crossterm",

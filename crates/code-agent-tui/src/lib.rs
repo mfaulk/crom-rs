@@ -14,6 +14,7 @@
 
 pub mod app;
 pub mod approval;
+pub mod approval_bridge;
 pub mod completion;
 pub mod composer;
 pub mod diff_view;
@@ -31,6 +32,7 @@ pub mod view;
 
 pub use app::{drive_single_prompt, TuiApp, TuiAppError};
 pub use approval::{format_approval_card, ApprovalContext, ApprovalKind};
+pub use approval_bridge::{new_bridge_pair, ApprovalBridge, BridgeRequest};
 pub use completion::{
     context_token_candidates, detect_trigger, slash_candidates, Candidate, CompletionKind,
     CompletionPopup, TriggerSpec, CONTEXT_TOKENS, SLASH_COMMANDS,
@@ -42,7 +44,8 @@ pub use composer::{
 pub use diff_view::{render_change_summary, render_diff_card, ChangeSummary, DiffEntry};
 pub use event_adapter::{map_sdk_event, SdkEventOutcome};
 pub use inspectors::{
-    InspectorMcp, InspectorPlugin, InspectorSkill, InspectorSubagent, InspectorTool, Inspectors,
+    InspectorAccount, InspectorMcp, InspectorModel, InspectorPlugin, InspectorProvider,
+    InspectorSession, InspectorSkill, InspectorSubagent, InspectorTool, Inspectors,
 };
 pub use layout::{
     DetailPanelMode, DetailPanelState, FocusPane, LayoutMode, LayoutState, SidePanelMode,

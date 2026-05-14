@@ -111,7 +111,12 @@ fn side_panel_view(state: &TuiAppState) -> PaneView {
         | SidePanelMode::Mcp
         | SidePanelMode::Subagents
         | SidePanelMode::Skills
-        | SidePanelMode::Plugins => inspector_body(state, mode),
+        | SidePanelMode::Plugins
+        | SidePanelMode::Sessions
+        | SidePanelMode::Auth
+        | SidePanelMode::Model
+        | SidePanelMode::Provider
+        | SidePanelMode::Diagnostics => inspector_body(state, mode),
         other => side_panel_body(other),
     };
     PaneView {
@@ -206,6 +211,104 @@ fn inspector_body(state: &TuiAppState, mode: SidePanelMode) -> Vec<String> {
                 format!(
                     "{} v{} [{} | {} | {}] — {} components",
                     p.name, ver, p.scope, enabled, p.status, p.component_total
+                )
+            })
+            .collect(),
+        // M13 Phase G: sessions / accounts / models / providers /
+        // diagnostics each get one row per record.
+        SidePanelMode::Sessions => state
+            .inspectors
+            .sessions
+            .iter()
+            .map(|s| {
+                let lock = if s.has_lock { " 🔒" } else { "" };
+                let ts = s.last_modified.as_deref().unwrap_or("?");
+                format!(
+                    "{} [{}]{} — last_modified {}",
+                    truncate(&s.id, 28),
+                    s.state,
+                    lock,
+                    ts
+                )
+            })
+            .collect(),
+        SidePanelMode::Auth => state
+            .inspectors
+            .accounts
+            .iter()
+            .map(|a| {
+                let display = a.display_name.as_deref().unwrap_or("");
+                let active = if a.active { "active" } else { "stored" };
+                let exp = a
+                    .expires_at
+                    .as_deref()
+                    .map(|s| format!(" exp:{s}"))
+                    .unwrap_or_default();
+                format!(
+                    "{} [{} | {}{}] {}",
+                    a.provider,
+                    a.login_method,
+                    active,
+                    exp,
+                    truncate(display, 32)
+                )
+            })
+            .collect(),
+        SidePanelMode::Model => state
+            .inspectors
+            .models
+            .iter()
+            .map(|m| {
+                let ctx = m
+                    .context_window
+                    .map(|n| format!(" ctx:{n}"))
+                    .unwrap_or_default();
+                let flags = match (m.supports_tools, m.supports_reasoning) {
+                    (true, true) => " [tools, reasoning]",
+                    (true, false) => " [tools]",
+                    (false, true) => " [reasoning]",
+                    (false, false) => "",
+                };
+                format!(
+                    "{} / {} [{}]{}{} — {}",
+                    m.provider,
+                    m.model_id,
+                    m.availability,
+                    ctx,
+                    flags,
+                    truncate(&m.display_name, 40)
+                )
+            })
+            .collect(),
+        SidePanelMode::Provider => state
+            .inspectors
+            .providers
+            .iter()
+            .map(|p| {
+                let creds = if p.has_credentials {
+                    "creds:yes"
+                } else {
+                    "creds:no"
+                };
+                let mark = if p.current { "* current" } else { "" };
+                format!("{} [{}]{}", p.provider, creds, mark)
+            })
+            .collect(),
+        SidePanelMode::Diagnostics => state
+            .diagnostics
+            .iter()
+            .map(|d| {
+                let hint = d
+                    .suggestion
+                    .as_deref()
+                    .map(|s| format!(" — hint: {}", truncate(s, 32)))
+                    .unwrap_or_default();
+                format!(
+                    "[{}] {} — {}{}",
+                    d.severity,
+                    d.code,
+                    truncate(&d.message, 56),
+                    hint
                 )
             })
             .collect(),
@@ -526,6 +629,7 @@ mod tests {
                 component_total: 4,
                 ..Default::default()
             }],
+            ..Inspectors::default()
         });
         for mode in [
             SidePanelMode::Tools,

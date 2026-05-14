@@ -349,6 +349,12 @@ struct TuiArgs {
     /// runtime default is used.
     #[arg(long)]
     model: Option<String>,
+    /// M13 Phase G: on startup, scan for interrupted / needs-recovery
+    /// sessions and surface them in a modal so the user can decide
+    /// which one to resume. Without this flag the sessions inspector
+    /// still lists them, but no modal is opened.
+    #[arg(long)]
+    recover: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -7474,9 +7480,14 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
             return Ok(());
         }
     };
+    // Phase G: wire the approval bridge so live SDK approval
+    // requests round-trip through the TUI modal. Built before the
+    // runtime so the runtime can take a reference to the SDK side.
+    let (approval_bridge, approval_rx) = code_agent_tui::new_bridge_pair();
     let mut builder = code_agent_sdk::AgentRuntime::builder()
         .provider(provider_config)
-        .workspace(code_agent_sdk::WorkspaceSource::filesystem(&cwd));
+        .workspace(code_agent_sdk::WorkspaceSource::filesystem(&cwd))
+        .approval_callback(approval_bridge.clone());
     if let Some(m) = &args.model {
         builder = builder.model(m.clone());
     }
@@ -7490,14 +7501,16 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
     let status_ctx =
         m9::build_default_status_ctx(&cwd, &settings, args.session.as_deref(), None, false);
     let composer = code_agent_tui::ComposerState::new(settings.ui.composer.clone());
-    // Phase F: pre-load read-only snapshots of the host registries
-    // (tools, MCP, agents, skills, plugins) so the side-panel
-    // inspectors have real content. Failures are best-effort: a
-    // missing skill directory or unreadable plugin entry leaves that
-    // category empty rather than aborting TUI startup; diagnostics
-    // are surfaced to the activity panel instead of stderr so the
-    // user can see why an inspector is empty.
-    let (inspectors, diagnostics) = build_inspector_snapshot_for_tui(&cwd, &settings);
+    // Phase F/G: pre-load read-only snapshots of the host registries
+    // (tools, MCP, agents, skills, plugins, sessions, accounts,
+    // models, providers) so the side-panel inspectors have real
+    // content. Failures are best-effort: a missing dir or unreadable
+    // entry leaves that category empty rather than aborting TUI
+    // startup; diagnostics are surfaced to the activity panel
+    // instead of stderr so the user can see why an inspector is
+    // empty.
+    let (inspectors, diagnostics) =
+        build_inspector_snapshot_for_tui(&cwd, &settings, args.fake_provider).await;
     let mut state = code_agent_tui::TuiAppState::new(
         composer,
         settings.ui.status_line.template.clone(),
@@ -7507,7 +7520,47 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
     for diag in diagnostics {
         state.push_activity(diag);
     }
-    let app = code_agent_tui::TuiApp::new(runtime, state);
+    // Phase G: when --recover is set and the snapshot found any
+    // interrupted / needs-recovery sessions, open a modal listing
+    // them so the user can pick one. Picking + resuming a session is
+    // deferred to Phase H+ since it requires SDK storage adapter
+    // wiring; for Phase G the modal just informs.
+    if args.recover {
+        let interrupted: Vec<&code_agent_tui::InspectorSession> = state
+            .inspectors
+            .sessions
+            .iter()
+            .filter(|s| matches!(s.state.as_str(), "interrupted" | "needs_recovery"))
+            .collect();
+        if interrupted.is_empty() {
+            state.push_activity("recover: no interrupted sessions found".to_string());
+        } else {
+            let mut body = vec![
+                "Recovery available. The following sessions did not exit cleanly:".to_string(),
+            ];
+            body.push(String::new());
+            for s in &interrupted {
+                body.push(format!(
+                    "  {} [{}]{}",
+                    truncate(&s.id, 28),
+                    s.state,
+                    if s.has_lock { " 🔒" } else { "" }
+                ));
+            }
+            body.push(String::new());
+            body.push(
+                "  This is informational only; resume action lands in a later phase. \
+                 Press Esc to dismiss."
+                    .to_string(),
+            );
+            state.push_modal(code_agent_tui::TuiModal::Custom {
+                id: "phase-g-recovery".to_string(),
+                title: format!("Recovery — {} session(s)", interrupted.len()),
+                body,
+            });
+        }
+    }
+    let app = code_agent_tui::TuiApp::new(runtime, state).with_approval_bridge(approval_rx);
     app.run()
         .await
         .map_err(|e| anyhow!("tui exited with error: {e}"))?;
@@ -7521,12 +7574,14 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
 /// plus a list of human-readable diagnostics (one per loader
 /// failure or registration warning) that the caller seeds into the
 /// activity panel.
-fn build_inspector_snapshot_for_tui(
+async fn build_inspector_snapshot_for_tui(
     cwd: &std::path::Path,
     settings: &code_agent_core::Settings,
+    fake_provider: bool,
 ) -> (code_agent_tui::Inspectors, Vec<String>) {
     use code_agent_tui::{
-        InspectorMcp, InspectorPlugin, InspectorSkill, InspectorSubagent, InspectorTool, Inspectors,
+        InspectorAccount, InspectorMcp, InspectorModel, InspectorPlugin, InspectorProvider,
+        InspectorSession, InspectorSkill, InspectorSubagent, InspectorTool, Inspectors,
     };
 
     let mut snapshot = Inspectors::empty();
@@ -7667,7 +7722,133 @@ fn build_inspector_snapshot_for_tui(
         });
     }
 
+    // --- Phase G: Sessions ----------------------------------------
+    // Recovery's `detect_state` returns the current session inventory
+    // with state classification (idle / running / interrupted / etc.).
+    // We use it directly here because there isn't a separate
+    // "summary" API; recovery + the session id is the canonical view.
+    let stale = settings.recovery.stale_lock_after_seconds;
+    match code_agent_session::recovery::detect_state(cwd, stale).await {
+        Ok(infos) => {
+            for info in infos {
+                let has_lock = info.lock.is_some();
+                let last_modified = info.last_modified_unix.map(|t| format!("unix:{t}"));
+                snapshot.sessions.push(InspectorSession {
+                    id: info.session_id.as_str().to_string(),
+                    state: session_state_label(info.state).to_string(),
+                    last_modified,
+                    has_lock,
+                });
+            }
+        }
+        Err(e) => diagnostics.push(format!("sessions list failed: {e}")),
+    }
+
+    // --- Phase G: Auth / Model / Provider --------------------------
+    // The auth registries are stored on disk. We open them in
+    // read-only mode and project a snapshot. Failures are logged to
+    // the activity panel, not propagated, so a missing or corrupt
+    // store doesn't keep the TUI from starting.
+    let allow_file = settings.auth.allow_file_credential_store.unwrap_or(false);
+    let store_result = code_agent_auth::CredentialStore::build(
+        code_agent_auth::CredentialStoreMode::Auto,
+        allow_file,
+        Some(cwd.join(".agent").join("auth.json")),
+    );
+    match store_result {
+        Ok(store) => {
+            // Take an immutable snapshot of the index so we don't
+            // hold the store lock across our project / format loop.
+            let index = store.snapshot_index();
+            for provider in known_provider_ids() {
+                let accounts = index.list_for(&provider);
+                let active_id = index.active_for(&provider);
+                for account in &accounts {
+                    let active = Some(&account.account_id) == active_id;
+                    snapshot.accounts.push(InspectorAccount {
+                        provider: provider.as_str().to_string(),
+                        account_id: account.account_id.as_str().to_string(),
+                        display_name: account.display_email.clone(),
+                        login_method: account.login_method.as_str().to_string(),
+                        active,
+                        expires_at: account.expires_at.map(|t| t.to_string()),
+                    });
+                }
+                let has_credentials = !accounts.is_empty();
+                let current = is_current_provider(&provider, fake_provider);
+                snapshot.providers.push(InspectorProvider {
+                    provider: provider.as_str().to_string(),
+                    has_credentials,
+                    current,
+                });
+            }
+        }
+        Err(e) => {
+            diagnostics.push(format!("credential store load failed: {e}"));
+            for provider in known_provider_ids() {
+                snapshot.providers.push(InspectorProvider {
+                    provider: provider.as_str().to_string(),
+                    has_credentials: false,
+                    current: is_current_provider(&provider, fake_provider),
+                });
+            }
+        }
+    }
+
+    let model_registry = code_agent_auth::starter_registry();
+    for info in &model_registry.models {
+        snapshot.models.push(InspectorModel {
+            provider: info.provider.as_str().to_string(),
+            model_id: info.model_id.clone(),
+            display_name: info.display_name.clone(),
+            context_window: info.context_window,
+            availability: info.availability.label(),
+            supports_tools: info.supports_tools,
+            supports_reasoning: info.supports_reasoning,
+        });
+    }
+
     (snapshot, diagnostics)
+}
+
+/// Phase G: known provider ids exposed in the Provider selector.
+/// Mirrors the set the `default_registry` registers. We don't pull
+/// from the live registry because that would require constructing a
+/// `FakeProviderState`, and the TUI selector is purely informational.
+fn known_provider_ids() -> Vec<code_agent_auth::ProviderId> {
+    use code_agent_auth::ProviderId::*;
+    vec![
+        Anthropic, OpenAi, Codex, Gemini, VertexAi, Bedrock, Foundry, Fake,
+    ]
+}
+
+fn session_state_label(s: code_agent_core::SessionRuntimeState) -> &'static str {
+    use code_agent_core::SessionRuntimeState::*;
+    match s {
+        Idle => "idle",
+        Running => "running",
+        Complete => "complete",
+        Crashed => "crashed",
+        Interrupted => "interrupted",
+        NeedsRecovery => "needs_recovery",
+    }
+}
+
+fn is_current_provider(p: &code_agent_auth::ProviderId, fake_provider: bool) -> bool {
+    use code_agent_auth::ProviderId::*;
+    match p {
+        Fake => fake_provider,
+        // Mirror `build_tui_provider_config`: an empty env var is
+        // treated as "not configured" so the inspector's "current"
+        // mark matches what the runtime actually uses.
+        Anthropic => {
+            !fake_provider
+                && std::env::var("ANTHROPIC_API_KEY")
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 fn permission_kind_label(kind: code_agent_core::permission::PermissionKind) -> &'static str {

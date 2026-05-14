@@ -210,6 +210,44 @@ pub struct TuiAppState {
     /// at a stale row if the host hot-reloads the snapshot; the
     /// renderer clamps to the visible range.
     pub inspector_selection: InspectorSelection,
+    /// Phase G: bounded ring buffer of [`DiagnosticEntry`] records
+    /// pulled from `SdkEvent::Diagnostic` events. Renders into the
+    /// Diagnostics side panel and is also surfaced in the activity
+    /// log.
+    pub diagnostics: Vec<DiagnosticEntry>,
+    /// Phase G: selection cursor for the Diagnostics panel. Same
+    /// `None`-initialized-then-seeds-to-0 semantics as the inspector
+    /// cursors.
+    pub diagnostic_selection: Option<usize>,
+}
+
+/// Phase G: TUI-local mirror of [`code_agent_sdk::error::Diagnostic`].
+/// Stays plain-string so the renderer doesn't depend on the SDK enum
+/// shape; the event-adapter step does the translation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiagnosticEntry {
+    /// Severity label: `info`, `warning`, `error`.
+    pub severity: String,
+    /// Stable diagnostic code (e.g. `tool/exec/timeout`).
+    pub code: String,
+    /// Human-readable message.
+    pub message: String,
+    /// Optional hint produced by the SDK to nudge the user toward a fix.
+    pub suggestion: Option<String>,
+}
+
+/// Maximum number of diagnostics retained in state. Past this point
+/// older entries drop on push.
+pub const DIAGNOSTIC_CAP: usize = 64;
+
+/// Phase G: snake-case label for a [`code_agent_sdk::error::DiagnosticSeverity`].
+fn diagnostic_severity_label(s: code_agent_sdk::error::DiagnosticSeverity) -> &'static str {
+    use code_agent_sdk::error::DiagnosticSeverity::*;
+    match s {
+        Info => "info",
+        Warning => "warning",
+        Error => "error",
+    }
 }
 
 /// Per-inspector selection cursor. Kept as a small named struct
@@ -222,6 +260,11 @@ pub struct InspectorSelection {
     pub subagents: Option<usize>,
     pub skills: Option<usize>,
     pub plugins: Option<usize>,
+    /// Phase G additions.
+    pub sessions: Option<usize>,
+    pub accounts: Option<usize>,
+    pub models: Option<usize>,
+    pub providers: Option<usize>,
 }
 
 /// Phase E: the minimal pending-approval record the TUI needs to
@@ -269,6 +312,8 @@ impl TuiAppState {
             last_patch: None,
             inspectors: Inspectors::empty(),
             inspector_selection: InspectorSelection::default(),
+            diagnostics: Vec::new(),
+            diagnostic_selection: None,
         }
     }
 
@@ -283,7 +328,8 @@ impl TuiAppState {
 
     /// Return the inspector list length for the active side panel
     /// mode, or `None` if the mode is not an inspector mode. Helper
-    /// for tests and the renderer.
+    /// for tests and the renderer. Phase G adds the Sessions / Auth /
+    /// Model / Provider / Diagnostics panels.
     pub fn inspector_list_len(&self, mode: SidePanelMode) -> Option<usize> {
         match mode {
             SidePanelMode::Tools => Some(self.inspectors.tools.len()),
@@ -291,6 +337,11 @@ impl TuiAppState {
             SidePanelMode::Subagents => Some(self.inspectors.subagents.len()),
             SidePanelMode::Skills => Some(self.inspectors.skills.len()),
             SidePanelMode::Plugins => Some(self.inspectors.plugins.len()),
+            SidePanelMode::Sessions => Some(self.inspectors.sessions.len()),
+            SidePanelMode::Auth => Some(self.inspectors.accounts.len()),
+            SidePanelMode::Model => Some(self.inspectors.models.len()),
+            SidePanelMode::Provider => Some(self.inspectors.providers.len()),
+            SidePanelMode::Diagnostics => Some(self.diagnostics.len()),
             _ => None,
         }
     }
@@ -310,6 +361,11 @@ impl TuiAppState {
             SidePanelMode::Subagents => self.inspector_selection.subagents,
             SidePanelMode::Skills => self.inspector_selection.skills,
             SidePanelMode::Plugins => self.inspector_selection.plugins,
+            SidePanelMode::Sessions => self.inspector_selection.sessions,
+            SidePanelMode::Auth => self.inspector_selection.accounts,
+            SidePanelMode::Model => self.inspector_selection.models,
+            SidePanelMode::Provider => self.inspector_selection.providers,
+            SidePanelMode::Diagnostics => self.diagnostic_selection,
             _ => return None,
         }
         .unwrap_or(0);
@@ -338,7 +394,57 @@ impl TuiAppState {
             SidePanelMode::Subagents => self.inspector_selection.subagents = value,
             SidePanelMode::Skills => self.inspector_selection.skills = value,
             SidePanelMode::Plugins => self.inspector_selection.plugins = value,
+            SidePanelMode::Sessions => self.inspector_selection.sessions = value,
+            SidePanelMode::Auth => self.inspector_selection.accounts = value,
+            SidePanelMode::Model => self.inspector_selection.models = value,
+            SidePanelMode::Provider => self.inspector_selection.providers = value,
+            SidePanelMode::Diagnostics => self.diagnostic_selection = value,
             _ => {}
+        }
+    }
+
+    /// Phase G: synthesize the tool-approval modal directly. Used by
+    /// both the `SdkEvent::ApprovalRequired` event arm and the
+    /// approval-bridge path so a TUI host that receives the callback
+    /// before the matching event (or where the event is suppressed)
+    /// still renders the modal and stores `pending_approval`.
+    pub fn open_approval_modal(&mut self, tool_name: String, summary: String) {
+        self.pending_approval = Some(PendingApproval {
+            tool_name: tool_name.clone(),
+            summary: summary.clone(),
+        });
+        self.layout.detail_panel.mode = DetailPanelMode::Approval;
+        self.layout.detail_panel.visible = true;
+        self.layout.push_modal(TuiModal::Custom {
+            id: APPROVAL_MODAL_ID.to_string(),
+            title: format!("Approve {tool_name}?"),
+            body: vec![
+                summary,
+                String::new(),
+                "  [y] yes  [s] yes-for-session  [n] no/Esc  [r] deny-with-feedback".to_string(),
+            ],
+        });
+    }
+
+    /// Phase G: append a diagnostic to the bounded ring buffer. Drops
+    /// the oldest entry once [`DIAGNOSTIC_CAP`] is exceeded. Selection
+    /// indices for the Diagnostics panel are unaffected; the renderer
+    /// clamps to the new bounds. Only `warning` / `error` severities
+    /// mirror to the activity log — `info` would churn the 16-entry
+    /// activity panel without adding signal, since the
+    /// `event_adapter` already produces a transcript card for every
+    /// diagnostic.
+    pub fn push_diagnostic(&mut self, entry: DiagnosticEntry) {
+        if matches!(entry.severity.as_str(), "warning" | "error") {
+            self.push_activity(format!(
+                "{}: {} — {}",
+                entry.severity, entry.code, entry.message
+            ));
+        }
+        self.diagnostics.push(entry);
+        if self.diagnostics.len() > DIAGNOSTIC_CAP {
+            let excess = self.diagnostics.len() - DIAGNOSTIC_CAP;
+            self.diagnostics.drain(..excess);
         }
     }
 
@@ -701,6 +807,17 @@ impl TuiAppState {
     /// Enter.
     fn apply_modal_key(&mut self, modal: TuiModal, k: KeyEvent) -> Vec<TuiAction> {
         match (modal, k) {
+            // Phase G: Esc on the tool-approval modal must also
+            // resolve the SDK callback with a Deny — silently popping
+            // the modal would strand the SDK awaiting a decision that
+            // never comes. Match this branch before the generic Esc
+            // arm.
+            (TuiModal::Custom { id, .. }, KeyEvent::Esc) if id == APPROVAL_MODAL_ID => {
+                let _ = self.layout.remove_custom_modals_by_id(APPROVAL_MODAL_ID);
+                vec![TuiAction::ResolveApproval(ApprovalDecisionAction::Deny {
+                    reason: "dismissed without decision".to_string(),
+                })]
+            }
             (_, KeyEvent::Esc) => {
                 let _ = self.layout.pop_modal();
                 // Cancelling search clears the in-progress input.
@@ -757,7 +874,15 @@ impl TuiAppState {
             'n' => ApprovalDecisionAction::Deny {
                 reason: "denied by user".to_string(),
             },
-            'r' => ApprovalDecisionAction::RequestRevision,
+            // Phase G: `r` (request revision) was listed in the
+            // Phase E modal body, but the SDK has no first-class
+            // revision variant. Until that lands, `r` maps to a
+            // descriptive Deny rather than promising a flow we can't
+            // honor. The modal copy was also dropped to avoid
+            // misleading users.
+            'r' => ApprovalDecisionAction::Deny {
+                reason: "user requested revision".to_string(),
+            },
             _ => return Vec::new(),
         };
         // Pop the modal so the user gets immediate visual feedback.
@@ -1079,21 +1204,7 @@ impl TuiAppState {
                     .remove_custom_modals_by_id(PLAN_APPROVAL_MODAL_ID);
             }
             SdkEvent::ApprovalRequired(a) => {
-                self.pending_approval = Some(PendingApproval {
-                    tool_name: a.tool_name.clone(),
-                    summary: a.summary.clone(),
-                });
-                self.layout.detail_panel.mode = DetailPanelMode::Approval;
-                self.layout.detail_panel.visible = true;
-                self.layout.push_modal(TuiModal::Custom {
-                    id: APPROVAL_MODAL_ID.to_string(),
-                    title: format!("Approve {}?", a.tool_name),
-                    body: vec![
-                        a.summary.clone(),
-                        String::new(),
-                        "  [y] yes  [s] yes-for-session  [n] no  [r] revise".to_string(),
-                    ],
-                });
+                self.open_approval_modal(a.tool_name.clone(), a.summary.clone());
             }
             SdkEvent::ApprovalResolved(_) => {
                 self.pending_approval = None;
@@ -1103,6 +1214,18 @@ impl TuiAppState {
                 self.last_patch = Some(p.patch.clone());
                 self.layout.detail_panel.mode = DetailPanelMode::Diff;
                 self.layout.detail_panel.visible = true;
+            }
+            // M13 Phase G: pull diagnostics into the bounded ring
+            // buffer that backs the Diagnostics side panel. The
+            // event-adapter mirror still produces an EventCard for
+            // the main transcript so this is purely additive.
+            SdkEvent::Diagnostic(d) => {
+                self.push_diagnostic(DiagnosticEntry {
+                    severity: diagnostic_severity_label(d.diagnostic.severity).to_string(),
+                    code: d.diagnostic.code.clone(),
+                    message: d.diagnostic.message.clone(),
+                    suggestion: d.diagnostic.suggestion.clone(),
+                });
             }
             _ => {}
         }
@@ -2342,6 +2465,168 @@ mod tests {
         });
         s.inspector_selection.tools = Some(42);
         assert_eq!(s.inspector_selected_index(SidePanelMode::Tools), Some(0));
+    }
+
+    #[test]
+    // Phase G fix: Esc on the tool-approval modal must resolve the
+    // SDK callback with a Deny, not silently dismiss. The reducer
+    // emits a ResolveApproval(Deny) action so app.rs can send it
+    // through the bridge resolver and prevent SDK hang.
+    fn approval_modal_esc_emits_deny_action() {
+        let mut s = fresh_state();
+        s.open_approval_modal("Bash".to_string(), "rm -rf target".to_string());
+        assert!(s.pending_approval.is_some());
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Esc));
+        match actions.first() {
+            Some(TuiAction::ResolveApproval(ApprovalDecisionAction::Deny { reason })) => {
+                assert!(reason.contains("dismissed"));
+            }
+            other => panic!("expected ResolveApproval(Deny), got {other:?}"),
+        }
+        // Modal popped, but pending_approval is preserved until the
+        // SDK confirms via ApprovalResolved (matches Phase E
+        // semantics).
+        assert!(s.layout.current_modal().is_none());
+        assert!(s.pending_approval.is_some());
+    }
+
+    #[test]
+    // Phase G: open_approval_modal sets pending_approval and pushes
+    // the modal whether or not an SdkEvent::ApprovalRequired ever
+    // arrives. Used by the approval-bridge path so a callback-only
+    // SDK still surfaces a prompt.
+    fn open_approval_modal_directly() {
+        let mut s = fresh_state();
+        s.open_approval_modal("Bash".to_string(), "echo hi".to_string());
+        assert_eq!(
+            s.pending_approval.as_ref().unwrap().tool_name,
+            "Bash".to_string()
+        );
+        match s.layout.current_modal() {
+            Some(TuiModal::Custom { id, title, .. }) => {
+                assert_eq!(id, APPROVAL_MODAL_ID);
+                assert!(title.contains("Bash"));
+            }
+            _ => panic!("expected approval modal on top"),
+        }
+    }
+
+    #[test]
+    // Phase G: info-severity diagnostics are NOT mirrored to the
+    // activity log (avoid churning the 16-entry panel with low-signal
+    // entries). Warning / error still mirror.
+    fn info_diagnostic_skips_activity_mirror() {
+        let mut s = fresh_state();
+        s.push_diagnostic(DiagnosticEntry {
+            severity: "info".into(),
+            code: "ok".into(),
+            message: "nothing to see here".into(),
+            suggestion: None,
+        });
+        assert_eq!(s.diagnostics.len(), 1);
+        // No mirror for info.
+        assert!(s
+            .activity
+            .iter()
+            .all(|a| !a.contains("nothing to see here")));
+        // Warning DOES mirror.
+        s.push_diagnostic(DiagnosticEntry {
+            severity: "warning".into(),
+            code: "x".into(),
+            message: "look here".into(),
+            suggestion: None,
+        });
+        assert!(s.activity.iter().any(|a| a.contains("look here")));
+    }
+
+    #[test]
+    // Phase G: SdkEvent::Diagnostic feeds the diagnostics ring buffer
+    // and mirrors a one-line summary to the activity log.
+    fn sdk_diagnostic_pushes_into_ring_buffer() {
+        use code_agent_sdk::error::{Diagnostic, DiagnosticSeverity};
+        use code_agent_sdk::event::DiagnosticEvent;
+        let mut s = fresh_state();
+        let diag = Diagnostic::new(
+            "tool/exec/timeout",
+            DiagnosticSeverity::Warning,
+            "bash command exceeded budget",
+        )
+        .with_suggestion("raise tool_limits.bash_timeout_seconds");
+        s.apply(TuiInbound::sdk(SdkEvent::Diagnostic(DiagnosticEvent {
+            run_id: rid(),
+            diagnostic: diag,
+        })));
+        assert_eq!(s.diagnostics.len(), 1);
+        assert_eq!(s.diagnostics[0].severity, "warning");
+        assert_eq!(s.diagnostics[0].code, "tool/exec/timeout");
+        assert!(s.diagnostics[0]
+            .suggestion
+            .as_deref()
+            .map(|s| s.contains("bash_timeout_seconds"))
+            .unwrap_or(false));
+        // The activity log also receives a short mirror.
+        assert!(s
+            .activity
+            .last()
+            .map(|a| a.contains("tool/exec/timeout"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    // Phase G: diagnostics ring buffer caps at DIAGNOSTIC_CAP; oldest
+    // entries drop on overflow.
+    fn diagnostics_ring_buffer_is_bounded() {
+        let mut s = fresh_state();
+        for i in 0..(DIAGNOSTIC_CAP + 5) {
+            s.push_diagnostic(DiagnosticEntry {
+                severity: "info".into(),
+                code: format!("c{i}"),
+                message: format!("m{i}"),
+                suggestion: None,
+            });
+        }
+        assert_eq!(s.diagnostics.len(), DIAGNOSTIC_CAP);
+        // Oldest 5 dropped; first remaining entry is index 5.
+        assert_eq!(s.diagnostics.first().unwrap().code, "c5");
+    }
+
+    #[test]
+    // Phase G: inspector_list_len now reports for sessions, accounts,
+    // models, providers, and diagnostics modes.
+    fn phase_g_inspector_modes_report_lengths() {
+        use crate::inspectors::{
+            InspectorAccount, InspectorModel, InspectorProvider, InspectorSession, Inspectors,
+        };
+        let mut s = fresh_state().with_inspectors(Inspectors {
+            sessions: vec![InspectorSession {
+                id: "s1".into(),
+                ..Default::default()
+            }],
+            accounts: vec![InspectorAccount {
+                provider: "anthropic".into(),
+                ..Default::default()
+            }],
+            models: vec![InspectorModel {
+                provider: "anthropic".into(),
+                model_id: "claude".into(),
+                ..Default::default()
+            }],
+            providers: vec![InspectorProvider {
+                provider: "anthropic".into(),
+                ..Default::default()
+            }],
+            ..Inspectors::default()
+        });
+        s.push_diagnostic(DiagnosticEntry {
+            severity: "info".into(),
+            code: "x".into(),
+            ..Default::default()
+        });
+        assert_eq!(s.inspector_list_len(SidePanelMode::Sessions), Some(1));
+        assert_eq!(s.inspector_list_len(SidePanelMode::Auth), Some(1));
+        assert_eq!(s.inspector_list_len(SidePanelMode::Model), Some(1));
+        assert_eq!(s.inspector_list_len(SidePanelMode::Provider), Some(1));
+        assert_eq!(s.inspector_list_len(SidePanelMode::Diagnostics), Some(1));
     }
 
     #[test]
