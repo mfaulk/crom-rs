@@ -164,6 +164,10 @@ impl TuiAppState {
             TuiInbound::Resize { width, height } => {
                 self.size = (width, height);
                 self.layout.recompute_for_size(width, height);
+                // Responsive shrink may hide the panel that currently
+                // holds focus. Bring focus back to the composer so the
+                // user always has a visible cursor.
+                self.clamp_focus();
                 Vec::new()
             }
         }
@@ -188,11 +192,24 @@ impl TuiAppState {
                 );
                 return Vec::new();
             }
-            KeyEvent::Esc if self.layout.current_modal().is_some() => {
-                let _ = self.layout.pop_modal();
-                return Vec::new();
-            }
             _ => {}
+        }
+        // When a modal is open, swallow most input so a key doesn't
+        // accidentally mutate the composer or submit a prompt behind
+        // the overlay. Esc still pops the modal; Ctrl+C still cancels
+        // the active run or exits.
+        if self.layout.current_modal().is_some() {
+            return match k {
+                KeyEvent::Esc => {
+                    let _ = self.layout.pop_modal();
+                    Vec::new()
+                }
+                KeyEvent::CtrlC => match self.run_status {
+                    RunStatus::Running => vec![TuiAction::CancelRun],
+                    RunStatus::Idle => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
         }
         match self.composer.handle_key(k) {
             KeyAction::Submit(prompt) => {
@@ -200,31 +217,25 @@ impl TuiAppState {
                 if trimmed.is_empty() {
                     return Vec::new();
                 }
+                // `//foo` is the literal-prompt escape: collapse the
+                // leading double-slash into a single `/` and submit
+                // `/foo` to the runtime. Lets users send absolute
+                // paths or anything that starts with `/` without
+                // colliding with the slash-command space.
+                if let Some(rest) = trimmed.strip_prefix("//") {
+                    let with_one_slash = format!("/{rest}");
+                    return self.submit_prompt_action(&with_one_slash);
+                }
                 // Slash commands route into the layout state machine
-                // instead of the runtime: `/plan`, `/files`, `/help`,
-                // and friends switch panels or open modals without
-                // submitting anything to the SDK.
+                // instead of the runtime. Unknown commands are NOT
+                // fall-through-submitted: that would turn a typo
+                // (`/halp`) into a silently-sent prompt, which is worse
+                // than a clear diagnostic.
                 if let Some(stripped) = trimmed.strip_prefix('/') {
                     self.apply_slash_command(stripped);
                     return Vec::new();
                 }
-                // Reject prompts while a run is in flight so we don't
-                // optimistically append a "You:" card for a prompt that
-                // would then be silently dropped by the host loop. The
-                // user sees a diagnostic; a future phase can queue.
-                if matches!(self.run_status, RunStatus::Running) {
-                    self.push_activity("ignored prompt: run already in progress".to_string());
-                    return Vec::new();
-                }
-                let prompt = trimmed.to_string();
-                self.push_transcript(EventCard {
-                    kind: "user",
-                    headline: "You:".to_string(),
-                    body: prompt.lines().map(String::from).collect(),
-                });
-                self.run_status = RunStatus::Running;
-                self.last_error = None;
-                vec![TuiAction::SubmitPrompt(prompt)]
+                self.submit_prompt_action(trimmed)
             }
             KeyAction::Interrupt => match self.run_status {
                 RunStatus::Running => vec![TuiAction::CancelRun],
@@ -235,19 +246,55 @@ impl TuiAppState {
         }
     }
 
+    /// Common path for submitting a literal prompt (used both by
+    /// vanilla input and the `//` escape). Enforces the
+    /// "no submit while run is in progress" guard.
+    fn submit_prompt_action(&mut self, prompt: &str) -> Vec<TuiAction> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Vec::new();
+        }
+        if matches!(self.run_status, RunStatus::Running) {
+            self.push_activity("ignored prompt: run already in progress".to_string());
+            return Vec::new();
+        }
+        let prompt = prompt.to_string();
+        self.push_transcript(EventCard {
+            kind: "user",
+            headline: "You:".to_string(),
+            body: prompt.lines().map(String::from).collect(),
+        });
+        self.run_status = RunStatus::Running;
+        self.last_error = None;
+        vec![TuiAction::SubmitPrompt(prompt)]
+    }
+
     fn apply_slash_command(&mut self, cmd: &str) {
-        let cmd = cmd.trim();
+        // Allow `/cmd args...` by splitting off the first whitespace
+        // run. Phase B doesn't act on args yet; Phase H will use them
+        // for palette / search inputs.
+        let (cmd_name, _args) = cmd
+            .trim()
+            .split_once(char::is_whitespace)
+            .unwrap_or((cmd.trim(), ""));
         // Side-panel switches. Accept any of the 14 canonical config
         // keys plus `agents` (alias for `subagents`) — kept in sync
         // with `SidePanelMode::from_config_key`.
-        if let Some(mode) = SidePanelMode::from_config_key(cmd) {
+        if let Some(mode) = SidePanelMode::from_config_key(cmd_name) {
             self.layout.side_panel.mode = mode;
             self.layout.side_panel.visible = true;
-            self.layout.focus = FocusPane::SidePanel;
+            // Only move focus to the side panel if it will actually be
+            // rendered: in Compact / Tiny layouts the panel is hidden,
+            // and stranding focus on an invisible pane creates a
+            // no-visible-focus state.
+            if self.layout.side_panel_rendered() {
+                self.layout.focus = FocusPane::SidePanel;
+            }
             self.push_activity(format!("side panel → {}", mode.label()));
+            self.clamp_focus();
             return;
         }
-        match cmd {
+        match cmd_name {
             "help" | "keys" => {
                 self.layout.push_modal(TuiModal::Help);
             }
@@ -272,6 +319,28 @@ impl TuiAppState {
             other => {
                 self.push_activity(format!("unknown slash command: /{other}"));
             }
+        }
+        // Whatever changed above, make sure focus still points at a
+        // pane that is rendered. Otherwise the user has no visible
+        // cursor until they press Tab.
+        self.clamp_focus();
+    }
+
+    /// If `layout.focus` points at a pane that is not currently
+    /// rendered (because it was hidden or because responsive mode
+    /// suppresses it), reset focus to the composer. Cheap to call
+    /// after any panel-state or layout-mode mutation.
+    fn clamp_focus(&mut self) {
+        let side_ok = self.layout.side_panel_rendered();
+        let detail_ok = self.layout.detail_panel_rendered();
+        match self.layout.focus {
+            FocusPane::SidePanel if !side_ok => {
+                self.layout.focus = FocusPane::Composer;
+            }
+            FocusPane::DetailPanel if !detail_ok => {
+                self.layout.focus = FocusPane::Composer;
+            }
+            _ => {}
         }
     }
 
@@ -621,9 +690,14 @@ mod tests {
 
     #[test]
     // A `/files` slash command switches the side panel mode and never
-    // submits a prompt to the runtime.
+    // submits a prompt to the runtime. On a Full-sized terminal the
+    // side panel is rendered, so focus moves to it.
     fn slash_command_routes_panel_switch() {
         let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
         for c in "/files".chars() {
             s.apply(TuiInbound::Key(KeyEvent::Char(c)));
         }
@@ -679,6 +753,130 @@ mod tests {
         });
         assert_eq!(s.layout.mode, crate::layout::LayoutMode::Full);
         assert_eq!(s.layout.side_panel.mode, SidePanelMode::Changes);
+    }
+
+    #[test]
+    // A `//path/...` prompt is the literal-prompt escape: the leading
+    // pair of slashes is collapsed to one and submitted unchanged.
+    fn double_slash_escapes_to_prompt() {
+        let mut s = fresh_state();
+        for c in "//var/log/syslog is broken".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert_eq!(
+            actions,
+            vec![TuiAction::SubmitPrompt(
+                "/var/log/syslog is broken".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    // Slash commands accept trailing arguments (Phase H will use them).
+    // The command name still resolves and the activity log records it.
+    fn slash_command_accepts_arguments() {
+        let mut s = fresh_state();
+        for c in "/files src/main.rs".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(actions.is_empty());
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Files);
+    }
+
+    #[test]
+    // While a modal is open, the composer must not see Enter / Char
+    // events. Esc still pops the modal; Ctrl+C cancels a running run.
+    fn modal_blocks_input_to_composer() {
+        let mut s = fresh_state();
+        s.layout.push_modal(TuiModal::Help);
+        for c in "this should be ignored".chars() {
+            let actions = s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+            assert!(actions.is_empty());
+        }
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(actions.is_empty(), "Enter must not submit while modal open");
+        assert!(
+            s.composer.buffer.is_empty(),
+            "composer should not have absorbed keys"
+        );
+        // Esc still pops the modal.
+        s.apply(TuiInbound::Key(KeyEvent::Esc));
+        assert!(s.layout.current_modal().is_none());
+    }
+
+    #[test]
+    // Ctrl+C with a modal open and a run in flight still cancels the
+    // run rather than getting swallowed.
+    fn ctrl_c_through_modal_cancels_run() {
+        let mut s = fresh_state();
+        s.run_status = RunStatus::Running;
+        s.layout.push_modal(TuiModal::Help);
+        let actions = s.apply(TuiInbound::Key(KeyEvent::CtrlC));
+        assert_eq!(actions, vec![TuiAction::CancelRun]);
+    }
+
+    #[test]
+    // Toggling a panel off while it has focus snaps focus back to the
+    // composer so the user always has a visible cursor.
+    fn hide_panel_clamps_focus() {
+        let mut s = fresh_state();
+        // Reach Full mode so panel is rendered.
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        // Focus the side panel.
+        s.apply(TuiInbound::Key(KeyEvent::Tab)); // Composer → Transcript
+        s.apply(TuiInbound::Key(KeyEvent::Tab)); // Transcript → SidePanel
+        assert_eq!(s.layout.focus, FocusPane::SidePanel);
+        // /toggle-side hides it.
+        for c in "/toggle-side".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(!s.layout.side_panel.visible);
+        assert_eq!(s.layout.focus, FocusPane::Composer);
+    }
+
+    #[test]
+    // On a Compact terminal where the side panel is not rendered,
+    // `/files` keeps focus on the composer because moving it to an
+    // invisible pane would leave the user with no visible cursor.
+    fn slash_switch_on_compact_keeps_focus_on_composer() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 70,
+            height: 16,
+        });
+        assert_eq!(s.layout.mode, crate::layout::LayoutMode::Compact);
+        for c in "/files".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Files);
+        // Mode is still Compact → side panel not rendered → focus
+        // stays on the composer.
+        assert_eq!(s.layout.focus, FocusPane::Composer);
+    }
+
+    #[test]
+    // Resizing down to Tiny while focus is on a panel clamps focus.
+    fn resize_to_tiny_clamps_focus() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        assert_eq!(s.layout.focus, FocusPane::SidePanel);
+        s.apply(TuiInbound::Resize {
+            width: 40,
+            height: 6,
+        });
+        assert_eq!(s.layout.focus, FocusPane::Composer);
     }
 
     #[test]
