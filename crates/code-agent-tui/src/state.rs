@@ -369,10 +369,14 @@ impl TuiAppState {
 
     fn apply_key(&mut self, k: KeyEvent) -> Vec<TuiAction> {
         // Completion popup keys take priority over everything except
-        // the global modal/layout dispatch. Tab accepts; Up/Down move
-        // selection; Esc closes. Any other key falls through to the
-        // composer (which may then trigger a fresh popup).
-        if self.composer_popup.is_some() && self.layout.current_modal().is_none() {
+        // the global modal/layout dispatch — but only when the
+        // composer pane is the focused pane. If focus has moved
+        // (Tab cycled to transcript), the popup is treated as stale
+        // and Tab/Up/Down/Esc fall through to pane-specific behavior.
+        if self.composer_popup.is_some()
+            && self.layout.current_modal().is_none()
+            && matches!(self.layout.focus, FocusPane::Composer)
+        {
             match k {
                 KeyEvent::Tab => {
                     self.accept_completion();
@@ -399,13 +403,18 @@ impl TuiAppState {
         }
         // Layout-priority keys intercepted before the composer. These
         // are global navigation that does not depend on which pane has
-        // focus, so the composer never sees them.
+        // focus, so the composer never sees them. Cycling focus away
+        // from the composer also closes any stale completion popup
+        // so navigation keys in the new pane aren't ambiguous.
         match k {
             KeyEvent::Tab => {
                 self.layout.focus = self.layout.focus.next(
                     self.layout.side_panel_rendered(),
                     self.layout.detail_panel_rendered(),
                 );
+                if !matches!(self.layout.focus, FocusPane::Composer) {
+                    self.composer_popup = None;
+                }
                 return Vec::new();
             }
             KeyEvent::ShiftTab => {
@@ -413,6 +422,9 @@ impl TuiAppState {
                     self.layout.side_panel_rendered(),
                     self.layout.detail_panel_rendered(),
                 );
+                if !matches!(self.layout.focus, FocusPane::Composer) {
+                    self.composer_popup = None;
+                }
                 return Vec::new();
             }
             _ => {}
@@ -1613,6 +1625,62 @@ mod tests {
         s.apply(TuiInbound::Paste(data));
         assert_eq!(s.composer.buffer.len(), PASTE_HARD_LIMIT);
         assert!(s.activity.iter().any(|a| a.contains("paste truncated")));
+    }
+
+    #[test]
+    // Accepting a mid-word completion replaces both the prefix and
+    // the suffix of the token under the cursor, not just the part
+    // before the cursor. Without this fix `/pl|an` + Tab would
+    // produce `/planan` (suffix duplication).
+    fn accept_completion_replaces_whole_token() {
+        let mut s = fresh_state();
+        for c in "/plugins".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        // Move the cursor back four characters so it sits between
+        // `/pl` and `ugins` — the popup's selected candidate is
+        // `/plan` (alphabetically first /pl* match).
+        s.composer.cursor = 3;
+        s.refresh_composer_popup();
+        let popup = s.composer_popup.as_ref().expect("popup");
+        assert_eq!(popup.kind, crate::completion::CompletionKind::Slash);
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        // Suffix `ugins` must be replaced, not duplicated.
+        assert!(
+            !s.composer.buffer.contains("ugins"),
+            "suffix duplication: {:?}",
+            s.composer.buffer
+        );
+        // The accepted candidate (whatever the popup picked) is in
+        // the buffer.
+        assert!(s.composer.buffer.starts_with('/'));
+    }
+
+    #[test]
+    // Cycling focus away from the composer closes the completion
+    // popup, so popup keys (Tab/Up/Down/Esc) don't hijack the new
+    // pane. Tab itself is consumed by the popup-accept path when
+    // the popup is open, so the cycle is exercised by ShiftTab,
+    // which falls through to the layout dispatch.
+    fn focus_cycle_clears_completion_popup() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        for c in "/p".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        assert!(s.composer_popup.is_some());
+        s.apply(TuiInbound::Key(KeyEvent::ShiftTab));
+        assert!(
+            !matches!(s.layout.focus, FocusPane::Composer),
+            "focus should have moved off composer"
+        );
+        assert!(
+            s.composer_popup.is_none(),
+            "popup should close when focus leaves composer"
+        );
     }
 
     #[test]
