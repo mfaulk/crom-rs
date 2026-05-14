@@ -70,6 +70,7 @@ code-agent-auth = { path = "crates/code-agent-auth", version = "0.1.0" }
 code-agent-provider-openai = { path = "crates/code-agent-provider-openai", version = "0.1.0" }
 code-agent-provider-gemini = { path = "crates/code-agent-provider-gemini", version = "0.1.0" }
 code-agent-sdk = { path = "crates/code-agent-sdk", version = "0.1.0" }
+code-agent-tui = { path = "crates/code-agent-tui", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

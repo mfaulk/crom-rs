@@ -340,6 +340,15 @@ struct TuiArgs {
     /// Print one frame and exit (used in tests / non-interactive demos).
     #[arg(long)]
     snapshot: bool,
+    /// Use the SDK fake provider (offline demo, deterministic echo).
+    /// When omitted, the TUI tries ANTHROPIC_API_KEY or falls back to a
+    /// snapshot frame if no provider can be built.
+    #[arg(long)]
+    fake_provider: bool,
+    /// Initial model id to seed the TUI's runtime. If omitted, the SDK
+    /// runtime default is used.
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -7416,17 +7425,20 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
         .as_deref()
         .and_then(code_agent_core::TerminalRenderer::from_str_lenient);
     let chosen = m9::choose_renderer(&settings.ui, &caps, cli_override);
-    println!(
-        "[tui] renderer={} (caps {}x{} tty={}) session={:?}",
-        chosen.as_str(),
-        caps.width,
-        caps.height,
-        caps.is_tty,
-        args.session
-    );
+
+    // Plain / snapshot path: keep M9 behavior so non-TTY contexts (CI,
+    // smoke tests, scripted demos) continue to print one deterministic
+    // frame and exit. Phase A only adds the live event-loop path below;
+    // it does not change the plain output.
     if args.snapshot || matches!(chosen, code_agent_core::TerminalRenderer::Plain) {
-        // Headless preview: print one snapshot frame using the deterministic
-        // status-line and transcript renderers, then exit.
+        println!(
+            "[tui] renderer={} (caps {}x{} tty={}) session={:?}",
+            chosen.as_str(),
+            caps.width,
+            caps.height,
+            caps.is_tty,
+            args.session
+        );
         let ctx =
             m9::build_default_status_ctx(&cwd, &settings, args.session.as_deref(), None, false);
         let line = code_agent_tui::format_status_line(
@@ -7438,11 +7450,73 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
         println!("(plain TUI fallback — use a TTY for the fullscreen UI)");
         return Ok(());
     }
-    println!(
-        "[tui] interactive UI is not yet implemented in this milestone alpha; \
-         use --snapshot for a preview frame or `--renderer plain`"
+
+    // Fullscreen path: build an SDK runtime and hand off to the live
+    // TUI app shell. M13 Phase A only supports the fake provider and
+    // Anthropic via ANTHROPIC_API_KEY; later phases extend to OAuth /
+    // OpenAI / Gemini routing already present in the rest of the CLI.
+    let provider_config = match build_tui_provider_config(&args)? {
+        Some(cfg) => cfg,
+        None => {
+            // Fall back to one preview frame so users without a configured
+            // provider still get useful output instead of an empty screen.
+            eprintln!(
+                "[tui] no provider configured; pass --fake-provider or set ANTHROPIC_API_KEY"
+            );
+            let ctx =
+                m9::build_default_status_ctx(&cwd, &settings, args.session.as_deref(), None, false);
+            let line = code_agent_tui::format_status_line(
+                &settings.ui.status_line.template,
+                &ctx,
+                caps.width.max(40) as usize,
+            );
+            println!("{line}");
+            return Ok(());
+        }
+    };
+    let mut builder = code_agent_sdk::AgentRuntime::builder()
+        .provider(provider_config)
+        .workspace(code_agent_sdk::WorkspaceSource::filesystem(&cwd));
+    if let Some(m) = &args.model {
+        builder = builder.model(m.clone());
+    }
+    let runtime = std::sync::Arc::new(
+        builder
+            .build()
+            .await
+            .map_err(|e| anyhow!("tui runtime build failed: {}", e.message))?,
     );
+
+    let status_ctx =
+        m9::build_default_status_ctx(&cwd, &settings, args.session.as_deref(), None, false);
+    let composer = code_agent_tui::ComposerState::new(settings.ui.composer.clone());
+    let state = code_agent_tui::TuiAppState::new(
+        composer,
+        settings.ui.status_line.template.clone(),
+        status_ctx,
+    );
+    let app = code_agent_tui::TuiApp::new(runtime, state);
+    app.run()
+        .await
+        .map_err(|e| anyhow!("tui exited with error: {e}"))?;
     Ok(())
+}
+
+fn build_tui_provider_config(args: &TuiArgs) -> Result<Option<code_agent_sdk::ProviderConfig>> {
+    use std::sync::Arc;
+    if args.fake_provider {
+        return Ok(Some(code_agent_sdk::ProviderConfig::fake(Arc::new(
+            code_agent_sdk::fake_provider::EchoFakeProvider,
+        ))));
+    }
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !key.is_empty() {
+            return Ok(Some(code_agent_sdk::ProviderConfig::anthropic_api_key(
+                code_agent_sdk::SecretString::new(key),
+            )));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

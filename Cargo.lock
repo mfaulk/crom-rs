@@ -455,7 +455,9 @@ name = "code-agent-tui"
 version = "0.1.0"
 dependencies = [
  "code-agent-core",
+ "code-agent-sdk",
  "crossterm",
+ "futures",
  "ratatui",
  "serde",
  "serde_json",
@@ -464,6 +466,9 @@ dependencies = [
  "textwrap",
  "thiserror 1.0.69",
  "time",
+ "tokio",
+ "tokio-stream",
+ "tracing",
  "unicode-width",
 ]
 
