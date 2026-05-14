@@ -268,6 +268,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "model",
     "provider",
     "subagents",
+    "activity",
     // Modals.
     "help",
     "keys",

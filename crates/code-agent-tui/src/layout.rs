@@ -90,6 +90,9 @@ pub enum SidePanelMode {
     Auth,
     Model,
     Provider,
+    /// M13 Phase H: scrollable view of the activity log (mirrors
+    /// `TuiAppState::activity` with selection navigation).
+    Activity,
 }
 
 impl SidePanelMode {
@@ -110,6 +113,7 @@ impl SidePanelMode {
             Self::Auth => "Auth",
             Self::Model => "Model",
             Self::Provider => "Provider",
+            Self::Activity => "Activity",
         }
     }
 
@@ -130,6 +134,7 @@ impl SidePanelMode {
             Self::Auth => "auth",
             Self::Model => "model",
             Self::Provider => "provider",
+            Self::Activity => "activity",
         }
     }
 
@@ -150,6 +155,7 @@ impl SidePanelMode {
             "auth" => Self::Auth,
             "model" => Self::Model,
             "provider" => Self::Provider,
+            "activity" => Self::Activity,
             _ => return None,
         })
     }
@@ -441,6 +447,7 @@ mod tests {
             SidePanelMode::Auth,
             SidePanelMode::Model,
             SidePanelMode::Provider,
+            SidePanelMode::Activity,
         ] {
             let key = mode.config_key();
             assert_eq!(SidePanelMode::from_config_key(key), Some(mode));
