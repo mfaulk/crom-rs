@@ -8,10 +8,12 @@
 //!   stdout using ratatui's `TestBackend`. Useful for smoke tests
 //!   and demos in non-interactive environments.
 //!
-//! Usage:
-//!     cargo run -p tui-demo -- live
-//!     cargo run -p tui-demo -- snapshot
-//!     cargo run -p tui-demo -- snapshot "hello"
+//! Usage (run from the example directory — this is a standalone
+//! workspace, not a member of the main code-agent workspace):
+//!     cd examples/tui-demo
+//!     cargo run -- live
+//!     cargo run -- snapshot
+//!     cargo run -- snapshot "hello"
 
 use std::sync::Arc;
 

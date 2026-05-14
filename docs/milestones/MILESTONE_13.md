@@ -584,7 +584,7 @@ These ride on the workspace's existing `tracing` infrastructure; subscribers con
 
 ### Tests
 
-`state.rs` adds 1 reducer test (`telemetry_does_not_perturb_state`) that asserts the `debug!` macros don't change observable state. The `examples/tui-demo` `snapshot` subcommand serves as a smoke test for the whole pipeline (run with `cargo run -p tui-demo -- snapshot`).
+`state.rs` adds reducer tests for the telemetry and approval surfaces. The `examples/tui-demo` `snapshot` subcommand serves as a smoke test for the whole pipeline; because the example is a standalone workspace, run it from the example directory: `cd examples/tui-demo && cargo run -- snapshot "hello"`.
 
 All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (1030 tests total) are clean.
 
