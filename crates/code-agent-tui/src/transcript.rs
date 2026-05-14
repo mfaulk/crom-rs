@@ -5,22 +5,86 @@
 use code_agent_core::{AgentEvent, AssistantContent};
 
 /// One transcript entry. Multi-line cards are split by newlines.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// M13 Phase C extensions:
+/// * `id` is assigned by [`crate::state::TuiAppState::push_transcript`]
+///   when the card enters state, and is stable for the lifetime of the
+///   session. It survives search-filtering and scrolling so the reducer
+///   can keep "selected" / "expanded" sets that don't drift when new
+///   cards arrive or older cards age out of the bounded transcript.
+/// * `expanded_body` is shown only when the user toggles the card open.
+///   Most cards leave it empty for Phase C; later phases will populate
+///   it with raw JSON / tool stdout / etc.
+/// * `source` is optional attribution (plugin name, MCP server,
+///   subagent name) rendered as a parenthesized suffix.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct EventCard {
     pub kind: &'static str,
     pub headline: String,
     pub body: Vec<String>,
+    pub id: u64,
+    pub expanded_body: Vec<String>,
+    pub source: Option<String>,
 }
 
 impl EventCard {
     /// Iterator over headline + body lines.
     pub fn lines(&self) -> Vec<String> {
-        let mut out = Vec::with_capacity(self.body.len() + 1);
-        out.push(self.headline.clone());
+        self.lines_with_expansion(false)
+    }
+
+    /// Same as [`Self::lines`], but with the `expanded_body` appended
+    /// when `expanded` is true.
+    pub fn lines_with_expansion(&self, expanded: bool) -> Vec<String> {
+        let extra = if expanded {
+            self.expanded_body.len()
+        } else {
+            0
+        };
+        let mut out = Vec::with_capacity(self.body.len() + 1 + extra);
+        let headline = match &self.source {
+            Some(s) => format!("{}  ({})", self.headline, s),
+            None => self.headline.clone(),
+        };
+        out.push(headline);
         for line in &self.body {
             out.push(format!("  {line}"));
         }
+        if expanded {
+            for line in &self.expanded_body {
+                out.push(format!("  {line}"));
+            }
+        }
         out
+    }
+
+    /// Does the card match the given case-insensitive substring? Used
+    /// by transcript search to filter the visible set.
+    pub fn matches_search(&self, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        let n = needle.to_lowercase();
+        if self.headline.to_lowercase().contains(&n) {
+            return true;
+        }
+        if self.body.iter().any(|l| l.to_lowercase().contains(&n)) {
+            return true;
+        }
+        if self
+            .expanded_body
+            .iter()
+            .any(|l| l.to_lowercase().contains(&n))
+        {
+            return true;
+        }
+        if let Some(src) = &self.source {
+            if src.to_lowercase().contains(&n) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -42,17 +106,20 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 kind: "assistant",
                 headline: "Agent:".to_string(),
                 body: text.lines().map(String::from).collect(),
+                ..Default::default()
             }
         }
         AgentEvent::AssistantTextDelta(delta) => EventCard {
             kind: "assistant_delta",
             headline: "...".to_string(),
             body: vec![delta.clone()],
+            ..Default::default()
         },
         AgentEvent::ToolCallStarted(t) => EventCard {
             kind: "tool_started",
             headline: format!("▶ {}", t.call.name),
             body: vec![preview(&t.call.input.to_string(), 200)],
+            ..Default::default()
         },
         AgentEvent::ToolCallCompleted(t) => EventCard {
             kind: "tool_completed",
@@ -63,11 +130,13 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 t.duration_ms
             ),
             body: Vec::new(),
+            ..Default::default()
         },
         AgentEvent::ToolCallDenied(t) => EventCard {
             kind: "tool_denied",
             headline: format!("✗ denied: {}", t.tool_name),
             body: vec![t.reason.clone()],
+            ..Default::default()
         },
         AgentEvent::UserToolResult(r) => EventCard {
             kind: "tool_result",
@@ -77,6 +146,7 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 r.tool_name
             ),
             body: vec![preview(&r.content, 200)],
+            ..Default::default()
         },
         AgentEvent::TodoUpdate(t) => EventCard {
             kind: "todo",
@@ -87,11 +157,13 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 .iter()
                 .map(|i| format!("[{:?}] {}", i.status, i.content))
                 .collect(),
+            ..Default::default()
         },
         AgentEvent::Interrupted(i) => EventCard {
             kind: "interrupted",
             headline: format!("Interrupted (turn {})", i.turn_index),
             body: Vec::new(),
+            ..Default::default()
         },
         AgentEvent::HookEvaluated(h) => EventCard {
             kind: "hook",
@@ -102,11 +174,13 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 .into_iter()
                 .chain(h.tool_name.clone())
                 .collect(),
+            ..Default::default()
         },
         AgentEvent::PolicyDecision(p) => EventCard {
             kind: "policy",
             headline: format!("policy: {} {:?}", p.tool_name, p.outcome),
             body: p.reason.clone().into_iter().collect(),
+            ..Default::default()
         },
         AgentEvent::Result(r) => EventCard {
             kind: "result",
@@ -116,11 +190,13 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 .clone()
                 .map(|s| vec![preview(&s, 1000)])
                 .unwrap_or_default(),
+            ..Default::default()
         },
         AgentEvent::CheckpointEvent(p) => EventCard {
             kind: "checkpoint",
             headline: format!("checkpoint: {}", p.event),
             body: Vec::new(),
+            ..Default::default()
         },
         AgentEvent::ApprovalPromptShown(a) => EventCard {
             kind: "approval_shown",
@@ -130,31 +206,37 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 .clone()
                 .map(|s| vec![format!("source: {s}")])
                 .unwrap_or_default(),
+            ..Default::default()
         },
         AgentEvent::ApprovalPromptResolved(a) => EventCard {
             kind: "approval_resolved",
             headline: format!("Approval: {} → {:?}", a.tool_name, a.decision),
             body: Vec::new(),
+            ..Default::default()
         },
         AgentEvent::ApprovalRevisionRequested(a) => EventCard {
             kind: "approval_revision",
             headline: format!("Revision requested for {}", a.tool_name),
             body: vec![a.message_preview.clone()],
+            ..Default::default()
         },
         AgentEvent::DiffViewed(d) => EventCard {
             kind: "diff_viewed",
             headline: format!("diff: {} files, {} bytes", d.files_changed, d.bytes),
             body: Vec::new(),
+            ..Default::default()
         },
         AgentEvent::ChangesViewed(c) => EventCard {
             kind: "changes_viewed",
             headline: format!("changes: {} files", c.files_changed),
             body: Vec::new(),
+            ..Default::default()
         },
         AgentEvent::DoctorCheckCompleted(d) => EventCard {
             kind: "doctor",
             headline: format!("doctor.{}: {:?}", d.check_id, d.status),
             body: vec![d.message.clone()],
+            ..Default::default()
         },
         AgentEvent::SessionRecovered(s) => EventCard {
             kind: "session_recovered",
@@ -163,11 +245,13 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 s.session_id, s.records_recovered, s.records_skipped
             ),
             body: Vec::new(),
+            ..Default::default()
         },
         AgentEvent::SessionRecoveryFailed(s) => EventCard {
             kind: "session_recovery_failed",
             headline: format!("recovery failed: {}", s.session_id),
             body: vec![s.reason.clone()],
+            ..Default::default()
         },
         AgentEvent::UiStarted(u) => EventCard {
             kind: "ui_started",
@@ -176,36 +260,43 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 u.renderer, u.width, u.height, u.is_tty
             ),
             body: Vec::new(),
+            ..Default::default()
         },
         AgentEvent::UiRendererChanged(u) => EventCard {
             kind: "ui_renderer_changed",
             headline: format!("ui: {} → {}", u.from, u.to),
             body: vec![u.reason.clone()],
+            ..Default::default()
         },
         AgentEvent::StatusLineConfigured(s) => EventCard {
             kind: "statusline",
             headline: "status line updated".to_string(),
             body: vec![s.template.clone()],
+            ..Default::default()
         },
         AgentEvent::NotificationSent(n) => EventCard {
             kind: "notification_sent",
             headline: format!("notify: {}/{}", n.channel, n.event),
             body: Vec::new(),
+            ..Default::default()
         },
         AgentEvent::NotificationFailed(n) => EventCard {
             kind: "notification_failed",
             headline: format!("notify-fail: {}/{}", n.channel, n.event),
             body: vec![n.reason.clone()],
+            ..Default::default()
         },
         AgentEvent::InitStarted(i) => EventCard {
             kind: "init_started",
             headline: format!("init: {} → {}", i.mode, i.cwd.display()),
             body: Vec::new(),
+            ..Default::default()
         },
         AgentEvent::InitCompleted(i) => EventCard {
             kind: "init_completed",
             headline: format!("init done: {}", i.mode),
             body: Vec::new(),
+            ..Default::default()
         },
         // Generic fallback: never panic on a future-added variant. Use
         // the JSON tag if available so the user can still see what kind
@@ -222,6 +313,7 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 kind,
                 headline: format!("· {tag}"),
                 body: Vec::new(),
+                ..Default::default()
             }
         }
     }
