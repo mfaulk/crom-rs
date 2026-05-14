@@ -45,6 +45,7 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
                 kind: "run_started",
                 headline: format!("▶ run started ({}/{})", e.provider.as_str(), e.model),
                 body: Vec::new(),
+                ..Default::default()
             }),
             activity: Some(format!("run: {} {}", e.provider.as_str(), e.model)),
             ..SdkEventOutcome::default()
@@ -53,26 +54,31 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
             kind: "planning_started",
             headline: "▶ planning…".to_string(),
             body: Vec::new(),
+            ..Default::default()
         }),
         SdkEvent::PlanCreated(_) => SdkEventOutcome::with_card(EventCard {
             kind: "plan_created",
             headline: "plan created".to_string(),
             body: Vec::new(),
+            ..Default::default()
         }),
         SdkEvent::PlanApproved(_) => SdkEventOutcome::with_card(EventCard {
             kind: "plan_approved",
             headline: "plan approved".to_string(),
             body: Vec::new(),
+            ..Default::default()
         }),
         SdkEvent::ActStarted(_) => SdkEventOutcome::with_card(EventCard {
             kind: "act_started",
             headline: "▶ act started".to_string(),
             body: Vec::new(),
+            ..Default::default()
         }),
         SdkEvent::AssistantMessage(m) => SdkEventOutcome::with_card(EventCard {
             kind: "assistant",
             headline: "Agent:".to_string(),
             body: m.text.lines().map(String::from).collect(),
+            ..Default::default()
         }),
         SdkEvent::AssistantTextDelta(d) => SdkEventOutcome {
             coalesce_assistant_delta: Some(d.delta.clone()),
@@ -83,6 +89,7 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
                 kind: "tool_started",
                 headline: format!("▶ {}", t.tool_name),
                 body: vec![preview(&t.input.to_string(), 200)],
+                ..Default::default()
             }),
             activity: Some(format!("tool: {}", t.tool_name)),
             ..SdkEventOutcome::default()
@@ -96,12 +103,14 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
                 t.duration_ms
             ),
             body: Vec::new(),
+            ..Default::default()
         }),
         SdkEvent::ApprovalRequired(a) => SdkEventOutcome {
             card: Some(EventCard {
                 kind: "approval_required",
                 headline: format!("? approve {}?", a.tool_name),
                 body: vec![preview(&a.summary, 200)],
+                ..Default::default()
             }),
             activity: Some(format!("approval: {}", a.tool_name)),
             ..SdkEventOutcome::default()
@@ -114,22 +123,26 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
                 approval_label(&a.decision)
             ),
             body: Vec::new(),
+            ..Default::default()
         }),
         SdkEvent::PatchProposed(p) => SdkEventOutcome::with_card(EventCard {
             kind: "patch_proposed",
             headline: format!("patch: {} file(s)", p.patch.files.len()),
             body: Vec::new(),
+            ..Default::default()
         }),
         SdkEvent::FileGenerated(f) => SdkEventOutcome::with_card(EventCard {
             kind: "file_generated",
             headline: format!("file: {}", f.path.as_str()),
             body: Vec::new(),
+            ..Default::default()
         }),
         SdkEvent::ValidationStarted(v) => SdkEventOutcome {
             card: Some(EventCard {
                 kind: "validation_started",
                 headline: format!("▶ validation: {}", v.command),
                 body: Vec::new(),
+                ..Default::default()
             }),
             activity: Some(format!("validate: {}", v.command)),
             ..SdkEventOutcome::default()
@@ -143,11 +156,13 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
                 v.report.exit_code
             ),
             body: Vec::new(),
+            ..Default::default()
         }),
         SdkEvent::Diagnostic(d) => SdkEventOutcome::with_card(EventCard {
             kind: "diagnostic",
             headline: format!("⚠ {:?}: {}", d.diagnostic.severity, d.diagnostic.code),
             body: vec![preview(&d.diagnostic.message, 240)],
+            ..Default::default()
         }),
         SdkEvent::RunCompleted(e) => SdkEventOutcome {
             card: Some(EventCard {
@@ -158,6 +173,7 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
                 } else {
                     vec![preview(&e.summary, 240)]
                 },
+                ..Default::default()
             }),
             activity: None,
             run_terminal: Some(true),
@@ -168,6 +184,7 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
                 kind: "run_failed",
                 headline: format!("✗ run failed ({:?})", e.status),
                 body: vec![preview(&e.message, 240)],
+                ..Default::default()
             }),
             run_terminal: Some(false),
             error: Some(preview(&e.message, 240)),
@@ -182,6 +199,7 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
                 } else {
                     vec![preview(&e.message, 240)]
                 },
+                ..Default::default()
             }),
             run_terminal: Some(false),
             ..SdkEventOutcome::default()
@@ -190,6 +208,7 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
             kind: "internal",
             headline: format!("· {}", i.kind),
             body: Vec::new(),
+            ..Default::default()
         }),
     }
 }
