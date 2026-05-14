@@ -14,10 +14,24 @@ use std::collections::HashSet;
 use code_agent_core::StatusLineContext;
 use code_agent_sdk::SdkEvent;
 
+use crate::completion::{
+    context_token_candidates, detect_trigger, slash_candidates, CompletionKind, CompletionPopup,
+    SLASH_COMMANDS,
+};
 use crate::composer::{ComposerState, KeyAction, KeyEvent};
 use crate::event_adapter::map_sdk_event;
 use crate::layout::{DetailPanelMode, FocusPane, LayoutState, SidePanelMode, TuiModal};
 use crate::transcript::EventCard;
+
+/// Max bytes accepted in a single paste before the reducer truncates
+/// and surfaces a warning. Phase D ceiling; later phases can wire
+/// `ui.composer.large_paste_warning_bytes` through `TuiAppState`.
+pub const PASTE_HARD_LIMIT: usize = 64 * 1024;
+
+/// Threshold at which a paste produces a warning entry in the
+/// activity log. Pastes between this and [`PASTE_HARD_LIMIT`] are
+/// inserted in full but logged.
+pub const PASTE_WARN_BYTES: usize = 32 * 1024;
 
 /// Maximum number of transcript cards retained in state. Bounded so a
 /// long-running session doesn't grow unbounded memory; later phases will
@@ -62,6 +76,10 @@ pub enum TuiInbound {
     /// A key press from the terminal, already decoded to the composer's
     /// abstract `KeyEvent` enum.
     Key(KeyEvent),
+    /// A whole-paste payload. Phase D delivers bracketed-paste data as
+    /// a single event so the reducer can compute size, warn on large
+    /// pastes, and insert the text in one go instead of per-char.
+    Paste(String),
     /// Terminal was resized to the given dimensions.
     Resize { width: u16, height: u16 },
 }
@@ -124,6 +142,10 @@ pub struct TuiAppState {
     /// even for large transcripts with case-insensitive substring
     /// matching.
     visible_cache: Option<Vec<usize>>,
+    /// Active completion popup, if any. Phase D autocomplete state:
+    /// rebuilt by `refresh_composer_popup` after every key that
+    /// mutates the composer buffer.
+    pub composer_popup: Option<CompletionPopup>,
 }
 
 impl TuiAppState {
@@ -153,6 +175,7 @@ impl TuiAppState {
             search_query: None,
             search_input: String::new(),
             visible_cache: None,
+            composer_popup: None,
         }
     }
 
@@ -238,6 +261,7 @@ impl TuiAppState {
                 Vec::new()
             }
             TuiInbound::Key(k) => self.apply_key(k),
+            TuiInbound::Paste(data) => self.apply_paste(data),
             TuiInbound::Resize { width, height } => {
                 self.size = (width, height);
                 self.layout.recompute_for_size(width, height);
@@ -250,16 +274,147 @@ impl TuiAppState {
         }
     }
 
+    /// Insert a clipboard / bracketed-paste payload into the composer.
+    /// Emits an activity warning when the paste exceeds
+    /// [`PASTE_WARN_BYTES`] and truncates when above
+    /// [`PASTE_HARD_LIMIT`].
+    fn apply_paste(&mut self, mut data: String) -> Vec<TuiAction> {
+        // When a modal is open, bracketed-paste is intercepted by
+        // the modal-specific handler (e.g. SearchTranscript). If
+        // the focus is on the transcript pane, pasting is a no-op.
+        if self.layout.current_modal().is_some()
+            || !matches!(self.layout.focus, FocusPane::Composer)
+        {
+            return Vec::new();
+        }
+        let original_len = data.len();
+        if original_len > PASTE_HARD_LIMIT {
+            // Truncate at a char boundary to keep the buffer valid UTF-8.
+            let mut cut = PASTE_HARD_LIMIT;
+            while cut > 0 && !data.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            data.truncate(cut);
+            self.push_activity(format!(
+                "paste truncated: {original_len} bytes > {PASTE_HARD_LIMIT} cap"
+            ));
+        } else if original_len > PASTE_WARN_BYTES {
+            self.push_activity(format!(
+                "large paste: {original_len} bytes (over {PASTE_WARN_BYTES} warn threshold)"
+            ));
+        }
+        // Insert at the cursor.
+        let pos = self.composer.cursor.min(self.composer.buffer.len());
+        self.composer.buffer.insert_str(pos, &data);
+        self.composer.cursor = pos + data.len();
+        self.refresh_composer_popup();
+        Vec::new()
+    }
+
+    /// Rebuild [`Self::composer_popup`] from the current composer
+    /// buffer + cursor. Pure: only the buffer + cursor are inspected.
+    /// File completions are intentionally NOT fetched here — the
+    /// reducer must not touch the filesystem. The host (`app.rs`)
+    /// can populate file candidates later if it wants to support
+    /// `@<path>` completions in the live shell; Phase D ships
+    /// slash + context-token completions only.
+    pub fn refresh_composer_popup(&mut self) {
+        let trigger = detect_trigger(&self.composer.buffer, self.composer.cursor);
+        self.composer_popup = match trigger {
+            Some(t) => {
+                let candidates = match t.kind {
+                    CompletionKind::Slash => slash_candidates(&t.token, SLASH_COMMANDS, 12),
+                    CompletionKind::ContextToken => context_token_candidates(&t.token, 12),
+                    // File candidates require the workspace root, which
+                    // lives in the host's runtime context; Phase D
+                    // leaves these to be populated by the host. We
+                    // still surface the popup with an empty list to
+                    // signal intent so later phases can plug in real
+                    // file completion.
+                    CompletionKind::File => Vec::new(),
+                };
+                if candidates.is_empty() {
+                    None
+                } else {
+                    Some(CompletionPopup::new(
+                        t.kind,
+                        candidates,
+                        t.token_start,
+                        t.token_end,
+                    ))
+                }
+            }
+            None => None,
+        };
+    }
+
+    /// Accept the currently-selected completion candidate. Splices the
+    /// candidate's `insert_text` into the composer buffer at the
+    /// trigger range, moves the cursor to the end of the inserted
+    /// text, and closes the popup.
+    pub fn accept_completion(&mut self) {
+        let Some(popup) = self.composer_popup.take() else {
+            return;
+        };
+        let Some(candidate) = popup.selected_candidate().cloned() else {
+            return;
+        };
+        let start = popup.token_start.min(self.composer.buffer.len());
+        let end = popup.token_end.min(self.composer.buffer.len()).max(start);
+        self.composer
+            .buffer
+            .replace_range(start..end, &candidate.insert_text);
+        self.composer.cursor = start + candidate.insert_text.len();
+    }
+
     fn apply_key(&mut self, k: KeyEvent) -> Vec<TuiAction> {
+        // Completion popup keys take priority over everything except
+        // the global modal/layout dispatch — but only when the
+        // composer pane is the focused pane. If focus has moved
+        // (Tab cycled to transcript), the popup is treated as stale
+        // and Tab/Up/Down/Esc fall through to pane-specific behavior.
+        if self.composer_popup.is_some()
+            && self.layout.current_modal().is_none()
+            && matches!(self.layout.focus, FocusPane::Composer)
+        {
+            match k {
+                KeyEvent::Tab => {
+                    self.accept_completion();
+                    return Vec::new();
+                }
+                KeyEvent::Up => {
+                    if let Some(p) = self.composer_popup.as_mut() {
+                        p.prev();
+                    }
+                    return Vec::new();
+                }
+                KeyEvent::Down => {
+                    if let Some(p) = self.composer_popup.as_mut() {
+                        p.next();
+                    }
+                    return Vec::new();
+                }
+                KeyEvent::Esc => {
+                    self.composer_popup = None;
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
         // Layout-priority keys intercepted before the composer. These
         // are global navigation that does not depend on which pane has
-        // focus, so the composer never sees them.
+        // focus, so the composer never sees them. Cycling focus away
+        // from the composer also closes any stale completion popup
+        // so navigation keys in the new pane aren't ambiguous.
         match k {
             KeyEvent::Tab => {
                 self.layout.focus = self.layout.focus.next(
                     self.layout.side_panel_rendered(),
                     self.layout.detail_panel_rendered(),
                 );
+                if !matches!(self.layout.focus, FocusPane::Composer) {
+                    self.composer_popup = None;
+                }
                 return Vec::new();
             }
             KeyEvent::ShiftTab => {
@@ -267,6 +422,9 @@ impl TuiAppState {
                     self.layout.side_panel_rendered(),
                     self.layout.detail_panel_rendered(),
                 );
+                if !matches!(self.layout.focus, FocusPane::Composer) {
+                    self.composer_popup = None;
+                }
                 return Vec::new();
             }
             _ => {}
@@ -304,7 +462,12 @@ impl TuiAppState {
             // into the composer and randomly trigger `g`/`e`/`n`.
             return Vec::new();
         }
-        match self.composer.handle_key(k) {
+        let action = self.composer.handle_key(k);
+        // Anything that may have mutated the composer buffer requires
+        // a popup refresh. Submit (which clears the buffer) closes the
+        // popup; chars / backspace / paste may open or update it.
+        self.refresh_composer_popup();
+        match action {
             KeyAction::Submit(prompt) => {
                 let trimmed = prompt.trim();
                 if trimmed.is_empty() {
@@ -1378,6 +1541,157 @@ mod tests {
         assert!(s.is_card_expanded(new_selected));
         // The vanished id was not toggled.
         assert!(!s.is_card_expanded(99));
+    }
+
+    #[test]
+    // Typing `/pl` opens a Slash popup with `plan` / `plugins` / etc.
+    // among the candidates. Tab accepts the highlighted candidate
+    // and replaces the trigger range in the composer buffer.
+    fn slash_popup_opens_and_accepts() {
+        let mut s = fresh_state();
+        for c in "/pl".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        let popup = s.composer_popup.as_ref().expect("popup should be open");
+        assert_eq!(popup.kind, crate::completion::CompletionKind::Slash);
+        assert!(!popup.candidates.is_empty(), "expected candidates");
+        // Tab accepts. The first candidate (`/plan`) replaces the
+        // trigger range; the popup closes.
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        assert!(s.composer_popup.is_none(), "popup should close on accept");
+        assert!(
+            s.composer.buffer.starts_with("/p"),
+            "buffer should contain inserted candidate: {:?}",
+            s.composer.buffer
+        );
+    }
+
+    #[test]
+    // Typing `@cha` opens a ContextToken popup including `@changed`.
+    // Esc closes the popup without altering the buffer.
+    fn at_context_token_popup_opens_and_closes_on_esc() {
+        let mut s = fresh_state();
+        for c in "@cha".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        let popup = s.composer_popup.as_ref().expect("popup should be open");
+        assert_eq!(popup.kind, crate::completion::CompletionKind::ContextToken);
+        assert!(popup.candidates.iter().any(|c| c.display == "@changed"));
+        s.apply(TuiInbound::Key(KeyEvent::Esc));
+        assert!(s.composer_popup.is_none());
+        assert_eq!(s.composer.buffer, "@cha");
+    }
+
+    #[test]
+    // Up/Down navigate the popup selection without touching the buffer.
+    fn popup_up_down_navigates_selection() {
+        let mut s = fresh_state();
+        for c in "/p".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        let first = s.composer_popup.as_ref().unwrap().selected;
+        s.apply(TuiInbound::Key(KeyEvent::Down));
+        let next = s.composer_popup.as_ref().unwrap().selected;
+        assert_ne!(first, next);
+        s.apply(TuiInbound::Key(KeyEvent::Up));
+        let back = s.composer_popup.as_ref().unwrap().selected;
+        assert_eq!(back, first);
+    }
+
+    #[test]
+    // A small paste is inserted at the cursor and produces no warning.
+    fn small_paste_inserts_without_warning() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Paste("hello world".to_string()));
+        assert_eq!(s.composer.buffer, "hello world");
+        assert_eq!(s.composer.cursor, "hello world".len());
+        assert!(s.activity.iter().all(|a| !a.contains("paste")));
+    }
+
+    #[test]
+    // A paste over PASTE_WARN_BYTES surfaces an activity entry.
+    fn large_paste_logs_warning() {
+        let mut s = fresh_state();
+        let data: String = "x".repeat(PASTE_WARN_BYTES + 100);
+        s.apply(TuiInbound::Paste(data));
+        assert!(s.activity.iter().any(|a| a.contains("large paste")));
+    }
+
+    #[test]
+    // A paste over PASTE_HARD_LIMIT is truncated to the cap.
+    fn huge_paste_is_truncated() {
+        let mut s = fresh_state();
+        let data: String = "x".repeat(PASTE_HARD_LIMIT * 2);
+        s.apply(TuiInbound::Paste(data));
+        assert_eq!(s.composer.buffer.len(), PASTE_HARD_LIMIT);
+        assert!(s.activity.iter().any(|a| a.contains("paste truncated")));
+    }
+
+    #[test]
+    // Accepting a mid-word completion replaces both the prefix and
+    // the suffix of the token under the cursor, not just the part
+    // before the cursor. Without this fix `/pl|an` + Tab would
+    // produce `/planan` (suffix duplication).
+    fn accept_completion_replaces_whole_token() {
+        let mut s = fresh_state();
+        for c in "/plugins".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        // Move the cursor back four characters so it sits between
+        // `/pl` and `ugins` — the popup's selected candidate is
+        // `/plan` (alphabetically first /pl* match).
+        s.composer.cursor = 3;
+        s.refresh_composer_popup();
+        let popup = s.composer_popup.as_ref().expect("popup");
+        assert_eq!(popup.kind, crate::completion::CompletionKind::Slash);
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        // Suffix `ugins` must be replaced, not duplicated.
+        assert!(
+            !s.composer.buffer.contains("ugins"),
+            "suffix duplication: {:?}",
+            s.composer.buffer
+        );
+        // The accepted candidate (whatever the popup picked) is in
+        // the buffer.
+        assert!(s.composer.buffer.starts_with('/'));
+    }
+
+    #[test]
+    // Cycling focus away from the composer closes the completion
+    // popup, so popup keys (Tab/Up/Down/Esc) don't hijack the new
+    // pane. Tab itself is consumed by the popup-accept path when
+    // the popup is open, so the cycle is exercised by ShiftTab,
+    // which falls through to the layout dispatch.
+    fn focus_cycle_clears_completion_popup() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        for c in "/p".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        assert!(s.composer_popup.is_some());
+        s.apply(TuiInbound::Key(KeyEvent::ShiftTab));
+        assert!(
+            !matches!(s.layout.focus, FocusPane::Composer),
+            "focus should have moved off composer"
+        );
+        assert!(
+            s.composer_popup.is_none(),
+            "popup should close when focus leaves composer"
+        );
+    }
+
+    #[test]
+    // Paste is ignored while a modal is open so the underlying
+    // composer never gets corrupted by a clipboard payload that was
+    // meant for the modal.
+    fn paste_under_modal_is_swallowed() {
+        let mut s = fresh_state();
+        s.layout.push_modal(TuiModal::Help);
+        s.apply(TuiInbound::Paste("should be ignored".to_string()));
+        assert!(s.composer.buffer.is_empty());
     }
 
     #[test]

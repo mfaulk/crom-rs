@@ -249,16 +249,13 @@ fn spawn_input_task(tx: mpsc::Sender<TuiInbound>) -> tokio::task::JoinHandle<()>
                     }
                 }
                 Ok(CtEvent::Paste(data)) => {
-                    // Emit one Char per scalar so the composer ends up
-                    // with the full paste; embedded newlines stay literal
-                    // and never accidentally submit mid-paste.
-                    for ch in data.chars() {
-                        if tx
-                            .blocking_send(TuiInbound::Key(KeyEvent::Char(ch)))
-                            .is_err()
-                        {
-                            return;
-                        }
+                    // M13 Phase D: emit a single Paste event so the
+                    // reducer can compute size, warn / truncate on
+                    // large payloads, and bulk-insert in one go. The
+                    // old per-character forwarding starved the
+                    // SDK arm on multi-KB pastes.
+                    if tx.blocking_send(TuiInbound::Paste(data)).is_err() {
+                        return;
                     }
                 }
                 Ok(_) => continue,
