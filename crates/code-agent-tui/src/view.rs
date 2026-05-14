@@ -95,19 +95,83 @@ fn projected_transcript(state: &TuiAppState) -> Vec<crate::transcript::EventCard
 }
 
 fn side_panel_view(state: &TuiAppState) -> PaneView {
+    // M13 Phase E: when the Plan side-panel is selected and a plan
+    // exists, render the M9 plan dashboard. Otherwise fall back to
+    // the Phase B placeholder.
+    let body = match state.layout.side_panel.mode {
+        SidePanelMode::Plan => state
+            .current_plan
+            .as_ref()
+            .map(crate::plan_view::format_plan_panel)
+            .unwrap_or_else(|| vec!["No active plan.".to_string()]),
+        other => side_panel_body(other),
+    };
     PaneView {
         title: state.layout.side_panel.mode.label().to_string(),
-        body: side_panel_body(state.layout.side_panel.mode),
+        body,
         focused: matches!(state.layout.focus, FocusPane::SidePanel),
     }
 }
 
 fn detail_panel_view(state: &TuiAppState) -> PaneView {
+    // M13 Phase E: real content for Approval / Diff modes when the
+    // reducer has populated `pending_approval` / `last_patch`.
+    let body = match state.layout.detail_panel.mode {
+        DetailPanelMode::Approval => state
+            .pending_approval
+            .as_ref()
+            .map(|a| {
+                vec![
+                    format!("tool: {}", a.tool_name),
+                    String::new(),
+                    a.summary.clone(),
+                    String::new(),
+                    "  [y] yes  [s] yes-for-session  [n] no  [r] revise".to_string(),
+                ]
+            })
+            .unwrap_or_else(|| detail_panel_body(state.layout.detail_panel.mode)),
+        DetailPanelMode::Diff => state
+            .last_patch
+            .as_ref()
+            .map(diff_body_lines)
+            .unwrap_or_else(|| detail_panel_body(state.layout.detail_panel.mode)),
+        other => detail_panel_body(other),
+    };
     PaneView {
         title: state.layout.detail_panel.mode.label().to_string(),
-        body: detail_panel_body(state.layout.detail_panel.mode),
+        body,
         focused: matches!(state.layout.focus, FocusPane::DetailPanel),
     }
+}
+
+/// Render a Phase E diff body from a `PatchSet`. Uses the
+/// SDK-provided unified diff verbatim and caps at 200 lines so a
+/// massive patch doesn't dominate the screen.
+fn diff_body_lines(patch: &code_agent_sdk::patch::PatchSet) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "files: +{} ~{} -{} (renamed {})",
+        patch.summary.files_created,
+        patch.summary.files_modified,
+        patch.summary.files_deleted,
+        patch.summary.files_renamed,
+    ));
+    lines.push(format!(
+        "lines: +{} -{}",
+        patch.summary.added_lines, patch.summary.removed_lines
+    ));
+    lines.push(String::new());
+    // Single-pass truncation: keep iterating after `take(200)` to see
+    // if there's at least one more line, then drop the iterator.
+    // Avoids a second full scan via `.count()` on huge patches.
+    let mut iter = patch.unified_diff.lines();
+    for line in iter.by_ref().take(200) {
+        lines.push(line.to_string());
+    }
+    if iter.next().is_some() {
+        lines.push("  ... (diff truncated at 200 lines)".to_string());
+    }
+    lines
 }
 
 fn modal_view_for(state: &TuiAppState, modal: &TuiModal) -> ModalView {
