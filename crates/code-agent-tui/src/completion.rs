@@ -107,37 +107,33 @@ pub struct TriggerSpec {
 /// function — the reducer calls it after every key that mutates the
 /// buffer or cursor.
 pub fn detect_trigger(buffer: &str, cursor: usize) -> Option<TriggerSpec> {
-    if cursor > buffer.len() {
+    if cursor > buffer.len() || !buffer.is_char_boundary(cursor) {
         return None;
     }
     let before_cursor = &buffer[..cursor];
 
     // Slash commands: only when the buffer starts with `/` and no
     // whitespace precedes the cursor. The user typing "fix /var" must
-    // not trigger slash completion.
-    if let Some(rest) = buffer.strip_prefix('/') {
-        if before_cursor.starts_with('/') && !before_cursor[1..].contains(char::is_whitespace) {
-            let token = rest
-                .split(char::is_whitespace)
-                .next()
-                .unwrap_or("")
-                .to_string();
-            return Some(TriggerSpec {
-                kind: CompletionKind::Slash,
-                token,
-                token_start: 0,
-                token_end: cursor.min(
-                    1 + buffer[1..]
-                        .find(char::is_whitespace)
-                        .unwrap_or(buffer.len() - 1),
-                ),
-            });
-        }
+    // not trigger slash completion. The matched `token` is the prefix
+    // *before* the cursor (so mid-word edits filter correctly); the
+    // matched `token_end` extends to the end of the surrounding word
+    // (so accept replaces both prefix and suffix).
+    if before_cursor.starts_with('/') && !before_cursor[1..].contains(char::is_whitespace) {
+        let token = before_cursor[1..].to_string();
+        let token_end = end_of_word(buffer, cursor);
+        return Some(TriggerSpec {
+            kind: CompletionKind::Slash,
+            token,
+            token_start: 0,
+            token_end,
+        });
     }
 
     // @ token: walk backwards from the cursor to find an `@` that
     // begins the current token. Only fires when the `@` is at the
-    // start of input or preceded by whitespace.
+    // start of input or preceded by whitespace. Like the slash path,
+    // `token` is the prefix before the cursor and `token_end` extends
+    // through any suffix the user already typed past the cursor.
     if let Some(at_offset) = find_at_token_start(buffer, cursor) {
         let token = &buffer[at_offset + 1..cursor];
         if token.is_empty() || token.chars().all(|c| !c.is_whitespace()) {
@@ -150,12 +146,23 @@ pub fn detect_trigger(buffer: &str, cursor: usize) -> Option<TriggerSpec> {
                 kind,
                 token: token.to_string(),
                 token_start: at_offset,
-                token_end: cursor,
+                token_end: end_of_word(buffer, cursor),
             });
         }
     }
 
     None
+}
+
+/// Return the byte offset of the end of the (whitespace-delimited)
+/// word that starts at or before `cursor`. If the cursor is at the
+/// end of the buffer or already at whitespace, returns `cursor`.
+fn end_of_word(buffer: &str, cursor: usize) -> usize {
+    let after = &buffer[cursor..];
+    match after.find(char::is_whitespace) {
+        Some(w) => cursor + w,
+        None => buffer.len(),
+    }
 }
 
 /// Find the byte offset of the `@` that begins the @-token currently
@@ -363,6 +370,30 @@ mod tests {
         assert_eq!(p.selected, 0);
         p.prev();
         assert_eq!(p.selected, 1);
+    }
+
+    #[test]
+    // Mid-word slash editing: cursor in the middle of `/plan` filters
+    // by the prefix BEFORE the cursor, not the whole token.
+    fn slash_trigger_mid_word_uses_prefix_only() {
+        // `/pl|an`: cursor after `/pl`, suffix `an` follows.
+        let t = detect_trigger("/plan", 3).unwrap();
+        assert_eq!(t.kind, CompletionKind::Slash);
+        assert_eq!(t.token, "pl");
+        // token_end must span the whole word so the accept path
+        // replaces both `pl` AND `an`.
+        assert_eq!(t.token_end, 5);
+    }
+
+    #[test]
+    // Mid-word `@` editing: cursor in the middle of `@changed`
+    // filters by the prefix BEFORE the cursor.
+    fn at_trigger_mid_word_uses_prefix_only() {
+        // `@ch|anged`: cursor after `@ch`.
+        let t = detect_trigger("@changed", 3).unwrap();
+        assert_eq!(t.kind, CompletionKind::ContextToken);
+        assert_eq!(t.token, "ch");
+        assert_eq!(t.token_end, 8);
     }
 
     #[test]
