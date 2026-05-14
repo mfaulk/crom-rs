@@ -18,6 +18,7 @@ use code_agent_core::{AgentEvent, AssistantContent};
 /// * `source` is optional attribution (plugin name, MCP server,
 ///   subagent name) rendered as a parenthesized suffix.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct EventCard {
     pub kind: &'static str,
     pub headline: String,
