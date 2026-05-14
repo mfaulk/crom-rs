@@ -364,6 +364,7 @@ mod tests {
                 kind: "assistant",
                 headline: "Agent:".into(),
                 body: vec!["hello".into()],
+                ..Default::default()
             }],
             composer: "fix the failing tests",
             footer: "[?] help [Ctrl+C] interrupt",
@@ -452,6 +453,7 @@ mod tests {
                 kind: "assistant",
                 headline: "Agent:".into(),
                 body: vec!["你好世界 🌏".into()],
+                ..Default::default()
             }],
             composer: "",
             footer: "",
@@ -481,6 +483,7 @@ mod tests {
                 kind: "assistant",
                 headline: "Agent:".into(),
                 body: vec!["transcript line".into()],
+                ..Default::default()
             }],
             composer: "type here",
             footer: "[?] help",
@@ -556,6 +559,7 @@ mod tests {
                 kind: "assistant",
                 headline: "A:".into(),
                 body: vec!["hi".into()],
+                ..Default::default()
             }],
             composer: "x",
             footer: "ignored",

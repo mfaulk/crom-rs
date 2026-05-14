@@ -9,6 +9,8 @@
 //! it can be exercised by unit tests with no terminal or runtime
 //! involvement.
 
+use std::collections::HashSet;
+
 use code_agent_core::StatusLineContext;
 use code_agent_sdk::SdkEvent;
 
@@ -79,10 +81,9 @@ pub enum RunStatus {
     Running,
 }
 
-/// Top-level TUI state. Phase B adds `layout` for the multi-pane
-/// cockpit. Later phases extend `LayoutState` (plan dashboard payload,
-/// inspector data, session list, etc.) without breaking the reducer
-/// surface.
+/// Top-level TUI state. Phase B added `layout` for the multi-pane
+/// cockpit; Phase C adds transcript navigation + search state.
+/// Later phases extend without breaking this surface.
 #[derive(Debug, Clone)]
 pub struct TuiAppState {
     pub composer: ComposerState,
@@ -95,6 +96,23 @@ pub struct TuiAppState {
     pub size: (u16, u16),
     pub should_quit: bool,
     pub layout: LayoutState,
+    /// Monotonic id assigned to each card as it enters state. Used to
+    /// give cards a stable identity that survives filtering / scrolling.
+    pub next_card_id: u64,
+    /// Id of the currently-selected transcript card, if any. `None`
+    /// means no selection; navigation keys initialize selection to the
+    /// most recent visible card.
+    pub selected_card_id: Option<u64>,
+    /// Ids of cards the user has explicitly expanded (e/Enter). Cards
+    /// with empty `expanded_body` ignore the expansion bit so the
+    /// renderer doesn't paint phantom whitespace.
+    pub expanded_card_ids: HashSet<u64>,
+    /// Active substring filter for the transcript. `None` means no
+    /// filter; the empty string is normalized to `None` on commit.
+    pub search_query: Option<String>,
+    /// Input buffer for the in-progress search modal (filled when the
+    /// SearchTranscript modal is open).
+    pub search_input: String,
 }
 
 impl TuiAppState {
@@ -118,7 +136,33 @@ impl TuiAppState {
             size: (80, 24),
             should_quit: false,
             layout,
+            next_card_id: 0,
+            selected_card_id: None,
+            expanded_card_ids: HashSet::new(),
+            search_query: None,
+            search_input: String::new(),
         }
+    }
+
+    /// Return the indices into `self.transcript` for the cards that
+    /// pass the current search filter. With no filter active, returns
+    /// `0..transcript.len()`.
+    pub fn visible_card_indices(&self) -> Vec<usize> {
+        match &self.search_query {
+            Some(q) if !q.is_empty() => self
+                .transcript
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| if c.matches_search(q) { Some(i) } else { None })
+                .collect(),
+            _ => (0..self.transcript.len()).collect(),
+        }
+    }
+
+    /// Is the given card expanded? An expanded card with empty
+    /// `expanded_body` still reports `true` (caller can short-circuit).
+    pub fn is_card_expanded(&self, id: u64) -> bool {
+        self.expanded_card_ids.contains(&id)
     }
 
     /// Replace the initial side panel mode + visibility. Convenience for
@@ -151,6 +195,7 @@ impl TuiAppState {
                     kind: "run_failed",
                     headline: "✗ run stream error".to_string(),
                     body: vec![message],
+                    ..Default::default()
                 });
                 Vec::new()
             }
@@ -194,22 +239,20 @@ impl TuiAppState {
             }
             _ => {}
         }
-        // When a modal is open, swallow most input so a key doesn't
-        // accidentally mutate the composer or submit a prompt behind
-        // the overlay. Esc still pops the modal; Ctrl+C still cancels
-        // the active run or exits.
-        if self.layout.current_modal().is_some() {
-            return match k {
-                KeyEvent::Esc => {
-                    let _ = self.layout.pop_modal();
-                    Vec::new()
-                }
-                KeyEvent::CtrlC => match self.run_status {
-                    RunStatus::Running => vec![TuiAction::CancelRun],
-                    RunStatus::Idle => Vec::new(),
-                },
-                _ => Vec::new(),
-            };
+        // When a modal is open, route keys to the modal-specific
+        // handler. The SearchTranscript modal accumulates an input
+        // buffer; other modals swallow most input. Esc always pops
+        // the modal; Ctrl+C always reaches the run-cancel path.
+        if let Some(modal) = self.layout.current_modal().cloned() {
+            return self.apply_modal_key(modal, k);
+        }
+        // Transcript-focused navigation. Only fires when the user is
+        // browsing the transcript pane; the composer pane gets the
+        // key otherwise.
+        if matches!(self.layout.focus, FocusPane::Transcript) {
+            if let Some(actions) = self.apply_transcript_nav_key(k) {
+                return actions;
+            }
         }
         match self.composer.handle_key(k) {
             KeyAction::Submit(prompt) => {
@@ -246,6 +289,111 @@ impl TuiAppState {
         }
     }
 
+    /// Route a key to the topmost modal. Most modals swallow input
+    /// other than Esc (close) and Ctrl+C (cancel run). The
+    /// SearchTranscript modal additionally accumulates printable
+    /// characters into `self.search_input` and commits the query on
+    /// Enter.
+    fn apply_modal_key(&mut self, modal: TuiModal, k: KeyEvent) -> Vec<TuiAction> {
+        match (modal, k) {
+            (_, KeyEvent::Esc) => {
+                let _ = self.layout.pop_modal();
+                // Cancelling search clears the in-progress input.
+                self.search_input.clear();
+                Vec::new()
+            }
+            (_, KeyEvent::CtrlC) => match self.run_status {
+                RunStatus::Running => vec![TuiAction::CancelRun],
+                RunStatus::Idle => Vec::new(),
+            },
+            (TuiModal::SearchTranscript, KeyEvent::Char(c)) => {
+                self.search_input.push(c);
+                Vec::new()
+            }
+            (TuiModal::SearchTranscript, KeyEvent::Backspace) => {
+                self.search_input.pop();
+                Vec::new()
+            }
+            (TuiModal::SearchTranscript, KeyEvent::Enter) => {
+                let q = self.search_input.trim().to_string();
+                self.search_query = if q.is_empty() { None } else { Some(q) };
+                self.search_input.clear();
+                let _ = self.layout.pop_modal();
+                // Jump selection to the first visible match.
+                let first = self
+                    .visible_card_indices()
+                    .first()
+                    .and_then(|i| self.transcript.get(*i).map(|c| c.id));
+                if first.is_some() {
+                    self.selected_card_id = first;
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Transcript-focused navigation. Returns `Some(actions)` when the
+    /// key was handled (so the caller should NOT also forward it to
+    /// the composer), `None` otherwise.
+    fn apply_transcript_nav_key(&mut self, k: KeyEvent) -> Option<Vec<TuiAction>> {
+        let visible = self.visible_card_indices();
+        if visible.is_empty() {
+            return None;
+        }
+        let current = self
+            .selected_card_id
+            .and_then(|id| visible.iter().position(|i| self.transcript[*i].id == id))
+            .unwrap_or_else(|| visible.len() - 1);
+        match k {
+            KeyEvent::Char('j') | KeyEvent::Down => {
+                let new = (current + 1).min(visible.len() - 1);
+                self.selected_card_id = Some(self.transcript[visible[new]].id);
+                Some(Vec::new())
+            }
+            KeyEvent::Char('k') | KeyEvent::Up => {
+                let new = current.saturating_sub(1);
+                self.selected_card_id = Some(self.transcript[visible[new]].id);
+                Some(Vec::new())
+            }
+            KeyEvent::Char('g') => {
+                self.selected_card_id = Some(self.transcript[visible[0]].id);
+                Some(Vec::new())
+            }
+            KeyEvent::Char('G') => {
+                self.selected_card_id = Some(self.transcript[visible[visible.len() - 1]].id);
+                Some(Vec::new())
+            }
+            KeyEvent::Char('e') | KeyEvent::Enter => {
+                if let Some(id) = self.selected_card_id {
+                    if self.expanded_card_ids.contains(&id) {
+                        self.expanded_card_ids.remove(&id);
+                    } else {
+                        self.expanded_card_ids.insert(id);
+                    }
+                }
+                Some(Vec::new())
+            }
+            KeyEvent::Char('n') => {
+                // Next search match. Without an active query this is a
+                // no-op (the visible set is everything).
+                if self.search_query.is_some() {
+                    let new = (current + 1).min(visible.len() - 1);
+                    self.selected_card_id = Some(self.transcript[visible[new]].id);
+                }
+                Some(Vec::new())
+            }
+            KeyEvent::Char('N') => {
+                if self.search_query.is_some() {
+                    let new = current.saturating_sub(1);
+                    self.selected_card_id = Some(self.transcript[visible[new]].id);
+                }
+                Some(Vec::new())
+            }
+            _ => None,
+        }
+    }
+
     /// Common path for submitting a literal prompt (used both by
     /// vanilla input and the `//` escape). Enforces the
     /// "no submit while run is in progress" guard.
@@ -263,6 +411,7 @@ impl TuiAppState {
             kind: "user",
             headline: "You:".to_string(),
             body: prompt.lines().map(String::from).collect(),
+            ..Default::default()
         });
         self.run_status = RunStatus::Running;
         self.last_error = None;
@@ -424,12 +573,22 @@ impl TuiAppState {
             kind: "assistant_delta",
             headline: "Agent:".to_string(),
             body,
+            ..Default::default()
         });
     }
 
-    fn push_transcript(&mut self, card: EventCard) {
+    fn push_transcript(&mut self, mut card: EventCard) {
+        // Stamp the card with a stable id before it enters state. The
+        // id is used by selection / expansion / search-result sets so
+        // they survive the transcript ring buffer's eviction of older
+        // cards.
+        card.id = self.next_card_id;
+        self.next_card_id = self.next_card_id.wrapping_add(1);
         self.transcript.push(card);
-        // Bounded ring buffer; oldest cards drop first.
+        // Bounded ring buffer; oldest cards drop first. Any selection
+        // or expansion pointing at an evicted id is preserved as-is —
+        // helpers (`is_card_expanded`, selection navigation) ignore
+        // ids that no longer correspond to a visible card.
         if self.transcript.len() > TRANSCRIPT_CAP {
             let excess = self.transcript.len() - TRANSCRIPT_CAP;
             self.transcript.drain(..excess);
@@ -879,6 +1038,169 @@ mod tests {
         assert_eq!(s.layout.focus, FocusPane::Composer);
     }
 
+    fn push_user_card(s: &mut TuiAppState, text: &str) {
+        s.push_transcript(EventCard {
+            kind: "user",
+            headline: text.to_string(),
+            body: vec![text.to_string()],
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    // Each push_transcript assigns a fresh monotonic id; cards retain
+    // their ids through subsequent pushes and eviction.
+    fn push_transcript_assigns_monotonic_ids() {
+        let mut s = fresh_state();
+        push_user_card(&mut s, "one");
+        push_user_card(&mut s, "two");
+        push_user_card(&mut s, "three");
+        let ids: Vec<u64> = s.transcript.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(s.next_card_id, 3);
+    }
+
+    #[test]
+    // With transcript focused, j/k navigate selection through visible
+    // cards and saturate at the ends.
+    fn transcript_nav_j_k_moves_selection() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        // Focus transcript.
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        push_user_card(&mut s, "a");
+        push_user_card(&mut s, "b");
+        push_user_card(&mut s, "c");
+        // First j with no selection: starts from last card (most recent).
+        s.apply(TuiInbound::Key(KeyEvent::Char('j')));
+        assert_eq!(s.selected_card_id, Some(2));
+        // k moves up to b.
+        s.apply(TuiInbound::Key(KeyEvent::Char('k')));
+        assert_eq!(s.selected_card_id, Some(1));
+        s.apply(TuiInbound::Key(KeyEvent::Char('k')));
+        assert_eq!(s.selected_card_id, Some(0));
+        // Saturates at top.
+        s.apply(TuiInbound::Key(KeyEvent::Char('k')));
+        assert_eq!(s.selected_card_id, Some(0));
+        // g/G jump to top/bottom.
+        s.apply(TuiInbound::Key(KeyEvent::Char('G')));
+        assert_eq!(s.selected_card_id, Some(2));
+        s.apply(TuiInbound::Key(KeyEvent::Char('g')));
+        assert_eq!(s.selected_card_id, Some(0));
+    }
+
+    #[test]
+    // Transcript navigation keys are ignored when focus is on the
+    // composer (default). Typing `j` adds it to the composer buffer.
+    fn transcript_nav_inert_when_composer_focused() {
+        let mut s = fresh_state();
+        push_user_card(&mut s, "a");
+        s.apply(TuiInbound::Key(KeyEvent::Char('j')));
+        // Composer absorbed the keystroke.
+        assert_eq!(s.composer.buffer, "j");
+        assert!(s.selected_card_id.is_none());
+    }
+
+    #[test]
+    // `e` and Enter toggle expansion of the selected card; cards
+    // without expanded_body still record the bit so the renderer
+    // can decide what to do.
+    fn e_toggles_expansion() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        push_user_card(&mut s, "a");
+        s.apply(TuiInbound::Key(KeyEvent::Char('j')));
+        assert!(!s.is_card_expanded(0));
+        s.apply(TuiInbound::Key(KeyEvent::Char('e')));
+        assert!(s.is_card_expanded(0));
+        // Enter also toggles when transcript-focused.
+        s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(!s.is_card_expanded(0));
+    }
+
+    #[test]
+    // `/search foo` opens the SearchTranscript modal; typing `foo` +
+    // Enter commits the query. Visible card list shrinks to matches.
+    fn search_modal_filters_transcript() {
+        let mut s = fresh_state();
+        push_user_card(&mut s, "alpha");
+        push_user_card(&mut s, "beta");
+        push_user_card(&mut s, "alphabet");
+        // Open the modal via slash command.
+        for c in "/search".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(matches!(
+            s.layout.current_modal(),
+            Some(TuiModal::SearchTranscript)
+        ));
+        // Type query.
+        for c in "alpha".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        assert_eq!(s.search_input, "alpha");
+        // Commit.
+        s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert_eq!(s.search_query.as_deref(), Some("alpha"));
+        assert!(s.layout.current_modal().is_none());
+        let visible = s.visible_card_indices();
+        // alpha + alphabet match; beta does not.
+        assert_eq!(visible.len(), 2);
+        // Selection jumps to first match.
+        assert!(s.selected_card_id.is_some());
+    }
+
+    #[test]
+    // Backspace removes the last char from the search input; Esc
+    // cancels the modal and clears the input without committing.
+    fn search_modal_backspace_and_cancel() {
+        let mut s = fresh_state();
+        for c in "/search".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        s.apply(TuiInbound::Key(KeyEvent::Enter));
+        for c in "wrong".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        s.apply(TuiInbound::Key(KeyEvent::Backspace));
+        s.apply(TuiInbound::Key(KeyEvent::Backspace));
+        assert_eq!(s.search_input, "wro");
+        s.apply(TuiInbound::Key(KeyEvent::Esc));
+        assert!(s.layout.current_modal().is_none());
+        assert!(s.search_input.is_empty());
+        assert!(s.search_query.is_none());
+    }
+
+    #[test]
+    // n / N navigate forward/backward through search matches when
+    // transcript is focused. Without an active query they're no-ops.
+    fn n_and_capital_n_navigate_matches() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        push_user_card(&mut s, "alpha");
+        push_user_card(&mut s, "beta");
+        push_user_card(&mut s, "alphabet");
+        s.search_query = Some("alpha".to_string());
+        // Focus transcript.
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        // First n from no selection → most recent match (alphabet, id 2).
+        s.apply(TuiInbound::Key(KeyEvent::Char('n')));
+        assert_eq!(s.selected_card_id, Some(2));
+        s.apply(TuiInbound::Key(KeyEvent::Char('N')));
+        assert_eq!(s.selected_card_id, Some(0));
+    }
+
     #[test]
     // Transcript length is bounded to TRANSCRIPT_CAP.
     fn transcript_is_bounded() {
@@ -888,6 +1210,7 @@ mod tests {
                 kind: "test",
                 headline: i.to_string(),
                 body: Vec::new(),
+                ..Default::default()
             });
         }
         assert_eq!(s.transcript.len(), TRANSCRIPT_CAP);

@@ -15,8 +15,8 @@ phase has merged and the acceptance checklist at the bottom is satisfied.
 | Phase | Scope | Status |
 |-------|-------|--------|
 | A | Live SDK-driven app shell: event loop, composer, transcript, status line; fake-provider end-to-end; `cmd_tui` no longer a stub | PR #103 (under review) |
-| B | `TuiAppState` layout primitives, side / detail panel infra, modal stack, multi-pane renderer, slash routing | in progress |
-| C | Virtualized timeline, event grouping, comprehensive renderers, search / navigation | planned |
+| B | `TuiAppState` layout primitives, side / detail panel infra, modal stack, multi-pane renderer, slash routing | PR #104 (under review) |
+| C | Card identity, selection + expansion + transcript search, n/N match navigation | in progress |
 | D | Composer maturity: slash / `@file` / context completions, history search, multiline | planned |
 | E | Diff / approval workbench + plan dashboard + deviation modal | planned |
 | F | Inspectors: tools, MCP, agents, skills, plugins | planned |
@@ -189,6 +189,60 @@ All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --
 * Real command palette content — Phase H.
 * Transcript search behavior beyond opening the modal — Phase C.
 * `@file` autocomplete in the composer — Phase D.
+
+## Phase C — Card identity, selection / expansion / search
+
+### What's new
+
+| Module | Purpose |
+|--------|---------|
+| `transcript.rs` | `EventCard` gains stable `id: u64`, optional `expanded_body: Vec<String>`, optional `source: Option<String>`. New `lines_with_expansion(bool)` and `matches_search(&str)` helpers. Derives `Default` so callers can opt into the new fields via `..Default::default()`. |
+| `state.rs` | `TuiAppState` gains `next_card_id`, `selected_card_id`, `expanded_card_ids: HashSet<u64>`, `search_query: Option<String>`, `search_input: String`. New helpers `visible_card_indices()` and `is_card_expanded()`. `push_transcript` stamps each card with a fresh id. New `apply_modal_key` (modal-aware key router) and `apply_transcript_nav_key` (transcript-focused navigation). |
+| `view.rs` | Builds the renderer transcript via a `projected_transcript` step that applies the search filter, inlines each expanded card's `expanded_body`, and marks the selected card with a `›` glyph (and other cards with a leading `  `). The SearchTranscript modal body reflects the in-progress `search_input`, the committed `search_query`, and a `visible of total` match count. |
+
+### Reducer behavior
+
+Transcript-focused navigation (only fires when `FocusPane::Transcript`):
+
+| Key | Action |
+|-----|--------|
+| `j` / `Down` | Move selection down by one. Saturates at the end. |
+| `k` / `Up` | Move selection up by one. Saturates at the start. |
+| `g` | Jump selection to the first visible card. |
+| `G` | Jump selection to the last visible card. |
+| `e` / `Enter` | Toggle expansion of the selected card. |
+| `n` | Next search match (no-op without an active query). |
+| `N` | Previous search match. |
+
+Modal-aware input (when the modal stack is non-empty):
+
+| Modal | Char / Backspace / Enter behavior |
+|-------|------------------------------------|
+| `SearchTranscript` | Char appends to `search_input`; Backspace pops; Enter commits to `search_query` and jumps selection to the first match; Esc cancels and clears the input. |
+| any other | All input is swallowed except `Esc` (close) and `Ctrl+C` (cancel run). |
+
+### Card identity and search semantics
+
+* `id` is assigned by `push_transcript` from a per-state monotonic counter (`next_card_id`). Wraps via `wrapping_add` for safety, though 2^64 cards is well beyond realistic use.
+* Selection and expansion sets are keyed by id rather than index, so they survive ring-buffer eviction (cards age out of `transcript` while their ids persist in the sets — helpers ignore ids that no longer resolve).
+* `matches_search` is case-insensitive and searches headline + body + expanded_body + source. The empty string normalizes to "no filter".
+* `visible_card_indices()` returns the indices into `self.transcript` that the renderer should display; without a query it returns `0..len()`.
+
+### Tests
+
+`state.rs` adds 8 reducer tests:
+`push_transcript_assigns_monotonic_ids`, `transcript_nav_j_k_moves_selection`, `transcript_nav_inert_when_composer_focused`, `e_toggles_expansion`, `search_modal_filters_transcript`, `search_modal_backspace_and_cancel`, `n_and_capital_n_navigate_matches`, plus an updated `transcript_is_bounded` that exercises Default-based literal construction.
+
+`view.rs` tests still pass and now exercise the projected-transcript path (selection glyph, expansion inlining).
+
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (972 tests total) are clean.
+
+### Out of scope for Phase C
+
+* Scrollbar / overflow indicators in the renderer (the existing `Paragraph::wrap` does soft wrapping; explicit virtualization beyond bounded `transcript` size lands when the inspectors in Phase F need it).
+* Rich per-event-type renderers (Bash stdout/stderr/exit grouping, MCP arg/result preview, subagent child links) — these need richer SDK event payloads first; Phase C's `expanded_body` and `source` fields are the seam those phases will fill.
+* Copy-selected-event-text via OSC52 — Phase H.
+* Raw-JSON detail-pane toggle — Phase E/F (depends on richer detail panel content).
 * Slash / `@file` / context-insertion autocomplete — Phase D.
 * Diff / approval workbench, plan dashboard — Phase E.
 * Tools / MCP / agents / skills / plugins inspectors — Phase F.

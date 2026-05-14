@@ -11,12 +11,20 @@ use crate::state::TuiAppState;
 /// Build a [`UiFrame`] from the current reducer state. The `footer`
 /// string is owned by the caller (typically the [`crate::TuiApp`]) so
 /// it can be customized without poking the reducer.
+///
+/// Phase C extensions:
+/// * The transcript is filtered through the active `search_query`.
+/// * The selected card is marked with a leading `›` glyph; expanded
+///   cards have their `expanded_body` appended inline.
+/// * Search-modal input is reflected in the `SearchTranscript` modal
+///   body so the user can see what they're typing.
 pub fn build_ui_frame<'a>(state: &'a TuiAppState, footer: &'a str) -> UiFrame<'a> {
+    let transcript = projected_transcript(state);
     UiFrame {
         status_template: &state.status_template,
         status_ctx: state.status_ctx.clone(),
         diagnostics: state.activity.clone(),
-        transcript: state.transcript.clone(),
+        transcript,
         composer: state.composer.buffer.as_str(),
         footer,
         approval: None::<ApprovalContext<'a>>,
@@ -31,10 +39,41 @@ pub fn build_ui_frame<'a>(state: &'a TuiAppState, footer: &'a str) -> UiFrame<'a
             .detail_panel
             .visible
             .then(|| detail_panel_view(state)),
-        modal: state.layout.current_modal().map(modal_view),
+        modal: state
+            .layout
+            .current_modal()
+            .map(|m| modal_view_for(state, m)),
         composer_focused: matches!(state.layout.focus, FocusPane::Composer),
         transcript_focused: matches!(state.layout.focus, FocusPane::Transcript),
     }
+}
+
+/// Return the cards the renderer should display. Honors the active
+/// search filter, the per-card expansion bit (folds `expanded_body`
+/// into the body so the renderer doesn't have to know about expansion
+/// state), and the selection marker (a leading `›` on the headline).
+fn projected_transcript(state: &TuiAppState) -> Vec<crate::transcript::EventCard> {
+    let indices = state.visible_card_indices();
+    let mut out = Vec::with_capacity(indices.len());
+    for i in indices {
+        let src = &state.transcript[i];
+        let mut card = src.clone();
+        if state.is_card_expanded(card.id) && !card.expanded_body.is_empty() {
+            // Fold expanded body into the visible body inline.
+            for line in &card.expanded_body {
+                card.body.push(line.clone());
+            }
+        }
+        if state.selected_card_id == Some(card.id) {
+            // Mark selection inline so the snapshot renderer
+            // (which doesn't have per-card styling) shows it.
+            card.headline = format!("› {}", card.headline);
+        } else {
+            card.headline = format!("  {}", card.headline);
+        }
+        out.push(card);
+    }
+    out
 }
 
 fn side_panel_view(state: &TuiAppState) -> PaneView {
@@ -53,9 +92,22 @@ fn detail_panel_view(state: &TuiAppState) -> PaneView {
     }
 }
 
-fn modal_view(modal: &TuiModal) -> ModalView {
+fn modal_view_for(state: &TuiAppState, modal: &TuiModal) -> ModalView {
     let title = modal.title().to_string();
     let body = match modal {
+        TuiModal::SearchTranscript => {
+            let mut lines = vec![format!("Search: {}_", state.search_input)];
+            lines.push(String::new());
+            if let Some(q) = &state.search_query {
+                lines.push(format!("Current filter: {q}"));
+            } else {
+                lines.push("(Enter commits, Esc cancels)".to_string());
+            }
+            let visible = state.visible_card_indices().len();
+            let total = state.transcript.len();
+            lines.push(format!("{visible} of {total} cards match"));
+            return ModalView { title, body: lines };
+        }
         TuiModal::Help => vec![
             "Keyboard shortcuts".to_string(),
             "".to_string(),
@@ -75,10 +127,6 @@ fn modal_view(modal: &TuiModal) -> ModalView {
         TuiModal::CommandPalette => vec![
             "Command palette".to_string(),
             "(content arrives in Phase H)".to_string(),
-        ],
-        TuiModal::SearchTranscript => vec![
-            "Transcript search".to_string(),
-            "(content arrives in Phase C)".to_string(),
         ],
         TuiModal::PromptHistory => vec![
             "Prompt history".to_string(),
@@ -172,13 +220,14 @@ mod tests {
     #[test]
     // Each modal variant maps to a non-empty body and stable title.
     fn modal_titles_are_stable() {
+        let state = fresh_state();
         for modal in [
             TuiModal::Help,
             TuiModal::CommandPalette,
             TuiModal::SearchTranscript,
             TuiModal::PromptHistory,
         ] {
-            let v = modal_view(&modal);
+            let v = modal_view_for(&state, &modal);
             assert!(!v.title.is_empty());
             assert!(!v.body.is_empty());
         }
