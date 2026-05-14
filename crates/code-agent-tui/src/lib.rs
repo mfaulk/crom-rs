@@ -14,6 +14,7 @@
 
 pub mod app;
 pub mod approval;
+pub mod completion;
 pub mod composer;
 pub mod diff_view;
 pub mod event_adapter;
@@ -29,6 +30,10 @@ pub mod view;
 
 pub use app::{drive_single_prompt, TuiApp, TuiAppError};
 pub use approval::{format_approval_card, ApprovalContext, ApprovalKind};
+pub use completion::{
+    context_token_candidates, detect_trigger, slash_candidates, Candidate, CompletionKind,
+    CompletionPopup, TriggerSpec, CONTEXT_TOKENS, SLASH_COMMANDS,
+};
 pub use composer::{
     autocomplete_files, autocomplete_slash, ComposerState, KeyAction, KeyEvent as ComposerKey,
     PromptHistory,
