@@ -210,6 +210,34 @@ impl TuiApp {
                 TuiAction::Exit => {
                     self.state.should_quit = true;
                 }
+                // M13 Phase E: approval/plan actions are surfaced as
+                // activity diagnostics for now. Live callback wiring
+                // (publishing the decision back through the SDK's
+                // `ApprovalCallback`) lands in a Phase G follow-up;
+                // Phase E delivers the visual workbench + reducer
+                // surface so the integration is testable.
+                TuiAction::ResolveApproval(decision) => {
+                    self.state
+                        .push_activity(format!("approval decision: {decision:?}"));
+                }
+                TuiAction::ApprovePlan(plan_id) => {
+                    self.state
+                        .push_activity(format!("approve plan: {}", plan_id.as_str()));
+                }
+                TuiAction::RejectPlan { plan_id, reason } => {
+                    self.state.push_activity(format!(
+                        "reject plan: {} ({})",
+                        plan_id.as_str(),
+                        reason.as_deref().unwrap_or("no reason")
+                    ));
+                }
+                TuiAction::RevisePlan { plan_id, hint } => {
+                    self.state.push_activity(format!(
+                        "revise plan: {} ({})",
+                        plan_id.as_str(),
+                        if hint.is_empty() { "<no hint>" } else { &hint }
+                    ));
+                }
             }
         }
     }
