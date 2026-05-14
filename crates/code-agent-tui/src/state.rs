@@ -14,6 +14,7 @@ use code_agent_sdk::SdkEvent;
 
 use crate::composer::{ComposerState, KeyAction, KeyEvent};
 use crate::event_adapter::map_sdk_event;
+use crate::layout::{DetailPanelMode, FocusPane, LayoutState, SidePanelMode, TuiModal};
 use crate::transcript::EventCard;
 
 /// Maximum number of transcript cards retained in state. Bounded so a
@@ -25,6 +26,11 @@ pub const TRANSCRIPT_CAP: usize = 1024;
 pub const ACTIVITY_CAP: usize = 16;
 
 /// Side-effect intents emitted by the reducer for the host loop to handle.
+///
+/// All UI-internal mutations (panel toggling, focus cycling, modal stack)
+/// happen inside the reducer and produce no `TuiAction`. The host loop
+/// only needs to react to actions that cross the runtime boundary or end
+/// the program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
     /// Submit a new prompt to the runtime. The host should construct an
@@ -73,9 +79,10 @@ pub enum RunStatus {
     Running,
 }
 
-/// Top-level TUI state. Intentionally small for Phase A: later phases
-/// add side/detail panels, modal stack, plan dashboard, etc., without
-/// breaking the reducer surface.
+/// Top-level TUI state. Phase B adds `layout` for the multi-pane
+/// cockpit. Later phases extend `LayoutState` (plan dashboard payload,
+/// inspector data, session list, etc.) without breaking the reducer
+/// surface.
 #[derive(Debug, Clone)]
 pub struct TuiAppState {
     pub composer: ComposerState,
@@ -87,6 +94,7 @@ pub struct TuiAppState {
     pub last_error: Option<String>,
     pub size: (u16, u16),
     pub should_quit: bool,
+    pub layout: LayoutState,
 }
 
 impl TuiAppState {
@@ -97,6 +105,8 @@ impl TuiAppState {
         status_template: String,
         status_ctx: StatusLineContext,
     ) -> Self {
+        let mut layout = LayoutState::default();
+        layout.recompute_for_size(80, 24);
         Self {
             composer,
             transcript: Vec::new(),
@@ -107,7 +117,18 @@ impl TuiAppState {
             last_error: None,
             size: (80, 24),
             should_quit: false,
+            layout,
         }
+    }
+
+    /// Replace the initial side panel mode + visibility. Convenience for
+    /// callers that want to honor `ui.default_side_panel` /
+    /// `ui.show_side_panel` settings without poking the layout field
+    /// directly.
+    pub fn with_initial_side_panel(mut self, mode: SidePanelMode, visible: bool) -> Self {
+        self.layout.side_panel.mode = mode;
+        self.layout.side_panel.visible = visible;
+        self
     }
 
     /// Apply an inbound event. Returns the list of host-side actions that
@@ -142,16 +163,49 @@ impl TuiAppState {
             TuiInbound::Key(k) => self.apply_key(k),
             TuiInbound::Resize { width, height } => {
                 self.size = (width, height);
+                self.layout.recompute_for_size(width, height);
                 Vec::new()
             }
         }
     }
 
     fn apply_key(&mut self, k: KeyEvent) -> Vec<TuiAction> {
+        // Layout-priority keys intercepted before the composer. These
+        // are global navigation that does not depend on which pane has
+        // focus, so the composer never sees them.
+        match k {
+            KeyEvent::Tab => {
+                self.layout.focus = self.layout.focus.next(
+                    self.layout.side_panel_rendered(),
+                    self.layout.detail_panel_rendered(),
+                );
+                return Vec::new();
+            }
+            KeyEvent::ShiftTab => {
+                self.layout.focus = self.layout.focus.prev(
+                    self.layout.side_panel_rendered(),
+                    self.layout.detail_panel_rendered(),
+                );
+                return Vec::new();
+            }
+            KeyEvent::Esc if self.layout.current_modal().is_some() => {
+                let _ = self.layout.pop_modal();
+                return Vec::new();
+            }
+            _ => {}
+        }
         match self.composer.handle_key(k) {
             KeyAction::Submit(prompt) => {
                 let trimmed = prompt.trim();
                 if trimmed.is_empty() {
+                    return Vec::new();
+                }
+                // Slash commands route into the layout state machine
+                // instead of the runtime: `/plan`, `/files`, `/help`,
+                // and friends switch panels or open modals without
+                // submitting anything to the SDK.
+                if let Some(stripped) = trimmed.strip_prefix('/') {
+                    self.apply_slash_command(stripped);
                     return Vec::new();
                 }
                 // Reject prompts while a run is in flight so we don't
@@ -179,6 +233,69 @@ impl TuiAppState {
             KeyAction::Exit => vec![TuiAction::Exit],
             KeyAction::None | KeyAction::HistorySearch => Vec::new(),
         }
+    }
+
+    fn apply_slash_command(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        // Side-panel switches. Accept any of the 14 canonical config
+        // keys plus `agents` (alias for `subagents`) — kept in sync
+        // with `SidePanelMode::from_config_key`.
+        if let Some(mode) = SidePanelMode::from_config_key(cmd) {
+            self.layout.side_panel.mode = mode;
+            self.layout.side_panel.visible = true;
+            self.layout.focus = FocusPane::SidePanel;
+            self.push_activity(format!("side panel → {}", mode.label()));
+            return;
+        }
+        match cmd {
+            "help" | "keys" => {
+                self.layout.push_modal(TuiModal::Help);
+            }
+            "palette" => {
+                self.layout.push_modal(TuiModal::CommandPalette);
+            }
+            "search" => {
+                self.layout.push_modal(TuiModal::SearchTranscript);
+            }
+            "history" => {
+                self.layout.push_modal(TuiModal::PromptHistory);
+            }
+            "toggle-side" | "side" => {
+                self.layout.side_panel.visible = !self.layout.side_panel.visible;
+            }
+            "toggle-detail" | "detail" => {
+                self.layout.detail_panel.visible = !self.layout.detail_panel.visible;
+            }
+            "" => {
+                // Bare `/` — no-op, harmless.
+            }
+            other => {
+                self.push_activity(format!("unknown slash command: /{other}"));
+            }
+        }
+    }
+
+    /// Public helper: directly set the side-panel mode (e.g. from a
+    /// command palette entry in a future phase, or from CLI args).
+    pub fn set_side_panel(&mut self, mode: SidePanelMode, visible: bool) {
+        self.layout.side_panel.mode = mode;
+        self.layout.side_panel.visible = visible;
+    }
+
+    /// Public helper: directly set the detail-panel mode.
+    pub fn set_detail_panel(&mut self, mode: DetailPanelMode, visible: bool) {
+        self.layout.detail_panel.mode = mode;
+        self.layout.detail_panel.visible = visible;
+    }
+
+    /// Public helper: open a modal explicitly.
+    pub fn push_modal(&mut self, modal: TuiModal) {
+        self.layout.push_modal(modal);
+    }
+
+    /// Public helper: close the topmost modal.
+    pub fn pop_modal(&mut self) -> Option<TuiModal> {
+        self.layout.pop_modal()
     }
 
     fn apply_sdk_event(&mut self, ev: &SdkEvent) {
@@ -461,6 +578,107 @@ mod tests {
             height: 50,
         });
         assert_eq!(s.size, (132, 50));
+    }
+
+    #[test]
+    // Tab cycles focus forward through visible panes; Shift+Tab cycles
+    // backward. The composer never sees these keys.
+    fn tab_and_shift_tab_cycle_focus() {
+        let mut s = fresh_state();
+        s.layout.side_panel.visible = true;
+        s.layout.detail_panel.visible = true;
+        // Recompute mode for a wide-enough size so panels are rendered.
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        assert_eq!(s.layout.focus, FocusPane::Composer);
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        assert_eq!(s.layout.focus, FocusPane::Transcript);
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        assert_eq!(s.layout.focus, FocusPane::SidePanel);
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        assert_eq!(s.layout.focus, FocusPane::DetailPanel);
+        s.apply(TuiInbound::Key(KeyEvent::Tab));
+        assert_eq!(s.layout.focus, FocusPane::Composer);
+        s.apply(TuiInbound::Key(KeyEvent::ShiftTab));
+        assert_eq!(s.layout.focus, FocusPane::DetailPanel);
+    }
+
+    #[test]
+    // Esc with a modal on top of the stack pops it; without a modal,
+    // Esc is a no-op (the composer ignores Esc by design).
+    fn esc_pops_modal_when_open() {
+        let mut s = fresh_state();
+        s.layout.push_modal(TuiModal::Help);
+        assert!(s.layout.current_modal().is_some());
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Esc));
+        assert!(actions.is_empty());
+        assert!(s.layout.current_modal().is_none());
+        // Without a modal Esc is harmless.
+        let _ = s.apply(TuiInbound::Key(KeyEvent::Esc));
+    }
+
+    #[test]
+    // A `/files` slash command switches the side panel mode and never
+    // submits a prompt to the runtime.
+    fn slash_command_routes_panel_switch() {
+        let mut s = fresh_state();
+        for c in "/files".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(actions.is_empty(), "slash must not emit SubmitPrompt");
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Files);
+        assert!(s.layout.side_panel.visible);
+        assert_eq!(s.layout.focus, FocusPane::SidePanel);
+    }
+
+    #[test]
+    // /help opens the help modal.
+    fn slash_help_opens_help_modal() {
+        let mut s = fresh_state();
+        for c in "/help".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(matches!(s.layout.current_modal(), Some(TuiModal::Help)));
+    }
+
+    #[test]
+    // Unknown slash commands surface as an activity entry but never
+    // submit a prompt.
+    fn unknown_slash_is_diagnostic_not_prompt() {
+        let mut s = fresh_state();
+        for c in "/nope".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(actions.is_empty());
+        assert!(s
+            .activity
+            .iter()
+            .any(|a| a.contains("unknown slash command")));
+    }
+
+    #[test]
+    // Resize recomputes the layout mode but preserves the user's
+    // panel selections.
+    fn resize_recomputes_layout_mode() {
+        let mut s = fresh_state();
+        s.layout.side_panel.mode = SidePanelMode::Changes;
+        s.apply(TuiInbound::Resize {
+            width: 40,
+            height: 6,
+        });
+        assert_eq!(s.layout.mode, crate::layout::LayoutMode::Tiny);
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Changes);
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        assert_eq!(s.layout.mode, crate::layout::LayoutMode::Full);
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Changes);
     }
 
     #[test]
