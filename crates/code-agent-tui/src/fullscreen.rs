@@ -296,13 +296,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// Degrade the caller-requested layout mode when the actual terminal is
 /// too small to honor it. Treats the renderer's `area` as authoritative
 /// because the caller's `LayoutState` may have been computed off an
-/// older resize event.
+/// older resize event. Never *expands* beyond the caller's selection.
 fn effective_layout_mode(requested: LayoutMode, area: Rect) -> LayoutMode {
     let measured = LayoutMode::from_size(area.width, area.height);
-    use std::cmp::min;
-    // Take the more conservative of (requested, measured): we never
-    // expand beyond the caller's selection, and we always shrink when
-    // the terminal can't fit the requested mode.
     let order = |m: LayoutMode| -> u8 {
         match m {
             LayoutMode::Tiny => 0,
@@ -313,7 +309,6 @@ fn effective_layout_mode(requested: LayoutMode, area: Rect) -> LayoutMode {
     if order(measured) < order(requested) {
         measured
     } else {
-        let _ = min(order(requested), order(measured));
         requested
     }
 }
