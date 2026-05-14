@@ -51,6 +51,13 @@ code-agent run "Find the bug in src/lib.rs, fix it, and re-run cargo test" \
 # Interactive chat (multiple prompts in one process).
 code-agent chat --show-usage
 
+# Full-screen terminal cockpit driven by the SDK runtime (M13 Phase A).
+# `--fake-provider` is offline and deterministic; remove it once an
+# `ANTHROPIC_API_KEY` is in your environment.
+code-agent tui --fake-provider
+code-agent tui --renderer plain     # plain-text fallback
+code-agent tui --snapshot           # single preview frame (CI-friendly)
+
 # Resume the latest session in this directory.
 code-agent continue "and now add a regression test"
 ```

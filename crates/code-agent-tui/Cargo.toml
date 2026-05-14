@@ -3,10 +3,11 @@ name = "code-agent-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Terminal UI (M9) for code-agent: plain + fullscreen renderers, status line, composer, approvals, diffs."
+description = "Terminal UI for code-agent: renderers, status line, composer, approvals, diffs, and the M13 live event-loop app shell."
 
 [dependencies]
 code-agent-core = { workspace = true }
+code-agent-sdk = { workspace = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
 serde = { workspace = true }
@@ -15,8 +16,14 @@ thiserror = { workspace = true }
 unicode-width = "0.2"
 textwrap = "0.16"
 similar = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
+code-agent-sdk = { workspace = true, features = ["fake-provider"] }
+tokio = { workspace = true, features = ["test-util"] }
