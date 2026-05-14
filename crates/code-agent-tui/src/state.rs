@@ -154,6 +154,14 @@ impl TuiAppState {
                 if trimmed.is_empty() {
                     return Vec::new();
                 }
+                // Reject prompts while a run is in flight so we don't
+                // optimistically append a "You:" card for a prompt that
+                // would then be silently dropped by the host loop. The
+                // user sees a diagnostic; a future phase can queue.
+                if matches!(self.run_status, RunStatus::Running) {
+                    self.push_activity("ignored prompt: run already in progress".to_string());
+                    return Vec::new();
+                }
                 let prompt = trimmed.to_string();
                 self.push_transcript(EventCard {
                     kind: "user",
@@ -200,23 +208,36 @@ impl TuiAppState {
     fn coalesce_assistant_delta(&mut self, delta: &str) {
         // Streaming deltas are coalesced into the most recent assistant
         // card so the transcript reflects a single message rather than a
-        // wall of fragments. If the last card isn't an assistant card,
-        // start a fresh one.
+        // wall of fragments. Embedded newlines must split into new body
+        // entries — otherwise a single body line could contain a literal
+        // `\n` and the transcript pane would silently lose the break.
+        // If the last card isn't an assistant card, start a fresh one.
+        let mut pieces = delta.split('\n');
+        let first = pieces.next().unwrap_or("");
+        let rest: Vec<&str> = pieces.collect();
         if let Some(last) = self.transcript.last_mut() {
             if last.kind == "assistant" || last.kind == "assistant_delta" {
                 if last.body.is_empty() {
-                    last.body.push(delta.to_string());
+                    last.body.push(first.to_string());
                 } else {
                     let n = last.body.len();
-                    last.body[n - 1].push_str(delta);
+                    last.body[n - 1].push_str(first);
+                }
+                for line in rest {
+                    last.body.push(line.to_string());
                 }
                 return;
             }
         }
+        let mut body: Vec<String> = Vec::with_capacity(1 + rest.len());
+        body.push(first.to_string());
+        for line in rest {
+            body.push(line.to_string());
+        }
         self.push_transcript(EventCard {
             kind: "assistant_delta",
             headline: "Agent:".to_string(),
-            body: vec![delta.to_string()],
+            body,
         });
     }
 
@@ -390,6 +411,45 @@ mod tests {
         assert_eq!(s.run_status, RunStatus::Idle);
         assert_eq!(s.last_error.as_deref(), Some("disconnected"));
         assert!(s.transcript.last().unwrap().kind == "run_failed");
+    }
+
+    #[test]
+    // Submitting a prompt while a run is already in progress is rejected
+    // before any state mutation, so no orphan "You:" card is left for a
+    // prompt that never runs. The user gets an activity entry instead.
+    fn submit_while_running_is_rejected() {
+        let mut s = fresh_state();
+        s.run_status = RunStatus::Running;
+        for c in "second".chars() {
+            s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+        }
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(actions.is_empty());
+        assert!(s.transcript.iter().all(|c| c.kind != "user"));
+        assert!(s
+            .activity
+            .iter()
+            .any(|a| a.contains("run already in progress")));
+    }
+
+    #[test]
+    // AssistantTextDelta events that contain a newline split into a new
+    // body line so the transcript pane never silently swallows a `\n`.
+    fn delta_with_newline_splits_into_lines() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::sdk(SdkEvent::AssistantTextDelta(
+            AssistantTextDelta {
+                run_id: rid(),
+                delta: "first\nsecond".to_string(),
+            },
+        )));
+        let last = s.transcript.last().unwrap();
+        assert_eq!(last.kind, "assistant_delta");
+        assert_eq!(
+            last.body,
+            vec!["first".to_string(), "second".to_string()],
+            "delta with `\\n` should split into separate body lines"
+        );
     }
 
     #[test]

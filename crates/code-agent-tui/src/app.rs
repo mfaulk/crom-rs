@@ -107,18 +107,41 @@ impl TuiApp {
             tokio::select! {
                 biased;
 
-                // Keyboard / resize events.
-                Some(inbound) = input_rx.recv() => {
+                // Keyboard / resize events. `recv()` returns None if the
+                // input task panicked or `crossterm::event::read()` failed
+                // — without explicit handling the loop would spin on the
+                // remaining branches with no input path. Treat a closed
+                // input channel as a fatal stop and surface a diagnostic.
+                inbound = input_rx.recv() => {
+                    let Some(inbound) = inbound else {
+                        self.state.apply(TuiInbound::RunStreamError(
+                            "terminal input channel closed".to_string(),
+                        ));
+                        break;
+                    };
                     let actions = self.state.apply(inbound);
                     self.handle_actions(actions, &mut active_run, &mut cancel).await;
+                    // Drain any other input events that arrived while we
+                    // were processing this one. Without this, a bracketed
+                    // paste of N characters triggers N full-frame redraws
+                    // and starves the SDK event arm.
+                    while let Ok(extra) = input_rx.try_recv() {
+                        let extra_actions = self.state.apply(extra);
+                        self.handle_actions(extra_actions, &mut active_run, &mut cancel).await;
+                        if self.state.should_quit {
+                            break;
+                        }
+                    }
                     if self.state.should_quit {
                         break;
                     }
                     self.draw(&mut terminal)?;
                 }
 
-                // SDK events from the currently-active run.
-                Some(event) = next_run_event(active_run.as_mut()) => {
+                // SDK events from the currently-active run. The `if` guard
+                // disables the branch entirely while idle so we never poll
+                // a stream that doesn't exist.
+                Some(event) = next_run_event(active_run.as_mut()), if active_run.is_some() => {
                     match event {
                         RunEvent::Sdk(ev) => {
                             self.state.apply(TuiInbound::sdk(ev));
@@ -323,25 +346,52 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
+        // Instantiate the guard immediately after raw mode is enabled so
+        // that any subsequent setup failure still triggers the Drop-based
+        // restoration. Without this, a failure in `queue!` or `flush`
+        // would leak raw mode permanently.
         enable_raw_mode()?;
+        let mut guard = Self { entered: true };
         let mut stdout = io::stdout();
-        queue!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-        stdout.flush()?;
-        Ok(Self { entered: true })
+        if let Err(e) = queue!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+            let _ = guard.leave();
+            return Err(e);
+        }
+        if let Err(e) = stdout.flush() {
+            let _ = guard.leave();
+            return Err(e);
+        }
+        Ok(guard)
     }
 
     fn stdout_handle(&self) -> Stdout {
         io::stdout()
     }
 
+    /// Tear the terminal back down. Runs every step even if an earlier
+    /// one fails — disabling raw mode is the most important step and
+    /// must not be skipped just because `LeaveAlternateScreen` returned
+    /// an I/O error. Returns the first error encountered, if any.
     fn leave(&mut self) -> io::Result<()> {
         if !self.entered {
             return Ok(());
         }
-        self.entered = false;
+        let mut first_err: Option<io::Error> = None;
         let mut stdout = io::stdout();
-        execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen)?;
-        disable_raw_mode()
+        if let Err(e) = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen) {
+            first_err.get_or_insert(e);
+        }
+        if let Err(e) = disable_raw_mode() {
+            first_err.get_or_insert(e);
+        }
+        // Only mark the guard as left after teardown has been attempted
+        // for every step, so a partial failure cannot trick Drop into
+        // skipping the remaining cleanup.
+        self.entered = false;
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
