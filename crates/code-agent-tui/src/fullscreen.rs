@@ -40,6 +40,16 @@ pub struct ModalView {
     pub body: Vec<String>,
 }
 
+/// Completion popup overlay payload. Painted just above the composer
+/// with the selected entry highlighted. Used by Phase D's slash /
+/// `@token` autocompletion.
+#[derive(Debug, Clone, Default)]
+pub struct CompletionView {
+    pub title: String,
+    pub entries: Vec<String>,
+    pub selected: usize,
+}
+
 /// Snapshot of everything the fullscreen renderer needs to paint a frame.
 /// Built once per redraw by the caller.
 #[derive(Debug, Clone, Default)]
@@ -69,6 +79,9 @@ pub struct UiFrame<'a> {
     pub composer_focused: bool,
     /// M13 Phase B: indicate the transcript is the focused pane.
     pub transcript_focused: bool,
+    /// M13 Phase D: active completion popup. `None` hides it. The
+    /// renderer paints it as an overlay just above the composer.
+    pub completion: Option<CompletionView>,
 }
 
 /// Draw one frame onto the supplied backend. Pure rendering: no input,
@@ -214,6 +227,12 @@ pub fn draw<B: Backend>(terminal: &mut Terminal<B>, frame: UiFrame<'_>) -> Resul
             f.render_widget(Paragraph::new(frame.footer), sections[4]);
         }
 
+        // Completion popup paints above the composer; the modal
+        // overlay (if any) still wins on top of it.
+        if let Some(c) = &frame.completion {
+            render_completion(f, c, composer_area);
+        }
+
         // Modal overlay paints last so it sits on top of everything.
         if let Some(modal) = &frame.modal {
             render_modal(f, modal, area);
@@ -239,6 +258,39 @@ fn render_transcript(f: &mut ratatui::Frame<'_>, frame: &UiFrame<'_>, rect: Rect
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title(title)),
         rect,
+    );
+}
+
+fn render_completion(f: &mut ratatui::Frame<'_>, popup: &CompletionView, composer_rect: Rect) {
+    // Compute popup rect: same width as the composer, placed just
+    // above it, capped at 12 visible entries (+ borders). On very
+    // small terminals where there isn't room above the composer,
+    // silently skip painting.
+    let max_entries = popup.entries.len().min(8) as u16;
+    if max_entries == 0 || composer_rect.y == 0 {
+        return;
+    }
+    let height = (max_entries + 2).min(composer_rect.y);
+    let y = composer_rect.y.saturating_sub(height);
+    let popup_rect = Rect::new(composer_rect.x, y, composer_rect.width, height);
+    f.render_widget(Clear, popup_rect);
+    let items: Vec<ListItem> = popup
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let prefix = if i == popup.selected { "› " } else { "  " };
+            ListItem::new(format!("{prefix}{l}"))
+        })
+        .collect();
+    f.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(popup.title.clone())
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+        ),
+        popup_rect,
     );
 }
 

@@ -4,7 +4,8 @@
 //! bodies returned here with real content.
 
 use crate::approval::ApprovalContext;
-use crate::fullscreen::{ModalView, PaneView, UiFrame};
+use crate::completion::CompletionKind;
+use crate::fullscreen::{CompletionView, ModalView, PaneView, UiFrame};
 use crate::layout::{DetailPanelMode, FocusPane, SidePanelMode, TuiModal};
 use crate::state::TuiAppState;
 
@@ -45,6 +46,23 @@ pub fn build_ui_frame<'a>(state: &'a TuiAppState, footer: &'a str) -> UiFrame<'a
             .map(|m| modal_view_for(state, m)),
         composer_focused: matches!(state.layout.focus, FocusPane::Composer),
         transcript_focused: matches!(state.layout.focus, FocusPane::Transcript),
+        completion: state.composer_popup.as_ref().map(completion_view),
+    }
+}
+
+/// Build a renderer-friendly [`CompletionView`] from the reducer's
+/// active popup. The title names the completion kind so the renderer
+/// can label the overlay without re-deriving the semantics.
+fn completion_view(popup: &crate::completion::CompletionPopup) -> CompletionView {
+    let title = match popup.kind {
+        CompletionKind::Slash => "Slash commands",
+        CompletionKind::ContextToken => "@ context tokens",
+        CompletionKind::File => "@ files",
+    };
+    CompletionView {
+        title: title.to_string(),
+        entries: popup.candidates.iter().map(|c| c.display.clone()).collect(),
+        selected: popup.selected,
     }
 }
 

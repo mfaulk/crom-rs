@@ -16,8 +16,8 @@ phase has merged and the acceptance checklist at the bottom is satisfied.
 |-------|-------|--------|
 | A | Live SDK-driven app shell: event loop, composer, transcript, status line; fake-provider end-to-end; `cmd_tui` no longer a stub | PR #103 (under review) |
 | B | `TuiAppState` layout primitives, side / detail panel infra, modal stack, multi-pane renderer, slash routing | PR #104 (under review) |
-| C | Card identity, selection + expansion + transcript search, n/N match navigation | in progress |
-| D | Composer maturity: slash / `@file` / context completions, history search, multiline | planned |
+| C | Card identity, selection + expansion + transcript search, n/N match navigation | PR #105 (under review) |
+| D | Composer popup: slash / `@token` autocomplete, batched-paste handling, popup overlay renderer | in progress |
 | E | Diff / approval workbench + plan dashboard + deviation modal | planned |
 | F | Inspectors: tools, MCP, agents, skills, plugins | planned |
 | G | Session browser, recovery flow, auth / model / provider selectors, diagnostics panel | planned |
@@ -243,6 +243,52 @@ All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --
 * Rich per-event-type renderers (Bash stdout/stderr/exit grouping, MCP arg/result preview, subagent child links) — these need richer SDK event payloads first; Phase C's `expanded_body` and `source` fields are the seam those phases will fill.
 * Copy-selected-event-text via OSC52 — Phase H.
 * Raw-JSON detail-pane toggle — Phase E/F (depends on richer detail panel content).
+
+## Phase D — Composer popup + paste handling
+
+### What's new
+
+| Module | Purpose |
+|--------|---------|
+| `completion.rs` (new) | Pure popup-state types and trigger detection. `CompletionKind` (Slash / ContextToken / File), `Candidate { display, insert_text }`, `CompletionPopup { kind, candidates, token_start, token_end, selected }`. `detect_trigger(buffer, cursor) -> Option<TriggerSpec>` inspects only the buffer + cursor — no async, no I/O — so it's safe to call after every keystroke. Catalogs: `SLASH_COMMANDS` (kept in sync with `state::apply_slash_command`) and `CONTEXT_TOKENS` (`@plan`, `@changed`, `@last-error`, `@last-diff`, `@checkpoint`, `@session`, `@tool`, `@agent`, `@skill`, `@plugin`, `@mcp`). |
+| `state.rs` | `TuiInbound::Paste(String)` for bracketed-paste payloads. `TuiAppState.composer_popup: Option<CompletionPopup>`. `refresh_composer_popup()` runs after every composer-mutating key. `accept_completion()` splices the selected candidate's `insert_text` over the trigger range and closes the popup. Popup keys (Tab accept, Up/Down navigate, Esc close) are intercepted before the layout/composer dispatch. `apply_paste` warns / truncates on large payloads (32 KB warn, 64 KB hard cap) and is a no-op while a modal is open or focus is outside the composer. |
+| `fullscreen.rs` | New `CompletionView { title, entries, selected }` field on `UiFrame`. The renderer paints the popup as an overlay just above the composer with `Clear`, a bordered `List`, and a `›` glyph marking the selected entry. Skips painting if the terminal is too short to fit above the composer. |
+| `view.rs` | Maps `state.composer_popup` to `CompletionView` and labels the overlay by kind ("Slash commands" / "@ context tokens" / "@ files"). |
+| `app.rs` | The input task now forwards bracketed-paste payloads as a single `TuiInbound::Paste(data)` event instead of N `Char(c)` keystrokes; large pastes no longer starve the SDK arm with N redraws. |
+
+### Trigger detection rules
+
+| Buffer state | Kind | Token |
+|--------------|------|-------|
+| `/<word>` at start of buffer, no whitespace before cursor | Slash | the word |
+| `@<word>` preceded by start-of-buffer or whitespace, `<word>` is a prefix of a `CONTEXT_TOKENS` entry | ContextToken | the word |
+| `@<word>` preceded by start-of-buffer or whitespace, not a context-token prefix | File | the word |
+| anything else | — | — |
+
+File candidates are intentionally **not** computed in the pure reducer (the reducer must not touch the filesystem). Phase D leaves `CompletionKind::File` with an empty candidate list — Phase F or later will populate it from the host workspace.
+
+### Paste thresholds
+
+| Constant | Default | Behavior |
+|----------|---------|----------|
+| `PASTE_WARN_BYTES` | 32 KiB | Activity entry logged: `large paste: N bytes (over 32768 warn threshold)`. |
+| `PASTE_HARD_LIMIT` | 64 KiB | Buffer truncated to the cap at a char boundary; activity entry: `paste truncated: N bytes > 65536 cap`. |
+
+Both thresholds are constants in Phase D; later phases can plumb them through `ui.composer.large_paste_warning_bytes` from `settings.json`.
+
+### Tests
+
+`completion.rs` adds 9 unit tests covering trigger detection (slash, context, file, whitespace boundaries) and popup navigation. `state.rs` adds 7 reducer tests:
+`slash_popup_opens_and_accepts`, `at_context_token_popup_opens_and_closes_on_esc`, `popup_up_down_navigates_selection`, `small_paste_inserts_without_warning`, `large_paste_logs_warning`, `huge_paste_is_truncated`, `paste_under_modal_is_swallowed`.
+
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` are clean.
+
+### Out of scope for Phase D
+
+* File candidates from a workspace root — Phase F.
+* Prompt history search modal (Ctrl+R) — deferred; Phase D ships popup + paste handling first.
+* Multiline composer cursor up/down by line — composer already supports newlines; Phase D doesn't add per-line cursor movement.
+* Prompt size warning at submit — low-value vs. paste warning; deferred.
 * Slash / `@file` / context-insertion autocomplete — Phase D.
 * Diff / approval workbench, plan dashboard — Phase E.
 * Tools / MCP / agents / skills / plugins inspectors — Phase F.
