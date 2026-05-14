@@ -27,13 +27,15 @@ use crossterm::{execute, queue};
 use futures::stream::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use code_agent_sdk::callback::ApprovalDecision;
 use code_agent_sdk::{AgentRequest, AgentRun, AgentRuntime, AgentSdkError, SdkEvent};
 
+use crate::approval_bridge::BridgeRequest;
 use crate::composer::KeyEvent;
 use crate::fullscreen::draw;
-use crate::state::{TuiAction, TuiAppState, TuiInbound};
+use crate::state::{ApprovalDecisionAction, TuiAction, TuiAppState, TuiInbound};
 
 /// Errors raised by the live TUI loop.
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +61,16 @@ pub struct TuiApp {
     runtime: Arc<AgentRuntime>,
     state: TuiAppState,
     footer: String,
+    /// Phase G: receiver paired with an
+    /// [`crate::approval_bridge::ApprovalBridge`] handed to the SDK.
+    /// When the SDK calls the bridge's `approve()`, the request lands
+    /// here. `None` if the host didn't wire a bridge — in that case
+    /// `ResolveApproval` actions only log to the activity panel.
+    bridge_rx: Option<mpsc::UnboundedReceiver<BridgeRequest>>,
+    /// Phase G: oneshot resolver for the in-flight approval, if any.
+    /// Set when the bridge forwards a request; cleared and consumed
+    /// when the user resolves the approval modal.
+    pending_resolver: Option<oneshot::Sender<ApprovalDecision>>,
 }
 
 impl TuiApp {
@@ -69,12 +81,22 @@ impl TuiApp {
             runtime,
             state,
             footer: "[?] help  [Ctrl+C] interrupt  [Ctrl+D] exit".to_string(),
+            bridge_rx: None,
+            pending_resolver: None,
         }
     }
 
     /// Replace the help footer text.
     pub fn with_footer(mut self, footer: impl Into<String>) -> Self {
         self.footer = footer.into();
+        self
+    }
+
+    /// Phase G: register an approval-bridge receiver so the SDK's
+    /// `ApprovalCallback` round-trips through the TUI modal. Pair
+    /// with [`crate::approval_bridge::new_bridge_pair`].
+    pub fn with_approval_bridge(mut self, rx: mpsc::UnboundedReceiver<BridgeRequest>) -> Self {
+        self.bridge_rx = Some(rx);
         self
     }
 
@@ -159,6 +181,28 @@ impl TuiApp {
                     self.draw(&mut terminal)?;
                 }
 
+                // Phase G: bridge-borne approval requests from the SDK.
+                // The `if` guard disables the branch when no bridge is
+                // wired. On receive: stash the resolver so the next
+                // `TuiAction::ResolveApproval` can answer it. The
+                // matching `SdkEvent::ApprovalRequired` is what drives
+                // the modal — the bridge only carries the resolver
+                // channel, not the UI state.
+                Some(bridge_req) = recv_bridge(self.bridge_rx.as_mut()), if self.bridge_rx.is_some() => {
+                    if let Some(old) = self.pending_resolver.take() {
+                        // Should not happen (TUI handles approvals
+                        // serially) but be defensive: deny the stale
+                        // resolver so the SDK side doesn't hang.
+                        let _ = old.send(ApprovalDecision::Deny {
+                            reason: "superseded by a new approval".to_string(),
+                        });
+                    }
+                    self.pending_resolver = Some(bridge_req.decision_tx);
+                    self.state
+                        .push_activity(format!("approval requested: {}", bridge_req.request.tool_name));
+                    self.draw(&mut terminal)?;
+                }
+
                 _ = tick.tick() => {
                     self.draw(&mut terminal)?;
                 }
@@ -210,15 +254,20 @@ impl TuiApp {
                 TuiAction::Exit => {
                     self.state.should_quit = true;
                 }
-                // M13 Phase E: approval/plan actions are surfaced as
-                // activity diagnostics for now. Live callback wiring
-                // (publishing the decision back through the SDK's
-                // `ApprovalCallback`) lands in a Phase G follow-up;
-                // Phase E delivers the visual workbench + reducer
-                // surface so the integration is testable.
+                // M13 Phase G: live wiring of the approval decision
+                // back to the SDK callback via the resolver that the
+                // bridge stashed on the previous bridge event. If no
+                // resolver is stored (no bridge wired, or a synthetic
+                // `ApprovalRequired` event without a matching bridge
+                // call) we still log the decision so reducer-only
+                // tests of the workbench remain useful.
                 TuiAction::ResolveApproval(decision) => {
-                    self.state
-                        .push_activity(format!("approval decision: {decision:?}"));
+                    let sdk_decision = sdk_decision_from(decision.clone());
+                    let label = format!("approval decision: {decision:?}");
+                    self.state.push_activity(label);
+                    if let Some(resolver) = self.pending_resolver.take() {
+                        let _ = resolver.send(sdk_decision);
+                    }
                 }
                 TuiAction::ApprovePlan(plan_id) => {
                     self.state
@@ -356,6 +405,34 @@ async fn next_run_event(run: Option<&mut AgentRun>) -> Option<RunEvent> {
         Some(Ok(ev)) => Some(RunEvent::Sdk(ev)),
         Some(Err(e)) => Some(RunEvent::Error(e.message)),
         None => Some(RunEvent::Ended),
+    }
+}
+
+/// Phase G: receive the next approval bridge request, gated on the
+/// optional receiver. Returning `None` indicates the channel was
+/// closed (the bridge `Arc` was dropped), which the caller treats as
+/// a permanent disable.
+async fn recv_bridge(
+    rx: Option<&mut mpsc::UnboundedReceiver<BridgeRequest>>,
+) -> Option<BridgeRequest> {
+    rx?.recv().await
+}
+
+/// Phase G: translate the reducer's transport-agnostic
+/// [`ApprovalDecisionAction`] into the SDK's
+/// [`code_agent_sdk::callback::ApprovalDecision`]. The reducer keeps
+/// `RequestRevision` as its own variant; the SDK doesn't model it
+/// directly, so we map it onto `Deny` with a reason that explains the
+/// intent. Future SDK extension can fold revision in as a first-class
+/// decision.
+fn sdk_decision_from(d: ApprovalDecisionAction) -> ApprovalDecision {
+    match d {
+        ApprovalDecisionAction::Allow => ApprovalDecision::Allow,
+        ApprovalDecisionAction::AllowForSession => ApprovalDecision::AllowForSession,
+        ApprovalDecisionAction::Deny { reason } => ApprovalDecision::Deny { reason },
+        ApprovalDecisionAction::RequestRevision => ApprovalDecision::Deny {
+            reason: "user requested revision".to_string(),
+        },
     }
 }
 

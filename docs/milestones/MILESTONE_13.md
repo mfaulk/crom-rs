@@ -14,13 +14,13 @@ phase has merged and the acceptance checklist at the bottom is satisfied.
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| A | Live SDK-driven app shell: event loop, composer, transcript, status line; fake-provider end-to-end; `cmd_tui` no longer a stub | PR #103 (under review) |
-| B | `TuiAppState` layout primitives, side / detail panel infra, modal stack, multi-pane renderer, slash routing | PR #104 (under review) |
-| C | Card identity, selection + expansion + transcript search, n/N match navigation | PR #105 (under review) |
-| D | Composer popup: slash / `@token` autocomplete, batched-paste handling, popup overlay renderer | PR #106 (under review) |
-| E | Diff / approval workbench + plan dashboard wired to SDK events | in progress |
-| F | Inspectors: tools, MCP, agents, skills, plugins | in progress |
-| G | Session browser, recovery flow, auth / model / provider selectors, diagnostics panel | planned |
+| A | Live SDK-driven app shell: event loop, composer, transcript, status line; fake-provider end-to-end; `cmd_tui` no longer a stub | PR #103 (merged) |
+| B | `TuiAppState` layout primitives, side / detail panel infra, modal stack, multi-pane renderer, slash routing | PR #109 (merged) |
+| C | Card identity, selection + expansion + transcript search, n/N match navigation | PR #110 (merged) |
+| D | Composer popup: slash / `@token` autocomplete, batched-paste handling, popup overlay renderer | PR #111 (merged) |
+| E | Diff / approval workbench + plan dashboard wired to SDK events | PR #112 (merged) |
+| F | Inspectors: tools, MCP, agents, skills, plugins | PR #113 (merged) |
+| G | Session browser, recovery flow, auth / model / provider selectors, diagnostics panel, live approval callback | in progress |
 | H | Command palette, help overlay, keybindings, accessibility, activity panel | planned |
 | I | New CLI subcommands, `examples/tui-demo`, UI telemetry events | planned |
 
@@ -423,3 +423,65 @@ All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --
 * Plugin marketplace browsing / install / enable-disable actions — Phase F is read-only.
 * File-system `@file` autocomplete candidates (the Phase D `CompletionKind::File` empty-list seam) — needs a workspace scanner; Phase F's host has the cwd and a workspace handle but the actual scanner and candidate sort are deferred to Phase H so the candidate model can share the command-palette infrastructure.
 * Hot-reload of the inspector snapshot when the user runs `/plugins reload` or edits a SKILL.md — Phase H+.
+
+## Phase G — Sessions, auth/model/provider, diagnostics, recovery, live approval
+
+### What's new
+
+| Module | Purpose |
+|--------|---------|
+| `inspectors.rs` | Four new record types — `InspectorSession`, `InspectorAccount`, `InspectorModel`, `InspectorProvider` — and four new `Inspectors` fields. All keep the plain-string / number shape so the renderer doesn't import auth / session types. |
+| `state.rs` | New ring buffer `diagnostics: Vec<DiagnosticEntry>` (bounded by `DIAGNOSTIC_CAP = 64`) fed by `SdkEvent::Diagnostic` via `apply_phase_e_workbench_event`. `inspector_list_len` / `inspector_selected_index` / `set_inspector_selection` extended for the 5 new modes (Sessions, Auth, Model, Provider, Diagnostics). New `push_diagnostic` method mirrors a one-line summary to the activity log. |
+| `view.rs` | `inspector_body` switch extended with arms for the 5 new modes. Row formats listed below. Selection glyph `›` and empty-state placeholder semantics carry over. |
+| `approval_bridge.rs` (new) | `ApprovalBridge` implements `code_agent_sdk::callback::ApprovalCallback`. Pairs with an unbounded mpsc receiver via `new_bridge_pair()` so the SDK's `approve()` round-trips through the TUI: SDK → mpsc → app loop → user → oneshot → SDK. Dropped resolver → SDK sees `Deny { reason: "approval canceled" }`; dropped receiver → SDK sees an `Internal` error. |
+| `app.rs` | `TuiApp` accepts `with_approval_bridge(rx)`. New select! branch routes `BridgeRequest` into a stashed `pending_resolver: Option<oneshot::Sender<ApprovalDecision>>`. The `ResolveApproval(decision)` action now translates the reducer's decision into an SDK `ApprovalDecision` (`RequestRevision` maps to `Deny { reason: "user requested revision" }`) and sends through the stashed resolver. |
+| `code-agent-cli/src/main.rs` | `cmd_tui` is now async-aware; `build_inspector_snapshot_for_tui` awaits `session::recovery::detect_state` and opens a `CredentialStore` to project accounts + providers + models from `code_agent_auth::starter_registry`. A new `--recover` flag opens a "Recovery — N session(s)" modal when interrupted / needs_recovery sessions are detected. The TUI runtime is constructed with `.approval_callback(approval_bridge)` so live approvals route through the TUI. |
+
+### Inspector rows (Phase G)
+
+| Mode | Row shape |
+|------|-----------|
+| Sessions | `<id> [<state>][🔒] — last_modified <ts>` |
+| Auth | `<provider> [<login_method> \| active/stored exp:<ts>] <display>` |
+| Model | `<provider> / <model_id> [<availability>] ctx:<N> [tools, reasoning] — <display>` |
+| Provider | `<provider> [creds:yes/no]* current` |
+| Diagnostics | `[<severity>] <code> — <message> — hint: <suggestion>` |
+
+Severity / availability / scope labels all reuse the upstream `as_str` / `label` methods so future variant additions surface in the inspector without further code changes.
+
+### Live approval callback wiring
+
+The SDK's approval path now reaches the TUI:
+
+1. Runtime policy calls `bridge.approve(request)`.
+2. `ApprovalBridge` creates a `oneshot` channel, sends `(request, decision_tx)` over its mpsc to the app loop, and awaits `decision_rx`.
+3. The app loop receives the `BridgeRequest`, stashes the resolver as `pending_resolver`, and (separately) the matching `SdkEvent::ApprovalRequired` event drives the existing Phase E modal.
+4. User presses `y` / `s` / `n` / `r`; reducer emits `TuiAction::ResolveApproval(decision)`.
+5. App handler consumes the resolver, translates the decision to the SDK shape, and sends it. Bridge unblocks; runtime continues.
+
+If the TUI exits before the user resolves the modal, the dropped resolver is mapped to a `Deny { reason: "approval canceled (TUI exited)" }` so the SDK side doesn't hang.
+
+### Recovery flow
+
+`code-agent tui --recover` triggers a startup scan of `<cwd>/.agent/sessions/` via `code_agent_session::recovery::detect_state`. If any session has state `Interrupted` or `NeedsRecovery`, a `Custom { id: "phase-g-recovery", ... }` modal lists the affected ids with their state and lock marker. The actual resume — replaying records, fork-vs-overwrite, lock takeover — is deferred to Phase H+ because it requires SDK storage adapter integration; Phase G's modal informs the user a recovery is available and the Sessions inspector lists them at all times regardless of the flag.
+
+### Keyboard (Phase G additions)
+
+Selection navigation in the 5 new panels works identically to the Phase F inspectors: `j` / `k` / `Up` / `Down` / `g` / `G` move the cursor; non-nav keys in inspector-focused modes are swallowed.
+
+### Tests
+
+`approval_bridge.rs` adds 3 async tests: `approve_round_trip`, `dropped_decision_denies`, `dropped_receiver_errors`.
+
+`state.rs` adds 3 reducer tests: `sdk_diagnostic_pushes_into_ring_buffer`, `diagnostics_ring_buffer_is_bounded`, `phase_g_inspector_modes_report_lengths`.
+
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (1020 tests total) are clean.
+
+### Out of scope for Phase G
+
+* Actual session resume / replay — Phase H+ (needs SDK storage adapter for record playback and lock takeover).
+* Live model / provider / auth switching (selecting a row and pressing `Enter` to change provider) — Phase H when the command palette ships an action-confirmation modal.
+* Real-time MCP / agent / plugin status — Phase F's inspector is configuration-side; running-status (connected, last error, latency) requires a heartbeat task and is deferred.
+* Detail panel for inspectors — selecting a session / account / model and seeing the full record. The `Phase G` detail panel still uses the Phase B placeholders for these modes.
+* `RequestRevision` as a first-class SDK decision — currently mapped to `Deny { reason }` because the SDK doesn't model revision. A future SDK extension can fold it in.
+* Diagnostic detail (location, metadata, full suggestion text) — the inspector shows a one-line summary only; the Phase E detail-panel `RawJson` mode can render the full record once Phase H surfaces it.

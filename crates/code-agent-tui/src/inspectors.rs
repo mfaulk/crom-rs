@@ -76,6 +76,62 @@ pub struct InspectorPlugin {
     pub component_total: usize,
 }
 
+/// Phase G: one row in the Sessions inspector.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectorSession {
+    pub id: String,
+    /// State label from `SessionRuntimeState::as_str` —
+    /// `idle` / `running` / `complete` / `crashed` / `interrupted` /
+    /// `needs_recovery`.
+    pub state: String,
+    /// ISO-ish timestamp or unix-seconds string; the renderer treats
+    /// this as opaque. `None` if no file timestamp was available.
+    pub last_modified: Option<String>,
+    /// True when a `.lock` file exists and the session looks
+    /// interruptable — surfaced as a `recovery available` hint.
+    pub has_lock: bool,
+}
+
+/// Phase G: one row in the Auth selector.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectorAccount {
+    /// Provider id label: `anthropic`, `openai`, `codex`, `gemini`,
+    /// `fake`, or `custom:<name>`.
+    pub provider: String,
+    pub account_id: String,
+    pub display_name: Option<String>,
+    /// Login method label: `api_key`, `oauth_browser`, etc.
+    pub login_method: String,
+    pub active: bool,
+    /// Stringified expiry, if any.
+    pub expires_at: Option<String>,
+}
+
+/// Phase G: one row in the Model selector.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectorModel {
+    pub provider: String,
+    pub model_id: String,
+    pub display_name: String,
+    pub context_window: Option<u64>,
+    /// Availability label: `available`, `requires_api_key`,
+    /// `requires_subscription`, `requires_plan`, `unavailable`,
+    /// `unknown`.
+    pub availability: String,
+    pub supports_tools: bool,
+    pub supports_reasoning: bool,
+}
+
+/// Phase G: one row in the Provider selector.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectorProvider {
+    pub provider: String,
+    /// True if at least one credential is stored for this provider.
+    pub has_credentials: bool,
+    /// True if this provider is the one driving the current TUI run.
+    pub current: bool,
+}
+
 /// Snapshot of every inspector category. Empty by default; the host
 /// populates the lists it can resolve at startup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,6 +141,11 @@ pub struct Inspectors {
     pub subagents: Vec<InspectorSubagent>,
     pub skills: Vec<InspectorSkill>,
     pub plugins: Vec<InspectorPlugin>,
+    /// Phase G additions.
+    pub sessions: Vec<InspectorSession>,
+    pub accounts: Vec<InspectorAccount>,
+    pub models: Vec<InspectorModel>,
+    pub providers: Vec<InspectorProvider>,
 }
 
 impl Inspectors {
