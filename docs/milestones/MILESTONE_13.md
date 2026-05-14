@@ -354,7 +354,7 @@ All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --
 | `inspectors.rs` (new) | Pure read-only record types — `InspectorTool`, `InspectorMcp`, `InspectorSubagent`, `InspectorSkill`, `InspectorPlugin` — and the `Inspectors` snapshot that owns the five vectors. Plain `String` / `usize` / `Option<u32>` fields so the renderer doesn't depend on `code-agent-core` / `code-agent-mcp` enum types. |
 | `state.rs` | New `TuiAppState` field `inspectors: Inspectors` and `inspector_selection: InspectorSelection { tools, mcp, subagents, skills, plugins: Option<usize> }`. New builder method `with_inspectors(inspectors)`. New helpers `inspector_list_len(mode)` / `inspector_selected_index(mode)` and the private `move_inspector_selection` / `set_inspector_selection` mutators. The reducer's side-panel key path intercepts `j`/`k`/`Up`/`Down`/`g`/`G` only when the panel is focused **and** the mode is one of the five inspector modes — non-inspector modes (Plan, Changes, Files, Sessions, …) continue to fall through to the composer so typed slash commands still work. |
 | `view.rs` | New `inspector_body(state, mode)` builds the side-panel body from the snapshot rows. Rows render with a leading `›` for the active selection and `  ` otherwise. Empty categories render `<Mode> inspector` / `(none configured)` instead of the Phase B placeholder. Long descriptions are truncated with `…` so a single row fits a ~80-column side panel. |
-| `code-agent-cli/src/main.rs` | `cmd_tui` now calls a new `build_inspector_snapshot_for_tui(cwd, settings)` before constructing `TuiAppState`, then chains `.with_inspectors(snapshot)`. The snapshot is built best-effort: each category that fails to load (missing dir, parse error, etc.) is left empty. Loaders: `code_agent_tools::register_builtin_with_limits` for tools, `code_agent_mcp::load_mcp_options` for MCP, `code_agent_core::agents::loader::load_filesystem_agents` for subagents, a TUI-local skill discoverer for skills, `plugins::build_for_invocation` for plugins. |
+| `code-agent-cli/src/main.rs` | `cmd_tui` now calls a new `build_inspector_snapshot_for_tui(cwd, settings)` before constructing `TuiAppState`. The snapshot honors `settings.agents.{enabled,allow_filesystem_agents,builtins,path}` and `settings.skills.{enabled,allow_filesystem_skills,compat_claude_skills,max_*}` for parity with the run path. After loading raw skills + agents + MCP options, the builder calls `plugins::apply_to_registries` so plugin-supplied components are merged into the inspector view. The builder returns `(Inspectors, Vec<String>)` — each diagnostic is seeded into the TUI activity panel so the user sees *why* an inspector is empty. MCP endpoints are redacted: stdio shows only `command (+N args)`; HTTP strips userinfo / query / fragment to avoid leaking bearer tokens. |
 
 ### Inspector rows
 
@@ -393,7 +393,7 @@ backing vector.
 
 `inspectors.rs` adds 2 unit tests (`default_is_empty`, `record_defaults_are_blank`).
 
-`state.rs` adds 5 reducer tests:
+`state.rs` adds 6 reducer tests:
 `with_inspectors_replaces_snapshot`,
 `inspector_j_k_navigates_selection` (j/k/g/G against a 3-row list),
 `inspector_nav_on_empty_list_is_inert` (nav keys swallowed without
@@ -401,14 +401,20 @@ falling through to the composer),
 `inspector_selection_is_per_mode` (per-mode persistence across
 panel switches),
 `inspector_selection_clamps_to_visible_range` (out-of-range
-selection clamps to last row).
+selection clamps to last row),
+`inspector_nonnav_key_does_not_modify_composer` (any character
+swallowed while inspector mode is focused).
 
 `view.rs` adds 3 renderer tests:
 `inspector_body_renders_real_rows_with_selection_glyph`,
 `inspector_body_empty_state_is_informative`,
 `all_inspector_modes_render_real_rows_when_populated`.
 
-All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (1011 tests total) are clean.
+`code-agent-cli` adds 2 redaction tests in `tui_inspector_helpers_tests`:
+`stdio_endpoint_redacts_args`,
+`http_endpoint_strips_query_fragment_and_userinfo`.
+
+All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (1014 tests total) are clean.
 
 ### Out of scope for Phase F
 
