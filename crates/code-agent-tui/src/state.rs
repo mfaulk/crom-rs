@@ -635,16 +635,13 @@ impl TuiAppState {
             'r' => ApprovalDecisionAction::RequestRevision,
             _ => return Vec::new(),
         };
-        // The approval flow is the host's responsibility to forward
-        // to the SDK callback. Pop the modal so the user gets
-        // immediate visual feedback; the host's action handler can
-        // later surface the decision result.
-        if let Some(TuiModal::Custom { id, .. }) = self.layout.current_modal() {
-            if id == APPROVAL_MODAL_ID {
-                let _ = self.layout.pop_modal();
-            }
-        }
-        self.pending_approval = None;
+        // Pop the modal so the user gets immediate visual feedback.
+        // Crucially, we do NOT clear `pending_approval` here — that's
+        // the job of `SdkEvent::ApprovalResolved`. Clearing early
+        // would flash the empty-approval placeholder while the SDK is
+        // still processing the decision, and could strand the user if
+        // the callback round-trips slowly.
+        let _ = self.layout.remove_custom_modals_by_id(APPROVAL_MODAL_ID);
         vec![TuiAction::ResolveApproval(decision)]
     }
 
@@ -665,11 +662,9 @@ impl TuiAppState {
             },
             _ => return Vec::new(),
         };
-        if let Some(TuiModal::Custom { id, .. }) = self.layout.current_modal() {
-            if id == PLAN_APPROVAL_MODAL_ID {
-                let _ = self.layout.pop_modal();
-            }
-        }
+        let _ = self
+            .layout
+            .remove_custom_modals_by_id(PLAN_APPROVAL_MODAL_ID);
         vec![action]
     }
 
@@ -907,12 +902,13 @@ impl TuiAppState {
                 });
             }
             SdkEvent::PlanApproved(_) => {
-                // Close the plan-approval modal if it's still up.
-                if let Some(TuiModal::Custom { id, .. }) = self.layout.current_modal() {
-                    if id == PLAN_APPROVAL_MODAL_ID {
-                        let _ = self.layout.pop_modal();
-                    }
-                }
+                // Remove the plan-approval modal wherever it sits in
+                // the stack — a layered approval modal could have been
+                // pushed on top in the meantime, and a top-only pop
+                // would strand the plan-approval modal indefinitely.
+                let _ = self
+                    .layout
+                    .remove_custom_modals_by_id(PLAN_APPROVAL_MODAL_ID);
             }
             SdkEvent::ApprovalRequired(a) => {
                 self.pending_approval = Some(PendingApproval {
@@ -933,11 +929,7 @@ impl TuiAppState {
             }
             SdkEvent::ApprovalResolved(_) => {
                 self.pending_approval = None;
-                if let Some(TuiModal::Custom { id, .. }) = self.layout.current_modal() {
-                    if id == APPROVAL_MODAL_ID {
-                        let _ = self.layout.pop_modal();
-                    }
-                }
+                let _ = self.layout.remove_custom_modals_by_id(APPROVAL_MODAL_ID);
             }
             SdkEvent::PatchProposed(p) => {
                 self.last_patch = Some(p.patch.clone());
@@ -1908,9 +1900,11 @@ mod tests {
     }
 
     #[test]
-    // `y` in the approval modal emits ResolveApproval(Allow), pops
-    // the modal, and clears pending_approval.
-    fn approval_y_key_emits_allow_and_clears_state() {
+    // `y` in the approval modal emits ResolveApproval(Allow) and
+    // pops the modal. `pending_approval` is intentionally kept
+    // until `SdkEvent::ApprovalResolved` arrives so the detail
+    // panel doesn't flash an empty state.
+    fn approval_y_key_emits_allow_and_keeps_pending() {
         use code_agent_sdk::event::ApprovalRequiredEvent;
         let mut s = fresh_state();
         s.apply(TuiInbound::sdk(SdkEvent::ApprovalRequired(
@@ -1925,8 +1919,43 @@ mod tests {
             actions,
             vec![TuiAction::ResolveApproval(ApprovalDecisionAction::Allow)]
         );
-        assert!(s.pending_approval.is_none());
+        assert!(
+            s.pending_approval.is_some(),
+            "pending_approval is held until ApprovalResolved"
+        );
         assert!(s.layout.current_modal().is_none());
+    }
+
+    #[test]
+    // ApprovalResolved (delayed, possibly with another modal layered
+    // on top) cleans up the approval modal from anywhere in the
+    // stack and clears pending_approval.
+    fn approval_resolved_strips_modal_from_stack() {
+        use code_agent_sdk::event::{
+            ApprovalDecisionWire, ApprovalRequiredEvent, ApprovalResolvedEvent,
+        };
+        let mut s = fresh_state();
+        s.apply(TuiInbound::sdk(SdkEvent::ApprovalRequired(
+            ApprovalRequiredEvent {
+                run_id: rid(),
+                tool_name: "Bash".to_string(),
+                summary: "cargo test".to_string(),
+            },
+        )));
+        // Layer a Help modal on top so the approval modal is NOT
+        // at the top of the stack.
+        s.layout.push_modal(TuiModal::Help);
+        s.apply(TuiInbound::sdk(SdkEvent::ApprovalResolved(
+            ApprovalResolvedEvent {
+                run_id: rid(),
+                tool_name: "Bash".to_string(),
+                decision: ApprovalDecisionWire::Allow,
+            },
+        )));
+        assert!(s.pending_approval.is_none());
+        // Approval modal removed; Help modal still on top.
+        assert!(matches!(s.layout.current_modal(), Some(TuiModal::Help)));
+        assert_eq!(s.layout.modal_stack.len(), 1);
     }
 
     #[test]
