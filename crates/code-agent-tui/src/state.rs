@@ -15,6 +15,7 @@ use code_agent_core::plan::{PlanDocument, PlanId};
 use code_agent_core::StatusLineContext;
 use code_agent_sdk::patch::PatchSet;
 use code_agent_sdk::SdkEvent;
+use tracing::debug;
 
 use crate::completion::{
     context_token_candidates, detect_trigger, slash_candidates, CompletionKind, CompletionPopup,
@@ -262,6 +263,19 @@ fn diagnostic_severity_label(s: code_agent_sdk::error::DiagnosticSeverity) -> &'
         Info => "info",
         Warning => "warning",
         Error => "error",
+    }
+}
+
+/// Phase I: short tag for an [`ApprovalDecisionAction`] suitable
+/// for telemetry. We never expose the `Deny { reason }` string in
+/// logs to preserve the same privacy posture as `submit_prompt`'s
+/// `prompt_bytes`.
+fn decision_kind_label(d: &ApprovalDecisionAction) -> &'static str {
+    match d {
+        ApprovalDecisionAction::Allow => "allow",
+        ApprovalDecisionAction::AllowForSession => "allow_for_session",
+        ApprovalDecisionAction::Deny { .. } => "deny",
+        ApprovalDecisionAction::RequestRevision => "request_revision",
     }
 }
 
@@ -843,9 +857,15 @@ impl TuiAppState {
             // arm.
             (TuiModal::Custom { id, .. }, KeyEvent::Esc) if id == APPROVAL_MODAL_ID => {
                 let _ = self.layout.remove_custom_modals_by_id(APPROVAL_MODAL_ID);
-                vec![TuiAction::ResolveApproval(ApprovalDecisionAction::Deny {
+                let decision = ApprovalDecisionAction::Deny {
                     reason: "dismissed without decision".to_string(),
-                })]
+                };
+                debug!(
+                    target: "code_agent_tui",
+                    decision_kind = decision_kind_label(&decision),
+                    "approval_decision"
+                );
+                vec![TuiAction::ResolveApproval(decision)]
             }
             (_, KeyEvent::Esc) => {
                 let _ = self.layout.pop_modal();
@@ -953,6 +973,7 @@ impl TuiAppState {
     pub fn open_palette(&mut self) {
         self.palette = Some(PaletteState::default());
         self.layout.push_modal(TuiModal::CommandPalette);
+        debug!(target: "code_agent_tui", "palette_open");
     }
 
     /// Phase H: close the command palette modal *and* clear the
@@ -1010,6 +1031,14 @@ impl TuiAppState {
         // still processing the decision, and could strand the user if
         // the callback round-trips slowly.
         let _ = self.layout.remove_custom_modals_by_id(APPROVAL_MODAL_ID);
+        // Phase I review fix: log only the kind (allow / deny /
+        // session-allow / revision) so an attacker-controlled or
+        // surprising Deny reason can't leak into logs.
+        debug!(
+            target: "code_agent_tui",
+            decision_kind = decision_kind_label(&decision),
+            "approval_decision"
+        );
         vec![TuiAction::ResolveApproval(decision)]
     }
 
@@ -1018,21 +1047,28 @@ impl TuiAppState {
             Some(p) => p.id.clone(),
             None => return Vec::new(),
         };
-        let action = match c.to_ascii_lowercase() {
-            'a' => TuiAction::ApprovePlan(plan_id),
-            'r' => TuiAction::RejectPlan {
-                plan_id,
-                reason: None,
-            },
-            'u' => TuiAction::RevisePlan {
-                plan_id,
-                hint: String::new(),
-            },
+        let (action, kind) = match c.to_ascii_lowercase() {
+            'a' => (TuiAction::ApprovePlan(plan_id), "approve"),
+            'r' => (
+                TuiAction::RejectPlan {
+                    plan_id,
+                    reason: None,
+                },
+                "reject",
+            ),
+            'u' => (
+                TuiAction::RevisePlan {
+                    plan_id,
+                    hint: String::new(),
+                },
+                "revise",
+            ),
             _ => return Vec::new(),
         };
         let _ = self
             .layout
             .remove_custom_modals_by_id(PLAN_APPROVAL_MODAL_ID);
+        debug!(target: "code_agent_tui", decision_kind = kind, "plan_approval_decision");
         vec![action]
     }
 
@@ -1165,6 +1201,7 @@ impl TuiAppState {
         });
         self.run_status = RunStatus::Running;
         self.last_error = None;
+        debug!(target: "code_agent_tui", prompt_bytes = prompt.len(), "submit_prompt");
         vec![TuiAction::SubmitPrompt(prompt)]
     }
 
@@ -1190,6 +1227,10 @@ impl TuiAppState {
                 self.layout.focus = FocusPane::SidePanel;
             }
             self.push_activity(format!("side panel → {}", mode.label()));
+            // M13 Phase I: telemetry for panel switches. Stays at
+            // `debug` so a default `RUST_LOG=info` keeps the TUI
+            // silent unless the operator opts in.
+            debug!(target: "code_agent_tui", panel = %mode.label(), "side_panel_switch");
             self.clamp_focus();
             return;
         }
@@ -2868,6 +2909,107 @@ mod tests {
         assert!(s.palette.is_none());
         // Help modal survives.
         assert!(matches!(s.layout.current_modal(), Some(TuiModal::Help)));
+    }
+
+    #[test]
+    // Phase I: telemetry events fire as `debug!` records on the
+    // `code_agent_tui` target. We can't capture them without a
+    // tracing subscriber here, so as a stand-in we just verify the
+    // surrounding side-effects (activity entry, panel switch) still
+    // happen — i.e., the tracing calls don't perturb reducer
+    // behavior.
+    fn telemetry_does_not_perturb_state() {
+        let mut s = fresh_state();
+        s.apply(TuiInbound::Resize {
+            width: 120,
+            height: 30,
+        });
+        s.apply_slash_command("tools");
+        assert_eq!(s.layout.side_panel.mode, SidePanelMode::Tools);
+        assert!(s
+            .activity
+            .last()
+            .map(|a| a.contains("side panel"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    // Phase I (review fix): real tracing-subscriber capture asserts
+    // the telemetry contract — event names and the absence of
+    // sensitive payload. Without this test, removing the target or
+    // renaming an event would silently break a downstream
+    // subscriber.
+    fn telemetry_emits_events_with_expected_shape() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for CapturedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for CapturedWriter {
+            type Writer = CapturedWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_target(true)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut s = fresh_state();
+            s.apply(TuiInbound::Resize {
+                width: 120,
+                height: 30,
+            });
+            // Trigger panel-switch, palette-open, submit, approval.
+            s.apply_slash_command("tools");
+            s.open_palette();
+            // Close the palette before submitting so chars hit the
+            // composer instead of the palette input.
+            s.close_palette();
+            // After /tools, focus is on the side panel; move it back
+            // to the composer so character input lands in the
+            // composer buffer rather than being swallowed by the
+            // inspector-nav swallow.
+            s.layout.focus = FocusPane::Composer;
+            for c in "hi".chars() {
+                s.apply(TuiInbound::Key(KeyEvent::Char(c)));
+            }
+            s.apply(TuiInbound::Key(KeyEvent::Enter));
+            // Approval flow.
+            s.open_approval_modal("Bash".to_string(), "summary".to_string());
+            // Press 'y' to allow.
+            s.apply(TuiInbound::Key(KeyEvent::Char('y')));
+        });
+        let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(captured.contains("code_agent_tui"), "{captured}");
+        assert!(captured.contains("side_panel_switch"), "{captured}");
+        assert!(captured.contains("palette_open"), "{captured}");
+        assert!(captured.contains("submit_prompt"), "{captured}");
+        assert!(captured.contains("approval_decision"), "{captured}");
+        assert!(captured.contains("decision_kind=\"allow\""), "{captured}");
+        // Privacy: the raw prompt text must not appear; only the byte count.
+        assert!(!captured.contains("prompt=\"hi\""), "{captured}");
+        // And the Deny reason text from a denial path must not leak.
+        assert!(
+            !captured.contains("dismissed without decision"),
+            "{captured}"
+        );
     }
 
     #[test]

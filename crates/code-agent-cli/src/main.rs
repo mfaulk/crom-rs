@@ -355,6 +355,12 @@ struct TuiArgs {
     /// still lists them, but no modal is opened.
     #[arg(long)]
     recover: bool,
+    /// M13 Phase I: print the discovered sessions (id, state, lock,
+    /// last-modified) as plain text and exit without launching the
+    /// TUI. Handy for scripts and recovery workflows. The format is
+    /// one session per line, fields separated by tabs.
+    #[arg(long)]
+    list_sessions: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -7425,6 +7431,35 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
             e
         })
         .context("load settings")?;
+
+    // M13 Phase I: list-sessions short-circuits the launch entirely
+    // and emits one session per line in tab-separated columns:
+    // <id>\t<state>\t<lock?>\t<last_modified_unix?>. Stays plain so
+    // shell scripts can parse it without jq.
+    if args.list_sessions {
+        let stale = settings.recovery.stale_lock_after_seconds;
+        match code_agent_session::recovery::detect_state(&cwd, stale).await {
+            Ok(infos) => {
+                for info in infos {
+                    let lock = if info.lock.is_some() { "locked" } else { "-" };
+                    let last_modified = info
+                        .last_modified_unix
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        info.session_id.as_str(),
+                        session_state_label(info.state),
+                        lock,
+                        last_modified,
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow!("list-sessions: {e}")),
+        }
+    }
+
     let caps = code_agent_tui::detect_capabilities_from_env();
     let cli_override = args
         .renderer
