@@ -18,12 +18,14 @@ pub mod composer;
 pub mod diff_view;
 pub mod event_adapter;
 pub mod fullscreen;
+pub mod layout;
 pub mod plain;
 pub mod plan_view;
 pub mod renderer;
 pub mod state;
 pub mod statusline;
 pub mod transcript;
+pub mod view;
 
 pub use app::{drive_single_prompt, TuiApp, TuiAppError};
 pub use approval::{format_approval_card, ApprovalContext, ApprovalKind};
@@ -33,6 +35,10 @@ pub use composer::{
 };
 pub use diff_view::{render_change_summary, render_diff_card, ChangeSummary, DiffEntry};
 pub use event_adapter::{map_sdk_event, SdkEventOutcome};
+pub use layout::{
+    DetailPanelMode, DetailPanelState, FocusPane, LayoutMode, LayoutState, SidePanelMode,
+    SidePanelState, TuiModal,
+};
 pub use plain::PlainRenderer;
 pub use plan_view::{
     format_deviation_modal, format_plan_approval_modal, format_plan_diff, format_plan_panel,
@@ -41,3 +47,4 @@ pub use renderer::{detect_capabilities_from_env, fallback_renderer_for, RenderEr
 pub use state::{RunStatus, TuiAction, TuiAppState, TuiInbound};
 pub use statusline::format_status_line;
 pub use transcript::{render_event_card, EventCard};
+pub use view::build_ui_frame;

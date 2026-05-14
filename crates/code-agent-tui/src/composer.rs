@@ -22,6 +22,11 @@ pub enum KeyEvent {
     CtrlEnter,
     Backspace,
     Tab,
+    /// Shift+Tab. Used by the M13 layout state machine to cycle focus
+    /// backwards across panes. The composer treats it as a no-op so
+    /// the variant is forward-compatible with future autocomplete
+    /// dismissal / backwards-cycle behavior.
+    ShiftTab,
     Up,
     Down,
     Left,
@@ -265,7 +270,7 @@ impl ComposerState {
             }
             KeyEvent::CtrlR => KeyAction::HistorySearch,
             KeyEvent::Esc => KeyAction::None,
-            KeyEvent::Tab => KeyAction::None,
+            KeyEvent::Tab | KeyEvent::ShiftTab => KeyAction::None,
         }
     }
 
