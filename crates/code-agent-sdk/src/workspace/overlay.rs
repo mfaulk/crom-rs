@@ -77,6 +77,15 @@ impl Workspace for OverlayWorkspace {
         self.base.search(query).await
     }
 
+    /// Apply a sequence of file-level patches to the overlay.
+    ///
+    /// Existence and `old_content_hash` checks consult the merged view
+    /// (overlay first, then base). The overlay write lock is held across
+    /// `base.read_file().await` calls to keep overlay-side mutators
+    /// linearizable — this assumes `base` is not a workspace that re-enters
+    /// this overlay (no cycles). Slow base reads will pause concurrent
+    /// overlay readers and writers, which is acceptable for the typical
+    /// single-agent usage pattern.
     async fn apply_patch(&self, patch: &PatchSet) -> Result<ApplyPatchReport, WorkspaceError> {
         let mut overlay = self.overlay.write().await;
         let mut report = ApplyPatchReport {
@@ -182,17 +191,35 @@ impl Workspace for OverlayWorkspace {
                     report.files_changed += 1;
                 }
                 FilePatch::Rename { from, to } => {
-                    let existing = overlay.get(from).cloned();
-                    overlay.insert(from.clone(), None);
-                    let bytes = match existing {
-                        Some(Some(bytes)) => bytes,
-                        _ => {
-                            drop(overlay);
-                            let content = self.base.read_file(from).await?;
-                            overlay = self.overlay.write().await;
-                            content.bytes
+                    // A pre-tombstoned source (delete_file then rename, or
+                    // Delete-then-Rename in the same PatchSet) must fail —
+                    // the merged view sees `from` as deleted, so it must not
+                    // resurrect from base.
+                    let lookup = match overlay.get(from).cloned() {
+                        Some(Some(bytes)) => Ok(Some(bytes)),
+                        Some(None) => Ok(None), // tombstoned: not_found
+                        None => match self.base.read_file(from).await {
+                            Ok(c) => Ok(Some(c.bytes)),
+                            Err(e) if e.code == "workspace.not_found" => Ok(None),
+                            Err(e) => Err(e),
+                        },
+                    };
+                    let bytes = match lookup {
+                        Ok(Some(bytes)) => bytes,
+                        Ok(None) => {
+                            report
+                                .failures
+                                .push(WorkspaceError::not_found(from.clone()));
+                            report.files_skipped += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            report.failures.push(e);
+                            report.files_skipped += 1;
+                            continue;
                         }
                     };
+                    overlay.insert(from.clone(), None);
                     overlay.insert(to.clone(), Some(bytes));
                     report.files_changed += 1;
                 }
@@ -431,5 +458,98 @@ mod tests {
         let report = ws.apply_patch(&patch).await.unwrap();
         assert_eq!(report.files_changed, 1);
         assert_eq!(ws.read_file(&p).await.unwrap().bytes, b"new");
+    }
+
+    /// Rename on a path the overlay has tombstoned must fail with
+    /// not_found and not resurrect the file from base (the merged view
+    /// sees `from` as deleted).
+    #[tokio::test]
+    async fn apply_patch_rename_pending_tombstone_fails() {
+        let base =
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"base".to_vec())]).unwrap());
+        let ws = OverlayWorkspace::new(base.clone());
+        let from = WorkspacePath::new("a.txt").unwrap();
+        let to = WorkspacePath::new("b.txt").unwrap();
+        ws.delete_file(&from).await.unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]);
+        let report = ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(report.files_changed, 0);
+        assert_eq!(report.files_skipped, 1);
+        assert_eq!(report.failures[0].code, "workspace.not_found");
+        assert_eq!(
+            ws.read_file(&to).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+    }
+
+    /// Delete-then-Rename in the same PatchSet treats `from` as tombstoned
+    /// after the Delete; the Rename then fails with not_found.
+    #[tokio::test]
+    async fn apply_patch_delete_then_rename_in_same_set() {
+        let base =
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"base".to_vec())]).unwrap());
+        let ws = OverlayWorkspace::new(base.clone());
+        let from = WorkspacePath::new("a.txt").unwrap();
+        let to = WorkspacePath::new("b.txt").unwrap();
+        let patch = PatchSet::from_files(vec![
+            FilePatch::Delete { path: from.clone() },
+            FilePatch::Rename {
+                from: from.clone(),
+                to: to.clone(),
+            },
+        ]);
+        let report = ws.apply_patch(&patch).await.unwrap();
+        // Delete succeeds, Rename fails.
+        assert_eq!(report.files_changed, 1);
+        assert_eq!(report.files_skipped, 1);
+        assert_eq!(report.failures[0].code, "workspace.not_found");
+    }
+
+    /// Delete-then-Create on the same path within one PatchSet: the Delete
+    /// tombstones the entry, then Create is allowed against the tombstone.
+    #[tokio::test]
+    async fn apply_patch_delete_then_create_in_same_set() {
+        let base =
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"old".to_vec())]).unwrap());
+        let ws = OverlayWorkspace::new(base.clone());
+        let p = WorkspacePath::new("a.txt").unwrap();
+        let patch = PatchSet::from_files(vec![
+            FilePatch::Delete { path: p.clone() },
+            FilePatch::Create {
+                path: p.clone(),
+                content: b"reborn".to_vec(),
+                is_binary: false,
+            },
+        ]);
+        let report = ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(report.files_changed, 2);
+        assert!(report.failures.is_empty());
+        assert_eq!(ws.read_file(&p).await.unwrap().bytes, b"reborn");
+    }
+
+    /// Create-then-Modify in one PatchSet: the second entry's hash must be
+    /// verified against the first entry's content, not against `base`.
+    #[tokio::test]
+    async fn apply_patch_create_then_modify_in_same_set() {
+        let base = Arc::new(InMemoryWorkspace::new());
+        let ws = OverlayWorkspace::new(base.clone());
+        let p = WorkspacePath::new("new.txt").unwrap();
+        let initial = b"v1".to_vec();
+        let initial_hash = compute_hash(&initial);
+        let patch = PatchSet::from_files(vec![
+            FilePatch::Create {
+                path: p.clone(),
+                content: initial.clone(),
+                is_binary: false,
+            },
+            modify(p.clone(), b"v2", Some(initial_hash)),
+        ]);
+        let report = ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(report.files_changed, 2);
+        assert!(report.failures.is_empty());
+        assert_eq!(ws.read_file(&p).await.unwrap().bytes, b"v2");
     }
 }
