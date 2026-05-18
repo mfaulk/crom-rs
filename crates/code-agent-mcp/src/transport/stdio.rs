@@ -245,13 +245,24 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     use tokio::io::AsyncBufReadExt;
+    // Accumulate raw bytes across `fill_buf` chunks and decode UTF-8
+    // exactly once after the line is complete (or EOF). The previous
+    // implementation called `std::str::from_utf8` on every chunk and
+    // failed with `Transport("stdio MCP response not utf-8: ...")`
+    // whenever a chunk boundary fell inside a multi-byte sequence
+    // (#171). A multi-byte codepoint is up to 4 bytes; with no
+    // newline yet seen we have no way to know whether a trailing
+    // partial codepoint belongs at the end of this chunk or the start
+    // of the next, so we defer decoding until we have a definite
+    // terminator.
+    let mut bytes: Vec<u8> = Vec::new();
     let mut total = 0usize;
+    let mut saw_newline = false;
     loop {
         let buf = reader.fill_buf().await?;
         if buf.is_empty() {
-            return Ok(total);
+            break;
         }
-        // Look for a newline within the buffered chunk.
         let pos = buf.iter().position(|b| *b == b'\n');
         let take = match pos {
             Some(p) => p + 1,
@@ -264,13 +275,129 @@ where
                 limit,
             });
         }
-        let chunk = std::str::from_utf8(&buf[..take])
-            .map_err(|e| McpError::Transport(format!("stdio MCP response not utf-8: {e}")))?;
-        out.push_str(chunk);
+        bytes.extend_from_slice(&buf[..take]);
         reader.consume(take);
         total += take;
         if pos.is_some() {
-            return Ok(total);
+            saw_newline = true;
+            break;
         }
+    }
+    if total == 0 && !saw_newline {
+        return Ok(0);
+    }
+    let s = std::str::from_utf8(&bytes)
+        .map_err(|e| McpError::Transport(format!("stdio MCP response not utf-8: {e}")))?;
+    out.push_str(s);
+    Ok(total)
+}
+
+#[cfg(test)]
+mod read_line_bounded_tests {
+    //! Regression coverage for #171: a UTF-8 multi-byte sequence that
+    //! straddles a `fill_buf` chunk boundary must not be reported as
+    //! "not utf-8".
+
+    use super::read_line_bounded;
+    use std::io::Cursor;
+    use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
+
+    /// A `AsyncBufRead` whose `fill_buf` returns at most `chunk_size`
+    /// bytes per poll. Lets us force a multi-byte codepoint to split.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        pos: usize,
+        chunk_size: usize,
+    }
+
+    impl ChunkedReader {
+        fn new(data: Vec<u8>, chunk_size: usize) -> Self {
+            Self {
+                data,
+                pos: 0,
+                chunk_size,
+            }
+        }
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let remaining = self.data.len() - self.pos;
+            let n = remaining.min(buf.remaining()).min(self.chunk_size);
+            let s = self.pos;
+            buf.put_slice(&self.data[s..s + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncBufRead for ChunkedReader {
+        fn poll_fill_buf(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<&[u8]>> {
+            let this = self.get_mut();
+            let remaining = this.data.len() - this.pos;
+            let n = remaining.min(this.chunk_size);
+            let s = this.pos;
+            std::task::Poll::Ready(Ok(&this.data[s..s + n]))
+        }
+
+        fn consume(self: std::pin::Pin<&mut Self>, amt: usize) {
+            let this = self.get_mut();
+            this.pos += amt;
+        }
+    }
+
+    // The original bug: a 3-byte UTF-8 codepoint (e.g. `日`) split
+    // across two `fill_buf` returns produced
+    // `Err(Transport("stdio MCP response not utf-8: ..."))`.
+    // Post-fix the accumulator defers UTF-8 decoding until the full
+    // line is in hand, so split codepoints are reassembled correctly.
+    #[tokio::test]
+    async fn handles_multibyte_split_across_fill_buf_chunks() {
+        // `日本` = E6 97 A5 E6 9C AC = 6 bytes followed by `\n`.
+        let mut data = "日本".as_bytes().to_vec();
+        data.push(b'\n');
+        // Chunk size 2 forces a split inside each 3-byte codepoint.
+        let mut reader = ChunkedReader::new(data, 2);
+        let mut out = String::new();
+        let n = read_line_bounded(&mut reader, &mut out, 1024)
+            .await
+            .expect("split utf-8 must succeed (#171)");
+        assert_eq!(n, "日本\n".len());
+        assert_eq!(out, "日本\n");
+    }
+
+    // Sanity: a single-chunk line still works.
+    #[tokio::test]
+    async fn reads_single_chunk_line() {
+        let data = b"hello\n".to_vec();
+        let mut reader = Cursor::new(data);
+        let mut out = String::new();
+        let n = read_line_bounded(&mut reader, &mut out, 1024)
+            .await
+            .unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(out, "hello\n");
+    }
+
+    // Limit is enforced before allocation.
+    #[tokio::test]
+    async fn enforces_byte_cap() {
+        let data = b"hello world\n".to_vec();
+        let mut reader = Cursor::new(data);
+        let mut out = String::new();
+        let err = read_line_bounded(&mut reader, &mut out, 4)
+            .await
+            .expect_err("cap must be enforced");
+        assert!(matches!(
+            err,
+            crate::errors::McpError::ResultTooLarge { .. }
+        ));
     }
 }
