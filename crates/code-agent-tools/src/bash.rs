@@ -315,16 +315,32 @@ async fn join_with_deadline(
     Ok((bytes, aborted))
 }
 
+/// Scrub secrets from a shell command before it is recorded as audit /
+/// telemetry metadata.
+///
+/// Composition (in order):
+/// 1. Conservative env-var-name match — if the command text contains a
+///    needle like `KEY`/`SECRET`/`TOKEN`, replace the whole command with
+///    a marker. This catches commands shaped like
+///    `export FOO_TOKEN=...` where the value is in a custom format the
+///    token-shape pass cannot recognize.
+/// 2. Token-shape redaction (`redact_secrets_in_str`) — surgically
+///    replaces well-known secret formats (Anthropic / OpenAI / Google API
+///    keys, AWS access keys, GitHub tokens, `Bearer ...` headers) with
+///    `[REDACTED]`, leaving the rest of the command intact.
+///
+/// Both passes are needed: env-var-name matching by itself was bypassed
+/// by `curl -H 'Authorization: Bearer sk-…'`-style commands (no needle in
+/// the text) and was the regression tracked in #142.
 fn redact(cmd: &str) -> String {
-    let mut out = cmd.to_string();
+    let lower = cmd.to_ascii_lowercase();
     for needle in SECRET_ENV_PATTERNS {
         let n = needle.to_ascii_lowercase();
-        if out.to_ascii_lowercase().contains(&n) {
-            out = format!("<redacted: contains pattern {n}>");
-            break;
+        if lower.contains(&n) {
+            return format!("<redacted: contains pattern {n}>");
         }
     }
-    out
+    code_agent_core::builtin_hooks::redact_secrets_in_str(cmd)
 }
 
 #[cfg(test)]
@@ -424,5 +440,81 @@ mod tests {
             err.is_panic(),
             "expected panic-flavored JoinError, got {err:?}"
         );
+    }
+
+    // redact() must scrub a Bearer-token Authorization header even though
+    // the command text contains none of the SECRET_ENV_PATTERNS needles.
+    // Regression for issue #142.
+    #[test]
+    fn redact_scrubs_bearer_authorization_header() {
+        let cmd = "curl -H 'Authorization: Bearer sk-ant-api03-aaaaaaaaaaaaaaaaaa' https://api.example.com";
+        let out = redact(cmd);
+        assert!(
+            !out.contains("sk-ant-api03"),
+            "raw Anthropic key leaked: {out}"
+        );
+        assert!(out.contains("[REDACTED]"), "expected [REDACTED] in: {out}");
+    }
+
+    // redact() must scrub an AWS access key id embedded in a URL even
+    // when the surrounding text does not match any env-var-name needle.
+    #[test]
+    fn redact_scrubs_aws_access_key_in_url() {
+        let cmd =
+            "aws s3 cp foo s3://bucket/ --endpoint-url https://AKIAIOSFODNN7EXAMPLE.example.com";
+        let out = redact(cmd);
+        assert!(
+            !out.contains("AKIAIOSFODNN7EXAMPLE"),
+            "AWS key leaked: {out}"
+        );
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    // redact() must scrub a GitHub personal access token passed via a
+    // bare `Authorization: <token>` header. This command happens to hit
+    // the env-var-name fallback (substring "token") before the
+    // token-shape pass, so the entire command is replaced with the
+    // marker — either form is acceptable as long as the secret value is
+    // gone.
+    #[test]
+    fn redact_scrubs_github_personal_access_token() {
+        let cmd = "gh api -H 'Authorization: token ghp_abcdefghijklmnopqrstuvwxyz0123' /user";
+        let out = redact(cmd);
+        assert!(
+            !out.contains("ghp_abcdefghijklmnopqrstuvwxyz0123"),
+            "GitHub token leaked: {out}"
+        );
+        assert!(
+            out.contains("[REDACTED]") || out.starts_with("<redacted:"),
+            "expected redaction marker in: {out}"
+        );
+    }
+
+    // redact() must scrub a GitHub token embedded in a URL where no
+    // env-var-name needle (KEY/SECRET/TOKEN/...) appears anywhere in
+    // the command, so only the token-shape pass can save us.
+    #[test]
+    fn redact_scrubs_github_token_with_no_needle_in_text() {
+        let cmd = "curl https://ghp_abcdefghijklmnopqrstuvwxyz0123@example.com/repo.git";
+        let out = redact(cmd);
+        assert!(!out.contains("ghp_abcdefghijklmnopqrstuvwxyz0123"));
+        assert!(out.contains("[REDACTED]"), "expected [REDACTED] in: {out}");
+    }
+
+    // redact() preserves the existing conservative env-var-name fallback:
+    // a command that contains the substring `KEY` is replaced wholesale,
+    // matching the long-standing behavior.
+    #[test]
+    fn redact_env_var_name_fallback_replaces_entire_command() {
+        let out = redact("export FOO_API_KEY=mysecret");
+        assert!(out.starts_with("<redacted: contains pattern"));
+    }
+
+    // redact() leaves commands with no recognizable secret material
+    // unchanged.
+    #[test]
+    fn redact_passes_through_benign_command() {
+        let cmd = "ls -la /tmp";
+        assert_eq!(redact(cmd), cmd);
     }
 }
