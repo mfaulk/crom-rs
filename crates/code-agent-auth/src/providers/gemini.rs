@@ -11,7 +11,7 @@ use crate::error::{AuthError, AuthErrorKind};
 use crate::provider::{AuthContext, AuthProvider};
 use crate::types::{
     AccountId, AuthStatus, LoginAlternative, LoginMethod, LoginMethodKind, LoginRequest,
-    LoginResult, ProviderId, RefreshResult, StoredAccount, StoredCredentialSecret,
+    LoginResult, ProviderId, RefreshResult, SecretString, StoredAccount, StoredCredentialSecret,
 };
 
 pub struct GeminiAuthProvider;
@@ -55,18 +55,23 @@ impl AuthProvider for GeminiAuthProvider {
         request: LoginRequest,
         _ctx: AuthContext,
     ) -> Result<LoginResult, AuthError> {
-        let key = request.api_key.ok_or_else(|| {
+        let raw = request.api_key.ok_or_else(|| {
             AuthError::new(
                 AuthErrorKind::InvalidApiKey,
                 "Gemini login requires an API key (use --api-key or pipe via --api-key-stdin).",
             )
         })?;
-        if key.expose().trim().is_empty() {
+        // Trim shell-paste whitespace before deriving the AccountId or
+        // storing the secret. Untrimmed values caused 401s and a
+        // divergent account id (#175).
+        let trimmed = raw.expose().trim().to_string();
+        if trimmed.is_empty() {
             return Err(AuthError::new(
                 AuthErrorKind::InvalidApiKey,
                 "API key is empty.",
             ));
         }
+        let key = SecretString::new(trimmed);
         let account = StoredAccount {
             account_id: AccountId::from_api_key("gemini", key.expose()),
             provider: ProviderId::Gemini,

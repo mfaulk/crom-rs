@@ -12,7 +12,7 @@ use crate::error::{AuthError, AuthErrorKind};
 use crate::provider::{AuthContext, AuthProvider};
 use crate::types::{
     AccountId, AuthStatus, LoginAlternative, LoginMethod, LoginMethodKind, LoginRequest,
-    LoginResult, ProviderId, RefreshResult, StoredAccount, StoredCredentialSecret,
+    LoginResult, ProviderId, RefreshResult, SecretString, StoredAccount, StoredCredentialSecret,
 };
 
 pub struct AnthropicAuthProvider;
@@ -57,18 +57,25 @@ impl AuthProvider for AnthropicAuthProvider {
         request: LoginRequest,
         _ctx: AuthContext,
     ) -> Result<LoginResult, AuthError> {
-        let key = request.api_key.ok_or_else(|| {
+        let raw = request.api_key.ok_or_else(|| {
             AuthError::new(
                 AuthErrorKind::InvalidApiKey,
                 "Anthropic login requires an API key (use --api-key or pipe via --api-key-stdin).",
             )
         })?;
-        if key.expose().trim().is_empty() {
+        // Trim once. Shell-paste flows commonly leave a trailing newline
+        // or surrounding whitespace; storing those bytes leaks them
+        // into the derived AccountId AND into every outbound
+        // Authorization header, which the provider then rejects with
+        // 401 (#175).
+        let trimmed = raw.expose().trim().to_string();
+        if trimmed.is_empty() {
             return Err(AuthError::new(
                 AuthErrorKind::InvalidApiKey,
                 "API key is empty.",
             ));
         }
+        let key = SecretString::new(trimmed);
         // Provider-side syntactic check: reject obviously truncated values
         // before we store them. We deliberately do *not* call out to the
         // network here so login works in offline builds.
@@ -200,6 +207,53 @@ mod tests {
         let provider = AnthropicAuthProvider;
         let req = LoginRequest {
             api_key: Some(SecretString::new("".into())),
+            method: Some(LoginMethodKind::ApiKey),
+            ..Default::default()
+        };
+        let err = provider
+            .login(req, AuthContext::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, AuthErrorKind::InvalidApiKey);
+    }
+
+    // Shell-paste regression for #175: a key with trailing whitespace
+    // (the canonical "paste from doc + newline" case) MUST be stored
+    // trimmed so the derived AccountId and the outbound Authorization
+    // header use the same canonical value. Untrimmed values
+    // produced a divergent AccountId and 401s.
+    #[tokio::test]
+    async fn whitespace_padded_api_key_is_trimmed_before_storage() {
+        let provider = AnthropicAuthProvider;
+        let padded = "  sk-test-padded  \n";
+        let result = provider
+            .login(
+                LoginRequest::api_key(LoginMethodKind::ApiKey, padded),
+                AuthContext::default(),
+            )
+            .await
+            .unwrap();
+        let stored = result.secret.api_key.as_ref().unwrap().expose().to_string();
+        assert_eq!(stored, "sk-test-padded");
+        // AccountId is derived from the trimmed key so two logins with
+        // different whitespace produce the SAME account id.
+        let trimmed_result = provider
+            .login(
+                LoginRequest::api_key(LoginMethodKind::ApiKey, "sk-test-padded"),
+                AuthContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.account.account_id, trimmed_result.account.account_id);
+    }
+
+    // Whitespace-only API key must be rejected as empty, not silently
+    // stored as an empty string after trimming.
+    #[tokio::test]
+    async fn whitespace_only_api_key_is_rejected() {
+        let provider = AnthropicAuthProvider;
+        let req = LoginRequest {
+            api_key: Some(SecretString::new("   \n\t  ".into())),
             method: Some(LoginMethodKind::ApiKey),
             ..Default::default()
         };
