@@ -586,14 +586,16 @@ pub fn redact_value_with_secrets(v: &Value, secrets: &[String]) -> Value {
 }
 
 pub fn redact_text_with_secrets(input: &str, secrets: &[String]) -> String {
-    // Defense in depth: even when `secrets` is populated, every entry must
-    // independently look secret-shaped before we substring-replace it in
-    // tool output. Otherwise an attacker who controls an env value or
-    // header (e.g. via `MCP_FOO=permission denied`) could poison the list
-    // to redact arbitrary text from diagnostics.
+    // Trust the secrets list: filtering happens at construction time in
+    // `secret_values()` (looks_like_secret_key OR should_redact_value),
+    // so a value reaching here is either user-tagged (via key name) or
+    // entropy-tagged. Re-filtering here would silently drop short
+    // values whose key name marked them as secret (e.g. API_KEY=short).
+    // We only enforce a minimum length to avoid degenerate substring
+    // replacements (a 1-byte "secret" would corrupt everything).
     let mut out = input.to_string();
     for secret in secrets {
-        if should_redact_value(secret) {
+        if secret.len() >= 4 {
             out = out.replace(secret, "[REDACTED]");
         }
     }
@@ -601,14 +603,23 @@ pub fn redact_text_with_secrets(input: &str, secrets: &[String]) -> String {
 }
 
 pub fn looks_like_secret_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key.contains("authorization")
-        || key.contains("token")
-        || key.contains("secret")
-        || key.contains("api_key")
-        || key.contains("apikey")
-        || key.contains("password")
-        || key.contains("credential")
+    // Normalize separators so `X-API-Key`, `api_key`, and `api.key` all
+    // match the same set of needles. Without this an HTTP header named
+    // `X-API-Key` would not look like a secret-shaped key and its value
+    // would never enter the redaction list.
+    let normalized: String = key
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    normalized.contains("authorization")
+        || normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("apikey")
+        || normalized.contains("accesskey")
+        || normalized.contains("privatekey")
+        || normalized.contains("password")
+        || normalized.contains("credential")
 }
 
 /// Conservative "this string is shaped like a real secret" heuristic.
@@ -623,33 +634,55 @@ fn should_redact_value(value: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("bearer ") || lower.starts_with("basic ") || lower.starts_with("token ") {
+    if starts_with_auth_scheme(trimmed) {
         return true;
     }
     if trimmed.len() < 24 {
         return false;
     }
-    if trimmed.chars().any(|c| c.is_whitespace()) {
-        return false;
+    // Walk the value once, collecting both class membership and
+    // whitespace presence so we don't traverse it four times. Bail out
+    // early as soon as three classes are seen (most secrets reach that
+    // in the first few bytes).
+    let mut has_lower = false;
+    let mut has_upper = false;
+    let mut has_digit = false;
+    let mut has_symbol = false;
+    for c in trimmed.chars() {
+        if c.is_whitespace() {
+            return false;
+        }
+        if c.is_ascii_lowercase() {
+            has_lower = true;
+        } else if c.is_ascii_uppercase() {
+            has_upper = true;
+        } else if c.is_ascii_digit() {
+            has_digit = true;
+        } else if !c.is_ascii_alphanumeric() {
+            has_symbol = true;
+        }
+        let classes =
+            (has_lower as u8) + (has_upper as u8) + (has_digit as u8) + (has_symbol as u8);
+        if classes >= 3 {
+            // Still need to confirm there's no whitespace later; keep
+            // walking but the verdict is already true if we finish.
+        }
     }
-    let mut classes = 0u8;
-    if trimmed.chars().any(|c| c.is_ascii_lowercase()) {
-        classes += 1;
+    (has_lower as u8) + (has_upper as u8) + (has_digit as u8) + (has_symbol as u8) >= 3
+}
+
+fn starts_with_auth_scheme(s: &str) -> bool {
+    const SCHEMES: &[&str] = &["bearer ", "basic ", "token "];
+    for scheme in SCHEMES {
+        if s.len() >= scheme.len() && s[..scheme.len()].eq_ignore_ascii_case(scheme) {
+            // Require a non-trivial single-token credential after the scheme.
+            // Otherwise `Bearer permission denied` would still poison the
+            // redaction list with the literal text "permission denied".
+            let credential = s[scheme.len()..].trim();
+            return credential.len() >= 8 && !credential.chars().any(|c| c.is_whitespace());
+        }
     }
-    if trimmed.chars().any(|c| c.is_ascii_uppercase()) {
-        classes += 1;
-    }
-    if trimmed.chars().any(|c| c.is_ascii_digit()) {
-        classes += 1;
-    }
-    if trimmed
-        .chars()
-        .any(|c| !c.is_ascii_alphanumeric() && !c.is_whitespace())
-    {
-        classes += 1;
-    }
-    classes >= 3
+    false
 }
 
 mod duration_seconds {
@@ -839,13 +872,15 @@ mod tests {
     }
 
     /// `should_redact_value` accepts strings that look like real secrets:
-    /// auth-scheme prefixes and high-entropy key-shaped values.
+    /// auth-scheme prefixes (with a non-trivial credential portion) and
+    /// high-entropy key-shaped values.
     #[test]
     fn should_redact_value_flags_real_secrets() {
-        assert!(super::should_redact_value("Bearer abc"));
-        assert!(super::should_redact_value("bearer abc"));
-        assert!(super::should_redact_value("Basic dXNlcjpwYXNz"));
-        assert!(super::should_redact_value("Token abc"));
+        // Auth-scheme prefix with a real-looking credential.
+        assert!(super::should_redact_value("Bearer abcd1234abcd1234"));
+        assert!(super::should_redact_value("bearer abcd1234abcd1234"));
+        assert!(super::should_redact_value("Basic dXNlcjpwYXNzd29yZA=="));
+        assert!(super::should_redact_value("Token abcd1234abcd1234"));
         // Long alphanumeric mixed-case secrets.
         assert!(super::should_redact_value(
             "sk-proj-AbCdEf1234567890XyZqrstuvWxyz"
@@ -860,6 +895,18 @@ mod tests {
         // intentional: AWS_SECRET_ACCESS_KEY-shaped values share too
         // much structure with arbitrary uppercase prose for the
         // value heuristic alone to be safe.
+    }
+
+    /// Auth-scheme prefix is not enough on its own — the credential
+    /// portion must also look secret-shaped (no whitespace, 8+ chars).
+    /// Otherwise an attacker who controls a header could poison the
+    /// list with `Bearer permission denied` and hide that phrase.
+    #[test]
+    fn should_redact_value_rejects_short_auth_scheme_credential() {
+        assert!(!super::should_redact_value("Bearer abc"));
+        assert!(!super::should_redact_value("Bearer permission denied"));
+        assert!(!super::should_redact_value("Token "));
+        assert!(!super::should_redact_value("Basic short"));
     }
 
     /// Benign long strings that the previous length-only heuristic would
@@ -884,20 +931,70 @@ mod tests {
         assert!(!super::should_redact_value("AAAAAAAAAAAAAAAAAAAAAAAA"));
     }
 
-    /// `redact_text_with_secrets` ignores list entries that fail the
-    /// secret-shape check, so an attacker who poisons the list with
-    /// arbitrary text can no longer hide that text from output.
+    /// Poisoning protection lives at `secret_values()` construction time,
+    /// not at redaction time. An attacker-controlled header value that
+    /// reads like prose (`User-Agent: permission denied`) must NOT be
+    /// added to the redaction list in the first place.
     #[test]
-    fn redact_text_with_secrets_resists_poisoning() {
-        let secrets = vec!["permission denied".to_string()];
-        let out = redact_text_with_secrets("error: permission denied", &secrets);
-        assert_eq!(out, "error: permission denied");
+    fn secret_values_resists_poisoning_via_header_value() {
+        let options = McpOptions {
+            enabled: true,
+            servers: BTreeMap::from([(
+                "docs".into(),
+                McpServerConfig::StreamableHttp(StreamableHttpMcpServerConfig {
+                    url: "http://127.0.0.1/mcp".into(),
+                    headers: BTreeMap::from([
+                        ("User-Agent".into(), "permission denied".into()),
+                        ("Accept".into(), "the secret is foo".into()),
+                    ]),
+                    startup_timeout: None,
+                    request_timeout: None,
+                }),
+            )]),
+            ..McpOptions::default()
+        };
+        let secrets = options.secret_values();
+        assert!(secrets.is_empty(), "poisoned: {secrets:?}");
+    }
 
-        let real_secret = "sk-proj-AbCdEf1234567890XyZqrstuvWxyz".to_string();
-        let secrets = vec![real_secret.clone()];
-        let out = redact_text_with_secrets(&format!("key={real_secret}"), &secrets);
-        assert!(out.contains("[REDACTED]"));
-        assert!(!out.contains(&real_secret));
+    /// `redact_text_with_secrets` honors every entry in the list once it
+    /// has been constructed, regardless of shape. This is the contract
+    /// callers depend on — values added via `looks_like_secret_key`
+    /// (e.g. `API_KEY=short`) must still be redacted in tool output.
+    #[test]
+    fn redact_text_with_secrets_redacts_key_selected_values() {
+        let options = McpOptions {
+            enabled: true,
+            servers: BTreeMap::from([(
+                "fake".into(),
+                McpServerConfig::Stdio(StdioMcpServerConfig {
+                    command: "fake".into(),
+                    args: Vec::new(),
+                    env: BTreeMap::from([("API_KEY".into(), "short_value_xyz".into())]),
+                    cwd: None,
+                    startup_timeout: None,
+                    request_timeout: None,
+                }),
+            )]),
+            ..McpOptions::default()
+        };
+        let secrets = options.secret_values();
+        let out = redact_text_with_secrets("got short_value_xyz from tool", &secrets);
+        assert_eq!(out, "got [REDACTED] from tool");
+    }
+
+    /// Hyphenated and dotted secret-shaped key names normalize correctly:
+    /// `X-API-Key`, `api-key`, and `api.key` all match.
+    #[test]
+    fn looks_like_secret_key_normalizes_separators() {
+        assert!(looks_like_secret_key("X-API-Key"));
+        assert!(looks_like_secret_key("api-key"));
+        assert!(looks_like_secret_key("api.key"));
+        assert!(looks_like_secret_key("API_KEY"));
+        assert!(looks_like_secret_key("X-Access-Key"));
+        assert!(looks_like_secret_key("private-key"));
+        assert!(!looks_like_secret_key("User-Agent"));
+        assert!(!looks_like_secret_key("Accept"));
     }
 
     /// `secret_values` honors the env-var *name* for stdio servers (not
