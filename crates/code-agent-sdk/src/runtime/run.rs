@@ -294,6 +294,13 @@ pub(crate) async fn execute_request(
     let mut usage: Option<code_agent_core::TokenUsage> = None;
     let mut final_summary = String::new();
     let mut status = AgentRunStatus::Completed;
+    // One-shot guard for the `max_tool_calls` budget. Without this,
+    // every event after the cap was crossed re-pushed an identical
+    // `budget.max_tool_calls_exceeded` diagnostic and re-fired
+    // `cancellation.cancel()`. Since cancellation does not stop the
+    // already-streaming agent loop instantly, dozens of duplicate
+    // diagnostics could accumulate before the run wound down (#149).
+    let mut max_tool_calls_reported = false;
 
     loop {
         // Race the next agent event against cancellation so the SDK
@@ -364,15 +371,19 @@ pub(crate) async fn execute_request(
             }
         }
 
-        // Budget enforcement.
+        // Budget enforcement. Guard against re-reporting: every event
+        // that arrives after the cap is crossed used to re-push an
+        // identical diagnostic and re-fire `cancel()`, producing a
+        // diagnostics list that grew with every additional event (#149).
         if let Some(max) = request.budgets.max_tool_calls {
-            if tool_calls > max as usize {
+            if !max_tool_calls_reported && tool_calls > max as usize {
                 cancellation.cancel();
                 diagnostics.push(Diagnostic::error(
                     "budget.max_tool_calls_exceeded",
                     "max_tool_calls budget exceeded",
                 ));
                 status = AgentRunStatus::Failed;
+                max_tool_calls_reported = true;
             }
         }
     }
