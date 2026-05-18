@@ -160,11 +160,9 @@ fn read_api_key(args: &LoginArgs) -> Result<Option<SecretString>> {
                 "--api-key requires a terminal; use --api-key=<KEY> or --api-key-stdin"
             ));
         }
-        eprint!("Enter API key (input hidden): ");
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        let mut buf = String::new();
-        std::io::stdin().read_line(&mut buf)?;
-        let trimmed = buf.trim().to_string();
+        let raw = rpassword::prompt_password("Enter API key (input hidden): ")
+            .map_err(|e| anyhow!("read API key: {e}"))?;
+        let trimmed = raw.trim().to_string();
         if trimmed.is_empty() {
             return Err(anyhow!("API key empty"));
         }
