@@ -202,10 +202,14 @@ pub(crate) async fn execute_request(
     options.permission_callback = Some(approval_cb);
 
     let provider = runtime.provider.clone();
+    // Thread the SDK-level cancellation pair (#145, #155) into the core
+    // agent loop so external cancel, deadline expiry, and budget
+    // breaches actually stop the run instead of being advisory.
     let agent = AgentBuilder::new()
         .options(options.clone())
         .provider(provider)
         .tools(tools.clone())
+        .cancellation(cancellation.flag(), cancellation.notify())
         .build()
         .map_err(AgentSdkError::from)?;
 
@@ -221,7 +225,21 @@ pub(crate) async fn execute_request(
     let mut final_summary = String::new();
     let mut status = AgentRunStatus::Completed;
 
-    while let Some(ev) = event_stream.next().await {
+    loop {
+        // Race the next agent event against cancellation so the SDK
+        // also releases the stream on cancel — without this the
+        // consumer keeps blocking on the agent task until it finishes
+        // naturally (#145, #155).
+        let ev = tokio::select! {
+            ev = event_stream.next() => match ev {
+                Some(ev) => ev,
+                None => break,
+            },
+            _ = cancellation.cancelled() => {
+                status = AgentRunStatus::Cancelled;
+                break;
+            }
+        };
         events_total += 1;
         // Track key counts.
         match &ev {

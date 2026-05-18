@@ -77,6 +77,13 @@ pub struct Agent {
     approval_memory: ApprovalMemory,
     checkpoint_handle: Option<Arc<dyn CheckpointHandle>>,
     child_session_sink_factory: Option<Arc<dyn crate::agents::ChildSessionSinkFactory>>,
+    /// Optional shared cancellation pair from
+    /// [`AgentBuilder::cancellation`]. When `Some`, `run()` uses this
+    /// pair so a host-side cancel reaches the loop. When `None`, `run()`
+    /// mints fresh internal pair (back-compat with callers that do not
+    /// need external cancellation).
+    cancel: Option<Arc<AtomicBool>>,
+    cancel_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[derive(Default)]
@@ -92,6 +99,13 @@ pub struct AgentBuilder {
     approval_memory: Option<ApprovalMemory>,
     checkpoint_handle: Option<Arc<dyn CheckpointHandle>>,
     child_session_sink_factory: Option<Arc<dyn crate::agents::ChildSessionSinkFactory>>,
+    /// Optional shared cancellation pair. When set, the agent loop's
+    /// `select!` arms wait on this notify and the per-step short-circuit
+    /// reads this flag, so a host (e.g. the SDK runtime, a `Ctrl-C`
+    /// handler, a deadline watcher) can stop a run from the outside.
+    /// Issue #145 / #155.
+    cancel: Option<Arc<AtomicBool>>,
+    cancel_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl AgentBuilder {
@@ -160,6 +174,20 @@ impl AgentBuilder {
         self
     }
 
+    /// Inject a shared cancellation pair so a host can stop the run from
+    /// the outside (issues #145, #155). Both halves are needed:
+    /// - `flag` is the per-step short-circuit (cheap atomic load).
+    /// - `notify` wakes any `tokio::select!` arm that is awaiting work.
+    ///
+    /// When this is omitted, `Agent::run` mints a fresh pair internally
+    /// (preserves the prior API for callers that do not need external
+    /// cancellation).
+    pub fn cancellation(mut self, flag: Arc<AtomicBool>, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.cancel = Some(flag);
+        self.cancel_notify = Some(notify);
+        self
+    }
+
     pub fn build(self) -> Result<Agent, AgentError> {
         let options = self
             .options
@@ -180,6 +208,8 @@ impl AgentBuilder {
             approval_memory: self.approval_memory.unwrap_or_default(),
             checkpoint_handle: self.checkpoint_handle,
             child_session_sink_factory: self.child_session_sink_factory,
+            cancel: self.cancel,
+            cancel_notify: self.cancel_notify,
         })
     }
 }
@@ -204,8 +234,19 @@ impl Agent {
         }
         let session_id = self.options.session_id.clone().unwrap();
         let (tx, rx) = mpsc::channel::<AgentEvent>(64);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_notify = Arc::new(tokio::sync::Notify::new());
+        // Prefer the host-injected cancellation pair from
+        // `AgentBuilder::cancellation` (issues #145, #155) so an
+        // external cancel reaches the loop. Fall back to a fresh
+        // internal pair so callers that do not need external
+        // cancellation keep working unchanged.
+        let cancel = self
+            .cancel
+            .take()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let cancel_notify = self
+            .cancel_notify
+            .take()
+            .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new()));
         tokio::spawn(async move {
             let cfg = RunConfig {
                 run_id: RunId::new(),
@@ -290,6 +331,8 @@ pub(crate) async fn run_loop(
         approval_memory,
         checkpoint_handle,
         child_session_sink_factory,
+        cancel: _,
+        cancel_notify: _,
     } = agent;
 
     let session_id = options
@@ -902,9 +945,34 @@ pub(crate) async fn run_loop(
         )
         .await;
 
+        // Register the notify waiter via `enable()` BEFORE checking the
+        // cancel flag so a concurrent `cancel()` between the check and
+        // the select! poll cannot drop the wakeup (#157). Without
+        // `enable()`, registration only happens on first poll, which
+        // opens the lost-wakeup window.
+        let cancel_notified = cfg.cancel_notify.notified();
+        tokio::pin!(cancel_notified);
+        cancel_notified.as_mut().enable();
+        if cfg.cancel.load(Ordering::Acquire) {
+            handle_interrupt(
+                &tx,
+                &session_sink,
+                &telemetry_sink,
+                &session_id,
+                &cfg.run_id,
+                turns,
+                last_result_text.clone(),
+                total_usage.clone(),
+                pricing.as_ref(),
+                &hooks,
+                &options.cwd,
+            )
+            .await;
+            return Ok(());
+        }
         let stream_result = tokio::select! {
             r = provider.stream_turn(req) => r,
-            _ = cfg.cancel_notify.notified() => {
+            _ = &mut cancel_notified => {
                 handle_interrupt(
                     &tx,
                     &session_sink,
@@ -972,9 +1040,19 @@ pub(crate) async fn run_loop(
         let mut turn_usage = TokenUsage::default();
 
         loop {
+            // Re-register the notify waiter before every poll so the
+            // wakeup-stays-pending window is closed each iteration
+            // (#157 lost-wakeup race). `enable()` registers without
+            // polling; the subsequent flag check is happens-after.
+            let cancel_notified = cfg.cancel_notify.notified();
+            tokio::pin!(cancel_notified);
+            cancel_notified.as_mut().enable();
+            if cfg.cancel.load(Ordering::Acquire) {
+                break;
+            }
             let next = tokio::select! {
                 e = stream.next() => e,
-                _ = cfg.cancel_notify.notified() => {
+                _ = &mut cancel_notified => {
                     cfg.cancel.store(true, Ordering::Release);
                     None
                 }
