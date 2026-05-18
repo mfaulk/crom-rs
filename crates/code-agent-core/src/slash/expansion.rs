@@ -126,16 +126,19 @@ pub async fn expand_custom_command(
     // word regardless of what characters it contains.
     let substituted = substitute_with_bash_aware_quoting(body, parsed)?;
 
-    // Two passes: bash expansion first, then file references. Bash output
-    // may itself contain @-tokens — but we deliberately do NOT recurse, so
-    // expansions cannot bootstrap further expansions. This keeps the
-    // expansion graph bounded.
+    // Two passes: bash expansion first into placeholders, then file
+    // references, then placeholder substitution. The placeholder
+    // indirection ensures bash OUTPUT is never rescanned for
+    // @-tokens — that was the #167 regression: an
+    // `expand_file_refs(&after_bash, ...)` walked the post-bash text
+    // and expanded any `@path` token the bash command happened to
+    // print, including malicious or unintended ones.
     let mut summaries: Vec<ExpandedToolCallSummary> = Vec::new();
     let mut bash_commands = Vec::new();
     let mut file_refs = Vec::new();
     let mut truncated = false;
 
-    let after_bash = expand_bash_blocks(
+    let (with_placeholders, bash_outputs) = expand_bash_blocks_to_placeholders(
         &substituted,
         options,
         executor,
@@ -146,7 +149,7 @@ pub async fn expand_custom_command(
     .await?;
 
     let after_files = expand_file_refs(
-        &after_bash,
+        &with_placeholders,
         options,
         executor,
         &mut summaries,
@@ -154,6 +157,10 @@ pub async fn expand_custom_command(
         &mut truncated,
     )
     .await?;
+
+    // Substitute bash placeholders with the real outputs AFTER the
+    // file-ref pass has finished, so the output is not re-scanned.
+    let after_files = substitute_bash_placeholders(after_files, &bash_outputs);
 
     if after_files.len() > options.max_expanded_prompt_bytes {
         return Err(SlashCommandError::PromptTooLarge {
@@ -266,6 +273,126 @@ fn shell_single_quote(s: &str) -> String {
     out
 }
 
+/// Sentinel used to mark the position of a bash-block output during the
+/// two-pass expansion. `\x00` cannot appear in normal text input
+/// (Rust `&str` UTF-8 still permits it, but real prompts and command
+/// definitions don't include NULs); the `BASH_<N>_END` framing makes
+/// it impossible to mistake one placeholder for another or for any
+/// `@path` token the file-ref pass would otherwise match.
+const BASH_PLACEHOLDER_PREFIX: &str = "\x00BASH_";
+const BASH_PLACEHOLDER_SUFFIX: &str = "_END\x00";
+
+fn bash_placeholder(idx: usize) -> String {
+    format!("{BASH_PLACEHOLDER_PREFIX}{idx}{BASH_PLACEHOLDER_SUFFIX}")
+}
+
+/// Like [`expand_bash_blocks`], but instead of inlining each bash
+/// block's output it writes a sentinel placeholder into the returned
+/// string and returns the outputs in a parallel vector. The caller is
+/// expected to substitute the placeholders back AFTER the file-ref
+/// pass has run, so the bash output is never rescanned for @-tokens
+/// (#167).
+async fn expand_bash_blocks_to_placeholders(
+    body: &str,
+    options: &SlashExpansionOptions,
+    executor: &dyn SlashExpansionExecutor,
+    summaries: &mut Vec<ExpandedToolCallSummary>,
+    bash_commands: &mut Vec<String>,
+    truncated: &mut bool,
+) -> Result<(String, Vec<String>), SlashCommandError> {
+    let mut out = String::new();
+    let mut outputs: Vec<String> = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '!' && i + 1 < bytes.len() && bytes[i + 1] as char == '`' {
+            let start = i + 2;
+            let rel_end = match body[start..].find('`') {
+                Some(p) => p,
+                None => {
+                    out.push('!');
+                    i += 1;
+                    continue;
+                }
+            };
+            let cmd = &body[start..start + rel_end];
+            if !options.allow_bash_expansion {
+                return Err(SlashCommandError::ExpansionDisabled {
+                    token: format!("!`{cmd}`"),
+                });
+            }
+            let result = executor.run_bash(cmd).await?;
+            let mut output = result;
+            if output.len() > options.max_expansion_output_bytes {
+                crate::compaction::truncate_utf8_in_place(
+                    &mut output,
+                    options.max_expansion_output_bytes,
+                );
+                output.push_str("\n...(truncated)");
+                *truncated = true;
+            }
+            summaries.push(ExpandedToolCallSummary {
+                kind: "bash".to_string(),
+                target: cmd.to_string(),
+                size_bytes: output.len(),
+                truncated: *truncated,
+            });
+            bash_commands.push(cmd.to_string());
+            out.push_str(&bash_placeholder(outputs.len()));
+            outputs.push(output);
+            i = start + rel_end + 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    Ok((out, outputs))
+}
+
+/// Replace every `\x00BASH_<N>_END\x00` placeholder in `body` with
+/// `outputs[N]`. Indices that fall outside the outputs vector are
+/// left as-is (defensive; we control both halves but a defensive
+/// no-op is safer than a panic).
+fn substitute_bash_placeholders(body: String, outputs: &[String]) -> String {
+    if outputs.is_empty() {
+        return body;
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body.as_str();
+    while let Some(p) = rest.find(BASH_PLACEHOLDER_PREFIX) {
+        out.push_str(&rest[..p]);
+        let after_prefix = &rest[p + BASH_PLACEHOLDER_PREFIX.len()..];
+        if let Some(end) = after_prefix.find(BASH_PLACEHOLDER_SUFFIX) {
+            let idx_str = &after_prefix[..end];
+            match idx_str.parse::<usize>() {
+                Ok(idx) if idx < outputs.len() => {
+                    out.push_str(&outputs[idx]);
+                    rest = &after_prefix[end + BASH_PLACEHOLDER_SUFFIX.len()..];
+                    continue;
+                }
+                _ => {
+                    // Defensive: emit the literal prefix and skip past
+                    // it so we don't loop forever on a malformed input.
+                    out.push_str(BASH_PLACEHOLDER_PREFIX);
+                    rest = after_prefix;
+                    continue;
+                }
+            }
+        } else {
+            // No suffix: emit the rest verbatim.
+            out.push_str(BASH_PLACEHOLDER_PREFIX);
+            rest = after_prefix;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[allow(dead_code)] // retained for downstream callers that may still
+                    // want the legacy single-pass behavior; the
+                    // expansion pipeline uses the placeholder variant
+                    // above.
 async fn expand_bash_blocks(
     body: &str,
     options: &SlashExpansionOptions,
@@ -684,5 +811,80 @@ mod tests {
         assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_single_quote(""), "''");
         assert_eq!(shell_single_quote("plain"), "'plain'");
+    }
+
+    // Regression for #167: bash output is NOT re-scanned for
+    // @-tokens. A bash command whose stdout contains `@secret.txt`
+    // must NOT trigger an implicit file read of `secret.txt`. Pre-fix
+    // `expand_file_refs(&after_bash, ...)` did exactly that, turning
+    // any bash printout into an arbitrary-file-read primitive.
+    #[tokio::test]
+    async fn bash_output_at_tokens_are_not_expanded() {
+        let parsed = parse_slash_command("/review").unwrap();
+        let mut bash = std::collections::HashMap::new();
+        // Bash command emits a line that LOOKS like a file ref.
+        bash.insert("git status".to_string(), "see also @secret.txt".to_string());
+        let mut files = std::collections::HashMap::new();
+        // If file expansion ever fires the secret content would be
+        // inlined; we'd see it in the expanded prompt.
+        files.insert("secret.txt".to_string(), "PASSWORD=hunter2".to_string());
+        let exec = FakeExecutor {
+            files,
+            bash,
+            invocations: Mutex::new(Vec::new()),
+        };
+        let r = expand_custom_command(
+            &parsed,
+            &cmd("Status:\n!`git status`"),
+            &SlashExpansionOptions::default(),
+            &exec,
+        )
+        .await
+        .unwrap();
+        // Bash output is present verbatim.
+        assert!(r.expanded_prompt.contains("see also @secret.txt"));
+        // The secret file content is NOT inlined.
+        assert!(
+            !r.expanded_prompt.contains("PASSWORD=hunter2"),
+            "bash output must not trigger implicit @-token expansion (#167)"
+        );
+        // No file-ref invocation was recorded.
+        assert!(
+            !exec
+                .invocations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|i| i.starts_with("read:")),
+            "no file should be read from bash output: {:?}",
+            exec.invocations.lock().unwrap()
+        );
+    }
+
+    // Original @-tokens in the command body still expand normally.
+    // The fix narrows what gets rescanned; it does not disable
+    // file-ref expansion in the user's prompt.
+    #[tokio::test]
+    async fn original_at_tokens_still_expand_when_bash_present() {
+        let parsed = parse_slash_command("/review").unwrap();
+        let mut bash = std::collections::HashMap::new();
+        bash.insert("date".to_string(), "Mon Jan 1 2026".to_string());
+        let mut files = std::collections::HashMap::new();
+        files.insert("README.md".to_string(), "# project\n".to_string());
+        let exec = FakeExecutor {
+            files,
+            bash,
+            invocations: Mutex::new(Vec::new()),
+        };
+        let r = expand_custom_command(
+            &parsed,
+            &cmd("date=!`date`, readme=@README.md"),
+            &SlashExpansionOptions::default(),
+            &exec,
+        )
+        .await
+        .unwrap();
+        assert!(r.expanded_prompt.contains("Mon Jan 1 2026"));
+        assert!(r.expanded_prompt.contains("# project"));
     }
 }
