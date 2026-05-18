@@ -156,6 +156,9 @@ impl AgentStorage for InMemoryStorage {
 /// JSONL-backed storage. Sessions live under `<root>/sessions/<id>.jsonl`;
 /// plans live under `<root>/plans/<id>.json`. No locking beyond a per-call
 /// tokio `RwLock` so two writes serialize.
+///
+/// Untrusted session/plan ids are rejected before any path is constructed
+/// to prevent path-traversal writes outside `<root>` — see [`Self::session_path`].
 pub struct FileStorage {
     root: PathBuf,
     write_lock: RwLock<()>,
@@ -173,14 +176,35 @@ impl FileStorage {
         })
     }
 
-    fn session_path(&self, session_id: &SessionId) -> PathBuf {
-        self.root
+    /// Path on disk for `session_id`. Returns
+    /// `Err(StorageError("storage.invalid_id", ...))` if the id does not
+    /// pass [`SessionId::is_valid_format`] — defending against a host
+    /// that propagates an attacker-controlled `SessionPolicy::Existing`
+    /// id (e.g. `../../../tmp/escape`) into the storage layer.
+    fn session_path(&self, session_id: &SessionId) -> Result<PathBuf, StorageError> {
+        if !session_id.is_valid_format() {
+            return Err(StorageError::new(
+                "storage.invalid_id",
+                format!("rejected session id: {}", session_id.as_str()),
+            ));
+        }
+        Ok(self
+            .root
             .join("sessions")
-            .join(format!("{}.jsonl", session_id))
+            .join(format!("{}.jsonl", session_id)))
     }
 
-    fn plan_path(&self, plan_id: &PlanId) -> PathBuf {
-        self.root.join("plans").join(format!("{}.json", plan_id))
+    /// Path on disk for `plan_id`. Returns
+    /// `Err(StorageError("storage.invalid_id", ...))` if the id does not
+    /// pass [`PlanId::is_valid_format`].
+    fn plan_path(&self, plan_id: &PlanId) -> Result<PathBuf, StorageError> {
+        if !plan_id.is_valid_format() {
+            return Err(StorageError::new(
+                "storage.invalid_id",
+                format!("rejected plan id: {}", plan_id.as_str()),
+            ));
+        }
+        Ok(self.root.join("plans").join(format!("{}.json", plan_id)))
     }
 }
 
@@ -191,10 +215,10 @@ impl AgentStorage for FileStorage {
         session_id: &SessionId,
         event: SdkEvent,
     ) -> Result<(), StorageError> {
+        let path = self.session_path(session_id)?;
         let _g = self.write_lock.write().await;
         let line = serde_json::to_string(&event)
             .map_err(|e| StorageError::serialization(e.to_string()))?;
-        let path = self.session_path(session_id);
         let mut content = String::new();
         content.push_str(&line);
         content.push('\n');
@@ -216,7 +240,7 @@ impl AgentStorage for FileStorage {
     }
 
     async fn load_session(&self, session_id: &SessionId) -> Result<SessionSnapshot, StorageError> {
-        let path = self.session_path(session_id);
+        let path = self.session_path(session_id)?;
         if !path.exists() {
             return Ok(SessionSnapshot {
                 session_id: session_id.clone(),
@@ -242,8 +266,8 @@ impl AgentStorage for FileStorage {
     }
 
     async fn save_plan(&self, plan: &PlanDocument) -> Result<(), StorageError> {
+        let path = self.plan_path(&plan.id)?;
         let _g = self.write_lock.write().await;
-        let path = self.plan_path(&plan.id);
         let body = serde_json::to_string_pretty(plan)
             .map_err(|e| StorageError::serialization(e.to_string()))?;
         tokio::fs::write(&path, body)
@@ -252,7 +276,7 @@ impl AgentStorage for FileStorage {
     }
 
     async fn load_plan(&self, plan_id: &PlanId) -> Result<PlanDocument, StorageError> {
-        let path = self.plan_path(plan_id);
+        let path = self.plan_path(plan_id)?;
         let body = tokio::fs::read_to_string(&path)
             .await
             .map_err(|_| StorageError::not_found(format!("plan {plan_id}")))?;
@@ -308,5 +332,53 @@ mod tests {
         s.append_event(&sid, ev(&rid)).await.unwrap();
         let snap = s.load_session(&sid).await.unwrap();
         assert_eq!(snap.events.len(), 1);
+    }
+
+    /// FileStorage rejects an attacker-controlled session id containing
+    /// path-traversal segments and refuses to write outside the root.
+    #[tokio::test]
+    async fn file_storage_rejects_traversal_session_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = FileStorage::new(dir.path()).unwrap();
+        let bad = SessionId::from("../../../tmp/escape".to_string());
+        let rid = crate::RunId::new();
+        let err = s
+            .append_event(&bad, ev(&rid))
+            .await
+            .expect_err("path traversal must be rejected");
+        assert_eq!(err.code, "storage.invalid_id");
+        // No file written under or outside the root.
+        let parent = dir.path().parent().unwrap();
+        assert!(
+            !parent.join("tmp").join("escape.jsonl").exists(),
+            "no file should escape the storage root"
+        );
+    }
+
+    /// FileStorage rejects an absolute-path session id.
+    #[tokio::test]
+    async fn file_storage_rejects_absolute_session_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = FileStorage::new(dir.path()).unwrap();
+        let bad = SessionId::from("/etc/passwd".to_string());
+        let err = s
+            .load_session(&bad)
+            .await
+            .expect_err("absolute path must be rejected");
+        assert_eq!(err.code, "storage.invalid_id");
+    }
+
+    /// FileStorage rejects an attacker-controlled plan id containing
+    /// path-traversal segments before any file is touched.
+    #[tokio::test]
+    async fn file_storage_rejects_traversal_plan_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = FileStorage::new(dir.path()).unwrap();
+        let bad = PlanId::from("../escape".to_string());
+        let err = s
+            .load_plan(&bad)
+            .await
+            .expect_err("path traversal must be rejected");
+        assert_eq!(err.code, "storage.invalid_id");
     }
 }
