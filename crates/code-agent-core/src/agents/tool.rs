@@ -438,6 +438,27 @@ impl Tool for AgentTool {
     }
 }
 
+/// RAII cleanup for the per-run entry in `SubagentRuntime::active`. The
+/// entry is pushed before `run_subagent` builds the child; any `?` between
+/// the push and the explicit success-path removal at step 11 would
+/// otherwise leak a `Running` entry. On drop we schedule the removal as
+/// a detached tokio task because `Drop` cannot be async. (#162)
+struct ActiveEntryGuard {
+    runtime: Arc<SubagentRuntime>,
+    subagent_session_id: SessionId,
+}
+
+impl Drop for ActiveEntryGuard {
+    fn drop(&mut self) {
+        let runtime = self.runtime.clone();
+        let sid = self.subagent_session_id.clone();
+        tokio::spawn(async move {
+            let mut active = runtime.active.lock().await;
+            active.retain(|h| h.subagent_session_id != sid);
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent(
     runtime: Arc<SubagentRuntime>,
@@ -648,7 +669,9 @@ async fn run_subagent(
             .await;
     }
 
-    // 5. Track this run.
+    // 5. Track this run. The RAII guard removes the entry on Drop so any
+    //    `?` between here and the explicit removal at step 11 cannot leave
+    //    a ghost `Running` entry in `runtime.active`. (#162)
     {
         let mut active = runtime.active.lock().await;
         active.push(SubagentRunHandle {
@@ -661,6 +684,10 @@ async fn run_subagent(
             status: SubagentStatus::Running,
         });
     }
+    let _active_guard = ActiveEntryGuard {
+        runtime: runtime.clone(),
+        subagent_session_id: subagent_session_id.clone(),
+    };
 
     // 6. Build and run the child agent with timeout. Decide whether the
     // child should participate in the parent's checkpoint lineage based on
@@ -959,12 +986,12 @@ async fn run_subagent(
             .await;
     }
 
-    // 11. Remove this run from the active handles. The vector is short
-    // (bounded by `max_concurrent_subagents`), but a long-lived parent
-    // session that delegates frequently would otherwise grow it without
-    // bound — so we drop the entry entirely on completion. Audit history
-    // lives in the persisted child session JSONL, not in this in-memory
-    // table.
+    // 11. Removal from `runtime.active` is handled by `_active_guard`'s
+    // `Drop`. We keep the explicit removal here as well so success paths
+    // see the entry gone synchronously instead of after the next task
+    // poll — important for tests that observe `active_runs()` right
+    // after a successful subagent invocation. The guard's drop is
+    // idempotent (retain is a no-op when no entry matches).
     {
         let mut active = runtime.active.lock().await;
         active.retain(|h| h.subagent_session_id != subagent_session_id);
@@ -1331,4 +1358,117 @@ pub fn builtin_starter_definitions() -> Vec<AgentDefinition> {
             &["Edit", "Write", "Bash", "Agent"],
         ),
     ]
+}
+
+#[cfg(test)]
+mod active_guard_tests {
+    //! Direct coverage of `ActiveEntryGuard`. Exercising the full
+    //! `run_subagent` flow requires a `SubagentRuntime` with a real
+    //! provider, registry, and hook tree, which is out of scope for a
+    //! unit test. Instead we verify the guard's contract in isolation
+    //! by constructing a minimal runtime with only the fields the
+    //! guard touches.
+
+    use super::*;
+    use crate::agents::runtime::AgentRuntimeOptions;
+    use crate::errors::ProviderError;
+    use crate::provider::{ModelEvent as PModelEvent, ModelRequest};
+    use futures::stream::BoxStream;
+    use std::sync::atomic::AtomicBool;
+
+    struct StubProvider;
+    #[async_trait]
+    impl ModelProvider for StubProvider {
+        async fn stream_turn(
+            &self,
+            _: ModelRequest,
+        ) -> Result<BoxStream<'static, Result<PModelEvent, ProviderError>>, ProviderError> {
+            Err(ProviderError::Other("stub".into()))
+        }
+    }
+
+    fn minimal_runtime() -> Arc<SubagentRuntime> {
+        Arc::new(SubagentRuntime {
+            registry: Arc::new(AgentRegistry::default()),
+            provider: Arc::new(StubProvider),
+            base_tools: ToolRegistry::default(),
+            parent_options: AgentOptions::default(),
+            parent_hooks: Hooks::default(),
+            session_sink: None,
+            child_sink_factory: None,
+            telemetry_sink: None,
+            pricing: None,
+            parent_checkpoint_handle: None,
+            runtime_options: AgentRuntimeOptions::default(),
+            semaphore: Arc::new(Semaphore::new(1)),
+            parent_event_tx: Mutex::new(None),
+            active: Mutex::new(Vec::new()),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn push_handle(_rt: &SubagentRuntime, sid: SessionId) -> SubagentRunHandle {
+        SubagentRunHandle {
+            parent_session_id: SessionId::new(),
+            parent_run_id: RunId::new(),
+            parent_tool_call_id: "tc".into(),
+            subagent_session_id: sid,
+            subagent_run_id: RunId::new(),
+            agent_name: "X".into(),
+            status: SubagentStatus::Running,
+        }
+    }
+
+    /// Dropping the guard removes the matching entry from `runtime.active`.
+    #[tokio::test]
+    async fn guard_drop_removes_matching_entry() {
+        let rt = minimal_runtime();
+        let sid = SessionId::new();
+        rt.active.lock().await.push(push_handle(&rt, sid.clone()));
+        assert_eq!(rt.active.lock().await.len(), 1);
+        {
+            let _g = ActiveEntryGuard {
+                runtime: rt.clone(),
+                subagent_session_id: sid.clone(),
+            };
+        }
+        // Guard spawns its cleanup task; yield until it runs.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            if rt.active.lock().await.is_empty() {
+                break;
+            }
+        }
+        assert!(rt.active.lock().await.is_empty(), "guard did not clean up");
+    }
+
+    /// If the explicit step-11 removal has already run, the guard's
+    /// drop is a no-op (idempotent retain) — no panic, no other
+    /// entries clobbered.
+    #[tokio::test]
+    async fn guard_drop_is_idempotent_after_explicit_removal() {
+        let rt = minimal_runtime();
+        let sid1 = SessionId::new();
+        let sid2 = SessionId::new();
+        rt.active.lock().await.push(push_handle(&rt, sid1.clone()));
+        rt.active.lock().await.push(push_handle(&rt, sid2.clone()));
+        // Simulate the explicit removal at step 11 for sid1.
+        rt.active
+            .lock()
+            .await
+            .retain(|h| h.subagent_session_id != sid1);
+        // The guard for sid1 drops — should be a no-op, leaving sid2 alone.
+        {
+            let _g = ActiveEntryGuard {
+                runtime: rt.clone(),
+                subagent_session_id: sid1.clone(),
+            };
+        }
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let active = rt.active.lock().await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].subagent_session_id, sid2);
+    }
 }
