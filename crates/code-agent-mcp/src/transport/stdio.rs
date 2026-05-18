@@ -111,10 +111,34 @@ impl StdioMcpTransport {
             let message = parse_json_rpc_message(line.trim_end())
                 .map_err(|e| McpError::Transport(format!("invalid JSON-RPC on stdout: {e}")))?;
             match message {
-                JsonRpcMessage::Response(resp)
-                    if resp.id.as_ref() == Some(expected_id) || resp.id.is_none() =>
-                {
-                    return Ok(resp)
+                // Strict id match. JSON-RPC 2.0 §5.1 permits `id: null`
+                // only when the server could not determine the id of
+                // the request (e.g. a parse error on a previous frame
+                // the client already gave up on). Treating null as a
+                // wildcard match for the currently-pending request
+                // (#173) mis-attributes those late, unowned errors to
+                // a fresh request that is still waiting on its real
+                // response. Log and continue waiting for our id.
+                JsonRpcMessage::Response(resp) if response_id_matches(&resp, expected_id) => {
+                    return Ok(resp);
+                }
+                JsonRpcMessage::Response(resp) if resp.id.is_none() => {
+                    push_log(
+                        &self.logs,
+                        self.max_log_bytes,
+                        McpServerLogEntry {
+                            stream: McpLogStream::Stdout,
+                            message: redact_text_with_secrets(
+                                &format!(
+                                    "dropping JSON-RPC response with id=null while waiting for {expected_id:?}: {}",
+                                    serde_json::to_string(&resp).unwrap_or_default()
+                                ),
+                                &self.secrets,
+                            ),
+                            truncated: false,
+                        },
+                    );
+                    continue;
                 }
                 JsonRpcMessage::Response(_) | JsonRpcMessage::Notification(_) => continue,
                 JsonRpcMessage::Request(req) => {
@@ -272,5 +296,70 @@ where
         if pos.is_some() {
             return Ok(total);
         }
+    }
+}
+
+/// Return true iff `resp` is the response to the request waiting for
+/// `expected_id`. Per JSON-RPC 2.0 §5.1 only an exact id match counts:
+/// `id: null` is the server's way of saying it could not determine the
+/// id of the failing request (parse error / invalid request), so a
+/// null-id response is NOT a wildcard match for the currently-pending
+/// request. The previous `resp.id.is_none()` match silently
+/// mis-attributed those errors to a fresh request whose real response
+/// was still in flight (#173).
+fn response_id_matches(resp: &JsonRpcResponse, expected_id: &crate::protocol::JsonRpcId) -> bool {
+    resp.id.as_ref() == Some(expected_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response_id_matches;
+    use crate::protocol::{JsonRpcId, JsonRpcResponse};
+
+    fn mk(id: Option<JsonRpcId>) -> JsonRpcResponse {
+        JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id,
+            result: Some(serde_json::Value::Null),
+            error: None,
+        }
+    }
+
+    #[test]
+    // A response whose id matches the expected request id is accepted.
+    fn matches_when_ids_equal() {
+        let expected = JsonRpcId::Number(7);
+        let resp = mk(Some(JsonRpcId::Number(7)));
+        assert!(response_id_matches(&resp, &expected));
+    }
+
+    #[test]
+    // A response whose id differs (even by one) is not accepted.
+    fn rejects_mismatched_id() {
+        let expected = JsonRpcId::Number(7);
+        let resp = mk(Some(JsonRpcId::Number(8)));
+        assert!(!response_id_matches(&resp, &expected));
+    }
+
+    // Regression for #173: a null-id response is NOT a match for any
+    // pending request. JSON-RPC 2.0 §5.1 reserves `id: null` for
+    // unidentifiable requests, not for a wildcard reply.
+    #[test]
+    fn rejects_null_id_even_when_request_pending() {
+        let expected = JsonRpcId::Number(7);
+        let resp = mk(None);
+        assert!(
+            !response_id_matches(&resp, &expected),
+            "null id must NOT match a pending request (#173)"
+        );
+    }
+
+    // String and number ids must not cross-match: a server that
+    // returns `id: \"7\"` is not replying to our `id: 7` request.
+    #[test]
+    fn string_id_does_not_match_numeric_id() {
+        let expected = JsonRpcId::Number(7);
+        let resp = mk(Some(JsonRpcId::String("7".into())));
+        assert!(!response_id_matches(&resp, &expected));
     }
 }
