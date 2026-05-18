@@ -173,6 +173,32 @@ async fn max_turns_budget_is_enforced() {
     ));
 }
 
+/// Normal-completion runs must not leave the deadline watcher
+/// sleeping in the background. Smoke test of the drop-guard wiring;
+/// the unit-level guarantee for `AbortOnDrop` lives in the SDK lib
+/// tests. Previously the JoinHandle was dropped immediately and the
+/// watcher ran for the full deadline window even after the run
+/// finished. (#164)
+#[tokio::test]
+async fn deadline_with_normal_completion_does_not_panic() {
+    let runtime = AgentRuntime::builder()
+        .provider(ProviderConfig::fake(Arc::new(EchoFakeProvider)))
+        .build()
+        .await
+        .unwrap();
+    // A 10-minute deadline that will never fire — the fake provider
+    // returns immediately. With the drop guard in place the watcher
+    // is aborted as soon as execute_request returns; without it the
+    // watcher would sleep ~10 minutes in the background but the test
+    // would still pass quickly. The point is to exercise the code
+    // path and ensure no panic / no leaked-cancel side effect.
+    let result = runtime
+        .run_once(AgentRequest::new("hi").deadline(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    assert!(matches!(result.status, AgentRunStatus::Completed));
+}
+
 /// Deadline triggers cancellation with TimedOut-ish status.
 #[tokio::test]
 async fn deadline_triggers_cancellation() {

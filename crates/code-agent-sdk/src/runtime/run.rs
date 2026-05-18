@@ -28,6 +28,17 @@ use crate::workspace::{
 };
 use crate::{RunId, SessionId};
 
+/// RAII guard that aborts a spawned task when the guard drops. Used to
+/// pin the deadline watcher to the lifetime of `execute_request` so it
+/// cannot outlive a normal-completion return path. (#164)
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Execute an AgentRequest. Owns the actual agent loop and returns a result
 /// summary; the streaming wrapper in `mod.rs` is responsible for shipping
 /// events to the host.
@@ -75,15 +86,22 @@ pub(crate) async fn execute_request(
 
     // Apply deadline.
     let deadline = request.deadline.or(request.budgets.max_duration);
-    if let Some(d) = deadline {
+    // Hold the watcher in a drop guard so a normal early return (Plan-only
+    // short-circuit, validation failure, etc.) tears the task down instead
+    // of letting it sleep for the rest of the deadline window. Previously
+    // the JoinHandle was dropped immediately, so the watcher relied on
+    // `cancellation.cancel()` being called somewhere to exit — which the
+    // normal-completion path does not do. (#164)
+    let _watcher_guard = deadline.map(|d| {
         let c = cancellation.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(d) => c.cancel(),
                 _ = c.cancelled() => {}
             }
         });
-    }
+        AbortOnDrop(handle.abort_handle())
+    });
 
     // Plan-only short circuit.
     if matches!(request.mode, AgentMode::PlanOnly)
@@ -1377,5 +1395,39 @@ mod snapshot_tests {
         assert_eq!(snap.len(), 1);
         let path = WorkspacePath::new("keep.txt").unwrap();
         assert_eq!(snap.get(&path).map(Vec::as_slice), Some(b"hello".as_ref()));
+    }
+
+    // AbortOnDrop must abort the spawned task when the guard is dropped,
+    // so a leaked deadline watcher doesn't outlive its enclosing
+    // execute_request call. (#164)
+    #[tokio::test]
+    async fn abort_on_drop_aborts_pinned_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let woke = Arc::new(AtomicBool::new(false));
+        let woke_clone = woke.clone();
+        let handle = tokio::spawn(async move {
+            // Long sleep that should NEVER fire because the guard
+            // aborts the task first.
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            woke_clone.store(true, Ordering::SeqCst);
+        });
+        let abort_handle = handle.abort_handle();
+        {
+            let _guard = AbortOnDrop(abort_handle);
+            // Guard drops here.
+        }
+        // Yield to let the abort propagate.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+            if handle.is_finished() {
+                break;
+            }
+        }
+        assert!(handle.is_finished(), "guard did not abort the task");
+        assert!(
+            !woke.load(Ordering::SeqCst),
+            "task body ran past abort point"
+        );
     }
 }
