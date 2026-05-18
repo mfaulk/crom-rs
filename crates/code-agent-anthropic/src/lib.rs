@@ -391,6 +391,18 @@ where
             partial_json: String,
         }
 
+        // A successful send returns Ok(()); a SendError means the consumer
+        // dropped the receiver. Stop draining the upstream SSE stream as
+        // soon as that happens — otherwise we keep billing/holding the
+        // upstream connection long after the caller cancelled the turn.
+        macro_rules! send_or_stop {
+            ($msg:expr) => {
+                if tx.send($msg).await.is_err() {
+                    return;
+                }
+            };
+        }
+
         let mut pending: HashMap<u32, PendingTool> = HashMap::new();
         let mut usage_accum = TokenUsage::default();
         let mut started = false;
@@ -419,7 +431,7 @@ where
                 SseEvent::MessageStart { message } => {
                     if !started {
                         started = true;
-                        let _ = tx.send(Ok(ModelEvent::MessageStart)).await;
+                        send_or_stop!(Ok(ModelEvent::MessageStart));
                     }
                     if let Some(u) = message.usage {
                         usage_accum.input_tokens += u.input_tokens;
@@ -446,7 +458,7 @@ where
                 },
                 SseEvent::ContentBlockDelta { index, delta } => match delta {
                     SseDelta::TextDelta { text } => {
-                        let _ = tx.send(Ok(ModelEvent::TextDelta { text })).await;
+                        send_or_stop!(Ok(ModelEvent::TextDelta { text }));
                     }
                     SseDelta::InputJsonDelta { partial_json } => {
                         if let Some(p) = pending.get_mut(&index) {
@@ -487,7 +499,7 @@ where
                             name: p.name,
                             input,
                         };
-                        let _ = tx.send(Ok(ModelEvent::ToolCall(call))).await;
+                        send_or_stop!(Ok(ModelEvent::ToolCall(call)));
                     }
                 }
                 SseEvent::MessageDelta { delta, usage } => {
@@ -496,12 +508,10 @@ where
                         usage_accum.output_tokens += u.output_tokens;
                         merge_cache(&mut usage_accum, &u);
                     }
-                    let _ = tx
-                        .send(Ok(ModelEvent::MessageStop {
-                            stop_reason: delta.stop_reason,
-                            usage: Some(usage_accum.clone()),
-                        }))
-                        .await;
+                    send_or_stop!(Ok(ModelEvent::MessageStop {
+                        stop_reason: delta.stop_reason,
+                        usage: Some(usage_accum.clone()),
+                    }));
                 }
                 SseEvent::MessageStop => {
                     // We may have already sent a MessageStop on MessageDelta. The
@@ -592,6 +602,72 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"][0]["text"], "hello");
+    }
+
+    /// Once the consumer drops the receiver, the spawned SSE drain task
+    /// must stop reading from upstream — otherwise the provider keeps
+    /// the connection open and runs up token cost for a cancelled turn.
+    /// We prove this by feeding events into an upstream channel and
+    /// asserting that, after the downstream receiver is dropped, the
+    /// upstream sender starts seeing `SendError` (the spawned task has
+    /// dropped its end of the upstream stream).
+    #[tokio::test]
+    async fn sse_drain_stops_when_consumer_drops_receiver() {
+        use futures::StreamExt;
+        use tokio::sync::mpsc;
+        use tokio::time::{timeout, Duration};
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        let (upstream_tx, upstream_rx) =
+            mpsc::unbounded_channel::<Result<eventsource_stream::Event, ProviderError>>();
+        let upstream: UnboundedReceiverStream<_> = UnboundedReceiverStream::new(upstream_rx);
+        let mut downstream = Box::pin(parse_sse(upstream));
+
+        let evt = |s: &str| eventsource_stream::Event {
+            event: String::new(),
+            data: s.to_string(),
+            id: String::new(),
+            retry: None,
+        };
+
+        // Drive at least one event through so the spawned task is actively
+        // pumping the stream.
+        upstream_tx
+            .send(Ok(evt(
+                r#"{"type":"message_start","message":{"id":"m","usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            )))
+            .expect("upstream alive before consumer drop");
+        let first = timeout(Duration::from_secs(1), downstream.next())
+            .await
+            .expect("first event arrived")
+            .expect("stream not exhausted");
+        assert!(first.is_ok());
+
+        // Consumer drops the receiver.
+        drop(downstream);
+
+        // Drive content_block_delta events (each triggers send_or_stop!).
+        // After at most a few iterations the spawned task must observe
+        // the closed downstream channel and return. Once it returns it
+        // drops `upstream`, which closes `upstream_rx` — and the next
+        // `upstream_tx.send()` then returns `SendError`.
+        let mut observed_task_exit = false;
+        for _ in 0..32 {
+            if upstream_tx
+                .send(Ok(evt(
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}"#,
+                )))
+                .is_err()
+            {
+                observed_task_exit = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            observed_task_exit,
+            "SSE drain task kept reading after consumer dropped the receiver"
+        );
     }
 
     #[test]
