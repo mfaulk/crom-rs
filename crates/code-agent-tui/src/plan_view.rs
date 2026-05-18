@@ -170,7 +170,19 @@ pub fn format_plan_approval_modal(plan: &PlanDocument) -> Vec<String> {
         }
     }
     out.push(String::new());
-    out.push("  [a] approve  [r] revise  [e] edit  [n] reject  [x] export  [?] help".into());
+    // SDK does not yet expose a plan-decision callback that the TUI can
+    // call (#146). Until it does, the keys read but cannot block the
+    // run — say so explicitly so the modal does not mislead operators.
+    // Keep each line under 80 columns so the modal renders on a default
+    // terminal without wrapping (review feedback).
+    out.push("  (informational: plan approval is not yet wired to the SDK;".into());
+    out.push("   the run will continue regardless of which key is pressed)".into());
+    out.push("  * = preview only".into());
+    // Keymap is the source of truth in `state::handle_plan_approval_key`:
+    // a → approve, r → reject, u → revise. Older copy showed e/n/x as
+    // well, but those keys have no handler and would mislead operators
+    // (#146 review feedback). Keep this in sync with state.rs.
+    out.push("  [a] approve*  [r] reject*  [u] revise*".into());
     out
 }
 
@@ -302,11 +314,34 @@ mod tests {
     }
 
     #[test]
-    // Approval modal renders the menu.
+    // Approval modal renders the menu and warns that the keys are not
+    // yet wired through to the SDK (issue #146 honest-UX fix). Each
+    // line also fits a default 80-col terminal.
     fn approval_modal_has_menu() {
         let p = small_plan();
         let lines = format_plan_approval_modal(&p);
-        assert!(lines.iter().any(|l| l.contains("[a] approve")));
+        // Keymap matches `state::handle_plan_approval_key` exactly.
+        assert!(lines.iter().any(|l| l.contains("[a] approve*")
+            && l.contains("[r] reject*")
+            && l.contains("[u] revise*")));
+        assert!(
+            !lines.iter().any(|l| l.contains("[n] reject")
+                || l.contains("[e] edit")
+                || l.contains("[x] export")),
+            "stale unsupported keys must not appear, got: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("preview only")));
+        assert!(
+            lines.iter().any(|l| l.contains("not yet wired to the SDK")),
+            "expected SDK-not-wired disclaimer, got: {lines:?}"
+        );
+        for l in &lines {
+            assert!(
+                l.chars().count() <= 80,
+                "line exceeds 80 columns ({} chars): {l}",
+                l.chars().count()
+            );
+        }
     }
 
     #[test]
