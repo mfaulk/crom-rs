@@ -41,11 +41,19 @@ const WINDOWS_RESERVED_NAMES: &[&str] = &[
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
+/// Upper bound for session-id length. Long enough for UUIDs (36) and
+/// short hashes, short enough to keep path-length and allocation costs
+/// bounded if a host accepts attacker-controlled ids. Mirrors the cap
+/// `PlanId::is_valid_format` enforces.
+pub const MAX_SESSION_ID_LEN: usize = 96;
+
 /// Returns true iff `s` is a syntactically valid session id.
-/// Accepts only `[A-Za-z0-9_-]+`, rejects empty strings, and rejects
-/// Windows reserved device basenames (case-insensitive).
+/// Accepts only `[A-Za-z0-9_-]+`, rejects empty strings, enforces an
+/// upper length bound (`MAX_SESSION_ID_LEN`), and rejects Windows
+/// reserved device basenames (case-insensitive).
 pub fn is_valid_session_id_str(s: &str) -> bool {
     if s.is_empty()
+        || s.len() > MAX_SESSION_ID_LEN
         || !s
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -247,5 +255,17 @@ mod tests {
         assert!(is_valid_session_id_str("CONversation"));
         assert!(is_valid_session_id_str("my-NUL-id"));
         assert!(is_valid_session_id_str("nullable"));
+    }
+
+    // A session id at the `MAX_SESSION_ID_LEN` cap passes; one byte
+    // over fails. Guards against an attacker-controlled
+    // `SessionPolicy::Existing` driving path-length / allocation
+    // pressure even though it passes the character class check.
+    #[test]
+    fn long_session_ids_capped() {
+        let at_cap: String = "a".repeat(MAX_SESSION_ID_LEN);
+        assert!(is_valid_session_id_str(&at_cap));
+        let over_cap: String = "a".repeat(MAX_SESSION_ID_LEN + 1);
+        assert!(!is_valid_session_id_str(&over_cap));
     }
 }
