@@ -183,28 +183,21 @@ pub fn classify_state(
 }
 
 fn parse_iso(s: &str) -> Option<i64> {
-    // Simple RFC 3339 parser scoped to our own emitted format. Returns the
-    // unix timestamp in seconds. Anything we can't parse falls back to None
-    // so the caller treats the lock as fresh — we'd rather under-recover
-    // than misjudge a real run as stale.
+    // Full RFC 3339 parser. Returns the unix timestamp in seconds.
+    // Anything we can't parse falls back to None so the caller treats
+    // the lock as fresh — we'd rather under-recover than misjudge a
+    // real run as stale.
+    //
+    // The previous hand-rolled implementation sliced the first 19
+    // characters and called `assume_utc()` on the result, silently
+    // dropping any timezone offset (`+HH:MM`, `-HH:MM`, or `Z`). A
+    // RunLock written with `2026-05-17T13:00:00-08:00` was therefore
+    // parsed as `13:00:00 UTC` — eight hours off, which flipped the
+    // staleness verdict for any lock written outside UTC (#159).
     let s = s.trim();
-    if s.len() < 19 {
-        return None;
-    }
-    let date = &s[..10];
-    let time_part = &s[11..19];
-    let mut date_iter = date.split('-');
-    let y: i32 = date_iter.next()?.parse().ok()?;
-    let mo: u8 = date_iter.next()?.parse().ok()?;
-    let d: u8 = date_iter.next()?.parse().ok()?;
-    let mut time_iter = time_part.split(':');
-    let h: u8 = time_iter.next()?.parse().ok()?;
-    let mi: u8 = time_iter.next()?.parse().ok()?;
-    let se: u8 = time_iter.next()?.parse().ok()?;
-    let date = time::Date::from_calendar_date(y, time::Month::try_from(mo).ok()?, d).ok()?;
-    let tt = time::Time::from_hms(h, mi, se).ok()?;
-    let dt = date.with_time(tt).assume_utc();
-    Some(dt.unix_timestamp())
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|dt| dt.unix_timestamp())
 }
 
 /// Inspect every session under `cwd` and report runtime state.
@@ -654,5 +647,44 @@ mod tests {
             .unwrap();
         assert!(id2_info.lock.is_none());
         assert_eq!(id2_info.state, S::Idle);
+    }
+
+    // Regression for #159: a non-UTC RFC 3339 timestamp must be
+    // converted to its UTC unix timestamp, not interpreted as UTC.
+    // The previous implementation sliced the leading 19 chars and
+    // called `assume_utc()`, so `2026-05-17T13:00:00-08:00` was
+    // misread as `2026-05-17T13:00:00Z` — eight hours off.
+    #[test]
+    fn parse_iso_honors_timezone_offset() {
+        let pst = "2026-05-17T13:00:00-08:00";
+        let utc = "2026-05-17T21:00:00Z";
+        let pst_ts = super::parse_iso(pst).expect("pst parses");
+        let utc_ts = super::parse_iso(utc).expect("utc parses");
+        assert_eq!(
+            pst_ts, utc_ts,
+            "RFC 3339 offset must be applied: PST 13:00 == UTC 21:00"
+        );
+    }
+
+    // Subsecond precision (`...000000Z`) and the `+00:00` synonym for
+    // UTC must also parse.
+    #[test]
+    fn parse_iso_handles_subsecond_and_plus_zero_offsets() {
+        let with_subsec = "2026-05-17T13:00:00.123456789Z";
+        let with_plus_zero = "2026-05-17T13:00:00+00:00";
+        let plain_z = "2026-05-17T13:00:00Z";
+        let a = super::parse_iso(with_subsec).expect("subsec parses");
+        let b = super::parse_iso(with_plus_zero).expect("plus zero parses");
+        let c = super::parse_iso(plain_z).expect("plain z parses");
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    // Garbage / truncated input still falls back to None.
+    #[test]
+    fn parse_iso_rejects_invalid_input() {
+        assert!(super::parse_iso("not a date").is_none());
+        assert!(super::parse_iso("2026-05-17").is_none());
+        assert!(super::parse_iso("").is_none());
     }
 }
