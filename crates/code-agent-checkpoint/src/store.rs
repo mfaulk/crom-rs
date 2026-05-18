@@ -159,8 +159,14 @@ pub struct LocalCheckpointStore {
     /// (read-modify-write), and `delete_checkpoint` (read-modify-write).
     /// Without this lock, a refresh after capture could clobber a newly
     /// appended entry.
+    /// Entries are `Weak<Mutex<()>>` so the map does not pin a lock
+    /// forever after the caller drops its `Arc`. `lock_for_weak` upgrades
+    /// an existing live entry or, on the cold (insert) path, sweeps all
+    /// dead entries before inserting a fresh `Arc`. Without this the
+    /// map grew without bound — one entry per distinct session for the
+    /// process lifetime.
     index_locks: tokio::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
     >,
     /// Per-(session, checkpoint) async mutexes that serialize manifest
     /// read-modify-writes inside `capture_before_tool`. Without this,
@@ -168,8 +174,10 @@ pub struct LocalCheckpointStore {
     /// read the manifest, each extend their own copy, and the second
     /// writer overwrites the first writer's `files_tracked` entries.
     /// Keyed by "<session_id>/<checkpoint_id>".
+    ///
+    /// Stored as `Weak` for the same reason as `index_locks`.
     manifest_locks: tokio::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
     >,
     /// Cached per-session total blob bytes, populated lazily so
     /// `capture_one_path` doesn't have to re-scan the blobs directory on
@@ -205,9 +213,7 @@ impl LocalCheckpointStore {
         session_id: &SessionId,
     ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         let mut g = self.index_locks.lock().await;
-        g.entry(session_id.to_string())
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        lock_for_weak(&mut g, session_id.to_string())
     }
 
     /// Returns (and lazily creates) the per-(session, checkpoint) manifest
@@ -221,9 +227,7 @@ impl LocalCheckpointStore {
     ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         let key = format!("{}/{}", session_id, checkpoint_id);
         let mut g = self.manifest_locks.lock().await;
-        g.entry(key)
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        lock_for_weak(&mut g, key)
     }
 
     pub fn root(&self) -> &Path {
@@ -977,6 +981,30 @@ impl LocalCheckpointStore {
         }
         Ok(())
     }
+}
+
+/// Look up (or insert) a `Weak`-stored mutex by key, upgrading the existing
+/// entry when it is still alive and replacing it with a fresh `Arc` when
+/// the previous holders have all dropped. On insert (the cold path) the
+/// caller sweeps dead entries so the map cannot grow without bound. The
+/// high-water mark of the map therefore tracks the *concurrent* distinct
+/// keys, not the total ever seen.
+fn lock_for_weak(
+    map: &mut std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    key: String,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    if let Some(weak) = map.get(&key) {
+        if let Some(arc) = weak.upgrade() {
+            return arc;
+        }
+    }
+    // Cold path: we're about to insert. Sweep dead entries first so a
+    // long-running host doesn't leak weak handles for sessions that have
+    // come and gone since the last insert.
+    map.retain(|_, w| w.strong_count() > 0);
+    let arc = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    map.insert(key, std::sync::Arc::downgrade(&arc));
+    arc
 }
 
 fn validate_session_id(session_id: &SessionId) -> Result<(), CheckpointError> {
@@ -1786,5 +1814,114 @@ mod tests {
             !orphan_path.exists(),
             "orphan manifest must be swept when the last index entry is deleted (#165)"
         );
+    }
+
+    /// `index_locks` and `manifest_locks` must not grow without bound as
+    /// distinct sessions/checkpoints come and go. After the per-call
+    /// `Arc` is dropped, the `Weak` entry stays alive only until the
+    /// next insert sweeps it.
+    #[tokio::test]
+    async fn lock_tables_do_not_grow_unboundedly() {
+        let (_dir, store, _initial_sid) = fresh_store();
+        // Run a bunch of distinct sessions, each acquiring then dropping
+        // its lock. With the old `Arc` map this would push the size
+        // monotonically. With `Weak` + cold-path sweep, the high-water
+        // mark is bounded by concurrency (= 1 here).
+        for _ in 0..100 {
+            let sid = SessionId::new();
+            let _lock = store.index_lock_for(&sid).await;
+            // `_lock` drops at end of iteration.
+        }
+        // One more acquisition triggers a sweep on insert; the map
+        // should contain at most one live entry (this one).
+        let final_sid = SessionId::new();
+        let _final_lock = store.index_lock_for(&final_sid).await;
+        let g = store.index_locks.lock().await;
+        assert!(
+            g.len() <= 1,
+            "index_locks leaked: {} entries after 100 distinct sessions",
+            g.len()
+        );
+    }
+
+    /// `manifest_lock_for` has the same growth behavior — different keys
+    /// (session/checkpoint pairs) reach the same sweep path.
+    #[tokio::test]
+    async fn manifest_lock_table_does_not_grow_unboundedly() {
+        let (_dir, store, _initial_sid) = fresh_store();
+        for _ in 0..100 {
+            let sid = SessionId::new();
+            let cid = CheckpointId::new();
+            let _lock = store.manifest_lock_for(&sid, &cid).await;
+        }
+        let sid = SessionId::new();
+        let cid = CheckpointId::new();
+        let _final_lock = store.manifest_lock_for(&sid, &cid).await;
+        let g = store.manifest_locks.lock().await;
+        assert!(
+            g.len() <= 1,
+            "manifest_locks leaked: {} entries after 100 distinct keys",
+            g.len()
+        );
+    }
+
+    /// Repeated lookups for the *same* key while the first `Arc` is
+    /// still alive must return the same instance — the upgrade path
+    /// returns the live mutex rather than minting a fresh one (which
+    /// would defeat serialization).
+    #[tokio::test]
+    async fn repeated_lookups_share_the_same_arc() {
+        let (_dir, store, sid) = fresh_store();
+        let a = store.index_lock_for(&sid).await;
+        let b = store.index_lock_for(&sid).await;
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+    }
+
+    /// Pathological daemon shape: one long-lived session holds its lock
+    /// while many transient sessions churn through. The anchor must
+    /// survive every sweep and the transients must be pruned, leaving
+    /// the final map at ~ {anchor, last-transient}.
+    #[tokio::test]
+    async fn anchored_live_key_survives_transient_churn() {
+        let (_dir, store, anchor_sid) = fresh_store();
+        let anchor = store.index_lock_for(&anchor_sid).await;
+        for _ in 0..100 {
+            let sid = SessionId::new();
+            let _t = store.index_lock_for(&sid).await;
+        }
+        let final_sid = SessionId::new();
+        let _final = store.index_lock_for(&final_sid).await;
+        let g = store.index_locks.lock().await;
+        assert!(
+            g.len() <= 2,
+            "anchor+1 expected, got {} entries after 100 transients",
+            g.len()
+        );
+        drop(g);
+        // Anchor is still alive — re-lookup must return the same Arc.
+        let anchor_again = store.index_lock_for(&anchor_sid).await;
+        assert!(std::sync::Arc::ptr_eq(&anchor, &anchor_again));
+    }
+
+    /// Same anchored-churn pattern for the manifest lock map.
+    #[tokio::test]
+    async fn anchored_manifest_lock_survives_churn() {
+        let (_dir, store, anchor_sid) = fresh_store();
+        let anchor_cid = CheckpointId::new();
+        let anchor = store.manifest_lock_for(&anchor_sid, &anchor_cid).await;
+        for _ in 0..100 {
+            let sid = SessionId::new();
+            let cid = CheckpointId::new();
+            let _t = store.manifest_lock_for(&sid, &cid).await;
+        }
+        let g = store.manifest_locks.lock().await;
+        assert!(
+            g.len() <= 2,
+            "anchor+1 expected, got {} entries after 100 transients",
+            g.len()
+        );
+        drop(g);
+        let anchor_again = store.manifest_lock_for(&anchor_sid, &anchor_cid).await;
+        assert!(std::sync::Arc::ptr_eq(&anchor, &anchor_again));
     }
 }
