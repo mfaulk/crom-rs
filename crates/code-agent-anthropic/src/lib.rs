@@ -516,6 +516,25 @@ where
                 }
             }
         }
+        // Stream ended. If we still have pending tool_use blocks
+        // (content_block_start observed but no matching content_block_stop),
+        // the model's response was truncated mid-stream. Pre-fix, the
+        // `pending` map was dropped silently and the agent loop hung
+        // waiting for a tool result that never arrived (#170). Surface
+        // a structured `ProviderError::Stream` so the caller can retry
+        // — preferred over best-effort parsing of `partial_json`
+        // because the upstream input may be syntactically incomplete
+        // (mid-object, mid-string, mid-escape).
+        if !pending.is_empty() {
+            let names: Vec<String> = pending.values().map(|p| p.name.clone()).collect();
+            let _ = tx
+                .send(Err(ProviderError::Stream(format!(
+                    "tool_use truncated mid-stream ({} pending: {})",
+                    pending.len(),
+                    names.join(", ")
+                ))))
+                .await;
+        }
     });
 
     ReceiverStream::new(rx)
@@ -622,5 +641,118 @@ mod tests {
         assert_eq!(body["tool_search"]["type"], "bm25");
         assert_eq!(body["tools"].as_array().unwrap().len(), 2);
         assert_eq!(body["tools"][1]["deferred"], true);
+    }
+
+    // Regression for #170: a truncated SSE stream that started a
+    // `tool_use` block but never reached `content_block_stop` must
+    // surface a `ProviderError::Stream` so the agent loop can retry.
+    // Pre-fix the `pending` map was dropped silently and the
+    // downstream loop hung waiting for a `ToolCall` event that never
+    // arrived.
+    #[tokio::test]
+    async fn truncated_tool_use_stream_emits_error() {
+        use eventsource_stream::Event;
+        use futures::stream::StreamExt;
+
+        fn ev(data: &str) -> Result<Event, ProviderError> {
+            Ok(Event {
+                event: String::new(),
+                data: data.to_string(),
+                id: String::new(),
+                retry: None,
+            })
+        }
+
+        // MessageStart, then ContentBlockStart for a tool_use, then a
+        // partial InputJsonDelta, then EOF — no ContentBlockStop, no
+        // MessageStop, no error.
+        let events = vec![
+            ev(
+                r#"{"type":"message_start","message":{"id":"m1","model":"x","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            ),
+            ev(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}"#,
+            ),
+            ev(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"foo"}}"#,
+            ),
+        ];
+        let stream = futures::stream::iter(events);
+        let mut out = parse_sse(stream).boxed();
+
+        let mut saw_error = false;
+        let mut saw_tool_call = false;
+        while let Some(item) = out.next().await {
+            match item {
+                Err(ProviderError::Stream(msg)) => {
+                    assert!(
+                        msg.contains("tool_use truncated"),
+                        "unexpected error message: {msg}"
+                    );
+                    saw_error = true;
+                }
+                Ok(ModelEvent::ToolCall(_)) => saw_tool_call = true,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_error,
+            "truncated tool_use stream must surface ProviderError::Stream (#170)"
+        );
+        assert!(
+            !saw_tool_call,
+            "no ToolCall should be emitted from a truncated stream"
+        );
+    }
+
+    // A clean stream that reaches `content_block_stop` for the
+    // tool_use is unaffected by the fix — no synthetic error.
+    #[tokio::test]
+    async fn complete_tool_use_stream_does_not_synthesize_error() {
+        use eventsource_stream::Event;
+        use futures::stream::StreamExt;
+
+        fn ev(data: &str) -> Result<Event, ProviderError> {
+            Ok(Event {
+                event: String::new(),
+                data: data.to_string(),
+                id: String::new(),
+                retry: None,
+            })
+        }
+        let events = vec![
+            ev(
+                r#"{"type":"message_start","message":{"id":"m1","model":"x","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            ),
+            ev(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}"#,
+            ),
+            ev(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"foo\"}"}}"#,
+            ),
+            ev(r#"{"type":"content_block_stop","index":0}"#),
+            ev(
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":0,"output_tokens":4}}"#,
+            ),
+        ];
+        let stream = futures::stream::iter(events);
+        let mut out = parse_sse(stream).boxed();
+        let mut saw_tool_call = false;
+        let mut saw_error = false;
+        while let Some(item) = out.next().await {
+            match item {
+                Ok(ModelEvent::ToolCall(tc)) => {
+                    assert_eq!(tc.name, "Read");
+                    saw_tool_call = true;
+                }
+                Err(_) => saw_error = true,
+                _ => {}
+            }
+        }
+        assert!(saw_tool_call, "tool call should be emitted on clean stream");
+        assert!(
+            !saw_error,
+            "no synthetic error for a complete stream (#170 regression)"
+        );
     }
 }
