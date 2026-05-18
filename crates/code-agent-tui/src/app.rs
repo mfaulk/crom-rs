@@ -279,20 +279,29 @@ impl TuiApp {
                         let _ = resolver.send(sdk_decision);
                     }
                 }
+                // Plan decisions are not yet wired through `AgentRuntime`:
+                // the SDK has no `PlanDecisionCallback` / `approve_plan` API
+                // for the TUI to call. We surface the keypress as an
+                // activity-log line and prefix it `[preview]` so the
+                // operator can see the UI is reading the keys but not
+                // blocking the run. See #146 for the followup that adds
+                // a real callback.
                 TuiAction::ApprovePlan(plan_id) => {
-                    self.state
-                        .push_activity(format!("approve plan: {}", plan_id.as_str()));
+                    self.state.push_activity(format!(
+                        "[preview] approve plan: {} (no SDK callback yet)",
+                        plan_id.as_str()
+                    ));
                 }
                 TuiAction::RejectPlan { plan_id, reason } => {
                     self.state.push_activity(format!(
-                        "reject plan: {} ({})",
+                        "[preview] reject plan: {} ({}) (no SDK callback yet)",
                         plan_id.as_str(),
                         reason.as_deref().unwrap_or("no reason")
                     ));
                 }
                 TuiAction::RevisePlan { plan_id, hint } => {
                     self.state.push_activity(format!(
-                        "revise plan: {} ({})",
+                        "[preview] revise plan: {} ({}) (no SDK callback yet)",
                         plan_id.as_str(),
                         if hint.is_empty() { "<no hint>" } else { &hint }
                     ));

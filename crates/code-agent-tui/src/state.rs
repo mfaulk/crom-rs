@@ -1339,17 +1339,25 @@ impl TuiAppState {
         match ev {
             SdkEvent::PlanCreated(p) => {
                 self.current_plan = Some(p.plan.clone());
-                // Route the plan dashboard into view and offer an
-                // approval modal so the user can act on it.
+                // Route the plan dashboard into view and surface an
+                // informational modal. The SDK does not yet expose a
+                // plan-decision callback, so the a/r/u keys only emit
+                // an activity log line — they cannot actually block,
+                // reject, or revise the plan. Label the keys "preview"
+                // so the UI does not lie about its effect (#146).
                 self.layout.side_panel.mode = SidePanelMode::Plan;
                 self.layout.side_panel.visible = true;
                 self.layout.push_modal(TuiModal::Custom {
                     id: PLAN_APPROVAL_MODAL_ID.to_string(),
-                    title: "Plan ready for approval".to_string(),
+                    title: "Plan ready for review".to_string(),
                     body: vec![
                         format!("Plan: {}", p.plan.title.clone()),
                         String::new(),
-                        "  [a] approve  [r] reject  [u] revise".to_string(),
+                        "  (informational — plan approval is not yet wired to the SDK;".to_string(),
+                        "   the run will continue regardless of the key pressed)".to_string(),
+                        String::new(),
+                        "  [a] approve (preview)  [r] reject (preview)  [u] revise (preview)"
+                            .to_string(),
                     ],
                 });
             }
@@ -3027,5 +3035,42 @@ mod tests {
         assert_eq!(s.transcript.len(), TRANSCRIPT_CAP);
         // Oldest cards (0..10) were dropped.
         assert_eq!(s.transcript.first().unwrap().headline, "10");
+    }
+
+    // The plan-approval modal pushed on `SdkEvent::PlanCreated` must
+    // tell the operator that pressing a/r/u is informational only —
+    // the SDK has no plan-decision callback yet (#146), so the run
+    // continues regardless of which key the operator presses.
+    #[test]
+    fn plan_approval_modal_carries_informational_disclaimer() {
+        use code_agent_core::plan::{new_plan_id, PlanDocument};
+        use code_agent_sdk::event::PlanCreated;
+
+        let mut s = fresh_state();
+        let plan = PlanDocument::new_draft(new_plan_id(), "demo", "u");
+        s.apply(TuiInbound::sdk(SdkEvent::PlanCreated(PlanCreated {
+            run_id: rid(),
+            plan,
+        })));
+
+        let modal = s
+            .layout
+            .current_modal()
+            .expect("plan-approval modal should be open");
+        let body = match modal {
+            TuiModal::Custom { id, body, .. } => {
+                assert_eq!(id, PLAN_APPROVAL_MODAL_ID);
+                body.clone()
+            }
+            other => panic!("expected Custom modal, got {other:?}"),
+        };
+        assert!(
+            body.iter().any(|l| l.contains("informational")),
+            "modal must label itself informational, got: {body:?}"
+        );
+        assert!(
+            body.iter().any(|l| l.contains("(preview)")),
+            "keys must be labelled preview, got: {body:?}"
+        );
     }
 }

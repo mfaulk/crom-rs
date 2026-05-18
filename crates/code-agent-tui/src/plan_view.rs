@@ -170,7 +170,17 @@ pub fn format_plan_approval_modal(plan: &PlanDocument) -> Vec<String> {
         }
     }
     out.push(String::new());
-    out.push("  [a] approve  [r] revise  [e] edit  [n] reject  [x] export  [?] help".into());
+    // SDK does not yet expose a plan-decision callback that the TUI can
+    // call (#146). Until it does, the keys read but cannot block the
+    // run — say so explicitly so the modal does not mislead operators.
+    out.push(
+        "  (informational — plan approval is not yet wired to the SDK; the run will continue)"
+            .into(),
+    );
+    out.push(
+        "  [a] approve (preview)  [r] revise (preview)  [e] edit (preview)  [n] reject (preview)  [x] export  [?] help"
+            .into(),
+    );
     out
 }
 
@@ -302,11 +312,16 @@ mod tests {
     }
 
     #[test]
-    // Approval modal renders the menu.
+    // Approval modal renders the menu and warns that the keys are not
+    // yet wired through to the SDK (issue #146 honest-UX fix).
     fn approval_modal_has_menu() {
         let p = small_plan();
         let lines = format_plan_approval_modal(&p);
-        assert!(lines.iter().any(|l| l.contains("[a] approve")));
+        assert!(lines.iter().any(|l| l.contains("[a] approve (preview)")));
+        assert!(
+            lines.iter().any(|l| l.contains("not yet wired to the SDK")),
+            "expected SDK-not-wired disclaimer, got: {lines:?}"
+        );
     }
 
     #[test]
