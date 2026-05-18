@@ -117,6 +117,14 @@ impl ModelProvider for OpenAiProvider {
         // Retry on 408 / 429 / 5xx with exponential backoff, mirroring the
         // Anthropic provider. Without this a single transient rate-limit
         // kills the turn even though the request would succeed on retry.
+        //
+        // Scope: we retry status-shaped failures only. Network-shaped
+        // failures (connect timeout, body-read error) come back through
+        // the trait as `ProviderError::Http` without retryable structure,
+        // so they propagate immediately — matching pre-fix behavior. A
+        // follow-up could distinguish them by extending the transport
+        // error type or moving retry into the reqwest backend, where
+        // `reqwest::Error::{is_timeout,is_connect}` is still available.
         let mut attempt: u32 = 0;
         let resp = loop {
             let r = self.transport.post_chat(&url, &key, &body).await?;
@@ -144,17 +152,16 @@ fn is_retryable_status(status: u16) -> bool {
     status == 408 || status == 429 || (500..=599).contains(&status)
 }
 
+/// 250ms * 2^attempt, capped at 30s. Pure: split out from `backoff` so
+/// tests can advance virtual time deterministically with
+/// `tokio::time::pause`, matching the Anthropic provider's curve.
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    let ms = 250u64.saturating_mul(1u64 << attempt.min(7)).min(30_000);
+    std::time::Duration::from_millis(ms)
+}
+
 async fn backoff(attempt: u32) {
-    // 250ms * 2^attempt, capped to 30s. Matches the Anthropic provider's
-    // pattern. Test builds skip the sleep to keep retry tests fast.
-    #[cfg(test)]
-    let _ = attempt;
-    #[cfg(not(test))]
-    {
-        use std::time::Duration;
-        let ms = 250u64.saturating_mul(1u64 << attempt.min(7)).min(30_000);
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-    }
+    tokio::time::sleep(retry_delay(attempt)).await;
 }
 
 fn require_api_key(cred: &ResolvedCredential) -> Result<SecretString, ProviderError> {
@@ -684,6 +691,20 @@ mod tests {
         assert!(!s.contains("\"type\":\"tool_result\""));
     }
 
+    /// The `retry_delay` curve is exactly `250ms * 2^attempt`, capped
+    /// at 30s. This locks in the schedule independently of any test
+    /// that exercises `stream_turn` under paused time.
+    #[test]
+    fn retry_delay_curve_matches_anthropic() {
+        use std::time::Duration;
+        assert_eq!(retry_delay(0), Duration::from_millis(250));
+        assert_eq!(retry_delay(1), Duration::from_millis(500));
+        assert_eq!(retry_delay(2), Duration::from_millis(1_000));
+        assert_eq!(retry_delay(3), Duration::from_millis(2_000));
+        // Cap kicks in at ~30s.
+        assert_eq!(retry_delay(20), Duration::from_millis(30_000));
+    }
+
     fn req(model: &str) -> ModelRequest {
         ModelRequest {
             model: model.into(),
@@ -699,7 +720,7 @@ mod tests {
     /// A transient 429 is retried and the eventual 200 succeeds. Matches
     /// the Anthropic provider's behavior; the OpenAI variant previously
     /// converted the 429 directly into a fatal turn error.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stream_turn_retries_on_429_then_succeeds() {
         let transport = Arc::new(MockTransport::default());
         transport.chat_queue.lock().unwrap().extend(vec![
@@ -734,7 +755,7 @@ mod tests {
     }
 
     /// 5xx server errors are retryable too.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stream_turn_retries_on_503_then_succeeds() {
         let transport = Arc::new(MockTransport::default());
         transport.chat_queue.lock().unwrap().extend(vec![
@@ -789,7 +810,7 @@ mod tests {
     }
 
     /// After `max_retries` retryable failures, the last error is surfaced.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stream_turn_gives_up_after_max_retries() {
         let transport = Arc::new(MockTransport::default());
         for _ in 0..6 {
