@@ -329,3 +329,43 @@ async fn bash_timeout_reaps_grandchildren() {
         "grandchild pid {pid} still alive after Bash timeout"
     );
 }
+
+#[tokio::test]
+// End-to-end regression for #142: a command that interpolates a real
+// secret value (no env-var-name needle in the surrounding text) must
+// have the value scrubbed from the `command_redacted` metadata field
+// before it is persisted to audit / telemetry surfaces.
+//
+// This exercises the production code path
+// `BashTool::execute -> redact -> metadata["command_redacted"]` rather
+// than the private `redact` helper directly, so a future regression
+// where `execute` stops calling `redact` would be caught here.
+async fn bash_metadata_command_redacted_scrubs_no_needle_secret() {
+    let dir = TempDir::new().unwrap();
+    let tool = BashTool::new(Arc::new(ToolLimits::default()));
+    // `echo` is a builtin; the command runs cleanly. The Bearer token
+    // shape is the canonical #142 example: it contains none of the
+    // env-var-name needles (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`,
+    // `PASSWD`, `ACCESS`, `PRIVATE`) anywhere in the surrounding text,
+    // so only the token-shape redactor in `redact_secrets_in_str` can
+    // save us.
+    let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAA";
+    let cmd = format!("echo {} >/dev/null", secret);
+    let res = tool
+        .execute(json!({"command": cmd}), ctx_for(&dir))
+        .await
+        .unwrap();
+    let redacted = res
+        .metadata
+        .get("command_redacted")
+        .and_then(|v| v.as_str())
+        .expect("command_redacted metadata must be present");
+    assert!(
+        !redacted.contains(secret),
+        "raw secret leaked through command_redacted: {redacted}"
+    );
+    assert!(
+        redacted.contains("[REDACTED]"),
+        "expected [REDACTED] marker in: {redacted}"
+    );
+}
