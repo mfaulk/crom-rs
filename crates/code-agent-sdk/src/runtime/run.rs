@@ -1399,7 +1399,8 @@ mod snapshot_tests {
 
     // AbortOnDrop must abort the spawned task when the guard is dropped,
     // so a leaked deadline watcher doesn't outlive its enclosing
-    // execute_request call. (#164)
+    // execute_request call. (#164) Asserts via JoinError::is_cancelled
+    // so the join reason is pinned to cancellation, not merely "finished".
     #[tokio::test]
     async fn abort_on_drop_aborts_pinned_task() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1417,14 +1418,12 @@ mod snapshot_tests {
             let _guard = AbortOnDrop(abort_handle);
             // Guard drops here.
         }
-        // Yield to let the abort propagate.
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-            if handle.is_finished() {
-                break;
-            }
-        }
-        assert!(handle.is_finished(), "guard did not abort the task");
+        // Awaiting the handle should resolve with a cancelled JoinError.
+        let join_err = handle.await.expect_err("task should be cancelled, not Ok");
+        assert!(
+            join_err.is_cancelled(),
+            "join reason was not cancellation: {join_err:?}"
+        );
         assert!(
             !woke.load(Ordering::SeqCst),
             "task body ran past abort point"
