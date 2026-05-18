@@ -287,23 +287,24 @@ impl TuiApp {
                 // blocking the run. See #146 for the followup that adds
                 // a real callback.
                 TuiAction::ApprovePlan(plan_id) => {
-                    self.state.push_activity(format!(
-                        "[preview] approve plan: {} (no SDK callback yet)",
-                        plan_id.as_str()
+                    self.state.push_activity(format_plan_preview_log(
+                        "approve",
+                        plan_id.as_str(),
+                        None,
                     ));
                 }
                 TuiAction::RejectPlan { plan_id, reason } => {
-                    self.state.push_activity(format!(
-                        "[preview] reject plan: {} ({}) (no SDK callback yet)",
+                    self.state.push_activity(format_plan_preview_log(
+                        "reject",
                         plan_id.as_str(),
-                        reason.as_deref().unwrap_or("no reason")
+                        Some(reason.as_deref().unwrap_or("no reason")),
                     ));
                 }
                 TuiAction::RevisePlan { plan_id, hint } => {
-                    self.state.push_activity(format!(
-                        "[preview] revise plan: {} ({}) (no SDK callback yet)",
+                    self.state.push_activity(format_plan_preview_log(
+                        "revise",
                         plan_id.as_str(),
-                        if hint.is_empty() { "<no hint>" } else { &hint }
+                        Some(if hint.is_empty() { "<no hint>" } else { &hint }),
                     ));
                 }
             }
@@ -314,6 +315,21 @@ impl TuiApp {
         let frame = crate::view::build_ui_frame(&self.state, &self.footer);
         draw(terminal, frame)?;
         Ok(())
+    }
+}
+
+/// Render the activity-log line for a (currently-no-op) plan decision.
+///
+/// Until the SDK exposes a `PlanDecisionCallback` (#146), the TUI's
+/// approve/reject/revise keys cannot block the run. The activity log
+/// line is the only operator-visible signal that their keypress was
+/// observed at all, so it must be prefixed `[preview]` and tagged
+/// `(no SDK callback yet)` so the operator cannot mistake it for a
+/// real effect.
+fn format_plan_preview_log(action: &str, plan_id: &str, detail: Option<&str>) -> String {
+    match detail {
+        Some(d) => format!("[preview] {action} plan: {plan_id} ({d}) (no SDK callback yet)"),
+        None => format!("[preview] {action} plan: {plan_id} (no SDK callback yet)"),
     }
 }
 
@@ -556,4 +572,29 @@ pub async fn drive_single_prompt(
     state.apply(TuiInbound::RunStreamEnded);
     let _ = run.final_result().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The plan-preview log line MUST advertise itself as preview-only
+    // and call out the missing SDK callback. A future edit that drops
+    // either signal would lie about a real effect to the operator (#146).
+    #[test]
+    fn plan_preview_log_advertises_preview_and_missing_callback() {
+        let approve = format_plan_preview_log("approve", "plan_abc", None);
+        assert!(
+            approve.starts_with("[preview] approve plan: plan_abc"),
+            "got: {approve}"
+        );
+        assert!(approve.contains("no SDK callback yet"), "got: {approve}");
+
+        let reject = format_plan_preview_log("reject", "plan_abc", Some("not now"));
+        assert!(
+            reject.starts_with("[preview] reject plan: plan_abc (not now)"),
+            "got: {reject}"
+        );
+        assert!(reject.contains("no SDK callback yet"), "got: {reject}");
+    }
 }
