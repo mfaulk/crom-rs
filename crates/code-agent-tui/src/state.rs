@@ -1345,6 +1345,8 @@ impl TuiAppState {
                 // an activity log line — they cannot actually block,
                 // reject, or revise the plan. Label the keys "preview"
                 // so the UI does not lie about its effect (#146).
+                // Each body line is kept under 80 columns so the modal
+                // renders cleanly on a default terminal.
                 self.layout.side_panel.mode = SidePanelMode::Plan;
                 self.layout.side_panel.visible = true;
                 self.layout.push_modal(TuiModal::Custom {
@@ -1353,11 +1355,11 @@ impl TuiAppState {
                     body: vec![
                         format!("Plan: {}", p.plan.title.clone()),
                         String::new(),
-                        "  (informational — plan approval is not yet wired to the SDK;".to_string(),
-                        "   the run will continue regardless of the key pressed)".to_string(),
+                        "  (informational: plan approval is not yet wired to the SDK;".to_string(),
+                        "   the run will continue regardless of which key is pressed)".to_string(),
                         String::new(),
-                        "  [a] approve (preview)  [r] reject (preview)  [u] revise (preview)"
-                            .to_string(),
+                        "  * = preview only".to_string(),
+                        "  [a] approve*  [r] reject*  [u] revise*".to_string(),
                     ],
                 });
             }
@@ -3069,8 +3071,22 @@ mod tests {
             "modal must label itself informational, got: {body:?}"
         );
         assert!(
-            body.iter().any(|l| l.contains("(preview)")),
-            "keys must be labelled preview, got: {body:?}"
+            body.iter().any(|l| l.contains("preview only")),
+            "modal must explain `*` legend, got: {body:?}"
         );
+        assert!(
+            body.iter()
+                .any(|l| l.contains("[a] approve*") && l.contains("[r] reject*")),
+            "keys must be suffixed `*` to indicate preview, got: {body:?}"
+        );
+        // Each body line must fit a default 80-col terminal so the
+        // modal does not wrap or truncate (review feedback).
+        for line in &body {
+            assert!(
+                line.chars().count() <= 80,
+                "body line exceeds 80 columns ({} chars): {line}",
+                line.chars().count()
+            );
+        }
     }
 }

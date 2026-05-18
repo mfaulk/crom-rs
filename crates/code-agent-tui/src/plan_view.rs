@@ -173,14 +173,12 @@ pub fn format_plan_approval_modal(plan: &PlanDocument) -> Vec<String> {
     // SDK does not yet expose a plan-decision callback that the TUI can
     // call (#146). Until it does, the keys read but cannot block the
     // run — say so explicitly so the modal does not mislead operators.
-    out.push(
-        "  (informational — plan approval is not yet wired to the SDK; the run will continue)"
-            .into(),
-    );
-    out.push(
-        "  [a] approve (preview)  [r] revise (preview)  [e] edit (preview)  [n] reject (preview)  [x] export  [?] help"
-            .into(),
-    );
+    // Keep each line under 80 columns so the modal renders on a default
+    // terminal without wrapping (review feedback).
+    out.push("  (informational: plan approval is not yet wired to the SDK;".into());
+    out.push("   the run will continue regardless of which key is pressed)".into());
+    out.push("  * = preview only".into());
+    out.push("  [a] approve*  [r] revise*  [e] edit*  [n] reject*  [x] export  [?] help".into());
     out
 }
 
@@ -313,15 +311,24 @@ mod tests {
 
     #[test]
     // Approval modal renders the menu and warns that the keys are not
-    // yet wired through to the SDK (issue #146 honest-UX fix).
+    // yet wired through to the SDK (issue #146 honest-UX fix). Each
+    // line also fits a default 80-col terminal.
     fn approval_modal_has_menu() {
         let p = small_plan();
         let lines = format_plan_approval_modal(&p);
-        assert!(lines.iter().any(|l| l.contains("[a] approve (preview)")));
+        assert!(lines.iter().any(|l| l.contains("[a] approve*")));
+        assert!(lines.iter().any(|l| l.contains("preview only")));
         assert!(
             lines.iter().any(|l| l.contains("not yet wired to the SDK")),
             "expected SDK-not-wired disclaimer, got: {lines:?}"
         );
+        for l in &lines {
+            assert!(
+                l.chars().count() <= 80,
+                "line exceeds 80 columns ({} chars): {l}",
+                l.chars().count()
+            );
+        }
     }
 
     #[test]
