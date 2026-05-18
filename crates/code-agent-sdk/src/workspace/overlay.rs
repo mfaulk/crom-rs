@@ -88,15 +88,26 @@ impl Workspace for OverlayWorkspace {
             match f {
                 FilePatch::Create { path, content, .. } => {
                     // Mirror InMemoryWorkspace: Create must target a path that
-                    // is not visible in the merged (base + overlay) view.
-                    let exists = match overlay.get(path) {
-                        Some(Some(_)) => true,
-                        Some(None) => false, // tombstoned — Create is allowed
+                    // is not visible in the merged (base + overlay) view. Hold
+                    // the write lock across `base.read_file().await` for
+                    // linearizability with other overlay mutators; the await
+                    // does not block the executor.
+                    let base_lookup = match overlay.get(path) {
+                        Some(Some(_)) => Ok(true),
+                        Some(None) => Ok(false), // tombstoned — Create is allowed
                         None => match self.base.read_file(path).await {
-                            Ok(_) => true,
-                            Err(e) if e.code == "workspace.not_found" => false,
-                            Err(e) => return Err(e),
+                            Ok(_) => Ok(true),
+                            Err(e) if e.code == "workspace.not_found" => Ok(false),
+                            Err(e) => Err(e),
                         },
+                    };
+                    let exists = match base_lookup {
+                        Ok(v) => v,
+                        Err(e) => {
+                            report.failures.push(e);
+                            report.files_skipped += 1;
+                            continue;
+                        }
                     };
                     if exists {
                         report.failures.push(
@@ -123,14 +134,22 @@ impl Workspace for OverlayWorkspace {
                     // not silently overwrite. None overlay entry → consult
                     // base. None base → not_found.
                     if let Some(expected) = old_content_hash {
-                        let current = match overlay.get(path) {
-                            Some(Some(bytes)) => Some(bytes.clone()),
-                            Some(None) => None, // tombstoned
+                        let lookup = match overlay.get(path) {
+                            Some(Some(bytes)) => Ok(Some(bytes.clone())),
+                            Some(None) => Ok(None), // tombstoned
                             None => match self.base.read_file(path).await {
-                                Ok(c) => Some(c.bytes),
-                                Err(e) if e.code == "workspace.not_found" => None,
-                                Err(e) => return Err(e),
+                                Ok(c) => Ok(Some(c.bytes)),
+                                Err(e) if e.code == "workspace.not_found" => Ok(None),
+                                Err(e) => Err(e),
                             },
+                        };
+                        let current = match lookup {
+                            Ok(v) => v,
+                            Err(e) => {
+                                report.failures.push(e);
+                                report.files_skipped += 1;
+                                continue;
+                            }
                         };
                         match current {
                             Some(existing) => {
@@ -376,6 +395,28 @@ mod tests {
         let report = ws.apply_patch(&patch).await.unwrap();
         assert_eq!(report.files_skipped, 1);
         assert_eq!(report.failures[0].code, "workspace.not_found");
+    }
+
+    /// Modify on a path the overlay has tombstoned still fails as not_found
+    /// even when base has the file (the merged view says "deleted").
+    #[tokio::test]
+    async fn apply_patch_modify_tombstoned_path_fails_not_found() {
+        let base =
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"keep".to_vec())]).unwrap());
+        let ws = OverlayWorkspace::new(base.clone());
+        let p = WorkspacePath::new("a.txt").unwrap();
+        ws.delete_file(&p).await.unwrap();
+        let hash = compute_hash(b"keep");
+        let patch = PatchSet::from_files(vec![modify(p.clone(), b"new", Some(hash))]);
+        let report = ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(report.files_changed, 0);
+        assert_eq!(report.files_skipped, 1);
+        assert_eq!(report.failures[0].code, "workspace.not_found");
+        // Tombstone is unchanged.
+        assert_eq!(
+            ws.read_file(&p).await.unwrap_err().code,
+            "workspace.not_found"
+        );
     }
 
     /// Modify without an old_content_hash skips the hash check (existing
