@@ -48,12 +48,17 @@ pub struct TransportResponse {
 #[derive(Debug, Clone)]
 pub struct OpenAiConfig {
     pub base_url: String,
+    /// Maximum number of retry *attempts* on 408 / 429 / 5xx responses,
+    /// matching the Anthropic provider. Total request attempts = 1 +
+    /// max_retries. Defaults to 3.
+    pub max_retries: u32,
 }
 
 impl Default for OpenAiConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE.into(),
+            max_retries: 3,
         }
     }
 }
@@ -107,18 +112,56 @@ impl ModelProvider for OpenAiProvider {
         let url = format!("{}/v1/chat/completions", self.cfg.base_url);
         let body = serde_json::to_string(&build_body(&request))
             .map_err(|e| ProviderError::Other(format!("encode body: {e}")))?;
-        let resp = self.transport.post_chat(&url, &key, &body).await?;
-        if resp.status < 200 || resp.status >= 300 {
-            return Err(ProviderError::Http(format!(
-                "openai: status {}: {}",
-                resp.status, resp.body
-            )));
-        }
+        let max_retries = self.cfg.max_retries;
+
+        // Retry on 408 / 429 / 5xx with exponential backoff, mirroring the
+        // Anthropic provider. Without this a single transient rate-limit
+        // kills the turn even though the request would succeed on retry.
+        //
+        // Scope: we retry status-shaped failures only. Network-shaped
+        // failures (connect timeout, body-read error) come back through
+        // the trait as `ProviderError::Http` without retryable structure,
+        // so they propagate immediately — matching pre-fix behavior. A
+        // follow-up could distinguish them by extending the transport
+        // error type or moving retry into the reqwest backend, where
+        // `reqwest::Error::{is_timeout,is_connect}` is still available.
+        let mut attempt: u32 = 0;
+        let resp = loop {
+            let r = self.transport.post_chat(&url, &key, &body).await?;
+            if (200..300).contains(&r.status) {
+                break r;
+            }
+            if !is_retryable_status(r.status) || attempt >= max_retries {
+                return Err(ProviderError::Http(format!(
+                    "openai: status {}: {}",
+                    r.status, r.body
+                )));
+            }
+            attempt += 1;
+            backoff(attempt).await;
+        };
+
         let parsed: ChatResponse = serde_json::from_str(&resp.body)
             .map_err(|e| ProviderError::InvalidResponse(format!("openai chat response: {e}")))?;
         let events = chat_response_to_events(parsed);
         Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
     }
+}
+
+fn is_retryable_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..=599).contains(&status)
+}
+
+/// 250ms * 2^attempt, capped at 30s. Pure: split out from `backoff` so
+/// tests can advance virtual time deterministically with
+/// `tokio::time::pause`, matching the Anthropic provider's curve.
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    let ms = 250u64.saturating_mul(1u64 << attempt.min(7)).min(30_000);
+    std::time::Duration::from_millis(ms)
+}
+
+async fn backoff(attempt: u32) {
+    tokio::time::sleep(retry_delay(attempt)).await;
 }
 
 fn require_api_key(cred: &ResolvedCredential) -> Result<SecretString, ProviderError> {
@@ -397,9 +440,14 @@ mod tests {
     #[derive(Default)]
     struct MockTransport {
         chat_response: Option<TransportResponse>,
+        /// FIFO queue of responses for retry tests. Each call to
+        /// `post_chat` consumes one entry; if empty, falls back to
+        /// `chat_response` / the default success body.
+        chat_queue: std::sync::Mutex<Vec<TransportResponse>>,
         models_response: Option<TransportResponse>,
         captured_body: std::sync::Mutex<Option<String>>,
         captured_key: std::sync::Mutex<Option<String>>,
+        chat_call_count: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -412,6 +460,13 @@ mod tests {
         ) -> Result<TransportResponse, ProviderError> {
             *self.captured_body.lock().unwrap() = Some(body.to_string());
             *self.captured_key.lock().unwrap() = Some(api_key.expose().to_string());
+            self.chat_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut queue = self.chat_queue.lock().unwrap();
+            if !queue.is_empty() {
+                return Ok(queue.remove(0));
+            }
+            drop(queue);
             Ok(self.chat_response.clone().unwrap_or(TransportResponse {
                 status: 200,
                 body: r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#.into(),
@@ -634,6 +689,157 @@ mod tests {
         let s = serde_json::to_string(&body).unwrap();
         assert!(!s.contains("\"type\":\"tool_use\""));
         assert!(!s.contains("\"type\":\"tool_result\""));
+    }
+
+    /// The `retry_delay` curve is exactly `250ms * 2^attempt`, capped
+    /// at 30s. This locks in the schedule independently of any test
+    /// that exercises `stream_turn` under paused time.
+    #[test]
+    fn retry_delay_curve_matches_anthropic() {
+        use std::time::Duration;
+        assert_eq!(retry_delay(0), Duration::from_millis(250));
+        assert_eq!(retry_delay(1), Duration::from_millis(500));
+        assert_eq!(retry_delay(2), Duration::from_millis(1_000));
+        assert_eq!(retry_delay(3), Duration::from_millis(2_000));
+        // Cap kicks in at ~30s.
+        assert_eq!(retry_delay(20), Duration::from_millis(30_000));
+    }
+
+    fn req(model: &str) -> ModelRequest {
+        ModelRequest {
+            model: model.into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            deferred_tools: vec![],
+            tool_search_config: None,
+            max_tokens: 8,
+        }
+    }
+
+    /// A transient 429 is retried and the eventual 200 succeeds. Matches
+    /// the Anthropic provider's behavior; the OpenAI variant previously
+    /// converted the 429 directly into a fatal turn error.
+    #[tokio::test(start_paused = true)]
+    async fn stream_turn_retries_on_429_then_succeeds() {
+        let transport = Arc::new(MockTransport::default());
+        transport.chat_queue.lock().unwrap().extend(vec![
+            TransportResponse {
+                status: 429,
+                body: r#"{"error":{"message":"rate limited"}}"#.into(),
+            },
+            TransportResponse {
+                status: 200,
+                body: r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#.into(),
+            },
+        ]);
+        let provider = OpenAiProvider::new(
+            OpenAiConfig::default(),
+            transport.clone(),
+            Arc::new(|| cred("sk-1")),
+        );
+        let mut s = provider.stream_turn(req("gpt-4.1")).await.unwrap();
+        let mut got = Vec::new();
+        while let Some(ev) = s.next().await {
+            got.push(ev.unwrap());
+        }
+        assert!(got
+            .iter()
+            .any(|e| matches!(e, ModelEvent::TextDelta { text } if text == "ok")));
+        assert_eq!(
+            transport
+                .chat_call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    /// 5xx server errors are retryable too.
+    #[tokio::test(start_paused = true)]
+    async fn stream_turn_retries_on_503_then_succeeds() {
+        let transport = Arc::new(MockTransport::default());
+        transport.chat_queue.lock().unwrap().extend(vec![
+            TransportResponse {
+                status: 503,
+                body: "service unavailable".into(),
+            },
+            TransportResponse {
+                status: 200,
+                body: r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#.into(),
+            },
+        ]);
+        let provider = OpenAiProvider::new(
+            OpenAiConfig::default(),
+            transport.clone(),
+            Arc::new(|| cred("sk-1")),
+        );
+        let _ = provider.stream_turn(req("gpt-4.1")).await.unwrap();
+        assert_eq!(
+            transport
+                .chat_call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    /// 4xx non-retryable errors abort immediately (single call).
+    #[tokio::test]
+    async fn stream_turn_does_not_retry_on_400() {
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .chat_queue
+            .lock()
+            .unwrap()
+            .push(TransportResponse {
+                status: 400,
+                body: r#"{"error":"bad request"}"#.into(),
+            });
+        let provider = OpenAiProvider::new(
+            OpenAiConfig::default(),
+            transport.clone(),
+            Arc::new(|| cred("sk-1")),
+        );
+        let result = provider.stream_turn(req("gpt-4.1")).await;
+        assert!(matches!(result, Err(ProviderError::Http(_))));
+        assert_eq!(
+            transport
+                .chat_call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    /// After `max_retries` retryable failures, the last error is surfaced.
+    #[tokio::test(start_paused = true)]
+    async fn stream_turn_gives_up_after_max_retries() {
+        let transport = Arc::new(MockTransport::default());
+        for _ in 0..6 {
+            transport
+                .chat_queue
+                .lock()
+                .unwrap()
+                .push(TransportResponse {
+                    status: 429,
+                    body: "rate limited".into(),
+                });
+        }
+        let provider = OpenAiProvider::new(
+            OpenAiConfig {
+                max_retries: 2,
+                ..OpenAiConfig::default()
+            },
+            transport.clone(),
+            Arc::new(|| cred("sk-1")),
+        );
+        let result = provider.stream_turn(req("gpt-4.1")).await;
+        assert!(matches!(result, Err(ProviderError::Http(_))));
+        // 1 initial attempt + 2 retries = 3 total.
+        assert_eq!(
+            transport
+                .chat_call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
     }
 
     #[test]
