@@ -497,3 +497,69 @@ async fn host_managed_session_does_not_persist() {
         "SDK must not persist events under SessionPolicy::HostManaged"
     );
 }
+
+/// A model provider whose `stream_turn` returns a stream that yields
+/// nothing and never terminates. Used to prove cancellation actually
+/// reaches the running core agent loop (#145, #155). With the pre-fix
+/// behavior the cancel flag was set but the provider stream kept
+/// blocking and `final_result()` never returned.
+#[derive(Default, Clone)]
+struct NeverEndingProvider;
+
+#[async_trait::async_trait]
+impl code_agent_core::provider::ModelProvider for NeverEndingProvider {
+    async fn stream_turn(
+        &self,
+        _request: code_agent_core::provider::ModelRequest,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<code_agent_core::ModelEvent, code_agent_core::ProviderError>,
+        >,
+        code_agent_core::ProviderError,
+    > {
+        // Yield nothing, forever. The agent loop will register a
+        // notify waiter via the cancellation pair and only break out
+        // when `cancel()` fires.
+        Ok(Box::pin(futures::stream::pending()))
+    }
+}
+
+/// Regression for #145/#155: cancellation against a never-ending
+/// provider must flip the run to `Cancelled` within a small bounded
+/// time after `cancel()`. Pre-fix the `CancellationHandle` was not
+/// threaded into the core agent loop, so `final_result()` would have
+/// hung forever waiting for the provider stream.
+#[tokio::test]
+async fn cancellation_stops_a_blocked_run() {
+    let runtime = AgentRuntime::builder()
+        .provider(ProviderConfig::fake(Arc::new(NeverEndingProvider)))
+        .build()
+        .await
+        .unwrap();
+    let handle = runtime
+        .run(AgentRequest::new("a never-ending task"))
+        .await
+        .unwrap();
+    let cancellation = handle.cancellation.clone();
+
+    // Fire cancel after the run has had a chance to start.
+    let spawn_cancel = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation.cancel();
+    });
+
+    // Pre-fix: this `final_result().await` blocked forever because the
+    // agent loop kept awaiting the never-ending provider stream.
+    let result = tokio::time::timeout(Duration::from_secs(2), handle.final_result())
+        .await
+        .expect("cancellation must propagate and final_result must return")
+        .expect("final_result returned an error");
+    spawn_cancel.await.unwrap();
+
+    assert!(
+        matches!(result.status, AgentRunStatus::Cancelled),
+        "expected Cancelled, got {:?}",
+        result.status
+    );
+}

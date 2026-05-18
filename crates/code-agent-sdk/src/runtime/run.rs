@@ -99,7 +99,45 @@ pub(crate) async fn execute_request(
             metadata: metadata.clone(),
             budgets: request.budgets.clone(),
         };
-        let plan_result = execute_plan(runtime.clone(), plan_req).await?;
+        // Race plan generation against cancellation so cancel/deadline
+        // can stop a stuck plan-only run (#145 / #155 follow-up). The
+        // underlying core plan driver does not yet observe cancel
+        // internally, so cancel here just releases the SDK await; the
+        // background task may continue briefly until it finishes
+        // naturally.
+        let plan_result = tokio::select! {
+            r = execute_plan(runtime.clone(), plan_req) => r?,
+            _ = cancellation.cancelled() => {
+                let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                return Ok(AgentRunResult {
+                    run_id,
+                    session_id,
+                    status: AgentRunStatus::Cancelled,
+                    summary: String::new(),
+                    artifacts: CodeArtifacts::empty(),
+                    patch: None,
+                    diagnostics: vec![Diagnostic::warning(
+                        "run.cancelled",
+                        "plan generation cancelled",
+                    )],
+                    validations: Vec::new(),
+                    plan: None,
+                    usage: None,
+                    provider: provider_id,
+                    model,
+                    events_summary: EventSummary {
+                        total_events: 0,
+                        tool_calls: 0,
+                        approvals_requested: 0,
+                        files_changed: 0,
+                        diagnostics_count: 1,
+                        duration_ms,
+                    },
+                    metadata,
+                    changed_files: Vec::new(),
+                });
+            }
+        };
         let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         return Ok(AgentRunResult {
             run_id,
@@ -141,7 +179,20 @@ pub(crate) async fn execute_request(
             metadata: metadata.clone(),
             budgets: request.budgets.clone(),
         };
-        let plan_result = execute_plan(runtime.clone(), plan_req).await?;
+        // Race plan-then-act against cancellation at the SDK boundary
+        // so cancel/deadline can stop the run (#145 / #155 follow-up).
+        let plan_result = tokio::select! {
+            r = execute_plan(runtime.clone(), plan_req) => r?,
+            _ = cancellation.cancelled() => return Ok(cancelled_result(
+                run_id.clone(),
+                session_id,
+                provider_id,
+                model,
+                metadata,
+                started,
+                "plan generation cancelled",
+            )),
+        };
         let act_req = ActRequest {
             plan: plan_result.plan.clone(),
             workspace: Some(WorkspaceSource::custom(workspace_for_run.clone())),
@@ -155,7 +206,18 @@ pub(crate) async fn execute_request(
             test_force_approval: true,
             deadline,
         };
-        return execute_act(runtime.clone(), act_req).await;
+        return tokio::select! {
+            r = execute_act(runtime.clone(), act_req) => r,
+            _ = cancellation.cancelled() => Ok(cancelled_result(
+                run_id,
+                None,
+                provider_id,
+                model,
+                metadata,
+                started,
+                "plan act cancelled",
+            )),
+        };
     }
 
     // Snapshot the workspace state before the regular run for any patch
@@ -210,10 +272,14 @@ pub(crate) async fn execute_request(
     options.permission_callback = Some(approval_cb);
 
     let provider = runtime.provider.clone();
+    // Thread the SDK-level cancellation pair (#145, #155) into the core
+    // agent loop so external cancel, deadline expiry, and budget
+    // breaches actually stop the run instead of being advisory.
     let agent = AgentBuilder::new()
         .options(options.clone())
         .provider(provider)
         .tools(tools.clone())
+        .cancellation(cancellation.flag(), cancellation.notify())
         .build()
         .map_err(AgentSdkError::from)?;
 
@@ -229,7 +295,21 @@ pub(crate) async fn execute_request(
     let mut final_summary = String::new();
     let mut status = AgentRunStatus::Completed;
 
-    while let Some(ev) = event_stream.next().await {
+    loop {
+        // Race the next agent event against cancellation so the SDK
+        // also releases the stream on cancel — without this the
+        // consumer keeps blocking on the agent task until it finishes
+        // naturally (#145, #155).
+        let ev = tokio::select! {
+            ev = event_stream.next() => match ev {
+                Some(ev) => ev,
+                None => break,
+            },
+            _ = cancellation.cancelled() => {
+                status = AgentRunStatus::Cancelled;
+                break;
+            }
+        };
         events_total += 1;
         // Track key counts.
         match &ev {
@@ -513,6 +593,47 @@ pub(crate) async fn execute_request(
         metadata,
         changed_files,
     })
+}
+
+/// Build a minimal `AgentRunResult` representing a cancelled SDK run.
+/// Used when cancellation fires before / during a plan/act sub-task so
+/// the SDK can return immediately without waiting for the underlying
+/// core driver to wind down (#145, #155 follow-up: covers the plan/act
+/// paths the codex reviewer flagged as still uncancellable).
+fn cancelled_result(
+    run_id: RunId,
+    session_id: Option<SessionId>,
+    provider: code_agent_auth::ProviderId,
+    model: String,
+    metadata: crate::request::RequestMetadata,
+    started: Instant,
+    reason: &str,
+) -> AgentRunResult {
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    AgentRunResult {
+        run_id,
+        session_id,
+        status: AgentRunStatus::Cancelled,
+        summary: String::new(),
+        artifacts: CodeArtifacts::empty(),
+        patch: None,
+        diagnostics: vec![Diagnostic::warning("run.cancelled", reason.to_string())],
+        validations: Vec::new(),
+        plan: None,
+        usage: None,
+        provider,
+        model,
+        events_summary: EventSummary {
+            total_events: 0,
+            tool_calls: 0,
+            approvals_requested: 0,
+            files_changed: 0,
+            diagnostics_count: 1,
+            duration_ms,
+        },
+        metadata,
+        changed_files: Vec::new(),
+    }
 }
 
 /// Run a standalone plan.

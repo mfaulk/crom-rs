@@ -78,24 +78,32 @@ impl CancellationHandle {
     }
 
     /// Wait until cancellation fires. Resolves immediately if already cancelled.
+    ///
+    /// Registers as a waiter via `Notified::enable` *before* checking the
+    /// flag, so a concurrent `cancel()` between the check and the
+    /// registration cannot drop the wakeup (#157). Without this pattern
+    /// `tokio::sync::Notify::notify_waiters()` is lossy — it only wakes
+    /// futures already in the waiter list.
     pub async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        // Force registration as a waiter without polling. Any subsequent
+        // notify_waiters() now reaches us.
+        notified.as_mut().enable();
         if self.is_cancelled() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 
     /// Expose the inner shared atomic. Used to thread cancellation into the
-    /// existing core `RunConfig` (forward-compat hook).
-    #[allow(dead_code)]
-    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+    /// core `RunConfig` so the agent loop can short-circuit on cancel.
+    pub fn flag(&self) -> Arc<AtomicBool> {
         self.flag.clone()
     }
 
-    /// Expose the inner notify so consumers can wake waiting tasks
-    /// (forward-compat hook).
-    #[allow(dead_code)]
-    pub(crate) fn notify(&self) -> Arc<tokio::sync::Notify> {
+    /// Expose the inner notify so consumers can wake waiting tasks.
+    pub fn notify(&self) -> Arc<tokio::sync::Notify> {
         self.notify.clone()
     }
 }
@@ -128,5 +136,77 @@ mod tests {
         let task = tokio::spawn(async move { c.cancelled().await });
         h.cancel();
         task.await.unwrap();
+    }
+
+    /// Directly demonstrate the fix's underlying primitive: a
+    /// `Notified` future that has been registered via `enable()`
+    /// before the corresponding `notify_waiters()` MUST observe the
+    /// wakeup, even though no `.await` poll has happened in between.
+    /// Without `enable()` the registration only happens on first
+    /// poll, leaving a window in which `notify_waiters()` reaches no
+    /// one — that is the #157 lost-wakeup shape.
+    #[tokio::test]
+    async fn pinned_and_enabled_notified_receives_subsequent_notify() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let waiter = notify.notified();
+        tokio::pin!(waiter);
+        // The pattern under test: enable registers without polling.
+        waiter.as_mut().enable();
+        // Fire AFTER enable: should reach the registered waiter.
+        notify.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_millis(200), waiter)
+            .await
+            .expect("enabled waiter must receive notify_waiters");
+    }
+
+    /// Inverse: confirm that a fresh, never-`enable()`d / never-polled
+    /// `Notified` future does NOT receive a wakeup that fired before
+    /// any registration happened. Pins down the exact `tokio::Notify`
+    /// semantics the #157 fix has to design around — if this ever
+    /// changes upstream the lost-wakeup pattern in `cancelled()`
+    /// goes away, but until then we must keep `enable()` in the body.
+    #[tokio::test]
+    async fn unenabled_notified_misses_prior_notify() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        // Fire BEFORE any waiter is created. notify_waiters() has no
+        // queue to wake, so the wakeup is dropped.
+        notify.notify_waiters();
+        // Build the future after the fact and try to await. It should
+        // NOT resolve — the notification has been lost.
+        let waiter = notify.notified();
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), waiter)
+            .await
+            .is_err();
+        assert!(
+            timed_out,
+            "Notify::notify_waiters() before waiter registration must be lost; \
+             the #157 fix exists precisely because of this semantic"
+        );
+    }
+
+    /// End-to-end: tight race between `cancel()` and `cancelled()`
+    /// across many iterations. With the pre-fix `cancelled()`
+    /// (check-flag-then-await-notified) and a multi-threaded runtime,
+    /// a subset of iterations would hit the registration-after-notify
+    /// window and hang; the test would time out. With the `enable()`
+    /// fix in `cancelled()` the waiter is registered before the flag
+    /// check, so no wakeup is dropped and every iteration completes
+    /// quickly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_does_not_lose_wakeup_under_stress() {
+        for i in 0..200 {
+            let h = CancellationHandle::new();
+            let h2 = h.clone();
+            let waiter = tokio::spawn(async move { h.cancelled().await });
+            // Give the spawned waiter a scheduling tick before cancel
+            // races it. Widens the bug window enough to expose the
+            // lost-wakeup against the pre-fix impl.
+            tokio::task::yield_now().await;
+            h2.cancel();
+            tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+                .await
+                .unwrap_or_else(|_| panic!("cancelled() hung on iteration {i} (#157)"))
+                .unwrap();
+        }
     }
 }
