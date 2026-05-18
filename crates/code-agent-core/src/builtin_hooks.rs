@@ -147,13 +147,25 @@ impl Default for BlockDangerousBashHook {
 }
 
 impl BlockDangerousBashHook {
-    pub fn with_extra_patterns(mut self, extras: Vec<String>) -> Self {
+    /// Append additional regex patterns to the dangerous-bash block list.
+    /// Operator-supplied patterns are validated; an invalid regex is a
+    /// configuration error, not a soft drop — silently swallowing it
+    /// would leave the operator believing extra protection is in place
+    /// when only the defaults are active (#158).
+    pub fn with_extra_patterns(self, extras: Vec<String>) -> Result<Self, HookError> {
+        self.try_with_extra_patterns(extras)
+    }
+
+    /// Same as [`Self::with_extra_patterns`]. Kept as a separate name so
+    /// callers can match `try_*` conventions if they prefer.
+    pub fn try_with_extra_patterns(mut self, extras: Vec<String>) -> Result<Self, HookError> {
         for p in extras {
-            if let Ok(r) = Regex::new(&p) {
-                self.patterns.push(r);
-            }
+            let r = Regex::new(&p).map_err(|e| {
+                HookError::Other(format!("invalid extra dangerous-bash pattern {p:?}: {e}"))
+            })?;
+            self.patterns.push(r);
         }
-        self
+        Ok(self)
     }
 }
 
@@ -519,25 +531,29 @@ impl Hook for MaxPatchSizeHook {
         if tool != "Edit" && tool != "Write" {
             return Ok(HookOutput::Continue);
         }
+        // For `Edit`, the relevant quantity is the BYTES OF NEW CONTENT
+        // INTRODUCED, not `old_string + new_string`. The old size sum
+        // was wrong in both directions (#161):
+        // - False positive: a large delete (`Edit(old=<5MB>, new="")`)
+        //   tripped a small cap even though it removed content.
+        // - False negative: a small `old_string` anchor with a huge
+        //   `new_string` payload could be sized as the sum, but a
+        //   short anchor + large payload still got close to bypassing
+        //   per-write caps because the operator typically sized the
+        //   cap relative to a reasonable patch, not the sum.
+        // Use `new_string` length alone, mirroring how `Write` is
+        // measured.
         let bytes: usize = match (&input.tool_input, tool) {
             (Some(v), "Write") => v
                 .get("content")
                 .and_then(|c| c.as_str())
                 .map(|s| s.len())
                 .unwrap_or(0),
-            (Some(v), "Edit") => {
-                let old = v
-                    .get("old_string")
-                    .and_then(|c| c.as_str())
-                    .map(str::len)
-                    .unwrap_or(0);
-                let new = v
-                    .get("new_string")
-                    .and_then(|c| c.as_str())
-                    .map(str::len)
-                    .unwrap_or(0);
-                old.saturating_add(new)
-            }
+            (Some(v), "Edit") => v
+                .get("new_string")
+                .and_then(|c| c.as_str())
+                .map(str::len)
+                .unwrap_or(0),
             _ => 0,
         };
         if bytes > self.max_bytes {
@@ -663,6 +679,85 @@ mod tests {
             .call(input_for(
                 "Write",
                 serde_json::json!({"file_path": "x.rs", "content": big}),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(r, HookOutput::Deny { .. }));
+    }
+
+    // Regression for #161: a large `Edit` delete (huge old_string,
+    // empty new_string) MUST NOT trip the size cap. The new content
+    // is zero bytes, so it is below any positive cap.
+    #[tokio::test]
+    async fn max_patch_allows_large_edit_delete() {
+        let h = MaxPatchSizeHook::new(10);
+        let huge = "x".repeat(5_000);
+        let r = h
+            .call(input_for(
+                "Edit",
+                serde_json::json!({
+                    "file_path": "x.rs",
+                    "old_string": huge,
+                    "new_string": "",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, HookOutput::Continue),
+            "deleting a large block should not trip MaxPatchSizeHook"
+        );
+    }
+
+    // Regression for #161: a small `old_string` anchor with a huge
+    // `new_string` payload MUST trip the size cap — the cap is on the
+    // new content being introduced, not the unchanged anchor.
+    #[tokio::test]
+    async fn max_patch_blocks_large_edit_insert() {
+        let h = MaxPatchSizeHook::new(10);
+        let huge = "x".repeat(11);
+        let r = h
+            .call(input_for(
+                "Edit",
+                serde_json::json!({
+                    "file_path": "x.rs",
+                    "old_string": "//",
+                    "new_string": huge,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, HookOutput::Deny { .. }),
+            "inserting >cap bytes via Edit must be blocked"
+        );
+    }
+
+    // Regression for #158: an invalid regex passed to
+    // `BlockDangerousBashHook::with_extra_patterns` must surface as
+    // `Err(HookError)`, not be silently dropped.
+    #[test]
+    fn extra_patterns_rejects_invalid_regex() {
+        let h = BlockDangerousBashHook::default();
+        let result = h.with_extra_patterns(vec!["[unterminated".to_string()]);
+        let err = match result {
+            Ok(_) => panic!("invalid regex must surface as HookError, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid extra"), "got: {msg}");
+    }
+
+    // Valid extra patterns are accepted and used by the hook.
+    #[tokio::test]
+    async fn extra_patterns_accepts_valid_regex_and_blocks_match() {
+        let h = BlockDangerousBashHook::default()
+            .with_extra_patterns(vec![r"^rm\s+-rf\s+/etc".to_string()])
+            .expect("valid regex");
+        let r = h
+            .call(input_for(
+                "Bash",
+                serde_json::json!({"command": "rm -rf /etc/important"}),
             ))
             .await
             .unwrap();
