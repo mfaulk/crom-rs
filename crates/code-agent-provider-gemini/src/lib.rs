@@ -210,10 +210,23 @@ struct GeminiFunctionResponse {
 /// name without the prefix.
 const GEMINI_TOOL_CALL_ID_PREFIX: &str = "gemini-";
 
+/// Separator inserted between the synthetic function name and a
+/// per-response unique counter to disambiguate parallel calls to the
+/// same function (#172). `#` cannot appear in a valid Gemini function
+/// name (Gemini constrains names to `[A-Za-z_][A-Za-z0-9_]*`), so it
+/// cannot collide with any real name byte.
+const GEMINI_TOOL_CALL_ID_UNIQUE_SEP: char = '#';
+
+/// Recover the function name from a synthesized Gemini tool-call id.
+/// Strips the `gemini-` prefix and the `#<counter>` uniqueness suffix
+/// (if present) so the wire response carries the original declared
+/// function name.
 fn strip_gemini_id_prefix(id: &str) -> String {
-    id.strip_prefix(GEMINI_TOOL_CALL_ID_PREFIX)
-        .unwrap_or(id)
-        .to_string()
+    let without_prefix = id.strip_prefix(GEMINI_TOOL_CALL_ID_PREFIX).unwrap_or(id);
+    match without_prefix.split_once(GEMINI_TOOL_CALL_ID_UNIQUE_SEP) {
+        Some((name, _counter)) => name.to_string(),
+        None => without_prefix.to_string(),
+    }
 }
 
 #[derive(Serialize)]
@@ -363,6 +376,12 @@ fn generate_response_to_events(resp: GenerateResponse) -> Vec<ModelEvent> {
     let mut stop_reason = None;
     if let Some(candidate) = resp.candidates.into_iter().next() {
         stop_reason = candidate.finish_reason;
+        // Per-response monotonic counter: parallel calls to the same
+        // function (Gemini idiomatically returns multiple
+        // `functionCall` parts with the same `name`) must each carry a
+        // distinct `ToolCall.id` so the downstream agent loop can
+        // pair tool-result events back to the right call (#172).
+        let mut next_call_idx: usize = 0;
         for part in candidate.content.parts {
             if let Some(text) = part.text {
                 if !text.is_empty() {
@@ -370,8 +389,16 @@ fn generate_response_to_events(resp: GenerateResponse) -> Vec<ModelEvent> {
                 }
             }
             if let Some(fc) = part.function_call {
+                let id = format!(
+                    "{prefix}{name}{sep}{idx}",
+                    prefix = GEMINI_TOOL_CALL_ID_PREFIX,
+                    name = fc.name,
+                    sep = GEMINI_TOOL_CALL_ID_UNIQUE_SEP,
+                    idx = next_call_idx,
+                );
+                next_call_idx += 1;
                 events.push(ModelEvent::ToolCall(ToolCall {
-                    id: format!("{}{}", GEMINI_TOOL_CALL_ID_PREFIX, fc.name),
+                    id,
                     name: fc.name,
                     input: fc.args,
                 }));
@@ -594,11 +621,74 @@ mod tests {
 
     #[test]
     // strip_gemini_id_prefix peels the synthetic prefix when present
-    // and returns the input verbatim otherwise.
+    // and returns the input verbatim otherwise. Also peels the
+    // `#<counter>` uniqueness suffix introduced for #172.
     fn strip_gemini_id_prefix_round_trips() {
         assert_eq!(strip_gemini_id_prefix("gemini-Read"), "Read");
         assert_eq!(strip_gemini_id_prefix("Read"), "Read");
         assert_eq!(strip_gemini_id_prefix(""), "");
+        // Uniqueness suffix:
+        assert_eq!(strip_gemini_id_prefix("gemini-Read#0"), "Read");
+        assert_eq!(strip_gemini_id_prefix("gemini-Read#42"), "Read");
+        // Multiple `#` (defensive): only the first split matters.
+        assert_eq!(strip_gemini_id_prefix("gemini-Read#0#extra"), "Read");
+    }
+
+    // Regression for #172: parallel calls to the same Gemini function
+    // (the canonical "two Read calls in one turn" shape) MUST produce
+    // distinct `ToolCall.id` values. Pre-fix both calls got the same
+    // id `gemini-Read`, so the downstream agent loop could not tell
+    // their results apart.
+    #[tokio::test]
+    async fn parallel_calls_to_same_function_get_distinct_ids() {
+        let body = r#"{
+            "candidates":[{
+                "content":{"parts":[
+                    {"functionCall":{"name":"Read","args":{"path":"a"}}},
+                    {"functionCall":{"name":"Read","args":{"path":"b"}}}
+                ]},
+                "finishReason":"TOOL_CALL"
+            }]
+        }"#;
+        let transport = Arc::new(MockTransport {
+            gen_response: Some(TransportResponse {
+                status: 200,
+                body: body.into(),
+            }),
+            ..Default::default()
+        });
+        let provider = GeminiProvider::new(
+            GeminiConfig::default(),
+            transport,
+            Arc::new(|| cred("AI-1")),
+        );
+        let req = ModelRequest {
+            model: "gemini-1.5-pro".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            deferred_tools: vec![],
+            tool_search_config: None,
+            max_tokens: 8,
+        };
+        let mut stream = provider.stream_turn(req).await.unwrap();
+        let mut tool_calls = Vec::new();
+        while let Some(ev) = stream.next().await {
+            if let Ok(ModelEvent::ToolCall(tc)) = ev {
+                tool_calls.push(tc);
+            }
+        }
+        assert_eq!(tool_calls.len(), 2);
+        assert_ne!(
+            tool_calls[0].id, tool_calls[1].id,
+            "parallel calls to the same function must produce distinct ids (#172)"
+        );
+        // Both still recover the original function name on round-trip.
+        assert_eq!(strip_gemini_id_prefix(&tool_calls[0].id), "Read");
+        assert_eq!(strip_gemini_id_prefix(&tool_calls[1].id), "Read");
+        // Inputs are preserved per call.
+        assert_eq!(tool_calls[0].input["path"], "a");
+        assert_eq!(tool_calls[1].input["path"], "b");
     }
 
     #[test]
