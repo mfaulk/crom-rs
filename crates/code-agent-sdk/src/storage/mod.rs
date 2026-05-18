@@ -381,4 +381,34 @@ mod tests {
             .expect_err("path traversal must be rejected");
         assert_eq!(err.code, "storage.invalid_id");
     }
+
+    /// FileStorage::save_plan also rejects a traversal id — the
+    /// load-only test above does not exercise the write surface
+    /// (`tokio::fs::write` in save_plan) directly. Verify no file
+    /// escapes the storage root.
+    #[tokio::test]
+    async fn file_storage_rejects_traversal_plan_id_on_save() {
+        use code_agent_core::plan::PlanDocument;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = FileStorage::new(dir.path()).unwrap();
+        let bad = PlanId::from("../escape".to_string());
+        let mut plan = PlanDocument::new_draft(bad, "t", "u");
+        // PlanDocument also tracks the id internally — ensure it is the
+        // bad one so save_plan exercises the rejection path.
+        plan.id = PlanId::from("../escape".to_string());
+
+        let err = s
+            .save_plan(&plan)
+            .await
+            .expect_err("save with bad plan id must be rejected");
+        assert_eq!(err.code, "storage.invalid_id");
+
+        // No file written under or outside the root.
+        let parent = dir.path().parent().unwrap();
+        assert!(
+            !parent.join("escape.json").exists(),
+            "no plan file should escape the storage root"
+        );
+    }
 }
