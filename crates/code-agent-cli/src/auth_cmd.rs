@@ -160,11 +160,14 @@ fn read_api_key(args: &LoginArgs) -> Result<Option<SecretString>> {
                 "--api-key requires a terminal; use --api-key=<KEY> or --api-key-stdin"
             ));
         }
+        // Print the prompt to stderr to match the previous behavior — CLI
+        // prompts on stderr stay visible when stdout is piped or
+        // redirected. `rpassword::read_password` only reads from the
+        // tty; it does not also write the prompt, so do that ourselves.
         eprint!("Enter API key (input hidden): ");
         let _ = std::io::Write::flush(&mut std::io::stderr());
-        let mut buf = String::new();
-        std::io::stdin().read_line(&mut buf)?;
-        let trimmed = buf.trim().to_string();
+        let raw = rpassword::read_password().map_err(|e| anyhow!("read API key: {e}"))?;
+        let trimmed = raw.trim().to_string();
         if trimmed.is_empty() {
             return Err(anyhow!("API key empty"));
         }
