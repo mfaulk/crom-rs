@@ -63,8 +63,8 @@ impl McpOptions {
         for server in self.servers.values() {
             match server {
                 McpServerConfig::Stdio(cfg) => {
-                    for value in cfg.env.values() {
-                        if should_redact_value(value) {
+                    for (key, value) in &cfg.env {
+                        if looks_like_secret_key(key) || should_redact_value(value) {
                             out.push(value.clone());
                         }
                     }
@@ -586,9 +586,14 @@ pub fn redact_value_with_secrets(v: &Value, secrets: &[String]) -> Value {
 }
 
 pub fn redact_text_with_secrets(input: &str, secrets: &[String]) -> String {
+    // Defense in depth: even when `secrets` is populated, every entry must
+    // independently look secret-shaped before we substring-replace it in
+    // tool output. Otherwise an attacker who controls an env value or
+    // header (e.g. via `MCP_FOO=permission denied`) could poison the list
+    // to redact arbitrary text from diagnostics.
     let mut out = input.to_string();
     for secret in secrets {
-        if !secret.is_empty() && secret.len() >= 4 {
+        if should_redact_value(secret) {
             out = out.replace(secret, "[REDACTED]");
         }
     }
@@ -606,11 +611,45 @@ pub fn looks_like_secret_key(key: &str) -> bool {
         || key.contains("credential")
 }
 
+/// Conservative "this string is shaped like a real secret" heuristic.
+///
+/// Length alone is not enough — benign values like `User-Agent: my-app/1.2.3`
+/// or `LANG=en_US.UTF-8` happily exceed any size bar. We require either an
+/// explicit auth-scheme prefix (`Bearer ` / `Basic ` / `Token `, RFC 7235)
+/// or a key-shaped value: 24+ contiguous non-whitespace bytes spanning at
+/// least three character classes (upper, lower, digit, non-alphanumeric).
 fn should_redact_value(value: &str) -> bool {
-    value.len() >= 12
-        || value.to_ascii_lowercase().starts_with("bearer ")
-        || value.contains("token")
-        || value.contains("secret")
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("bearer ") || lower.starts_with("basic ") || lower.starts_with("token ") {
+        return true;
+    }
+    if trimmed.len() < 24 {
+        return false;
+    }
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+    let mut classes = 0u8;
+    if trimmed.chars().any(|c| c.is_ascii_lowercase()) {
+        classes += 1;
+    }
+    if trimmed.chars().any(|c| c.is_ascii_uppercase()) {
+        classes += 1;
+    }
+    if trimmed.chars().any(|c| c.is_ascii_digit()) {
+        classes += 1;
+    }
+    if trimmed
+        .chars()
+        .any(|c| !c.is_ascii_alphanumeric() && !c.is_whitespace())
+    {
+        classes += 1;
+    }
+    classes >= 3
 }
 
 mod duration_seconds {
@@ -797,5 +836,118 @@ mod tests {
             summary["servers"]["docs"]["headers"]["Authorization"],
             "[REDACTED]"
         );
+    }
+
+    /// `should_redact_value` accepts strings that look like real secrets:
+    /// auth-scheme prefixes and high-entropy key-shaped values.
+    #[test]
+    fn should_redact_value_flags_real_secrets() {
+        assert!(super::should_redact_value("Bearer abc"));
+        assert!(super::should_redact_value("bearer abc"));
+        assert!(super::should_redact_value("Basic dXNlcjpwYXNz"));
+        assert!(super::should_redact_value("Token abc"));
+        // Long alphanumeric mixed-case secrets.
+        assert!(super::should_redact_value(
+            "sk-proj-AbCdEf1234567890XyZqrstuvWxyz"
+        ));
+        // JWT-shaped tokens are alphanumeric with dots/dashes (4 classes).
+        assert!(super::should_redact_value(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkw.abcdef-ghijk"
+        ));
+        // Pure-upper or pure-lower 24+ char keys aren't caught by the
+        // entropy heuristic on their own — they rely on the env-var
+        // name (`looks_like_secret_key`) to be redacted. That is
+        // intentional: AWS_SECRET_ACCESS_KEY-shaped values share too
+        // much structure with arbitrary uppercase prose for the
+        // value heuristic alone to be safe.
+    }
+
+    /// Benign long strings that the previous length-only heuristic would
+    /// have flagged must no longer be added to the redaction list.
+    #[test]
+    fn should_redact_value_rejects_benign_long_strings() {
+        // The issue's two motivating examples.
+        assert!(!super::should_redact_value("code-agent/1.2.3"));
+        assert!(!super::should_redact_value("en_US.UTF-8"));
+        // Common header values.
+        assert!(!super::should_redact_value(
+            "Mozilla/5.0 (X11; Linux x86_64)"
+        ));
+        assert!(!super::should_redact_value("application/json"));
+        // Attacker-shaped poisoning probes (contain "token"/"secret"
+        // substring but no actual key shape).
+        assert!(!super::should_redact_value("permission denied"));
+        assert!(!super::should_redact_value("the access token has expired"));
+        assert!(!super::should_redact_value("secret recipe"));
+        // Pure lowercase or no-digit values fail the class check.
+        assert!(!super::should_redact_value("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!super::should_redact_value("AAAAAAAAAAAAAAAAAAAAAAAA"));
+    }
+
+    /// `redact_text_with_secrets` ignores list entries that fail the
+    /// secret-shape check, so an attacker who poisons the list with
+    /// arbitrary text can no longer hide that text from output.
+    #[test]
+    fn redact_text_with_secrets_resists_poisoning() {
+        let secrets = vec!["permission denied".to_string()];
+        let out = redact_text_with_secrets("error: permission denied", &secrets);
+        assert_eq!(out, "error: permission denied");
+
+        let real_secret = "sk-proj-AbCdEf1234567890XyZqrstuvWxyz".to_string();
+        let secrets = vec![real_secret.clone()];
+        let out = redact_text_with_secrets(&format!("key={real_secret}"), &secrets);
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains(&real_secret));
+    }
+
+    /// `secret_values` honors the env-var *name* for stdio servers (not
+    /// only the value), so `API_KEY=short` still ends up redactable.
+    #[test]
+    fn secret_values_uses_stdio_env_key_name() {
+        let options = McpOptions {
+            enabled: true,
+            servers: BTreeMap::from([(
+                "fake".into(),
+                McpServerConfig::Stdio(StdioMcpServerConfig {
+                    command: "fake".into(),
+                    args: Vec::new(),
+                    env: BTreeMap::from([
+                        ("API_KEY".into(), "short".into()),
+                        ("LANG".into(), "en_US.UTF-8".into()),
+                    ]),
+                    cwd: None,
+                    startup_timeout: None,
+                    request_timeout: None,
+                }),
+            )]),
+            ..McpOptions::default()
+        };
+        let secrets = options.secret_values();
+        assert!(secrets.contains(&"short".to_string()));
+        assert!(!secrets.contains(&"en_US.UTF-8".to_string()));
+    }
+
+    /// A long but benign header value is NOT added to the redaction list,
+    /// so its substrings cannot leak [REDACTED] markers into tool output.
+    #[test]
+    fn secret_values_excludes_long_benign_headers() {
+        let options = McpOptions {
+            enabled: true,
+            servers: BTreeMap::from([(
+                "docs".into(),
+                McpServerConfig::StreamableHttp(StreamableHttpMcpServerConfig {
+                    url: "http://127.0.0.1/mcp".into(),
+                    headers: BTreeMap::from([
+                        ("User-Agent".into(), "code-agent/1.2.3".into()),
+                        ("Accept".into(), "application/json".into()),
+                    ]),
+                    startup_timeout: None,
+                    request_timeout: None,
+                }),
+            )]),
+            ..McpOptions::default()
+        };
+        let secrets = options.secret_values();
+        assert!(secrets.is_empty(), "unexpected secrets: {secrets:?}");
     }
 }
