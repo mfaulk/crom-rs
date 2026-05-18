@@ -408,10 +408,25 @@ where
         let mut started = false;
 
         tokio::pin!(stream);
-        while let Some(item) = stream.next().await {
+        loop {
+            // Wake on EITHER the next upstream event OR the downstream
+            // channel closing. Without this, the task remains blocked in
+            // `stream.next().await` while the consumer is gone, and the
+            // upstream HTTP connection stays open until the server hangs
+            // up. `biased;` makes a ready closed-channel signal win over
+            // buffered upstream events.
+            let item = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                next = stream.next() => match next {
+                    Some(x) => x,
+                    None => break,
+                },
+            };
             let ev = match item {
                 Ok(e) => e,
                 Err(e) => {
+                    // Already returning — `let _ = tx.send` is fine here.
                     let _ = tx.send(Err(e)).await;
                     return;
                 }
@@ -529,6 +544,7 @@ where
                 }
                 SseEvent::Ping => {}
                 SseEvent::Error { error } => {
+                    // Already returning — `let _ = tx.send` is fine here.
                     let _ = tx.send(Err(ProviderError::Stream(error.message))).await;
                     return;
                 }
@@ -740,6 +756,40 @@ mod tests {
         assert!(
             observed_task_exit,
             "SSE drain task kept buffering tool_use JSON after consumer dropped the receiver"
+        );
+    }
+
+    /// The task must wake on consumer drop even when blocked in
+    /// `stream.next().await` with no buffered events upstream. Without
+    /// the `tokio::select!` on `tx.closed()`, the task would block
+    /// indefinitely on the upstream HTTP connection.
+    #[tokio::test]
+    async fn sse_drain_stops_when_idle_and_consumer_drops() {
+        use tokio::sync::mpsc;
+        use tokio::time::{timeout, Duration};
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        let (upstream_tx, upstream_rx) =
+            mpsc::unbounded_channel::<Result<eventsource_stream::Event, ProviderError>>();
+        let upstream: UnboundedReceiverStream<_> = UnboundedReceiverStream::new(upstream_rx);
+        let downstream = Box::pin(parse_sse(upstream));
+
+        // Don't send any events. Task is blocked in stream.next(). Drop
+        // the receiver — the task must wake via tx.closed() and exit,
+        // which drops the upstream stream and closes upstream_rx.
+        drop(downstream);
+
+        // Wait for the task to release upstream_rx. Without the select!,
+        // this would hang forever since nothing is poking the loop.
+        let result = timeout(Duration::from_secs(2), async {
+            while !upstream_tx.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "SSE drain task did not wake on consumer drop while idle"
         );
     }
 
