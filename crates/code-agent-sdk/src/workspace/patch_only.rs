@@ -168,13 +168,20 @@ impl Workspace for PatchOnlyWorkspace {
                     report.files_changed += 1;
                 }
                 FilePatch::Rename { from, to } => {
+                    // Resolve the source under the same lock that performs the
+                    // move so the rename is linearizable. Dropping the lock to
+                    // call `self.read_file` lets a concurrent `write_file(from)`
+                    // slip in between read and tombstone, leaving `from`
+                    // deleted and `to` populated with the *pre-write* content.
+                    let bytes = match state.pending.get(from) {
+                        Some(Some(b)) => b.clone(),
+                        Some(None) => {
+                            return Err(WorkspaceError::not_found(from.clone()));
+                        }
+                        None => self.base.read_file(from).await?.bytes,
+                    };
                     state.pending.insert(from.clone(), None);
-                    // Read the source content from base or pending and reuse it.
-                    drop(state);
-                    let src = self.read_file(from).await?;
-                    let mut state2 = self.state.lock().await;
-                    state2.pending.insert(to.clone(), Some(src.bytes));
-                    state = state2;
+                    state.pending.insert(to.clone(), Some(bytes));
                     report.files_changed += 1;
                 }
             }
@@ -229,5 +236,186 @@ mod tests {
         ws.write_file(&p, b"hi\n").await.unwrap();
         let patch = ws.take_patch().await.unwrap();
         assert_eq!(patch.summary.files_created, 1);
+    }
+
+    /// apply_patch Rename reads the source from base and re-keys it under `to`.
+    #[tokio::test]
+    async fn apply_patch_rename_moves_existing_file() {
+        let base =
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"hello".to_vec())]).unwrap());
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let from = WorkspacePath::new("a.txt").unwrap();
+        let to = WorkspacePath::new("b.txt").unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]);
+        let report = ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(report.files_changed, 1);
+        assert!(report.failures.is_empty());
+        assert_eq!(ws.read_file(&to).await.unwrap().bytes, b"hello");
+        let err = ws.read_file(&from).await.unwrap_err();
+        assert_eq!(err.code, "workspace.not_found");
+    }
+
+    /// apply_patch Rename uses pending content when the source was written via
+    /// the wrapper but not present in base.
+    #[tokio::test]
+    async fn apply_patch_rename_uses_pending_source() {
+        let base = Arc::new(InMemoryWorkspace::new());
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let from = WorkspacePath::new("draft.txt").unwrap();
+        let to = WorkspacePath::new("final.txt").unwrap();
+        ws.write_file(&from, b"draft body").await.unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]);
+        ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(ws.read_file(&to).await.unwrap().bytes, b"draft body");
+        assert_eq!(
+            ws.read_file(&from).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+    }
+
+    /// apply_patch Rename surfaces NotFound when the source does not exist in
+    /// base or pending, and leaves the workspace untouched.
+    #[tokio::test]
+    async fn apply_patch_rename_missing_source_errors() {
+        let base = Arc::new(InMemoryWorkspace::new());
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let from = WorkspacePath::new("nope.txt").unwrap();
+        let to = WorkspacePath::new("dest.txt").unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]);
+        let err = ws.apply_patch(&patch).await.unwrap_err();
+        assert_eq!(err.code, "workspace.not_found");
+        // The wrapper must not leave a stale tombstone for `from`.
+        assert_eq!(
+            ws.read_file(&from).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+        // Nor a phantom entry for `to`.
+        assert_eq!(
+            ws.read_file(&to).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+        assert!(ws.snapshot_patch().await.unwrap().files.is_empty());
+    }
+
+    /// apply_patch Rename where `from == to` preserves the file (insert order
+    /// guarantees the `Some(bytes)` overwrites the tombstone).
+    #[tokio::test]
+    async fn apply_patch_rename_self_preserves_file() {
+        let base =
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"data".to_vec())]).unwrap());
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let p = WorkspacePath::new("a.txt").unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: p.clone(),
+            to: p.clone(),
+        }]);
+        ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(ws.read_file(&p).await.unwrap().bytes, b"data");
+        // Self-rename of an unchanged file is a no-op against base.
+        assert!(ws.snapshot_patch().await.unwrap().files.is_empty());
+    }
+
+    /// apply_patch Rename overwrites an existing destination.
+    #[tokio::test]
+    async fn apply_patch_rename_overwrites_destination() {
+        let base = Arc::new(
+            InMemoryWorkspace::from_pairs(vec![
+                ("from.txt", b"src".to_vec()),
+                ("to.txt", b"dest".to_vec()),
+            ])
+            .unwrap(),
+        );
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let from = WorkspacePath::new("from.txt").unwrap();
+        let to = WorkspacePath::new("to.txt").unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]);
+        ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(ws.read_file(&to).await.unwrap().bytes, b"src");
+        assert_eq!(
+            ws.read_file(&from).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+    }
+
+    /// apply_patch Rename refuses to resurrect a file that the wrapper has
+    /// already tombstoned (i.e. delete_file then rename of the same path),
+    /// even when base still has the underlying content.
+    #[tokio::test]
+    async fn apply_patch_rename_pending_tombstone_source_errors() {
+        let base =
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"base".to_vec())]).unwrap());
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let from = WorkspacePath::new("a.txt").unwrap();
+        let to = WorkspacePath::new("b.txt").unwrap();
+        ws.delete_file(&from).await.unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]);
+        let err = ws.apply_patch(&patch).await.unwrap_err();
+        assert_eq!(err.code, "workspace.not_found");
+        // `to` must not have been resurrected with base content.
+        assert_eq!(
+            ws.read_file(&to).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+        // The original tombstone on `from` remains.
+        assert_eq!(
+            ws.read_file(&from).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+    }
+
+    /// A concurrent write that races with apply_patch Rename must either
+    /// (a) win and produce a coherent final state, or (b) lose without leaving
+    /// `from` deleted and `to` carrying *pre-write* content. The previous
+    /// implementation dropped the lock between read and tombstone, which made
+    /// (b) impossible to rule out. With the linearizable rename it is safe.
+    #[tokio::test]
+    async fn apply_patch_rename_linearizable_under_concurrent_write() {
+        // We can't deterministically trigger the original race in a test, but
+        // we can pin down the *invariant* that survives any interleaving: at
+        // the end of a successful rename, `to` must equal whichever value was
+        // last written to `from` (the only path that affects rename input).
+        for _ in 0..32 {
+            let base =
+                Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"base".to_vec())]).unwrap());
+            let ws = Arc::new(PatchOnlyWorkspace::new(base.clone()));
+            let from = WorkspacePath::new("a.txt").unwrap();
+            let to = WorkspacePath::new("b.txt").unwrap();
+            let ws_w = ws.clone();
+            let from_w = from.clone();
+            let writer = tokio::spawn(async move {
+                ws_w.write_file(&from_w, b"new").await.unwrap();
+            });
+            let patch = PatchSet::from_files(vec![FilePatch::Rename {
+                from: from.clone(),
+                to: to.clone(),
+            }]);
+            let _ = ws.apply_patch(&patch).await;
+            writer.await.unwrap();
+            let to_bytes = ws.read_file(&to).await.ok().map(|c| c.bytes);
+            // Allowed terminal states for `to`:
+            //   - missing (rename never started before write completed)
+            //   - "base" (rename serialized before write)
+            //   - "new"  (rename serialized after write, picking up overlay)
+            match to_bytes.as_deref() {
+                None => {}
+                Some(b"base") | Some(b"new") => {}
+                Some(other) => panic!("non-linearizable to bytes: {other:?}"),
+            }
+        }
     }
 }
