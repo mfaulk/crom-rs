@@ -422,7 +422,21 @@ pub fn aggregate(records: &[HookCallRecord]) -> (HookAggregateDecision, HookAdde
                 }
                 added.push_str(content);
             }
-            Ok(HookOutput::Continue) | Err(_) => {}
+            Ok(HookOutput::Continue) => {}
+            Err(e) => {
+                // A hook that returned `Err(HookError)` previously was
+                // lumped in with `Ok(Continue)` and silently ignored
+                // (#156). Surface the error as a denial with the
+                // error text — operators should not be able to wire up
+                // a misconfigured hook and have the agent proceed as if
+                // it was not there.
+                return (
+                    HookAggregateDecision::Deny {
+                        reason: format!("hook error: {e}"),
+                    },
+                    HookAddedContext(added),
+                );
+            }
         }
     }
 
@@ -648,5 +662,43 @@ mod tests {
         let m = ToolMatcher::parse("*").unwrap();
         assert!(m.matches("Anything"));
         assert!(m.matches(""));
+    }
+
+    // Regression for #156: a hook that returned `Err(HookError)` was
+    // previously lumped in with `Ok(Continue)` and silently ignored.
+    // It now denies the action so misconfigured hooks fail loud.
+    #[test]
+    fn aggregate_err_now_denies_instead_of_continuing() {
+        let records = vec![HookCallRecord {
+            event: HookEventName::PreToolUse,
+            tool_name: Some("X".into()),
+            output: Err(HookError::Other("hook went bang".into())),
+        }];
+        let (d, _ctx) = aggregate(&records);
+        match d {
+            HookAggregateDecision::Deny { reason } => {
+                assert!(reason.contains("hook went bang"), "got: {reason}");
+            }
+            other => panic!("expected Deny on hook error, got {other:?}"),
+        }
+    }
+
+    // An Err from one hook denies the chain even if later hooks would
+    // have returned Allow. Pre-fix the Err was silently dropped and the
+    // Allow won.
+    #[test]
+    fn aggregate_err_short_circuits_subsequent_allow() {
+        let records = vec![
+            HookCallRecord {
+                event: HookEventName::PreToolUse,
+                tool_name: Some("X".into()),
+                output: Err(HookError::Other("misconfigured".into())),
+            },
+            rec(HookOutput::Allow {
+                updated_input: None,
+            }),
+        ];
+        let (d, _ctx) = aggregate(&records);
+        assert!(matches!(d, HookAggregateDecision::Deny { .. }));
     }
 }
