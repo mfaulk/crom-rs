@@ -11,13 +11,20 @@ use crate::error::{AuthError, AuthErrorKind};
 /// (`access_token`, `refresh_token`, `expires_in`) or fields commonly
 /// emitted by AI-platform identity providers (e.g. `id_token`).
 ///
+/// Per RFC 6749 §5.1, clients MUST ignore unrecognized response
+/// parameters. Real providers exercise that latitude: Microsoft / Azure
+/// AD adds `ext_expires_in`, Google adds `id_token`/`scope` even on
+/// non-OpenID flows, GitHub adds `scope`, Okta adds `state`. The
+/// previous `#[serde(deny_unknown_fields)]` annotation failed the
+/// entire token exchange on any extra field, breaking login against
+/// those providers (#169). Drop it so unknown fields are tolerated.
+///
 /// `Debug` is implemented by hand because deriving it would dump the
 /// raw `access_token` / `refresh_token` / `id_token` into any
 /// `tracing::debug!` or `{:?}` format string, including indirectly
 /// through containing types like `DeviceCodeOutcome` or
 /// `BrowserLoginOutcome`.
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TokenResponse {
     pub access_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,6 +249,35 @@ mod tests {
         assert!(dbg.contains("Bearer"));
         assert!(dbg.contains("3600"));
         assert!(dbg.contains("read write"));
+    }
+
+    // Regression for #169: a real OAuth provider can ship extra
+    // fields in its token response (e.g. Microsoft's `ext_expires_in`,
+    // Google's `id_token` on non-OpenID flows, GitHub's `scope`,
+    // Okta's `state`). RFC 6749 §5.1 says clients MUST ignore them.
+    // Pre-fix the `#[serde(deny_unknown_fields)]` annotation broke
+    // login entirely on those providers; we drop it here.
+    #[test]
+    fn token_response_tolerates_extra_provider_fields() {
+        let body = serde_json::json!({
+            "access_token": "abc",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            // Real-world extras from various providers.
+            "ext_expires_in": 7200,    // Microsoft / Azure AD
+            "id_token": "xyz",          // also accepted via the field, but here
+                                        // we're really testing the *unknown*
+                                        // field below.
+            "scope": "read write",      // GitHub / Okta
+            "state": "session-state",   // some flows
+            "issued_token_type": "urn:...:access_token",
+        });
+        let tr: TokenResponse =
+            serde_json::from_value(body).expect("must accept extra provider fields");
+        assert_eq!(tr.access_token, "abc");
+        assert_eq!(tr.expires_in, Some(3600));
+        assert_eq!(tr.id_token.as_deref(), Some("xyz"));
+        assert_eq!(tr.scope.as_deref(), Some("read write"));
     }
 
     #[test]
