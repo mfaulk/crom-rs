@@ -168,11 +168,13 @@ impl Workspace for PatchOnlyWorkspace {
                     report.files_changed += 1;
                 }
                 FilePatch::Rename { from, to } => {
-                    state.pending.insert(from.clone(), None);
-                    // Read the source content from base or pending and reuse it.
+                    // Read the source from base or pending *before* tombstoning
+                    // `from` — otherwise read_file sees the pending None entry
+                    // we just inserted and returns NotFound for every rename.
                     drop(state);
                     let src = self.read_file(from).await?;
                     let mut state2 = self.state.lock().await;
+                    state2.pending.insert(from.clone(), None);
                     state2.pending.insert(to.clone(), Some(src.bytes));
                     state = state2;
                     report.files_changed += 1;
@@ -229,5 +231,73 @@ mod tests {
         ws.write_file(&p, b"hi\n").await.unwrap();
         let patch = ws.take_patch().await.unwrap();
         assert_eq!(patch.summary.files_created, 1);
+    }
+
+    /// apply_patch Rename reads the source from base and re-keys it under `to`.
+    #[tokio::test]
+    async fn apply_patch_rename_moves_existing_file() {
+        let base =
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"hello".to_vec())]).unwrap());
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let from = WorkspacePath::new("a.txt").unwrap();
+        let to = WorkspacePath::new("b.txt").unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]);
+        let report = ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(report.files_changed, 1);
+        assert!(report.failures.is_empty());
+        assert_eq!(ws.read_file(&to).await.unwrap().bytes, b"hello");
+        let err = ws.read_file(&from).await.unwrap_err();
+        assert_eq!(err.code, "workspace.not_found");
+    }
+
+    /// apply_patch Rename uses pending content when the source was written via
+    /// the wrapper but not present in base.
+    #[tokio::test]
+    async fn apply_patch_rename_uses_pending_source() {
+        let base = Arc::new(InMemoryWorkspace::new());
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let from = WorkspacePath::new("draft.txt").unwrap();
+        let to = WorkspacePath::new("final.txt").unwrap();
+        ws.write_file(&from, b"draft body").await.unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]);
+        ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(ws.read_file(&to).await.unwrap().bytes, b"draft body");
+        assert_eq!(
+            ws.read_file(&from).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+    }
+
+    /// apply_patch Rename surfaces NotFound when the source does not exist in
+    /// base or pending, and leaves the workspace untouched.
+    #[tokio::test]
+    async fn apply_patch_rename_missing_source_errors() {
+        let base = Arc::new(InMemoryWorkspace::new());
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let from = WorkspacePath::new("nope.txt").unwrap();
+        let to = WorkspacePath::new("dest.txt").unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]);
+        let err = ws.apply_patch(&patch).await.unwrap_err();
+        assert_eq!(err.code, "workspace.not_found");
+        // The wrapper must not leave a stale tombstone for `from`.
+        assert_eq!(
+            ws.read_file(&from).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+        // Nor a phantom entry for `to`.
+        assert_eq!(
+            ws.read_file(&to).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+        assert!(ws.snapshot_patch().await.unwrap().files.is_empty());
     }
 }
