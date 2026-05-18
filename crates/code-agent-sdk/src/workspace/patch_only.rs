@@ -300,4 +300,47 @@ mod tests {
         );
         assert!(ws.snapshot_patch().await.unwrap().files.is_empty());
     }
+
+    /// apply_patch Rename where `from == to` preserves the file (insert order
+    /// guarantees the `Some(bytes)` overwrites the tombstone).
+    #[tokio::test]
+    async fn apply_patch_rename_self_preserves_file() {
+        let base =
+            Arc::new(InMemoryWorkspace::from_pairs(vec![("a.txt", b"data".to_vec())]).unwrap());
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let p = WorkspacePath::new("a.txt").unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: p.clone(),
+            to: p.clone(),
+        }]);
+        ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(ws.read_file(&p).await.unwrap().bytes, b"data");
+        // Self-rename of an unchanged file is a no-op against base.
+        assert!(ws.snapshot_patch().await.unwrap().files.is_empty());
+    }
+
+    /// apply_patch Rename overwrites an existing destination.
+    #[tokio::test]
+    async fn apply_patch_rename_overwrites_destination() {
+        let base = Arc::new(
+            InMemoryWorkspace::from_pairs(vec![
+                ("from.txt", b"src".to_vec()),
+                ("to.txt", b"dest".to_vec()),
+            ])
+            .unwrap(),
+        );
+        let ws = PatchOnlyWorkspace::new(base.clone());
+        let from = WorkspacePath::new("from.txt").unwrap();
+        let to = WorkspacePath::new("to.txt").unwrap();
+        let patch = PatchSet::from_files(vec![FilePatch::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]);
+        ws.apply_patch(&patch).await.unwrap();
+        assert_eq!(ws.read_file(&to).await.unwrap().bytes, b"src");
+        assert_eq!(
+            ws.read_file(&from).await.unwrap_err().code,
+            "workspace.not_found"
+        );
+    }
 }
