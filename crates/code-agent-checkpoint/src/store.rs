@@ -525,14 +525,44 @@ impl LocalCheckpointStore {
             atomic_write(&path, buf.as_bytes()).await?;
         }
 
-        // 3. Only now unlink the manifest. Surface unlink failures
-        //    (e.g. permission denied on the manifests dir, manifest
-        //    file held open elsewhere). On failure the index already
-        //    reflects the intended state (entry gone) and the manifest
-        //    becomes an orphan a future sweep can clean up.
+        // 3. Only now unlink the deleted checkpoint's manifest.
+        //    Surface unlink failures (e.g. permission denied on the
+        //    manifests dir, manifest file held open elsewhere). On
+        //    failure the index already reflects the intended state
+        //    (entry gone) and the manifest becomes an orphan a future
+        //    sweep can clean up.
         let manifest = self.manifest_path(session_id, checkpoint_id)?;
         if manifest.exists() {
             tokio::fs::remove_file(&manifest).await?;
+        }
+
+        // 4. If `kept` is empty after this delete, also delete any
+        //    ORPHAN manifests in the manifests dir (manifests whose
+        //    index entry was already missing because a prior
+        //    `create_checkpoint` trim failed). Without this step
+        //    `list_checkpoints` reports "no checkpoints" forever while
+        //    those orphan files silently consume disk (#165).
+        //
+        //    Only sweep when `kept` is empty so we never delete a
+        //    manifest that the post-delete index claims to point at.
+        //    The orphan-sweep is scoped to this session's manifests
+        //    directory so it cannot affect other sessions.
+        if kept.is_empty() {
+            let dir = self.manifests_dir_for(session_id)?;
+            if dir.exists() {
+                let mut rd = tokio::fs::read_dir(&dir).await?;
+                while let Some(entry) = rd.next_entry().await? {
+                    let p = entry.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                        // best-effort: surface only hard failures.
+                        if let Err(e) = tokio::fs::remove_file(&p).await {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1696,5 +1726,65 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CheckpointError::BlobMissing(_)));
+    }
+
+    // Regression for #165: deleting the last checkpoint in the index
+    // also sweeps orphan manifests. Pre-fix the index was truncated to
+    // zero bytes while orphans (e.g. left over from a prior trim
+    // failure) remained on disk, hidden from `list_checkpoints`
+    // forever.
+    #[tokio::test]
+    async fn delete_last_entry_sweeps_orphan_manifests() {
+        let (_dir, store, sid) = fresh_store();
+        store.ensure_dirs(&sid).await.unwrap();
+
+        // Create the surviving checkpoint (the one we'll delete).
+        let surviving = store
+            .create_checkpoint(CreateCheckpointRequest {
+                session_id: sid.clone(),
+                run_id: RunId::new(),
+                cwd: store.root().to_path_buf(),
+                description: None,
+                user_message_id: None,
+                git_state: None,
+            })
+            .await
+            .unwrap();
+
+        // Simulate an orphan: write a manifest directly without an
+        // index entry (the shape a prior `create_checkpoint` trim
+        // failure would leave behind).
+        let orphan_cid = CheckpointId::new();
+        let orphan_meta = CheckpointMetadata {
+            checkpoint_id: orphan_cid.clone(),
+            session_id: sid.clone(),
+            run_id: RunId::new(),
+            user_message_id: None,
+            cwd: store.root().to_path_buf(),
+            created_at: OffsetDateTime::now_utc(),
+            description: None,
+            files_tracked: Vec::new(),
+            git_state: None,
+        };
+        store.write_manifest(&sid, &orphan_meta).await.unwrap();
+        let orphan_path = store.manifest_path(&sid, &orphan_cid).unwrap();
+        assert!(
+            orphan_path.exists(),
+            "orphan manifest must exist pre-delete"
+        );
+
+        // Delete the surviving checkpoint. Post-delete the index is
+        // empty; the orphan-sweep must remove the orphan too.
+        store
+            .delete_checkpoint_locked(&sid, &surviving)
+            .await
+            .unwrap();
+
+        let list = store.list_checkpoints(&sid).await.unwrap();
+        assert!(list.is_empty(), "index should be empty after delete");
+        assert!(
+            !orphan_path.exists(),
+            "orphan manifest must be swept when the last index entry is deleted (#165)"
+        );
     }
 }
