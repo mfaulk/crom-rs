@@ -113,8 +113,21 @@ pub struct AuthCommonArgs {
     pub allow_file_store: bool,
 }
 
+/// Effective `allow_file_credential_store`: the `--allow-file-store` flag
+/// forces it on for this run; otherwise we honor
+/// `auth.allow_file_credential_store` from user+project settings. The
+/// top-level auth subcommands don't otherwise load settings, so without
+/// this the configured value would be silently ignored and `Auto` mode
+/// would fall through to the no-op backend.
+fn settings_allow_file_store(cwd: &std::path::Path) -> bool {
+    code_agent_core::settings::load(cwd, code_agent_core::settings::SettingSource::UserAndProject)
+        .map(|s| s.auth.allow_file_credential_store.unwrap_or(false))
+        .unwrap_or(false)
+}
+
 /// Resolve a credential store rooted at `cwd/.agent`.
 pub fn build_store(cwd: &std::path::Path, allow_file_store: bool) -> Result<CredentialStore> {
+    let allow_file_store = allow_file_store || settings_allow_file_store(cwd);
     let index_path = cwd.join(".agent").join("auth.json");
     let store = CredentialStore::build(
         CredentialStoreMode::Auto,
@@ -900,6 +913,33 @@ pub async fn format_logout(
 mod tests {
     use super::*;
 
+    /// Sets an env var for the test's duration and restores the prior value
+    /// (or unsets it) on drop, so settings-isolation doesn't leak across tests.
+    struct EnvVarGuard {
+        key: String,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
     #[tokio::test]
     // /login fake --api-key=demo stores a credential and marks the fake provider active.
     async fn slash_login_fake_api_key_stores_credential() {
@@ -912,6 +952,47 @@ mod tests {
         let idx = store.snapshot_index();
         assert_eq!(idx.list_for(&ProviderId::Fake).len(), 1);
         assert!(idx.active_for(&ProviderId::Fake).is_some());
+    }
+
+    #[tokio::test]
+    // Regression: `build_store` honors `auth.allow_file_credential_store`
+    // from settings.json even when the `--allow-file-store` flag is not
+    // passed. Without it, the top-level auth subcommands ignored the
+    // configured value and `Auto` mode fell through to the no-op backend.
+    async fn build_store_honors_allow_file_setting() {
+        // `build_store` loads user+project settings, so isolate the user
+        // config home to an empty dir — otherwise the developer's real
+        // ~/.config/code-agent/settings.json could opt the file store in and
+        // make the negative arm below spuriously succeed.
+        let cfg_home = tempfile::TempDir::new().unwrap();
+        let _cfg_guard = EnvVarGuard::set("CODE_AGENT_CONFIG_HOME", cfg_home.path());
+
+        // No flag, no settings -> file store stays disabled, so a login
+        // (which writes a secret) fails via the no-op backend.
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = handle_login_slash("fake --api-key=demo", dir.path(), false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("credential store"),
+            "expected credential-store error, got: {err}"
+        );
+
+        // Same call, but a project settings.json opts the file store in.
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join(".agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{ "auth": { "allow_file_credential_store": true } }"#,
+        )
+        .unwrap();
+        let out = handle_login_slash("fake --api-key=demo", dir.path(), false)
+            .await
+            .unwrap();
+        assert!(out.contains("Active provider: fake"));
+        let store = build_store(dir.path(), false).unwrap();
+        assert_eq!(store.snapshot_index().list_for(&ProviderId::Fake).len(), 1);
     }
 
     #[tokio::test]
