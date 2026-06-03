@@ -46,8 +46,12 @@ pub fn agent_tool_name(server: &str, tool: &str) -> Result<String, String> {
 
 pub fn parse_agent_tool_name(name: &str) -> Option<McpToolNameParts> {
     let rest = name.strip_prefix("mcp__")?;
+    // Split only on the first `__` after the prefix: the server name never
+    // contains `__` (identifier-safe, joined by exactly one `__`), but a
+    // remote tool name may, so the entire remainder is the tool name. This
+    // round-trips every name `agent_tool_name` produces.
     let (server, tool) = rest.split_once("__")?;
-    if server.is_empty() || tool.is_empty() || tool.contains("__") {
+    if server.is_empty() || tool.is_empty() {
         return None;
     }
     Some(McpToolNameParts {
@@ -92,5 +96,16 @@ mod tests {
         let parts = parse_agent_tool_name("mcp__docs__search").unwrap();
         assert_eq!(parts.server_name, "docs");
         assert_eq!(parts.remote_tool_name, "search");
+    }
+
+    #[test]
+    // A remote tool name containing `__` round-trips: the producer joins on a
+    // single `__`, and the parser splits only on the first one.
+    fn round_trips_tool_name_with_double_underscore() {
+        let name = agent_tool_name("srv", "do__thing").unwrap();
+        assert_eq!(name, "mcp__srv__do__thing");
+        let parts = parse_agent_tool_name(&name).unwrap();
+        assert_eq!(parts.server_name, "srv");
+        assert_eq!(parts.remote_tool_name, "do__thing");
     }
 }
