@@ -1,14 +1,14 @@
 //! PKCE verifier/challenge + CSRF state generation.
 //!
-//! Bytes come from the OS CSPRNG via [`rand::rngs::OsRng`] (which uses
+//! Bytes come from the OS CSPRNG via [`rand::rngs::SysRng`] (which uses
 //! `getrandom` under the hood). Earlier revisions of this module
 //! derived these values from `SystemTime + pid + counter` hashed with
 //! SHA-256 — that was rejected during code review as not appropriate
 //! entropy for OAuth state and PKCE verifiers, since the inputs are
 //! predictable to a local observer.
 
-use rand::rngs::OsRng;
-use rand::TryRngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use sha2::Digest;
 
 /// Generate a URL-safe random string suitable for the PKCE
@@ -33,12 +33,12 @@ pub fn s256_challenge(verifier: &str) -> String {
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
-    // rand 0.9 models the OS CSPRNG as a *fallible* `TryRngCore` (getrandom
+    // rand 0.10 models the OS CSPRNG as a *fallible* `TryRng` (getrandom
     // can fail), so there is no infallible `fill_bytes`. A CSPRNG failure
     // here is unrecoverable for OAuth state / PKCE verifiers — emitting
     // low-entropy material would be worse than aborting — so surface it as a
     // panic rather than degrade silently.
-    OsRng
+    SysRng
         .try_fill_bytes(&mut buf)
         .expect("OS CSPRNG (getrandom) failed");
     buf
@@ -91,12 +91,12 @@ mod tests {
     // 1024 consecutive verifier draws have no collisions and pass a
     // light entropy smell-test (no draw shares more than 50% of its
     // bytes with any other draw). This is a sanity check that we are
-    // calling OsRng, not a deterministic generator.
+    // calling SysRng, not a deterministic generator.
     fn entropy_no_collisions_over_many_draws() {
         let mut seen = HashSet::new();
         for _ in 0..1024 {
             let v = generate_verifier();
-            assert!(seen.insert(v), "verifier collision under OsRng");
+            assert!(seen.insert(v), "verifier collision under SysRng");
         }
     }
 

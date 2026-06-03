@@ -60,7 +60,7 @@ bytes = "1"
 tempfile = "3"
 sha2 = "0.11"
 hex = "0.4"
-rand = "0.9"
+rand = { version = "0.10", features = ["sys_rng"] }
 
 code-agent-core = { path = "crates/code-agent-core", version = "0.1.0" }
 code-agent-anthropic = { path = "crates/code-agent-anthropic", version = "0.1.0" }
