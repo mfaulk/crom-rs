@@ -5414,10 +5414,23 @@ fn resolve_runtime_credential(
         .auth
         .allow_file_credential_store
         .unwrap_or(false);
+    resolve_stored_credential(&cfg.cwd, allow_file, provider)
+}
+
+/// Resolve a credential from the `.agent/auth.json` store rooted at `cwd`,
+/// honoring the `allow_file_store` opt-in and the same `ExplicitFirst`
+/// precedence (explicit env keys, then stored credentials) used across the
+/// CLI. Factored out so non-run surfaces (e.g. the TUI) can resolve a
+/// logged-in credential without constructing a full `ResolvedRunConfig`.
+fn resolve_stored_credential(
+    cwd: &std::path::Path,
+    allow_file: bool,
+    provider: code_agent_auth::ProviderId,
+) -> Result<code_agent_auth::ResolvedCredential> {
     let store = code_agent_auth::CredentialStore::build(
         code_agent_auth::CredentialStoreMode::Auto,
         allow_file,
-        Some(cfg.cwd.join(".agent").join("auth.json")),
+        Some(cwd.join(".agent").join("auth.json")),
     )
     .map_err(|e| anyhow!("credential store: {e}"))?;
     let env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
@@ -7496,13 +7509,13 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
     // TUI app shell. M13 Phase A only supports the fake provider and
     // Anthropic via ANTHROPIC_API_KEY; later phases extend to OAuth /
     // OpenAI / Gemini routing already present in the rest of the CLI.
-    let provider_config = match build_tui_provider_config(&args)? {
+    let provider_config = match build_tui_provider_config(&args, &cwd, &settings)? {
         Some(cfg) => cfg,
         None => {
             // Fall back to one preview frame so users without a configured
             // provider still get useful output instead of an empty screen.
             eprintln!(
-                "[tui] no provider configured; pass --fake-provider or set ANTHROPIC_API_KEY"
+                "[tui] no provider configured; run `code-agent login anthropic`, set ANTHROPIC_API_KEY, or pass --fake-provider"
             );
             let ctx =
                 m9::build_default_status_ctx(&cwd, &settings, args.session.as_deref(), None, false);
@@ -8078,21 +8091,35 @@ mod tui_inspector_helpers_tests {
     }
 }
 
-fn build_tui_provider_config(args: &TuiArgs) -> Result<Option<code_agent_sdk::ProviderConfig>> {
+fn build_tui_provider_config(
+    args: &TuiArgs,
+    cwd: &std::path::Path,
+    settings: &Settings,
+) -> Result<Option<code_agent_sdk::ProviderConfig>> {
     use std::sync::Arc;
     if args.fake_provider {
         return Ok(Some(code_agent_sdk::ProviderConfig::fake(Arc::new(
             code_agent_sdk::fake_provider::EchoFakeProvider,
         ))));
     }
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        if !key.is_empty() {
-            return Ok(Some(code_agent_sdk::ProviderConfig::anthropic_api_key(
-                code_agent_sdk::SecretString::new(key),
-            )));
+    // Resolve via the same precedence ladder as the act/run path so the TUI
+    // honors both `ANTHROPIC_API_KEY` and a credential stored by
+    // `code-agent login` (file store gated by `allow_file_credential_store`).
+    // The SDK builder only wires the Anthropic API-key variant today, so a
+    // stored OAuth credential still falls through to the no-provider notice.
+    let allow_file = settings.auth.allow_file_credential_store.unwrap_or(false);
+    match resolve_stored_credential(cwd, allow_file, code_agent_auth::ProviderId::Anthropic) {
+        // Guard against a set-but-empty key (e.g. `ANTHROPIC_API_KEY=`): the
+        // resolver surfaces it as an `ApiKey` with an empty secret, but the
+        // pre-resolver TUI path required a non-empty key. Fall through to the
+        // no-provider notice rather than building a provider that can't auth.
+        Ok(code_agent_auth::ResolvedCredential::ApiKey { key, .. }) if !key.expose().is_empty() => {
+            Ok(Some(code_agent_sdk::ProviderConfig::anthropic_api_key(
+                code_agent_sdk::SecretString::new(key.expose().to_string()),
+            )))
         }
+        _ => Ok(None),
     }
-    Ok(None)
 }
 
 #[cfg(test)]
