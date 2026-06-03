@@ -78,21 +78,35 @@ pub fn resolve_credential(inputs: AuthResolverInputs<'_>) -> Result<ResolvedAuth
             key: k.clone(),
         });
 
+    // Look up a stored account's secret and turn it into a resolved
+    // credential. A genuine backend `Err` (store unavailable / I/O) is
+    // propagated; a true "no entry" stays `Ok(None)` and falls through.
+    let resolve_stored = |aid: &AccountId| -> Result<Option<ResolvedCredential>, AuthError> {
+        let Some(store) = inputs.store else {
+            return Ok(None);
+        };
+        let Some(secret) = store.get_secret(&provider, aid)? else {
+            return Ok(None);
+        };
+        let account = store.snapshot_index().get(&provider, aid).cloned();
+        Ok(secret_to_credential(
+            &provider,
+            aid,
+            &secret,
+            account.as_ref(),
+        ))
+    };
+
     // Source B: explicit CLI account override (must be present in store).
-    let cli_account = inputs.explicit_account.as_ref().and_then(|aid| {
-        let store = inputs.store?;
-        let secret = store.get_secret(&provider, aid).ok().flatten()?;
-        secret_to_credential(&provider, aid, &secret)
-    });
+    let cli_account = match inputs.explicit_account.as_ref() {
+        Some(aid) => resolve_stored(aid)?,
+        None => None,
+    };
 
     // Source C: active stored account.
-    let stored_active = match (inputs.active_account, inputs.store) {
-        (Some(aid), Some(store)) => store
-            .get_secret(&provider, aid)
-            .ok()
-            .flatten()
-            .and_then(|secret| secret_to_credential(&provider, aid, &secret)),
-        _ => None,
+    let stored_active = match inputs.active_account {
+        Some(aid) => resolve_stored(aid)?,
+        None => None,
     };
 
     // Source D: env var API key.
@@ -105,18 +119,28 @@ pub fn resolve_credential(inputs: AuthResolverInputs<'_>) -> Result<ResolvedAuth
     });
 
     // Source E: any stored account for provider, most recent first.
-    let stored_first = inputs.store.and_then(|store| {
-        let idx = store.snapshot_index();
-        let mut accounts: Vec<_> = idx.list_for(&provider).into_iter().collect();
-        accounts.sort_by_key(|a| std::cmp::Reverse(a.created_at));
-        accounts.into_iter().find_map(|acct| {
-            store
-                .get_secret(&provider, &acct.account_id)
-                .ok()
-                .flatten()
-                .and_then(|secret| secret_to_credential(&provider, &acct.account_id, &secret))
-        })
-    });
+    let stored_first = match inputs.store {
+        Some(store) => {
+            let idx = store.snapshot_index();
+            let mut accounts: Vec<_> = idx.list_for(&provider).into_iter().cloned().collect();
+            accounts.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+            let mut found = None;
+            for acct in accounts {
+                // Propagate genuine backend errors; skip accounts whose
+                // secret is simply absent or non-credential.
+                if let Some(secret) = store.get_secret(&provider, &acct.account_id)? {
+                    if let Some(cred) =
+                        secret_to_credential(&provider, &acct.account_id, &secret, Some(&acct))
+                    {
+                        found = Some(cred);
+                        break;
+                    }
+                }
+            }
+            found
+        }
+        None => None,
+    };
 
     let stored_any = stored_active.clone().or_else(|| stored_first.clone());
 
@@ -152,6 +176,7 @@ fn secret_to_credential(
     provider: &ProviderId,
     account_id: &AccountId,
     secret: &crate::types::StoredCredentialSecret,
+    account: Option<&crate::types::StoredAccount>,
 ) -> Option<ResolvedCredential> {
     if let Some(api_key) = secret.api_key.as_ref() {
         return Some(ResolvedCredential::ApiKey {
@@ -165,7 +190,7 @@ fn secret_to_credential(
             provider: provider.clone(),
             account_id: account_id.clone(),
             access_token: at.clone(),
-            expires_at: None,
+            expires_at: account.and_then(|a| a.expires_at),
         });
     }
     None
@@ -298,6 +323,137 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err.kind, AuthErrorKind::NotLoggedIn);
+    }
+
+    #[test]
+    // A stored OAuth account with an expiry produces an OAuthBearer that
+    // carries that expiry rather than discarding it.
+    fn oauth_credential_carries_stored_expiry() {
+        let store = CredentialStore::new_in_memory_for_tests();
+        let aid = AccountId::new("oauth-1");
+        let expiry = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let acct = StoredAccount {
+            account_id: aid.clone(),
+            provider: ProviderId::Anthropic,
+            login_method: LoginMethodKind::OAuthBrowser,
+            display_email: None,
+            workspace_id: None,
+            plan_type: None,
+            created_at: OffsetDateTime::now_utc(),
+            last_refresh_at: None,
+            expires_at: Some(expiry),
+            scopes: vec![],
+            active: true,
+            metadata: serde_json::json!({}),
+            needs_reauth: false,
+        };
+        let secret = StoredCredentialSecret {
+            access_token: Some(SecretString::new("at-token".into())),
+            ..Default::default()
+        };
+        store.put(acct, &secret).unwrap();
+        store
+            .set_active(&ProviderId::Anthropic, aid.clone())
+            .unwrap();
+        let res = resolve_credential(AuthResolverInputs {
+            provider: Some(ProviderId::Anthropic),
+            mode: AuthPrecedenceMode::StoredFirst,
+            explicit_api_key: None,
+            explicit_account: None,
+            active_account: Some(&aid),
+            env: BTreeMap::new(),
+            store: Some(&store),
+        })
+        .unwrap();
+        match res.credential {
+            ResolvedCredential::OAuthBearer {
+                access_token,
+                expires_at,
+                ..
+            } => {
+                assert_eq!(access_token.expose(), "at-token");
+                assert_eq!(expires_at, Some(expiry));
+            }
+            _ => panic!("expected OAuthBearer"),
+        }
+    }
+
+    /// Backend whose `get` always fails with a hard backend error,
+    /// simulating an unavailable store / I/O failure.
+    struct FailingGetBackend;
+
+    impl crate::store::SecretBackend for FailingGetBackend {
+        fn name(&self) -> &'static str {
+            "failing_get"
+        }
+        fn put(
+            &self,
+            _provider: &ProviderId,
+            _account_id: &AccountId,
+            _secret: &StoredCredentialSecret,
+        ) -> Result<(), AuthError> {
+            Ok(())
+        }
+        fn get(
+            &self,
+            _provider: &ProviderId,
+            _account_id: &AccountId,
+        ) -> Result<Option<StoredCredentialSecret>, AuthError> {
+            Err(AuthError::new(
+                AuthErrorKind::CredentialStoreUnavailable,
+                "backend unavailable",
+            ))
+        }
+        fn delete(
+            &self,
+            _provider: &ProviderId,
+            _account_id: &AccountId,
+        ) -> Result<(), AuthError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    // A genuine backend error during lookup is surfaced to the caller
+    // rather than collapsed into NotLoggedIn.
+    fn backend_error_propagates_not_not_logged_in() {
+        use std::sync::Arc;
+        let aid = AccountId::new("k1");
+        let acct = StoredAccount {
+            account_id: aid.clone(),
+            provider: ProviderId::Anthropic,
+            login_method: LoginMethodKind::ApiKey,
+            display_email: None,
+            workspace_id: None,
+            plan_type: None,
+            created_at: OffsetDateTime::now_utc(),
+            last_refresh_at: None,
+            expires_at: None,
+            scopes: vec![],
+            active: true,
+            metadata: serde_json::json!({}),
+            needs_reauth: false,
+        };
+        // Seed the index so the active-account lookup hits the backend.
+        let store = CredentialStore {
+            mode: crate::types::CredentialStoreMode::Auto,
+            allow_file_store: true,
+            backend: Arc::new(FailingGetBackend),
+            index: Arc::new(std::sync::Mutex::new(crate::store::AccountIndex::default())),
+            index_path: None,
+        };
+        store.index.lock().unwrap().upsert(acct);
+        let err = resolve_credential(AuthResolverInputs {
+            provider: Some(ProviderId::Anthropic),
+            mode: AuthPrecedenceMode::StoredFirst,
+            explicit_api_key: None,
+            explicit_account: None,
+            active_account: Some(&aid),
+            env: BTreeMap::new(),
+            store: Some(&store),
+        })
+        .unwrap_err();
+        assert_eq!(err.kind, AuthErrorKind::CredentialStoreUnavailable);
     }
 
     #[test]
