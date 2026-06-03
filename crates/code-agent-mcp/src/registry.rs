@@ -38,6 +38,16 @@ pub fn agent_tool_name(server: &str, tool: &str) -> Result<String, String> {
     if !is_identifier_safe(server) {
         return Err(format!("unsafe MCP server name {server:?}"));
     }
+    // `mcp__{server}__{tool}` uses `__` as the single server/tool delimiter,
+    // and `parse_agent_tool_name` splits on the *first* `__` after the prefix.
+    // The remote tool name is allowed to contain `__`, so the server name
+    // must not — otherwise `mcp__a__b__tool` would be ambiguous and parse back
+    // to the wrong (server, tool) split, breaking server-scoped policy/hooks.
+    if server.contains("__") {
+        return Err(format!(
+            "MCP server name {server:?} must not contain \"__\" (reserved as the tool-name delimiter)"
+        ));
+    }
     if !is_identifier_safe(tool) {
         return Err(format!("unsafe MCP tool name {tool:?}"));
     }
@@ -88,6 +98,23 @@ mod tests {
     fn rejects_unsafe_names() {
         assert!(agent_tool_name("git-hub", "list_issues").is_err());
         assert!(agent_tool_name("github", "list issues").is_err());
+    }
+
+    #[test]
+    // A server name containing `__` is rejected: it would otherwise make
+    // `mcp__{server}__{tool}` ambiguous and parse back to the wrong split
+    // (e.g. server "prod__github" -> parsed server "prod"), breaking
+    // server-scoped allow/deny policy, hooks, and telemetry. The remote tool
+    // name may still contain `__`; only the server name is constrained.
+    fn rejects_server_name_with_double_underscore() {
+        assert!(agent_tool_name("prod__github", "delete_issue").is_err());
+        // The dangerous case must not silently round-trip to the wrong split.
+        assert!(agent_tool_name("prod__github", "delete_issue").is_err());
+        // A single-underscore server name is still fine.
+        let name = agent_tool_name("prod_github", "delete_issue").unwrap();
+        let parts = parse_agent_tool_name(&name).unwrap();
+        assert_eq!(parts.server_name, "prod_github");
+        assert_eq!(parts.remote_tool_name, "delete_issue");
     }
 
     #[test]
