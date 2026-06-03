@@ -143,11 +143,28 @@ where
         options.preserve_tool_results,
         CompactionPreservePolicy::PreserveErrors
     ) {
-        // Walk older messages and keep any error tool-results.
+        // Walk older messages and keep any error tool-results. The
+        // originating assistant turn (with the matching `tool_use`) was
+        // summarized away, so a bare `tool_result` would be an orphan that
+        // the Anthropic API rejects (every `tool_result` must be
+        // immediately preceded by an assistant message whose `tool_use`
+        // shares its id). Synthesize a placeholder assistant `tool_use`
+        // with the original id directly before each preserved result to
+        // restore that pairing while keeping the error content intact.
         for msg in older {
             for block in &msg.content {
                 if let ContentBlock::ToolResult(tr) = block {
                     if tr.is_error {
+                        let tool_name = find_tool_name_for_id(older, &tr.tool_use_id)
+                            .unwrap_or_else(|| "unknown".to_string());
+                        new_conv.push(Message {
+                            role: MessageRole::Assistant,
+                            content: vec![ContentBlock::ToolUse(crate::conversation::ToolCall {
+                                id: tr.tool_use_id.clone(),
+                                name: tool_name,
+                                input: serde_json::json!({}),
+                            })],
+                        });
                         new_conv.push(Message {
                             role: MessageRole::User,
                             content: vec![ContentBlock::ToolResult(tr.clone())],
@@ -170,6 +187,23 @@ where
         summary_preview,
         compacted: true,
     }
+}
+
+/// Look up the originating tool name for a `tool_use_id` by scanning the
+/// older messages for the matching assistant `tool_use` block. Used to give
+/// the synthesized placeholder assistant message a faithful tool name so the
+/// reconstructed `tool_use`/`tool_result` pair matches the original call.
+fn find_tool_name_for_id(messages: &[Message], tool_use_id: &str) -> Option<String> {
+    for msg in messages {
+        for block in &msg.content {
+            if let ContentBlock::ToolUse(call) = block {
+                if call.id == tool_use_id {
+                    return Some(call.name.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn first_line_preview(s: &str) -> String {
@@ -346,7 +380,115 @@ mod tests {
             ..Default::default()
         };
         let r = compact_conversation(&c, &opts);
-        // 1 summary + 1 preserved error + 3 recent = 5
+        // 1 summary + 1 placeholder tool_use + 1 preserved error + 3 recent
         assert!(r.post_messages >= 5);
+    }
+
+    #[test]
+    // Regression for #163: every preserved error `tool_result` must be
+    // immediately preceded by an assistant message containing a matching
+    // `tool_use` id. Otherwise the Anthropic API rejects the orphan
+    // `tool_result` with a 400.
+    fn preserve_errors_pairs_tool_use_with_result() {
+        let mut c = Conversation::new();
+        // An originating assistant turn with the tool_use that produced the
+        // error, plus a non-error result that must NOT be preserved.
+        c.push(Message {
+            role: MessageRole::Assistant,
+            content: vec![
+                ContentBlock::ToolUse(crate::conversation::ToolCall {
+                    id: "call_err".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "false"}),
+                }),
+                ContentBlock::ToolUse(crate::conversation::ToolCall {
+                    id: "call_ok".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({}),
+                }),
+            ],
+        });
+        c.push(Message {
+            role: MessageRole::User,
+            content: vec![
+                ContentBlock::ToolResult(crate::conversation::ToolResult {
+                    tool_use_id: "call_err".into(),
+                    content: vec![ToolResultContent::Text {
+                        text: "boom".into(),
+                    }],
+                    is_error: true,
+                }),
+                ContentBlock::ToolResult(crate::conversation::ToolResult {
+                    tool_use_id: "call_ok".into(),
+                    content: vec![ToolResultContent::Text { text: "ok".into() }],
+                    is_error: false,
+                }),
+            ],
+        });
+        for i in 0..6 {
+            c.push(make_text(MessageRole::User, &format!("msg {i}")));
+        }
+        let opts = CompactionOptions {
+            preserve_recent_turns: 3,
+            preserve_tool_results: CompactionPreservePolicy::PreserveErrors,
+            ..Default::default()
+        };
+        let r = compact_conversation(&c, &opts);
+
+        // Structural validity: for each message, any tool_result block must
+        // have its id present as a tool_use in the immediately preceding
+        // assistant message.
+        let msgs = &r.conversation.messages;
+        let mut saw_preserved_error = false;
+        for (i, msg) in msgs.iter().enumerate() {
+            for block in &msg.content {
+                if let ContentBlock::ToolResult(tr) = block {
+                    if !tr.is_error {
+                        continue;
+                    }
+                    saw_preserved_error = true;
+                    assert!(i > 0, "tool_result must have a preceding message");
+                    let prev = &msgs[i - 1];
+                    assert_eq!(
+                        prev.role,
+                        MessageRole::Assistant,
+                        "tool_result must follow an assistant message"
+                    );
+                    let has_match = prev.content.iter().any(
+                        |b| matches!(b, ContentBlock::ToolUse(call) if call.id == tr.tool_use_id),
+                    );
+                    assert!(
+                        has_match,
+                        "tool_result id {} has no matching tool_use in the preceding assistant message",
+                        tr.tool_use_id
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_preserved_error,
+            "expected at least one preserved error tool_result"
+        );
+
+        // The placeholder reuses the original id and recovers the tool name.
+        let placeholder = msgs.iter().find_map(|m| {
+            m.content.iter().find_map(|b| match b {
+                ContentBlock::ToolUse(call) if call.id == "call_err" => Some(call.clone()),
+                _ => None,
+            })
+        });
+        let placeholder = placeholder.expect("placeholder tool_use should exist");
+        assert_eq!(placeholder.name, "Bash");
+
+        // The non-error result must not be preserved (only errors are).
+        let preserved_non_error = msgs.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult(tr) if tr.tool_use_id == "call_ok"))
+        });
+        assert!(
+            !preserved_non_error,
+            "non-error result should be summarized away"
+        );
     }
 }
