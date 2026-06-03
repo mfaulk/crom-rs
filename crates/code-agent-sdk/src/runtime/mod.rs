@@ -71,7 +71,6 @@ pub(crate) struct RuntimeInner {
     #[allow(dead_code)]
     pub(crate) credential_resolver: Option<Arc<dyn CredentialResolver>>,
     pub(crate) event_sink: Option<Arc<dyn EventSink>>,
-    #[allow(dead_code)]
     pub(crate) secret_redactor: Arc<dyn SecretRedactor>,
     #[allow(dead_code)]
     pub(crate) tool_host: Option<Arc<dyn ToolHost>>,
@@ -144,13 +143,7 @@ impl AgentRuntime {
             model: model.clone(),
             metadata: metadata.clone(),
         });
-        let _ = event_tx.send(Ok(start_event.clone())).await;
-        if let Some(sink) = &inner.event_sink {
-            sink.emit(start_event.clone()).await;
-        }
-        if let Some(s) = &storage_session {
-            let _ = inner.storage.append_event(s, start_event).await;
-        }
+        run::emit_event(&inner, &event_tx, storage_session.as_ref(), start_event).await;
 
         let run_id_for_task = run_id.clone();
         let session_for_task = session_id.clone();
@@ -220,13 +213,7 @@ impl AgentRuntime {
                     diagnostics: final_result.diagnostics.clone(),
                 }),
             };
-            let _ = event_tx.send(Ok(evt.clone())).await;
-            if let Some(sink) = &inner.event_sink {
-                sink.emit(evt.clone()).await;
-            }
-            if let Some(s) = &storage_session_for_task {
-                let _ = inner.storage.append_event(s, evt).await;
-            }
+            run::emit_event(&inner, &event_tx, storage_session_for_task.as_ref(), evt).await;
             *result_for_task.lock().await = Some(Ok(final_result));
         });
 

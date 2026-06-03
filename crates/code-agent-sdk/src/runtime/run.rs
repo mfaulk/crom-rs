@@ -1,5 +1,6 @@
 //! Execution of `AgentRequest` against the underlying core agent loop.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::budget::CancellationHandle;
 use crate::error::{AgentSdkError, AgentSdkErrorKind, Diagnostic};
-use crate::event::{DiagnosticEvent, PatchProposedEvent, SdkEvent, SdkEventMapper};
+use crate::event::{redact_event, DiagnosticEvent, PatchProposedEvent, SdkEvent, SdkEventMapper};
 use crate::patch::{CodeArtifacts, FilePatch, PatchSet};
 use crate::plan::{ActRequest, PlanRequest, PlanResult};
 use crate::request::{AgentMode, AgentRequest, PatchPolicy, PlanPolicy};
@@ -36,6 +37,38 @@ struct AbortOnDrop(tokio::task::AbortHandle);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// Redact, then ship a single `SdkEvent` to the three sinks: the
+/// caller's event channel, the optional runtime event sink, and (when a
+/// storage session is active) the storage log.
+///
+/// - Secret redaction is applied once here so every persisted/emitted
+///   copy is scrubbed by the configured `SecretRedactor` (#211). The
+///   value handed to tool execution is never routed through this path,
+///   so tool dispatch still sees the real input.
+/// - Storage-append and event-send failures are logged rather than
+///   silently discarded (#151). They are intentionally non-fatal: a
+///   closed consumer channel or a transient storage error must not abort
+///   an otherwise-healthy run.
+pub(crate) async fn emit_event(
+    runtime: &RuntimeInner,
+    event_tx: &mpsc::Sender<Result<SdkEvent, AgentSdkError>>,
+    storage_session: Option<&SessionId>,
+    event: SdkEvent,
+) {
+    let event = redact_event(&*runtime.secret_redactor, event);
+    if let Err(e) = event_tx.send(Ok(event.clone())).await {
+        tracing::debug!(error = %e, "sdk event channel closed; dropping event");
+    }
+    if let Some(sink) = &runtime.event_sink {
+        sink.emit(event.clone()).await;
+    }
+    if let Some(s) = storage_session {
+        if let Err(e) = runtime.storage.append_event(s, event).await {
+            tracing::warn!(error = %e, "failed to append event to storage");
+        }
     }
 }
 
@@ -86,6 +119,13 @@ pub(crate) async fn execute_request(
 
     // Apply deadline.
     let deadline = request.deadline.or(request.budgets.max_duration);
+    // Flag set by the deadline watcher before it cancels, so the
+    // finalization logic can distinguish a deadline-driven cancellation
+    // (which must surface as `TimedOut`) from an external cancel (which
+    // stays `Cancelled`). Without it, a deadline expiry cancelled the run
+    // but the status was only ever `Cancelled`; `TimedOut` was unreachable
+    // on this path (#212).
+    let deadline_fired = Arc::new(AtomicBool::new(false));
     // Hold the watcher in a drop guard so a normal early return (Plan-only
     // short-circuit, validation failure, etc.) tears the task down instead
     // of letting it sleep for the rest of the deadline window. Previously
@@ -94,9 +134,13 @@ pub(crate) async fn execute_request(
     // normal-completion path does not do. (#164)
     let _watcher_guard = deadline.map(|d| {
         let c = cancellation.clone();
+        let fired = deadline_fired.clone();
         let handle = tokio::spawn(async move {
             tokio::select! {
-                _ = tokio::time::sleep(d) => c.cancel(),
+                _ = tokio::time::sleep(d) => {
+                    fired.store(true, Ordering::SeqCst);
+                    c.cancel();
+                }
                 _ = c.cancelled() => {}
             }
         });
@@ -387,21 +431,19 @@ pub(crate) async fn execute_request(
         }
         // Map to SDK event for downstream consumers.
         if let Some(sdk_ev) = mapper.map(&ev) {
-            let _ = event_tx.send(Ok(sdk_ev.clone())).await;
-            if let Some(sink) = &runtime.event_sink {
-                sink.emit(sdk_ev.clone()).await;
-            }
-            if let Some(s) = &storage_session {
-                let _ = runtime.storage.append_event(s, sdk_ev).await;
-            }
+            emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
         }
 
         // Budget enforcement. Guard against re-reporting: every event
         // that arrives after the cap is crossed used to re-push an
         // identical diagnostic and re-fire `cancel()`, producing a
         // diagnostics list that grew with every additional event (#149).
+        //
+        // The cap is inclusive: `tool_calls >= max` so that exactly
+        // `max` tool calls are allowed to start. The previous `>` check
+        // permitted `max + 1` calls before tripping (#213).
         if let Some(max) = request.budgets.max_tool_calls {
-            if !max_tool_calls_reported && tool_calls > max as usize {
+            if !max_tool_calls_reported && tool_calls >= max as usize {
                 cancellation.cancel();
                 diagnostics.push(Diagnostic::error(
                     "budget.max_tool_calls_exceeded",
@@ -468,13 +510,7 @@ pub(crate) async fn execute_request(
                         run_id: run_id.clone(),
                         patch: p.clone(),
                     });
-                    let _ = event_tx.send(Ok(sdk_ev.clone())).await;
-                    if let Some(sink) = &runtime.event_sink {
-                        sink.emit(sdk_ev.clone()).await;
-                    }
-                    if let Some(s) = &storage_session {
-                        let _ = runtime.storage.append_event(s, sdk_ev).await;
-                    }
+                    emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
                 }
                 patch = Some(p);
             }
@@ -535,13 +571,7 @@ pub(crate) async fn execute_request(
                             run_id: run_id.clone(),
                             report: report.clone(),
                         });
-                    let _ = event_tx.send(Ok(sdk_ev.clone())).await;
-                    if let Some(sink) = &runtime.event_sink {
-                        sink.emit(sdk_ev.clone()).await;
-                    }
-                    if let Some(s) = &storage_session {
-                        let _ = runtime.storage.append_event(s, sdk_ev).await;
-                    }
+                    emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
                     validations.push(report);
                 }
             } else {
@@ -578,13 +608,7 @@ pub(crate) async fn execute_request(
             run_id: run_id.clone(),
             diagnostic: diag.clone(),
         });
-        let _ = event_tx.send(Ok(sdk_ev.clone())).await;
-        if let Some(sink) = &runtime.event_sink {
-            sink.emit(sdk_ev.clone()).await;
-        }
-        if let Some(s) = &storage_session {
-            let _ = runtime.storage.append_event(s, sdk_ev).await;
-        }
+        emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
     }
 
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -600,11 +624,20 @@ pub(crate) async fn execute_request(
     if cancellation.is_cancelled() && status == AgentRunStatus::Completed {
         status = AgentRunStatus::Cancelled;
     }
+    // A deadline-driven cancellation is reported as `TimedOut` rather than
+    // `Cancelled`. The watcher sets `deadline_fired` before cancelling, so
+    // any cancellation observed here that coincides with the flag is a
+    // timeout (#212). External cancels leave the flag clear and stay
+    // `Cancelled`.
+    if status == AgentRunStatus::Cancelled && deadline_fired.load(Ordering::SeqCst) {
+        status = AgentRunStatus::TimedOut;
+    }
 
     let summary = if final_summary.is_empty() {
         match status {
             AgentRunStatus::Completed => "run completed".to_string(),
             AgentRunStatus::Cancelled => "run cancelled".to_string(),
+            AgentRunStatus::TimedOut => "run timed out".to_string(),
             AgentRunStatus::Failed => "run failed".to_string(),
             _ => format!("{status:?}"),
         }
@@ -721,8 +754,11 @@ pub(crate) async fn execute_plan(
             "model returned a textual plan instead of using the SubmitPlan tool",
         ));
     }
-    // Best-effort: persist the plan if the runtime has storage.
-    let _ = runtime.storage.save_plan(&outcome.plan).await;
+    // Best-effort: persist the plan if the runtime has storage. A
+    // storage failure is logged but does not fail plan generation (#151).
+    if let Err(e) = runtime.storage.save_plan(&outcome.plan).await {
+        tracing::warn!(error = %e, "failed to persist plan to storage");
+    }
     Ok(PlanResult {
         plan: outcome.plan,
         diagnostics,
