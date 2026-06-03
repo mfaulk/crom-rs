@@ -655,7 +655,30 @@ mod tests {
 
     fn send_raw_request(port: u16, request: &str) -> std::net::TcpStream {
         use std::net::TcpStream;
-        let mut stream = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).unwrap();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        // The server thread accepts on a non-blocking listener with a 50ms
+        // poll, so a connect can land in a transient window. Under heavy
+        // parallel test load (e.g. nextest on a busy macOS runner) the
+        // loopback connect can momentarily get `ConnectionRefused` before the
+        // accept loop drains the backlog. Retry briefly rather than unwrap on
+        // the first attempt — the server deadline is 5s, well beyond this.
+        let mut stream = {
+            let mut last_err = None;
+            let mut connected = None;
+            for _ in 0..100 {
+                match TcpStream::connect(addr) {
+                    Ok(s) => {
+                        connected = Some(s);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+            connected.unwrap_or_else(|| panic!("connect to callback server failed: {last_err:?}"))
+        };
         stream.write_all(request.as_bytes()).unwrap();
         stream.flush().unwrap();
         stream

@@ -2651,7 +2651,7 @@ fn skill_tool_is_allowed(options: &AgentOptions) -> bool {
         })
 }
 
-/// Build [`SlashExpansionOptions`] from the merged settings. CLI overrides
+/// Build [`code_agent_core::SlashExpansionOptions`] from the merged settings. CLI overrides
 /// land via `--no-slash-commands` (handled earlier) and the
 /// `slash_commands.allow_*` / `max_*` knobs in `.agent/settings.json`.
 fn slash_expansion_options_from_settings(
@@ -5227,7 +5227,7 @@ enum ProviderRoute {
 }
 
 /// Map a resolved provider id to a [`ProviderRoute`] by routing through
-/// the canonical [`ProviderId::parse`] so the set of known providers
+/// the canonical [`code_agent_auth::ProviderId::parse`] so the set of known providers
 /// cannot drift between the auth crate and the CLI runtime dispatch.
 ///
 /// Each first-party variant maps to its dedicated runtime when one
@@ -8160,7 +8160,7 @@ fn build_tui_provider_config(
     Ok(tui_provider_config_from_credential(&credential))
 }
 
-/// Map a resolved Anthropic credential to the TUI's [`ProviderConfig`],
+/// Map a resolved Anthropic credential to the TUI's [`code_agent_sdk::ProviderConfig`],
 /// returning `None` when no usable API key is present. Factored out of
 /// [`build_tui_provider_config`] so the credential → config decision (which
 /// drives the "no provider configured" notice) is unit-testable without

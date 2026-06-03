@@ -169,8 +169,9 @@ impl ActRequest {
         self
     }
 
-    /// Internal/test escape hatch. Use [`crate::AgentRuntime::approve_plan`]
-    /// in production: requires going through the approval pipeline.
+    /// Internal/test escape hatch. In production, drive approval through the
+    /// configured [`ApprovalPolicy`] (e.g. [`ApprovalPolicy::CallbackRequired`])
+    /// so the plan goes through the approval pipeline.
     pub fn test_force_approval(mut self) -> Self {
         self.test_force_approval = true;
         self

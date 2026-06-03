@@ -12,6 +12,10 @@ on:
       - '**/*.md'
       - 'docs/**'
       - 'LICENSE*'
+  schedule:
+    # Weekly run (Mondays 06:00 UTC) so the security/deny audits keep
+    # catching newly-published advisories even without new commits.
+    - cron: '0 6 * * 1'
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -23,21 +27,109 @@ env:
 
 jobs:
   build-test:
-    name: build / test
-    runs-on: ubuntu-latest
+    name: build / test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Primary lane: lint + test on stable/ubuntu.
+          - name: ubuntu / stable
+            os: ubuntu-latest
+            toolchain: stable
+            lint: true
+          # OS coverage on stable.
+          - name: macos / stable
+            os: macos-latest
+            toolchain: stable
+            lint: false
+          # MSRV lane. Must match `workspace.package.rust-version` in Cargo.toml.
+          - name: ubuntu / msrv 1.88.0
+            os: ubuntu-latest
+            toolchain: 1.88.0
+            lint: false
+          # Early-warning lane for upcoming compiler changes.
+          - name: ubuntu / beta
+            os: ubuntu-latest
+            toolchain: beta
+            lint: false
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.toolchain }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      # fmt + clippy only need to run once; guard them to the primary lane.
       - name: Format
+        if: matrix.lint
         run: cargo fmt --all --check
       - name: Clippy
+        if: matrix.lint
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo nextest run --locked --workspace --all-targets
+
+  docs:
+    name: docs (rustdoc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken_intra_doc_links
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Doc
+        run: cargo doc --workspace --no-deps --all-features
+
+  examples-build:
+    name: examples / check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Excluded-from-workspace example crates (Cargo.toml `[workspace] exclude`)
+        # plus the standalone examples that ship their own Cargo.toml. Each is
+        # checked against its own manifest. Verified to `cargo check` against main.
+        example:
+          - bugfix-demo
+          - policy-demo
+          - checkpoint-demo
+          - mcp-demo
+          - subagent-demo
+          - skills-demo
+          - beta-demo
+          - planning-demo
+          - headless-sdk-demo
+          - tool-search-demo
+          - tui-demo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Isolate the cache per example so the matrix legs don't thrash a
+          # single shared key (default key is OS + job name, identical here).
+          key: ${{ matrix.example }}
+      - name: Check ${{ matrix.example }}
+        # `--workspace` so example sub-crates that aren't the default package
+        # (e.g. the fake MCP server in mcp-demo / tool-search-demo) are built.
+        run: cargo check --locked --workspace --manifest-path examples/${{ matrix.example }}/Cargo.toml
+
+  deny:
+    name: security / cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources licenses

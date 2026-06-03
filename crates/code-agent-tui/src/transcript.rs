@@ -7,7 +7,7 @@ use code_agent_core::{AgentEvent, AssistantContent};
 /// One transcript entry. Multi-line cards are split by newlines.
 ///
 /// M13 Phase C extensions:
-/// * `id` is assigned by [`crate::state::TuiAppState::push_transcript`]
+/// * `id` is assigned by `TuiAppState::push_transcript`
 ///   when the card enters state, and is stable for the lifetime of the
 ///   session. It survives search-filtering and scrolling so the reducer
 ///   can keep "selected" / "expanded" sets that don't drift when new

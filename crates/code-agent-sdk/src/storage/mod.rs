@@ -158,7 +158,7 @@ impl AgentStorage for InMemoryStorage {
 /// tokio `RwLock` so two writes serialize.
 ///
 /// Untrusted session/plan ids are rejected before any path is constructed
-/// to prevent path-traversal writes outside `<root>` — see [`Self::session_path`].
+/// to prevent path-traversal writes outside `<root>` — see `Self::session_path`.
 pub struct FileStorage {
     root: PathBuf,
     write_lock: RwLock<()>,

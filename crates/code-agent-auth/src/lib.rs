@@ -4,7 +4,7 @@
 //! The crate is dependency-light: it only pulls in the workspace's
 //! standard async + serde stack, plus `sha2`/`hex` for PKCE and the
 //! redacted account-id hash. No HTTP client is bundled — providers and
-//! the OAuth flows accept an [`oauth::HttpTransport`] that the host
+//! the OAuth flows accept an [`oauth::browser::HttpTransport`] that the host
 //! crate is free to back with `reqwest`, a fake transport, or anything
 //! else.
 

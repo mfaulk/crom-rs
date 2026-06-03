@@ -221,7 +221,7 @@ pub struct LoginAlternative {
     pub command_hint: Option<String>,
 }
 
-/// Request body for [`AuthProvider::login`]. We carry both an opaque
+/// Request body for [`crate::AuthProvider::login`]. We carry both an opaque
 /// `params` map and typed convenience fields so providers can stay
 /// extensible without losing type-safety on common inputs.
 #[derive(Debug, Default)]
@@ -252,7 +252,7 @@ pub struct LoginResult {
     pub display_summary: String,
 }
 
-/// What [`AuthProvider::status`] reports about a stored or env-resolved
+/// What [`crate::AuthProvider::status`] reports about a stored or env-resolved
 /// account. Always redacted.
 #[derive(Debug, Clone)]
 pub struct AuthStatus {
