@@ -415,9 +415,17 @@ pub fn redact_secrets_in_plan(plan: &mut PlanDocument) {
     if !plan.metadata.is_null() {
         plan.metadata = redact_secrets_in_value(&plan.metadata);
     }
+    plan.title = redact_secrets_in_str(&plan.title);
     plan.user_request = redact_secrets_in_str(&plan.user_request);
     plan.summary = redact_secrets_in_str(&plan.summary);
     plan.goal = redact_secrets_in_str(&plan.goal);
+    for f in plan.files.iter_mut() {
+        // Redact the free-form reason and, defensively, the path itself.
+        f.path.redact_in_place(redact_secrets_in_str);
+        if let Some(reason) = f.reason.as_mut() {
+            *reason = redact_secrets_in_str(reason);
+        }
+    }
     for s in plan.assumptions.iter_mut() {
         *s = redact_secrets_in_str(s);
     }
@@ -738,6 +746,28 @@ mod tests {
         assert!(p.goal.contains("[REDACTED]"));
         assert!(p.assumptions[0].contains("[REDACTED]"));
         assert!(p.success_criteria[0].contains("Plain text"));
+    }
+
+    #[test]
+    // plan.title and the string fields of plan.files (path + reason) are
+    // redacted, not just summary/goal/steps. (#216)
+    fn redact_secrets_in_plan_scrubs_title_and_files() {
+        let mut p = plan_with_edit();
+        p.title = "Rotate sk-ant-api03-bbbbbbbbbbbbbbbbbbbb".into();
+        p.files.push(PlanFileRef {
+            path: WorkspaceRelativePath::try_new("src/sk-ant-api03-cccccccccccccccccccc.rs")
+                .unwrap(),
+            access: PlanFileAccess::Read,
+            reason: Some("uses ghp_abcdefghijklmnopqrstuvwx".into()),
+        });
+        super::redact_secrets_in_plan(&mut p);
+        assert!(p.title.contains("[REDACTED]"));
+        assert!(!p.title.contains("sk-ant-api03"));
+        let f = p.files.last().unwrap();
+        assert!(f.path.as_str().contains("[REDACTED]"));
+        assert!(!f.path.as_str().contains("sk-ant-api03"));
+        assert!(f.reason.as_deref().unwrap().contains("[REDACTED]"));
+        assert!(!f.reason.as_deref().unwrap().contains("ghp_"));
     }
 
     #[test]

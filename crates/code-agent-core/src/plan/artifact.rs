@@ -100,6 +100,22 @@ impl WorkspaceRelativePath {
     pub fn as_path(&self) -> PathBuf {
         PathBuf::from(&self.0)
     }
+
+    /// Best-effort secret redaction of the stored path. The `[REDACTED]`
+    /// sentinel is a valid path component, so a redacted path normally
+    /// re-validates; if the (already-validated) input somehow produces an
+    /// invalid path after redaction we still store the redacted string so a
+    /// secret never survives, accepting that the path may no longer be a
+    /// clean workspace-relative path. (#216)
+    pub(crate) fn redact_in_place(&mut self, redact: impl Fn(&str) -> String) {
+        let redacted = redact(&self.0);
+        if redacted != self.0 {
+            self.0 = match Self::try_new(redacted.clone()) {
+                Ok(p) => p.0,
+                Err(_) => redacted,
+            };
+        }
+    }
 }
 
 /// Lifecycle status of a plan document.
