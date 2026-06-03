@@ -174,6 +174,9 @@ impl RequestMetadata {
 pub struct AgentRequest {
     pub task: String,
     pub mode: AgentMode,
+    /// Optional per-request system prompt. Overrides the runtime-level
+    /// [`crate::AgentRuntimeBuilder::system_prompt`] for this run only.
+    pub system_prompt: Option<String>,
     pub workspace: Option<WorkspaceSource>,
     pub session_policy: SessionPolicy,
     pub plan_policy: PlanPolicy,
@@ -194,6 +197,7 @@ impl AgentRequest {
         Self {
             task: task.into(),
             mode: AgentMode::default(),
+            system_prompt: None,
             workspace: None,
             session_policy: SessionPolicy::default(),
             plan_policy: PlanPolicy::default(),
@@ -212,6 +216,10 @@ impl AgentRequest {
 
     pub fn mode(mut self, mode: AgentMode) -> Self {
         self.mode = mode;
+        self
+    }
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
         self
     }
     pub fn workspace(mut self, w: WorkspaceSource) -> Self {
