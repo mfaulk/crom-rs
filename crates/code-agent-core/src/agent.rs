@@ -1068,7 +1068,13 @@ pub(crate) async fn run_loop(
                 Ok(ModelEvent::MessageStart) => {}
                 Ok(ModelEvent::TextDelta { text }) => {
                     text_buf.push_str(&text);
-                    let _ = tx.send(AgentEvent::AssistantTextDelta(text)).await;
+                    // A failed send means the receiver (the `Agent::run`
+                    // stream) was dropped. Treat that as an implicit cancel
+                    // so the loop stops streaming work nobody is reading
+                    // (#160). The next iteration's cancel check breaks out.
+                    if tx.send(AgentEvent::AssistantTextDelta(text)).await.is_err() {
+                        cfg.cancel.store(true, Ordering::Release);
+                    }
                 }
                 Ok(ModelEvent::ToolCall(c)) => {
                     tool_calls.push(c);
@@ -1175,11 +1181,16 @@ pub(crate) async fn run_loop(
             content: assistant_blocks.clone(),
             stop_reason: stop_reason.clone(),
         };
-        emit(
+        // Cancellable: if the consumer dropped the stream, this send fails
+        // and flips the cancel flag so the subsequent per-turn / tool-loop
+        // cancel checks short-circuit before the next provider or tool call
+        // (#160). This covers tool-only turns that emit no text deltas.
+        emit_cancellable(
             &tx,
             &session_sink,
             &session_id,
             AgentEvent::AssistantMessage(assistant_msg.clone()),
+            Some(&cfg.cancel),
         )
         .await;
 
@@ -1860,6 +1871,7 @@ pub(crate) async fn run_loop(
                 call,
                 &pending.body,
                 pending.is_error,
+                &cfg.cancel,
             )
             .await;
         }
@@ -2463,6 +2475,22 @@ async fn emit(
     sid: &SessionId,
     ev: AgentEvent,
 ) {
+    emit_cancellable(tx, sink, sid, ev, None).await;
+}
+
+/// Like [`emit`], but treats a failed send (receiver dropped) as an
+/// implicit cancel. When the returned stream from `Agent::run` is dropped,
+/// the channel receiver is gone and every `tx.send(...)` returns
+/// `SendError`. With `cancel` supplied we set that flag so `run_loop`'s
+/// existing cancel checks short-circuit the next provider/tool call instead
+/// of running work whose output nobody can observe (#160).
+async fn emit_cancellable(
+    tx: &mpsc::Sender<AgentEvent>,
+    sink: &Option<Arc<dyn SessionSink>>,
+    sid: &SessionId,
+    ev: AgentEvent,
+    cancel: Option<&AtomicBool>,
+) {
     if let Some(s) = sink {
         // Persistence errors must not crash the run, but they must not
         // disappear silently either — a buggy/internal caller could supply
@@ -2478,7 +2506,11 @@ async fn emit(
             );
         }
     }
-    let _ = tx.send(ev).await;
+    if tx.send(ev).await.is_err() {
+        if let Some(cancel) = cancel {
+            cancel.store(true, Ordering::Release);
+        }
+    }
 }
 
 async fn emit_telemetry(sink: &Option<Arc<dyn TelemetrySink>>, ev: AgentTelemetryEvent) {
@@ -2522,6 +2554,7 @@ async fn emit_hook_telemetry(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn push_tool_result_user(
     tx: &mpsc::Sender<AgentEvent>,
     sink: &Option<Arc<dyn SessionSink>>,
@@ -2530,6 +2563,7 @@ async fn push_tool_result_user(
     call: &ToolCall,
     text: &str,
     is_error: bool,
+    cancel: &AtomicBool,
 ) {
     let result = ConvToolResult {
         tool_use_id: call.id.clone(),
@@ -2546,7 +2580,7 @@ async fn push_tool_result_user(
         content: text.to_string(),
         is_error,
     });
-    emit(tx, sink, sid, ev).await;
+    emit_cancellable(tx, sink, sid, ev, Some(cancel)).await;
 }
 
 #[cfg(test)]

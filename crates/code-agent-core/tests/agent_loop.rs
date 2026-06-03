@@ -314,6 +314,143 @@ async fn loop_stops_at_max_turns() {
     assert_eq!(r.subtype, ResultSubtype::ErrorMaxTurns);
 }
 
+// Regression for #160: dropping the `Agent::run` stream early must stop the
+// spawned loop. Before the fix, send sites used `let _ = tx.send(..).await`
+// and ignored `SendError`, so the loop kept calling the provider and
+// running tools whose output nobody could observe. With the fix, a failed
+// send (receiver gone) flips the cancel flag and the loop short-circuits
+// before the next provider call.
+#[tokio::test]
+async fn dropping_stream_stops_loop_before_next_provider_call() {
+    use code_agent_core::ToolCall;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    // Provider that counts how many turns it was asked to stream. Each turn
+    // requests a tool call, so absent cancellation the loop would keep
+    // calling it until max_turns.
+    #[derive(Clone)]
+    struct CountingProvider {
+        turns_started: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingProvider {
+        async fn stream_turn(
+            &self,
+            _req: ModelRequest,
+        ) -> Result<BoxStream<'static, Result<ModelEvent, ProviderError>>, ProviderError> {
+            self.turns_started.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(
+                vec![
+                    ModelEvent::MessageStart,
+                    ModelEvent::ToolCall(ToolCall {
+                        id: "t1".into(),
+                        name: "Block".into(),
+                        input: json!({}),
+                    }),
+                    ModelEvent::MessageStop {
+                        stop_reason: Some("tool_use".into()),
+                        usage: None,
+                    },
+                ]
+                .into_iter()
+                .map(Ok),
+            )))
+        }
+    }
+
+    // Tool that signals when it starts and blocks until released, giving the
+    // test a deterministic point to drop the stream while a turn is in
+    // flight.
+    struct BlockingTool {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "Block"
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn permission_kind(&self) -> PermissionKind {
+            PermissionKind::ReadOnly
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+            _ctx: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ToolResult::ok_text("unblocked"))
+        }
+    }
+
+    let turns_started = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(CountingProvider {
+        turns_started: turns_started.clone(),
+    });
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(BlockingTool {
+        entered: entered.clone(),
+        release: release.clone(),
+    }));
+    let opts = AgentOptions {
+        max_turns: Some(5),
+        allowed_tools: vec!["Block".into()],
+        permission_mode: PermissionMode::Default,
+        permission_callback: Some(Arc::new(AlwaysAllow)),
+        ..AgentOptions::default()
+    };
+
+    let mut stream = query("hi", opts, provider, tools).await.unwrap();
+
+    // Pump the stream until the tool reports it has started executing. At
+    // this point the first provider turn has fully streamed and the loop is
+    // parked inside the tool future.
+    let pump = tokio::spawn(async move { while stream.next().await.is_some() {} });
+    entered.notified().await;
+
+    // The first (and only) provider turn must have happened.
+    assert_eq!(turns_started.load(Ordering::SeqCst), 1);
+
+    // Drop the consumer: abort the pump task so the ReceiverStream (and its
+    // channel receiver) is dropped while the tool is still blocked.
+    pump.abort();
+    let _ = pump.await;
+
+    // Release the tool so the loop resumes. Pushing the tool result now
+    // fails to send (receiver gone), which must flip the cancel flag and
+    // stop the loop before it requests a second provider turn.
+    release.notify_one();
+
+    // Give the spawned loop time to either correctly stop or (on regression)
+    // call the provider again.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if turns_started.load(Ordering::SeqCst) > 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        turns_started.load(Ordering::SeqCst),
+        1,
+        "loop made a second provider call after the stream was dropped; \
+         dropping the stream did not cancel the run"
+    );
+}
+
 #[tokio::test]
 // PermissionMode::Default requires approval for mutating and execution tools.
 async fn default_mode_denies_mutating_without_approval() {
