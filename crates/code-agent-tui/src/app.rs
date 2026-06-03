@@ -13,6 +13,7 @@
 //! terminal — see `state.rs` for the bulk of behavioral coverage.
 
 use std::io::{self, Stdout, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,7 +112,17 @@ impl TuiApp {
         terminal.clear()?;
 
         let (input_tx, mut input_rx) = mpsc::channel::<TuiInbound>(64);
-        let input_task = spawn_input_task(input_tx);
+        // #154: a shared shutdown flag the input thread polls so it can
+        // exit cleanly. The thread runs a blocking `crossterm::event::read()`
+        // which `abort()` cannot interrupt — a JoinHandle abort only
+        // cancels at an await point, and a thread parked inside a blocking
+        // syscall has none. By polling with a timeout and checking this
+        // flag each tick, the thread observes the shutdown request and
+        // returns before the TerminalGuard restores the terminal, so a
+        // stray keystroke can't be read against (and corrupt) the
+        // post-exit terminal.
+        let input_shutdown = Arc::new(AtomicBool::new(false));
+        let input_task = spawn_input_task(input_tx, input_shutdown.clone());
 
         // Active run. None when idle. We pull events off `run.events` in
         // the select! loop and feed them into the reducer.
@@ -267,7 +278,17 @@ impl TuiApp {
             c.cancel();
         }
         drop(active_run);
-        input_task.abort();
+        // #154: signal the input thread to stop, then wait for it to
+        // actually return before restoring the terminal. The thread polls
+        // `input_shutdown` between event polls, so it observes the request
+        // within one poll interval and exits its loop. Joining here (rather
+        // than the old `abort()`, which cannot interrupt a thread parked in
+        // a blocking `event::read()`) guarantees no input read is in flight
+        // when `guard.leave()` puts the terminal back into cooked mode, so
+        // a stray keystroke during teardown can't be consumed against the
+        // restored terminal.
+        input_shutdown.store(true, Ordering::Relaxed);
+        let _ = input_task.await;
         guard.leave()?;
         Ok(())
     }
@@ -400,11 +421,41 @@ fn format_plan_preview_log(action: &str, plan_id: &str, detail: Option<&str>) ->
     }
 }
 
+/// Poll interval for the input thread's `crossterm::event::poll`. Short
+/// enough that a shutdown request is observed promptly (worst-case
+/// teardown latency), long enough that an idle terminal doesn't busy-spin.
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// #154: decide whether the input thread should keep looping. Pulled out
+/// as a free function so the shutdown-flag contract is unit-testable
+/// without a terminal: returns `false` (stop) once the shared flag is
+/// set, `true` (keep polling) otherwise.
+fn input_should_continue(shutdown: &AtomicBool) -> bool {
+    !shutdown.load(Ordering::Relaxed)
+}
+
 /// Spawn a blocking task that reads crossterm events and forwards them
 /// (decoded into our abstract composer `KeyEvent`) to the main loop.
-fn spawn_input_task(tx: mpsc::Sender<TuiInbound>) -> tokio::task::JoinHandle<()> {
+///
+/// #154: rather than parking in a blocking `crossterm::event::read()`
+/// (which `abort()` cannot interrupt), the thread polls with a timeout
+/// and checks `shutdown` each tick. When the main loop sets the flag on
+/// teardown, the thread observes it within one `INPUT_POLL_INTERVAL` and
+/// returns cleanly — before the terminal is restored.
+fn spawn_input_task(
+    tx: mpsc::Sender<TuiInbound>,
+    shutdown: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        loop {
+        while input_should_continue(&shutdown) {
+            // Wait up to INPUT_POLL_INTERVAL for an event. On timeout
+            // (`Ok(false)`) loop back to re-check the shutdown flag. A
+            // poll error means the terminal is gone, so stop.
+            match crossterm::event::poll(INPUT_POLL_INTERVAL) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
+            }
             match crossterm::event::read() {
                 Ok(CtEvent::Key(k)) => {
                     if matches!(k.kind, KeyEventKind::Release) {
@@ -663,6 +714,24 @@ mod tests {
             "got: {reject}"
         );
         assert!(reject.contains("no SDK callback yet"), "got: {reject}");
+    }
+
+    // #154: the input thread keeps polling until the shared shutdown
+    // flag is set, then stops. The blocking `event::read()` loop can't be
+    // exercised without a terminal, but this predicate is the load-bearing
+    // contract that lets the thread exit cleanly on teardown.
+    #[test]
+    fn input_thread_stops_when_shutdown_flag_set() {
+        let flag = AtomicBool::new(false);
+        assert!(
+            input_should_continue(&flag),
+            "should keep polling while flag is clear"
+        );
+        flag.store(true, Ordering::Relaxed);
+        assert!(
+            !input_should_continue(&flag),
+            "should stop once flag is set"
+        );
     }
 
     use crate::composer::ComposerState;
