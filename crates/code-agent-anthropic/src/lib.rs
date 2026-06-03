@@ -60,7 +60,7 @@ impl AnthropicConfig {
 /// OpenAI and Gemini providers. Anthropic differs in that a successful
 /// response is a *streaming* SSE body rather than a single JSON blob, so the
 /// success variant carries a byte stream instead of a `String`.
-pub enum MessagesResponse {
+pub(crate) enum MessagesResponse {
     /// 2xx: the SSE byte stream to feed into `parse_sse`.
     Stream(BoxStream<'static, Result<Bytes, ProviderError>>),
     /// Non-2xx HTTP status with its (already read) response body.
@@ -77,7 +77,7 @@ pub enum MessagesResponse {
 /// implementation (`ReqwestMessagesClient`) wraps `reqwest`; tests inject a
 /// mock that returns canned `MessagesResponse`s.
 #[async_trait]
-pub trait MessagesClient: Send + Sync {
+pub(crate) trait MessagesClient: Send + Sync {
     async fn post_messages(
         &self,
         url: &str,
