@@ -120,9 +120,12 @@ pub struct AuthCommonArgs {
 /// this the configured value would be silently ignored and `Auto` mode
 /// would fall through to the no-op backend.
 fn settings_allow_file_store(cwd: &std::path::Path) -> bool {
-    code_agent_core::settings::load(cwd, code_agent_core::settings::SettingSource::UserAndProject)
-        .map(|s| s.auth.allow_file_credential_store.unwrap_or(false))
-        .unwrap_or(false)
+    code_agent_core::settings::load(
+        cwd,
+        code_agent_core::settings::SettingSource::UserAndProject,
+    )
+    .map(|s| s.auth.allow_file_credential_store.unwrap_or(false))
+    .unwrap_or(false)
 }
 
 /// Resolve a credential store rooted at `cwd/.agent`.

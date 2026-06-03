@@ -8113,9 +8113,7 @@ fn build_tui_provider_config(
         // resolver surfaces it as an `ApiKey` with an empty secret, but the
         // pre-resolver TUI path required a non-empty key. Fall through to the
         // no-provider notice rather than building a provider that can't auth.
-        Ok(code_agent_auth::ResolvedCredential::ApiKey { key, .. })
-            if !key.expose().is_empty() =>
-        {
+        Ok(code_agent_auth::ResolvedCredential::ApiKey { key, .. }) if !key.expose().is_empty() => {
             Ok(Some(code_agent_sdk::ProviderConfig::anthropic_api_key(
                 code_agent_sdk::SecretString::new(key.expose().to_string()),
             )))
