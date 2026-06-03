@@ -238,16 +238,25 @@ fn substitute_with_bash_aware_quoting(
             continue;
         }
 
-        // $ARGUMENTS — full raw argument string.
+        // $ARGUMENTS — full raw argument string. Require a word boundary
+        // after the token so longer identifiers like `$ARGUMENTSET` or
+        // `$ARGUMENTS_LIST` are not mangled (#214).
         if c == '$' && body[i..].starts_with("$ARGUMENTS") {
-            let raw = parsed.raw_arguments.as_str();
-            if in_bash {
-                out.push_str(&shell_single_quote(raw));
-            } else {
-                out.push_str(raw);
+            let end = i + "$ARGUMENTS".len();
+            let bounded = match bytes.get(end) {
+                None => true,
+                Some(&b) => !(b as char).is_ascii_alphanumeric() && b != b'_',
+            };
+            if bounded {
+                let raw = parsed.raw_arguments.as_str();
+                if in_bash {
+                    out.push_str(&shell_single_quote(raw));
+                } else {
+                    out.push_str(raw);
+                }
+                i = end;
+                continue;
             }
-            i += "$ARGUMENTS".len();
-            continue;
         }
 
         out.push(c);
@@ -589,6 +598,31 @@ mod tests {
         .unwrap();
         assert!(r.expanded_prompt.contains("base=main"));
         assert!(r.expanded_prompt.contains("all=main file.rs"));
+    }
+
+    #[tokio::test]
+    // $ARGUMENTS substitution respects word boundaries: longer identifiers
+    // such as `$ARGUMENTSET` are left intact (#214).
+    async fn arguments_substitution_respects_word_boundary() {
+        let parsed = parse_slash_command("/review foo").unwrap();
+        let exec = FakeExecutor {
+            files: Default::default(),
+            bash: Default::default(),
+            invocations: Mutex::new(Vec::new()),
+        };
+        let r = expand_custom_command(
+            &parsed,
+            &cmd("set=$ARGUMENTSET list=$ARGUMENTS_LIST all=$ARGUMENTS end=$ARGUMENTS"),
+            &SlashExpansionOptions::default(),
+            &exec,
+        )
+        .await
+        .unwrap();
+        // Longer identifiers untouched.
+        assert!(r.expanded_prompt.contains("set=$ARGUMENTSET"));
+        assert!(r.expanded_prompt.contains("list=$ARGUMENTS_LIST"));
+        // Bare $ARGUMENTS (followed by space or end) expands.
+        assert!(r.expanded_prompt.contains("all=foo end=foo"));
     }
 
     #[tokio::test]
