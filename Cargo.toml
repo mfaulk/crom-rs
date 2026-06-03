@@ -56,7 +56,7 @@ similar = "3"
 time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing", "macros"] }
 bytes = "1"
 tempfile = "3"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 rand = "0.8"
 
