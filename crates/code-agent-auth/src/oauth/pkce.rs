@@ -8,7 +8,7 @@
 //! predictable to a local observer.
 
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::TryRngCore;
 use sha2::Digest;
 
 /// Generate a URL-safe random string suitable for the PKCE
@@ -33,7 +33,14 @@ pub fn s256_challenge(verifier: &str) -> String {
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
-    OsRng.fill_bytes(&mut buf);
+    // rand 0.9 models the OS CSPRNG as a *fallible* `TryRngCore` (getrandom
+    // can fail), so there is no infallible `fill_bytes`. A CSPRNG failure
+    // here is unrecoverable for OAuth state / PKCE verifiers — emitting
+    // low-entropy material would be worse than aborting — so surface it as a
+    // panic rather than degrade silently.
+    OsRng
+        .try_fill_bytes(&mut buf)
+        .expect("OS CSPRNG (getrandom) failed");
     buf
 }
 
