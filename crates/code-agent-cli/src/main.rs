@@ -8147,17 +8147,38 @@ fn build_tui_provider_config(
     // The SDK builder only wires the Anthropic API-key variant today, so a
     // stored OAuth credential still falls through to the no-provider notice.
     let allow_file = settings.auth.allow_file_credential_store.unwrap_or(false);
-    match resolve_stored_credential(cwd, allow_file, code_agent_auth::ProviderId::Anthropic) {
+    // Mirror `build_anthropic_provider`: distinguish "no stored credential"
+    // (`NotLoggedIn`, fall through to the no-provider notice) from a real
+    // credential-store failure, which must propagate rather than be silently
+    // swallowed into the "no provider configured" path.
+    let credential =
+        match resolve_stored_credential(cwd, allow_file, code_agent_auth::ProviderId::Anthropic) {
+            Ok(cred) => cred,
+            Err(e) if is_not_logged_in_error(&e) => code_agent_auth::ResolvedCredential::None,
+            Err(e) => return Err(e),
+        };
+    Ok(tui_provider_config_from_credential(&credential))
+}
+
+/// Map a resolved Anthropic credential to the TUI's [`ProviderConfig`],
+/// returning `None` when no usable API key is present. Factored out of
+/// [`build_tui_provider_config`] so the credential → config decision (which
+/// drives the "no provider configured" notice) is unit-testable without
+/// touching the credential store (the resolver uses `Auto` mode / keychain).
+fn tui_provider_config_from_credential(
+    credential: &code_agent_auth::ResolvedCredential,
+) -> Option<code_agent_sdk::ProviderConfig> {
+    match credential {
         // Guard against a set-but-empty key (e.g. `ANTHROPIC_API_KEY=`): the
         // resolver surfaces it as an `ApiKey` with an empty secret, but the
         // pre-resolver TUI path required a non-empty key. Fall through to the
         // no-provider notice rather than building a provider that can't auth.
-        Ok(code_agent_auth::ResolvedCredential::ApiKey { key, .. }) if !key.expose().is_empty() => {
-            Ok(Some(code_agent_sdk::ProviderConfig::anthropic_api_key(
+        code_agent_auth::ResolvedCredential::ApiKey { key, .. } if !key.expose().is_empty() => {
+            Some(code_agent_sdk::ProviderConfig::anthropic_api_key(
                 code_agent_sdk::SecretString::new(key.expose().to_string()),
-            )))
+            ))
         }
-        _ => Ok(None),
+        _ => None,
     }
 }
 
@@ -8276,5 +8297,42 @@ mod provider_route_tests {
         // typed kind attached) is not treated as not-logged-in.
         let plain = anyhow!("credential store: backend unavailable");
         assert!(!is_not_logged_in_error(&plain));
+    }
+
+    // #210: the TUI must build a provider from a *stored* credential (e.g. one
+    // written by `code-agent auth login anthropic --api-key`, no env var), not
+    // only from `ANTHROPIC_API_KEY`. `build_tui_provider_config` resolves via
+    // `resolve_stored_credential` (which uses keychain `Auto` mode and so isn't
+    // hermetically testable); this exercises the credential → ProviderConfig
+    // decision it feeds into.
+    #[test]
+    fn stored_api_key_credential_yields_a_provider_config() {
+        let stored = code_agent_auth::ResolvedCredential::ApiKey {
+            provider: code_agent_auth::ProviderId::Anthropic,
+            source: code_agent_auth::CredentialSource::Keychain,
+            key: code_agent_auth::SecretString::new("sk-stored-key".to_string()),
+        };
+        assert!(
+            tui_provider_config_from_credential(&stored).is_some(),
+            "a non-empty stored API key must produce a provider config"
+        );
+    }
+
+    #[test]
+    fn empty_or_missing_credential_yields_no_provider() {
+        // A set-but-empty key (e.g. `ANTHROPIC_API_KEY=`) must not build a
+        // provider that cannot authenticate.
+        let empty = code_agent_auth::ResolvedCredential::ApiKey {
+            provider: code_agent_auth::ProviderId::Anthropic,
+            source: code_agent_auth::CredentialSource::EnvVar("ANTHROPIC_API_KEY".to_string()),
+            key: code_agent_auth::SecretString::new(String::new()),
+        };
+        assert!(tui_provider_config_from_credential(&empty).is_none());
+
+        // No credential at all falls through to the no-provider notice.
+        assert!(
+            tui_provider_config_from_credential(&code_agent_auth::ResolvedCredential::None)
+                .is_none()
+        );
     }
 }
