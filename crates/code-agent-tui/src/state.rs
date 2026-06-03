@@ -452,6 +452,13 @@ impl TuiAppState {
     /// before the matching event (or where the event is suppressed)
     /// still renders the modal and stores `pending_approval`.
     pub fn open_approval_modal(&mut self, tool_name: String, summary: String) {
+        // #177: the approval modal can be opened from two uncoordinated
+        // paths (the live bridge handler in app.rs and the
+        // `SdkEvent::ApprovalRequired` reducer arm). Strip any existing
+        // approval modal before pushing so the two paths can never stack
+        // duplicates regardless of arrival order — there is always exactly
+        // one approval modal on the stack.
+        let _ = self.layout.remove_custom_modals_by_id(APPROVAL_MODAL_ID);
         self.pending_approval = Some(PendingApproval {
             tool_name: tool_name.clone(),
             summary: summary.clone(),
@@ -1443,7 +1450,31 @@ impl TuiAppState {
                     .remove_custom_modals_by_id(PLAN_APPROVAL_MODAL_ID);
             }
             SdkEvent::ApprovalRequired(a) => {
-                self.open_approval_modal(a.tool_name.clone(), a.summary.clone());
+                // #177: the approval modal can be opened from two
+                // uncoordinated paths — the live bridge handler
+                // (`recv_bridge` in app.rs, which opens the modal AND
+                // stashes the SDK resolver) and this reducer arm (which
+                // also serves reducer-only hosts/tests that have no
+                // bridge). When a bridge is wired, both fire for the same
+                // request and we would push a second, resolver-less modal
+                // on top of the bridge's. Guard against that: if an
+                // approval modal is already on the stack, only refresh the
+                // activity log and leave the existing modal (with its live
+                // resolver) untouched. The bridge is the single source of
+                // truth when present; this arm stays self-sufficient when
+                // it is not.
+                let already_open =
+                    self.layout.modal_stack.iter().any(
+                        |m| matches!(m, TuiModal::Custom { id, .. } if id == APPROVAL_MODAL_ID),
+                    );
+                if already_open {
+                    self.push_activity(format!(
+                        "approval required: {} (modal already open)",
+                        a.tool_name
+                    ));
+                } else {
+                    self.open_approval_modal(a.tool_name.clone(), a.summary.clone());
+                }
             }
             SdkEvent::ApprovalResolved(_) => {
                 self.pending_approval = None;
@@ -2486,6 +2517,68 @@ mod tests {
         // Approval modal removed; Help modal still on top.
         assert!(matches!(s.layout.current_modal(), Some(TuiModal::Help)));
         assert_eq!(s.layout.modal_stack.len(), 1);
+    }
+
+    // #177: the approval modal can be opened from two uncoordinated
+    // paths — the bridge handler (which opens the modal directly) and
+    // the `SdkEvent::ApprovalRequired` reducer arm. Whatever order they
+    // arrive in, the stack must end up with exactly one approval modal so
+    // the decision can never go to the wrong (resolver-less) prompt.
+    fn count_approval_modals(s: &TuiAppState) -> usize {
+        s.layout
+            .modal_stack
+            .iter()
+            .filter(|m| matches!(m, TuiModal::Custom { id, .. } if id == APPROVAL_MODAL_ID))
+            .count()
+    }
+
+    #[test]
+    // Bridge-first then event: the bridge opens the modal (modelled here
+    // by a direct `open_approval_modal`), then the matching SDK event
+    // arrives. The reducer must NOT stack a second modal.
+    fn approval_bridge_then_event_keeps_single_modal() {
+        use code_agent_sdk::event::ApprovalRequiredEvent;
+        let mut s = fresh_state();
+        // Bridge path.
+        s.open_approval_modal("Bash".to_string(), "rm -rf target".to_string());
+        assert_eq!(count_approval_modals(&s), 1);
+        // SDK event for the same approval arrives afterwards.
+        s.apply(TuiInbound::sdk(SdkEvent::ApprovalRequired(
+            ApprovalRequiredEvent {
+                run_id: rid(),
+                tool_name: "Bash".to_string(),
+                summary: "rm -rf target".to_string(),
+            },
+        )));
+        assert_eq!(
+            count_approval_modals(&s),
+            1,
+            "reducer must not stack a duplicate approval modal"
+        );
+    }
+
+    #[test]
+    // Event-first then bridge: the SDK event opens a (resolver-less)
+    // modal, then the bridge opens its own. `open_approval_modal` is
+    // idempotent on the stack, so there is still exactly one modal.
+    fn approval_event_then_bridge_keeps_single_modal() {
+        use code_agent_sdk::event::ApprovalRequiredEvent;
+        let mut s = fresh_state();
+        s.apply(TuiInbound::sdk(SdkEvent::ApprovalRequired(
+            ApprovalRequiredEvent {
+                run_id: rid(),
+                tool_name: "Bash".to_string(),
+                summary: "rm -rf target".to_string(),
+            },
+        )));
+        assert_eq!(count_approval_modals(&s), 1);
+        // Bridge path opens its modal for the same approval.
+        s.open_approval_modal("Bash".to_string(), "rm -rf target".to_string());
+        assert_eq!(
+            count_approval_modals(&s),
+            1,
+            "open_approval_modal must replace, not stack, the existing modal"
+        );
     }
 
     #[test]

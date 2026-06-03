@@ -238,6 +238,12 @@ impl TuiApp {
                             reason: "superseded by a new approval".to_string(),
                         });
                     }
+                    // #177: the bridge is the single source of truth for an
+                    // approval that has a live SDK resolver. `open_approval_modal`
+                    // is idempotent on the modal stack, so if the
+                    // `SdkEvent::ApprovalRequired` reducer arm already opened a
+                    // resolver-less modal for this request, this call replaces it
+                    // with one whose resolver we own below — no duplicate modal.
                     self.state.open_approval_modal(
                         bridge_req.request.tool_name.clone(),
                         bridge_req.request.summary.clone(),
@@ -307,12 +313,7 @@ impl TuiApp {
                 // call) we still log the decision so reducer-only
                 // tests of the workbench remain useful.
                 TuiAction::ResolveApproval(decision) => {
-                    let sdk_decision = sdk_decision_from(decision.clone());
-                    let label = format!("approval decision: {decision:?}");
-                    self.state.push_activity(label);
-                    if let Some(resolver) = self.pending_resolver.take() {
-                        let _ = resolver.send(sdk_decision);
-                    }
+                    self.resolve_approval(decision);
                 }
                 // Plan decisions are not yet wired through `AgentRuntime`:
                 // the SDK has no `PlanDecisionCallback` / `approve_plan` API
@@ -347,6 +348,33 @@ impl TuiApp {
                     ));
                 }
             }
+        }
+    }
+
+    /// Dispatch a resolved approval decision back to the SDK via the
+    /// stashed bridge resolver.
+    ///
+    /// #177: the approval modal is opened from two uncoordinated paths
+    /// (the bridge handler and the `SdkEvent::ApprovalRequired` reducer
+    /// arm). Only the bridge handler stashes a `pending_resolver`. When a
+    /// resolver is present we send the decision exactly once (the
+    /// `take()` guarantees it cannot be sent twice). When it is absent the
+    /// decision has nowhere to go — expected for reducer-only hosts with
+    /// no bridge, but a bug if a bridge is wired and the request was
+    /// already answered or never landed. Either way we surface a visible
+    /// diagnostic in the activity log rather than silently dropping the
+    /// decision.
+    fn resolve_approval(&mut self, decision: ApprovalDecisionAction) {
+        let sdk_decision = sdk_decision_from(decision.clone());
+        self.state
+            .push_activity(format!("approval decision: {decision:?}"));
+        if let Some(resolver) = self.pending_resolver.take() {
+            let _ = resolver.send(sdk_decision);
+        } else {
+            self.state.push_activity(format!(
+                "warning: approval decision ({decision:?}) had no pending request \
+                 to resolve; not sent to the SDK"
+            ));
         }
     }
 
@@ -635,5 +663,66 @@ mod tests {
             "got: {reject}"
         );
         assert!(reject.contains("no SDK callback yet"), "got: {reject}");
+    }
+
+    use crate::composer::ComposerState;
+    use code_agent_core::{ComposerConfig, StatusLineContext};
+    use code_agent_sdk::fake_provider::EchoFakeProvider;
+    use code_agent_sdk::ProviderConfig;
+
+    async fn test_app() -> TuiApp {
+        let runtime = AgentRuntime::builder()
+            .provider(ProviderConfig::fake(Arc::new(EchoFakeProvider)))
+            .build()
+            .await
+            .expect("runtime");
+        let state = TuiAppState::new(
+            ComposerState::new(ComposerConfig::default()),
+            "{run_status}".to_string(),
+            StatusLineContext::default(),
+        );
+        TuiApp::new(Arc::new(runtime), state)
+    }
+
+    // #177: a resolved decision with a stashed resolver is sent exactly
+    // once, and the resolver is consumed (so it can never fire twice).
+    #[tokio::test]
+    async fn resolve_approval_signals_resolver_once() {
+        let mut app = test_app().await;
+        let (tx, rx) = oneshot::channel::<ApprovalDecision>();
+        app.pending_resolver = Some(tx);
+        app.resolve_approval(ApprovalDecisionAction::Allow);
+        // Decision reached the SDK side exactly once.
+        assert_eq!(rx.await, Ok(ApprovalDecision::Allow));
+        // Resolver was consumed — a second resolve cannot double-send.
+        assert!(app.pending_resolver.is_none());
+        // No "no pending request" warning when a resolver was present.
+        assert!(
+            !app.state
+                .activity
+                .iter()
+                .any(|l| l.contains("no pending request")),
+            "should not warn when a resolver is present: {:?}",
+            app.state.activity
+        );
+    }
+
+    // #177: with no stashed resolver the decision is never silently
+    // dropped — a visible diagnostic is pushed to the activity log.
+    #[tokio::test]
+    async fn resolve_approval_without_resolver_warns_visibly() {
+        let mut app = test_app().await;
+        assert!(app.pending_resolver.is_none());
+        app.resolve_approval(ApprovalDecisionAction::Deny {
+            reason: "no".to_string(),
+        });
+        assert!(
+            app.state
+                .activity
+                .iter()
+                .any(|l| l.contains("no pending request to resolve")),
+            "missing-resolver decision must surface a diagnostic: {:?}",
+            app.state.activity
+        );
     }
 }
