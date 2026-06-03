@@ -288,6 +288,14 @@ impl TuiApp {
         // a stray keystroke during teardown can't be consumed against the
         // restored terminal.
         input_shutdown.store(true, Ordering::Relaxed);
+        // Close the receiver before joining. The input thread sends over a
+        // *bounded* channel; if it is parked in `blocking_send` on a full
+        // channel during an exit burst it never reaches the `input_shutdown`
+        // check, and while `input_rx` is still alive that send never errors —
+        // so `input_task.await` would hang forever, leaving the terminal in
+        // raw mode. Closing the receiver makes the pending/next send fail so
+        // the thread unblocks and exits.
+        input_rx.close();
         let _ = input_task.await;
         guard.leave()?;
         Ok(())
