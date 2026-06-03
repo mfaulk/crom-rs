@@ -90,8 +90,15 @@ impl SdkEventMapper {
     }
 }
 
-/// Scrub secrets from the user-visible text payloads of an `SdkEvent`
-/// using the configured `SecretRedactor`, returning the redacted copy.
+/// Scrub secrets from the free-form text payloads of an `SdkEvent` using
+/// the configured `SecretRedactor`, returning the redacted copy.
+///
+/// Covers every variant that can carry model- or command-generated text:
+/// assistant text/deltas, diagnostic and run-status messages, tool-call
+/// input, validation command text + captured stdout/stderr, and opaque
+/// internal-event JSON. Variants that only hold identifiers, enums, counts,
+/// token usage, or workspace paths/patches (the host's own on-disk files)
+/// are intentionally left untouched.
 ///
 /// This is applied to the copy that is emitted to consumers / persisted
 /// to storage — never to the value handed to tool execution, which still
@@ -124,6 +131,25 @@ pub fn redact_event(redactor: &dyn SecretRedactor, mut event: SdkEvent) -> SdkEv
         SdkEvent::ToolCallStarted(e) => {
             redact_json_strings(redactor, &mut e.input);
         }
+        // Validation runs arbitrary commands whose text and captured
+        // stdout/stderr are surfaced to consumers — a prime leak vector.
+        SdkEvent::ValidationStarted(e) => {
+            e.command = redactor.redact(&e.command);
+        }
+        SdkEvent::ValidationCompleted(e) => {
+            e.report.command = redactor.redact(&e.report.command);
+            e.report.stdout = redactor.redact(&e.report.stdout);
+            e.report.stderr = redactor.redact(&e.report.stderr);
+        }
+        // Opaque internal events are emitted verbatim under full verbosity;
+        // scrub their JSON string leaves.
+        SdkEvent::Internal(e) => {
+            redact_json_strings(redactor, &mut e.payload);
+        }
+        // Remaining variants carry no free-form text that the agent can
+        // populate with secret material: identifiers, enums, counts, token
+        // usage, and workspace paths/patches (the host's own files, already
+        // on disk). Left intact so the structured event shape is preserved.
         _ => {}
     }
     event
@@ -253,6 +279,37 @@ mod tests {
         match out {
             SdkEvent::Diagnostic(e) => {
                 assert!(!e.diagnostic.message.contains(secret));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// redact_event scrubs validation command output (stdout/stderr), a
+    /// prime leak vector since validation runs arbitrary commands (#211).
+    #[test]
+    fn redact_event_scrubs_validation_output() {
+        use crate::callback::DefaultSecretRedactor;
+        use crate::event::ValidationCompletedEvent;
+        use crate::result::ValidationReport;
+        let redactor = DefaultSecretRedactor;
+        let secret = "sk-ant-abcdefghijklmnopqrstuvwxyz0123456789";
+        let ev = SdkEvent::ValidationCompleted(ValidationCompletedEvent {
+            run_id: RunId::new(),
+            report: ValidationReport {
+                command: format!("echo {secret}"),
+                success: true,
+                exit_code: Some(0),
+                stdout: format!("leaked {secret}"),
+                stderr: String::new(),
+                duration_ms: 1,
+                timed_out: false,
+            },
+        });
+        let out = redact_event(&redactor, ev);
+        match out {
+            SdkEvent::ValidationCompleted(e) => {
+                assert!(!e.report.command.contains(secret), "command leaked");
+                assert!(!e.report.stdout.contains(secret), "stdout leaked");
             }
             other => panic!("unexpected event: {other:?}"),
         }
