@@ -404,11 +404,7 @@ mod tests {
                 "backend unavailable",
             ))
         }
-        fn delete(
-            &self,
-            _provider: &ProviderId,
-            _account_id: &AccountId,
-        ) -> Result<(), AuthError> {
+        fn delete(&self, _provider: &ProviderId, _account_id: &AccountId) -> Result<(), AuthError> {
             Ok(())
         }
     }
