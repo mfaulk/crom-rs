@@ -439,11 +439,19 @@ pub(crate) async fn execute_request(
         // identical diagnostic and re-fire `cancel()`, producing a
         // diagnostics list that grew with every additional event (#149).
         //
-        // The cap is inclusive: `tool_calls >= max` so that exactly
-        // `max` tool calls are allowed to start. The previous `>` check
-        // permitted `max + 1` calls before tripping (#213).
+        // Trip only once the count *exceeds* the cap (`> max`), so a run
+        // that uses exactly `max` tool calls still finishes and returns a
+        // result rather than being marked Failed at its allowance. This is a
+        // reactive cancellation: `tool_calls` is incremented on
+        // `ToolCallStarted`, so the (max+1)-th call has already started by the
+        // time this fires (cooperative cancellation cannot un-start it).
+        // Strictly preventing the (max+1)-th call from dispatching at all
+        // would require a pre-dispatch budget gate in the core agent loop
+        // (code-agent-core), which is out of scope for the SDK runtime — see
+        // #213. (An earlier `>=` attempt failed runs at their exact allowance,
+        // e.g. max_tool_calls=1 on the first call, which is worse.)
         if let Some(max) = request.budgets.max_tool_calls {
-            if !max_tool_calls_reported && tool_calls >= max as usize {
+            if !max_tool_calls_reported && tool_calls > max as usize {
                 cancellation.cancel();
                 diagnostics.push(Diagnostic::error(
                     "budget.max_tool_calls_exceeded",
