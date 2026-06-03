@@ -1410,6 +1410,13 @@ impl TuiAppState {
                 // so the UI does not lie about its effect (#146).
                 // Each body line is kept under 80 columns so the modal
                 // renders cleanly on a default terminal.
+                //
+                // TODO(#146): wire a real PlanDecisionCallback through
+                // AgentRuntime so the operator's approve/reject/revise
+                // keypress can actually gate execution. That change spans
+                // sdk + core and is intentionally out of scope for this
+                // crate-exclusive fix; until it lands the modal must stay
+                // informational and the keys preview-only.
                 self.layout.side_panel.mode = SidePanelMode::Plan;
                 self.layout.side_panel.visible = true;
                 self.layout.push_modal(TuiModal::Custom {

@@ -321,6 +321,10 @@ impl TuiApp {
                 // operator can see the UI is reading the keys but not
                 // blocking the run. See #146 for the followup that adds
                 // a real callback.
+                //
+                // TODO(#146): wire a real PlanDecisionCallback through
+                // AgentRuntime so these arms can send an actual decision
+                // to the SDK instead of only logging a preview line.
                 TuiAction::ApprovePlan(plan_id) => {
                     self.state.push_activity(format_plan_preview_log(
                         "approve",
