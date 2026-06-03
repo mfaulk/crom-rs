@@ -122,7 +122,12 @@ jobs:
       - name: Check ${{ matrix.example }}
         # `--workspace` so example sub-crates that aren't the default package
         # (e.g. the fake MCP server in mcp-demo / tool-search-demo) are built.
-        run: cargo check --locked --workspace --manifest-path examples/${{ matrix.example }}/Cargo.toml
+        # No `--locked`: each example ships its own Cargo.lock that dependabot
+        # does not manage, so a workspace dependency bump (which reaches the
+        # examples via path deps) legitimately needs to update the example lock.
+        # `--locked` would reject that and fail every dependabot cargo PR; the
+        # workspace build/test lanes above still run with `--locked`.
+        run: cargo check --workspace --manifest-path examples/${{ matrix.example }}/Cargo.toml
 
   deny:
     name: security / cargo-deny
