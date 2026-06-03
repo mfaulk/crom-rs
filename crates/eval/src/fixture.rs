@@ -124,9 +124,20 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, FixtureError> {
 /// Name of the tag that pins the pristine baseline commit.
 const BASELINE_TAG: &str = "eval-baseline";
 
+/// Build-artifact paths excluded from the baseline and the final patch.
+///
+/// Oracle commands (`cargo test`/`clippy`) regenerate `target/` and `Cargo.lock`
+/// inside the workspace during the run. Without excluding them, `git add -A`
+/// would sweep them into `final.patch` and inflate the changed-file count that
+/// patch-quality scoring reads. They are never the thing under evaluation.
+const PATCH_EXCLUDES: &[&str] = &["/target/", "/Cargo.lock", "/**/target/"];
+
 /// Initialise a fresh git repo and create a baseline commit of the fixture.
 fn git_init_baseline(dir: &Path) -> Result<(), FixtureError> {
     git(dir, &["init", "-q"])?;
+    // Exclude build artifacts via `.git/info/exclude` (untracked, so it never
+    // shows up in the diff) before the first `add`.
+    write_git_exclude(dir)?;
     git(dir, &["add", "-A"])?;
     // `--allow-empty` so empty fixtures still get a baseline to diff against.
     git(
@@ -137,6 +148,18 @@ fn git_init_baseline(dir: &Path) -> Result<(), FixtureError> {
     // its own commits, resets, or amends.
     git(dir, &["tag", BASELINE_TAG])?;
     Ok(())
+}
+
+/// Write `.git/info/exclude` so build artifacts never enter the index.
+fn write_git_exclude(dir: &Path) -> Result<(), FixtureError> {
+    let exclude_path = dir.join(".git").join("info").join("exclude");
+    if let Some(parent) = exclude_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| FixtureError::Io(format!("create {}: {e}", parent.display())))?;
+    }
+    let body = format!("{}\n", PATCH_EXCLUDES.join("\n"));
+    std::fs::write(&exclude_path, body)
+        .map_err(|e| FixtureError::Io(format!("write {}: {e}", exclude_path.display())))
 }
 
 /// Generate the patch for a workspace by diffing against the baseline commit.
@@ -270,6 +293,33 @@ mod tests {
         assert!(patch.changed_files.iter().any(|f| f == "file.txt"));
         assert!(patch.changed_files.iter().any(|f| f == "new.txt"));
         assert!(patch.insertions >= 2);
+    }
+
+    #[test]
+    fn excludes_build_artifacts_from_patch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        write(&ws.join("src/lib.rs"), "pub fn f() {}\n");
+        git_init_baseline(&ws).unwrap();
+
+        // Simulate cargo populating target/ and a lockfile during the run, plus
+        // a real source edit.
+        write(&ws.join("target/debug/junk.o"), "binary");
+        write(&ws.join("Cargo.lock"), "# generated\n");
+        fs::write(ws.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
+
+        let patch = generate_patch(&ws).unwrap();
+        assert!(patch.changed_files.iter().any(|f| f == "src/lib.rs"));
+        assert!(
+            !patch.changed_files.iter().any(|f| f.contains("target/")),
+            "target/ leaked into patch: {:?}",
+            patch.changed_files
+        );
+        assert!(
+            !patch.changed_files.iter().any(|f| f == "Cargo.lock"),
+            "Cargo.lock leaked into patch: {:?}",
+            patch.changed_files
+        );
     }
 
     #[test]
