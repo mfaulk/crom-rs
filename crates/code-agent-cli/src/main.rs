@@ -8160,7 +8160,7 @@ fn build_tui_provider_config(
     Ok(tui_provider_config_from_credential(&credential))
 }
 
-/// Map a resolved Anthropic credential to the TUI's [`ProviderConfig`],
+/// Map a resolved Anthropic credential to the TUI's [`code_agent_sdk::ProviderConfig`],
 /// returning `None` when no usable API key is present. Factored out of
 /// [`build_tui_provider_config`] so the credential → config decision (which
 /// drives the "no provider configured" notice) is unit-testable without

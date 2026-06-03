@@ -677,8 +677,7 @@ mod tests {
                     }
                 }
             }
-            connected
-                .unwrap_or_else(|| panic!("connect to callback server failed: {last_err:?}"))
+            connected.unwrap_or_else(|| panic!("connect to callback server failed: {last_err:?}"))
         };
         stream.write_all(request.as_bytes()).unwrap();
         stream.flush().unwrap();
