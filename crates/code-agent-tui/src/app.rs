@@ -165,7 +165,31 @@ impl TuiApp {
                 Some(event) = next_run_event(active_run.as_mut()), if active_run.is_some() => {
                     match event {
                         RunEvent::Sdk(ev) => {
+                            // #209: the reducer flips `run_status` back to
+                            // `Idle` on a terminal SDK event (RunCompleted /
+                            // RunFailed / RunCancelled), but the stream only
+                            // yields `None` (→ `RunEvent::Ended`) one tick
+                            // later. In that window a freshly-submitted prompt
+                            // passes the reducer's Idle guard yet gets dropped
+                            // by `handle_actions` because `active_run` is still
+                            // `Some`. Clear the run as soon as we observe the
+                            // terminal event so the next submit actually
+                            // starts — treat it like `Ended`.
+                            // Match the terminal variants directly rather
+                            // than building a full `SdkEventOutcome` (with its
+                            // preview allocations) just to read `run_terminal`
+                            // — this runs on every SDK event on the hot path.
+                            let terminal = matches!(
+                                ev,
+                                SdkEvent::RunCompleted(_)
+                                    | SdkEvent::RunFailed(_)
+                                    | SdkEvent::RunCancelled(_)
+                            );
                             self.state.apply(TuiInbound::sdk(ev));
+                            if terminal {
+                                active_run = None;
+                                cancel = None;
+                            }
                         }
                         RunEvent::Error(message) => {
                             self.state.apply(TuiInbound::RunStreamError(message));
@@ -197,7 +221,18 @@ impl TuiApp {
                 //    defensively deny any stale resolver so a stuck
                 //    `pending_resolver` (e.g. after a panic-recovered
                 //    handler) never strands the SDK.
-                Some(bridge_req) = recv_bridge(self.bridge_rx.as_mut()), if self.bridge_rx.is_some() => {
+                // #152: bind the full `Option` rather than gating on a
+                // `Some(..)` pattern. A `Some(_) = ..` arm leaves the `if`
+                // guard `true` after the channel closes, so `recv_bridge`
+                // returns `Ready(None)` and `select!` re-polls this arm on
+                // every loop iteration — a busy spin under `biased`. When
+                // we observe the close (`None`), drop the receiver so the
+                // guard disables the arm permanently.
+                maybe_req = recv_bridge(self.bridge_rx.as_mut()), if self.bridge_rx.is_some() => {
+                    let Some(bridge_req) = maybe_req else {
+                        self.bridge_rx = None;
+                        continue;
+                    };
                     if let Some(old) = self.pending_resolver.take() {
                         let _ = old.send(ApprovalDecision::Deny {
                             reason: "superseded by a new approval".to_string(),
