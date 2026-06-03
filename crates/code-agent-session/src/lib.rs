@@ -1419,9 +1419,9 @@ mod tests {
 
         // The normal user prompt is still copied.
         assert!(
-            records
-                .iter()
-                .any(|r| matches!(&r.payload, SessionPayload::UserPrompt { text } if text == "hello")),
+            records.iter().any(
+                |r| matches!(&r.payload, SessionPayload::UserPrompt { text } if text == "hello")
+            ),
             "normal records must still be copied into the fork"
         );
 
