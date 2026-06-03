@@ -531,6 +531,19 @@ pub async fn fork_session(
     let new_id = store.create(cwd).await?;
     append_fork_metadata(store, cwd, &new_id, source).await?;
     for r in records {
+        // Skip the source's own lineage/provenance markers. We write a fresh
+        // ForkMetadata above; copying the source's ForkMetadata/
+        // SettingsSnapshot/SubagentMetadata would corrupt lineage, since
+        // `summarize_session` resolves `source_session_id` from whichever
+        // ForkMetadata it encounters. Normal message/event records are kept.
+        if matches!(
+            r.payload,
+            SessionPayload::ForkMetadata { .. }
+                | SessionPayload::SettingsSnapshot { .. }
+                | SessionPayload::SubagentMetadata { .. }
+        ) {
+            continue;
+        }
         // Keep the original timestamp but rewrite the session id so the
         // new file references itself, not the source.
         let copied = SessionRecord {
@@ -1354,5 +1367,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    // Forking a session that already carries its own lineage/provenance
+    // markers must not copy them into the fork: the fork gets exactly one
+    // ForkMetadata (the fresh one) pointing at the immediate source, and the
+    // source's SettingsSnapshot/SubagentMetadata are dropped.
+    async fn fork_does_not_duplicate_metadata() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+
+        // Build a source that is itself a fork of `grandparent` and carries a
+        // settings snapshot plus a normal user prompt.
+        let grandparent = store.create(dir.path()).await.unwrap();
+        let source = store.create(dir.path()).await.unwrap();
+        append_fork_metadata(&store, dir.path(), &source, &grandparent)
+            .await
+            .unwrap();
+        append_settings_snapshot(&store, dir.path(), &source, "summary")
+            .await
+            .unwrap();
+        append_user_prompt(&store, dir.path(), &source, "hello")
+            .await
+            .unwrap();
+
+        let fork = fork_session(&store, dir.path(), &source).await.unwrap();
+        let records = store.load(&fork).await.unwrap();
+
+        let fork_metas: Vec<&str> = records
+            .iter()
+            .filter_map(|r| match &r.payload {
+                SessionPayload::ForkMetadata { source_session_id } => {
+                    Some(source_session_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fork_metas,
+            vec![source.as_str()],
+            "fork must contain exactly one ForkMetadata pointing at the immediate source"
+        );
+
+        assert!(
+            !records
+                .iter()
+                .any(|r| matches!(r.payload, SessionPayload::SettingsSnapshot { .. })),
+            "source SettingsSnapshot must not be copied into the fork"
+        );
+
+        // The normal user prompt is still copied.
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(&r.payload, SessionPayload::UserPrompt { text } if text == "hello")),
+            "normal records must still be copied into the fork"
+        );
+
+        // summarize_session resolves the correct immediate source.
+        let summary = summarize_session(&store, &fork).await.unwrap();
+        assert_eq!(summary.source_session_id.as_deref(), Some(source.as_str()));
     }
 }
