@@ -9,7 +9,7 @@ mod mapping;
 
 use serde::{Deserialize, Serialize};
 
-pub use mapping::SdkEventMapper;
+pub use mapping::{redact_event, SdkEventMapper};
 
 use code_agent_auth::ProviderId;
 use code_agent_core::plan::PlanDocument;
