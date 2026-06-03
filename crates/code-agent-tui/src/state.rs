@@ -9,6 +9,7 @@
 //! it can be exercised by unit tests with no terminal or runtime
 //! involvement.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 
 use code_agent_core::plan::{PlanDocument, PlanId};
@@ -183,7 +184,15 @@ pub struct TuiAppState {
     /// renderer's per-frame call to `visible_card_indices` is cheap
     /// even for large transcripts with case-insensitive substring
     /// matching.
-    visible_cache: Option<Vec<usize>>,
+    ///
+    /// `RefCell` so `visible_card_indices(&self)` can memoize on a cache
+    /// miss (#227): every `push_transcript` invalidates the cache, and
+    /// without lazy repopulation the renderer would re-run the O(n)
+    /// substring scan on every frame while streaming under an active
+    /// filter. The cache is always either `None` (invalidated) or a
+    /// value computed against the current transcript + query, so a lazy
+    /// fill is always correct.
+    visible_cache: RefCell<Option<Vec<usize>>>,
     /// Active completion popup, if any. Phase D autocomplete state:
     /// rebuilt by `refresh_composer_popup` after every key that
     /// mutates the composer buffer.
@@ -334,7 +343,7 @@ impl TuiAppState {
             expanded_card_ids: HashSet::new(),
             search_query: None,
             search_input: String::new(),
-            visible_cache: None,
+            visible_cache: RefCell::new(None),
             composer_popup: None,
             current_plan: None,
             pending_approval: None,
@@ -490,11 +499,19 @@ impl TuiAppState {
     /// cycle is O(visible). The cache is invalidated by
     /// `push_transcript` and by any mutation of `search_query` that
     /// goes through the reducer's modal path.
+    ///
+    /// #227: on a cache miss this recomputes *and stores* the result via
+    /// interior mutability, so the per-frame renderer call stays O(1)
+    /// while the agent streams cards under an active filter — previously
+    /// each `push_transcript` invalidated the cache and every frame
+    /// re-ran the full O(n) substring scan.
     pub fn visible_card_indices(&self) -> Vec<usize> {
-        if let Some(cached) = &self.visible_cache {
+        if let Some(cached) = self.visible_cache.borrow().as_ref() {
             return cached.clone();
         }
-        self.compute_visible_indices()
+        let computed = self.compute_visible_indices();
+        *self.visible_cache.borrow_mut() = Some(computed.clone());
+        computed
     }
 
     fn compute_visible_indices(&self) -> Vec<usize> {
@@ -510,11 +527,12 @@ impl TuiAppState {
     }
 
     fn invalidate_search_cache(&mut self) {
-        self.visible_cache = None;
+        *self.visible_cache.borrow_mut() = None;
     }
 
     fn refresh_search_cache(&mut self) {
-        self.visible_cache = Some(self.compute_visible_indices());
+        let computed = self.compute_visible_indices();
+        *self.visible_cache.borrow_mut() = Some(computed);
     }
 
     /// Is the given card expanded? An expanded card with empty
@@ -582,12 +600,33 @@ impl TuiAppState {
     /// [`PASTE_WARN_BYTES`] and truncates when above
     /// [`PASTE_HARD_LIMIT`].
     fn apply_paste(&mut self, mut data: String) -> Vec<TuiAction> {
-        // When a modal is open, bracketed-paste is intercepted by
-        // the modal-specific handler (e.g. SearchTranscript). If
-        // the focus is on the transcript pane, pasting is a no-op.
-        if self.layout.current_modal().is_some()
-            || !matches!(self.layout.focus, FocusPane::Composer)
-        {
+        // #228: route bracketed-paste into the active text-input modal's
+        // buffer instead of discarding it. The Search and CommandPalette
+        // modals accept typed characters, so a paste into them should
+        // fill the same buffer the keystrokes do. Strip embedded newlines
+        // — these are single-line inputs and a literal `\n` would corrupt
+        // the query / filter. Non-text modals leave the paste a no-op.
+        if let Some(modal) = self.layout.current_modal() {
+            match modal {
+                TuiModal::SearchTranscript => {
+                    self.search_input
+                        .extend(data.chars().filter(|c| *c != '\n' && *c != '\r'));
+                    return Vec::new();
+                }
+                TuiModal::CommandPalette => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.input
+                            .extend(data.chars().filter(|c| *c != '\n' && *c != '\r'));
+                        p.selected = 0;
+                    }
+                    return Vec::new();
+                }
+                _ => return Vec::new(),
+            }
+        }
+        // No modal: only the composer accepts pastes. If the focus is on
+        // another pane (e.g. the transcript), pasting is a no-op.
+        if !matches!(self.layout.focus, FocusPane::Composer) {
             return Vec::new();
         }
         let original_len = data.len();
@@ -867,13 +906,19 @@ impl TuiAppState {
                 );
                 vec![TuiAction::ResolveApproval(decision)]
             }
-            (_, KeyEvent::Esc) => {
+            (closed, KeyEvent::Esc) => {
                 let _ = self.layout.pop_modal();
-                // Cancelling search clears the in-progress input.
-                self.search_input.clear();
-                // Phase H: also clear palette state so a re-open
-                // starts from a blank input.
-                self.palette = None;
+                // #153: only clear the state that belongs to the modal
+                // being closed. The old catch-all wiped both
+                // `search_input` and `palette` on *any* Esc, so dismissing
+                // an unrelated (possibly layered) modal — Help,
+                // PromptHistory, a Custom modal — would silently discard a
+                // half-typed search query or palette filter underneath it.
+                match closed {
+                    TuiModal::SearchTranscript => self.search_input.clear(),
+                    TuiModal::CommandPalette => self.palette = None,
+                    _ => {}
+                }
                 Vec::new()
             }
             (_, KeyEvent::CtrlC) => match self.run_status {
@@ -1043,6 +1088,19 @@ impl TuiAppState {
     }
 
     fn handle_plan_approval_key(&mut self, c: char) -> Vec<TuiAction> {
+        // #226: a/r/u must always close the modal, even when there is no
+        // `current_plan` to attach the decision to. Removing the modal up
+        // front (before the early return for `None`) means the operator is
+        // never stranded with a modal that only Esc can dismiss. An
+        // unrecognized key still leaves the modal open so a stray keypress
+        // doesn't dismiss the prompt.
+        match c.to_ascii_lowercase() {
+            'a' | 'r' | 'u' => {}
+            _ => return Vec::new(),
+        }
+        let _ = self
+            .layout
+            .remove_custom_modals_by_id(PLAN_APPROVAL_MODAL_ID);
         let plan_id = match &self.current_plan {
             Some(p) => p.id.clone(),
             None => return Vec::new(),
@@ -1065,9 +1123,6 @@ impl TuiAppState {
             ),
             _ => return Vec::new(),
         };
-        let _ = self
-            .layout
-            .remove_custom_modals_by_id(PLAN_APPROVAL_MODAL_ID);
         debug!(target: "code_agent_tui", decision_kind = kind, "plan_approval_decision");
         vec![action]
     }
@@ -3088,5 +3143,152 @@ mod tests {
                 line.chars().count()
             );
         }
+    }
+
+    // #226: a/r/u must close the plan-approval modal even when
+    // `current_plan` is None. Before the fix the handler early-returned
+    // before removing the modal, stranding the operator (only Esc closed
+    // it).
+    #[test]
+    fn plan_approval_keys_close_modal_when_no_current_plan() {
+        for key in ['a', 'r', 'u'] {
+            let mut s = fresh_state();
+            // Push the plan-approval modal without seeding `current_plan`.
+            s.layout.push_modal(TuiModal::Custom {
+                id: PLAN_APPROVAL_MODAL_ID.to_string(),
+                title: "Plan ready for review".to_string(),
+                body: vec!["[a] approve* [r] reject* [u] revise*".to_string()],
+            });
+            assert!(s.current_plan.is_none());
+            let actions = s.apply(TuiInbound::Key(KeyEvent::Char(key)));
+            // No plan → no decision action, but the modal must be gone.
+            assert!(
+                actions.is_empty(),
+                "no plan should yield no action for {key}"
+            );
+            assert!(
+                s.layout.current_modal().is_none(),
+                "modal must close for key {key} even with no current_plan"
+            );
+        }
+    }
+
+    // #226 companion: with a plan present, a/r/u still emit the decision
+    // action and close the modal (regression guard for the reordered
+    // handler).
+    #[test]
+    fn plan_approval_keys_emit_action_with_current_plan() {
+        use code_agent_core::plan::{new_plan_id, PlanDocument};
+        use code_agent_sdk::event::PlanCreated;
+
+        let mut s = fresh_state();
+        let plan = PlanDocument::new_draft(new_plan_id(), "demo", "u");
+        s.apply(TuiInbound::sdk(SdkEvent::PlanCreated(PlanCreated {
+            run_id: rid(),
+            plan,
+        })));
+        assert!(s.current_plan.is_some());
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Char('a')));
+        assert!(
+            matches!(actions.as_slice(), [TuiAction::ApprovePlan(_)]),
+            "expected ApprovePlan, got {actions:?}"
+        );
+        assert!(s.layout.current_modal().is_none());
+    }
+
+    // #227: under an active search filter, the visibility cache must
+    // memoize on a miss so a second `visible_card_indices()` call between
+    // transcript mutations is served from the cache (interior mutability).
+    #[test]
+    fn visible_cache_memoizes_under_active_filter() {
+        let mut s = fresh_state();
+        push_user_card(&mut s, "alpha");
+        push_user_card(&mut s, "beta");
+        s.search_query = Some("alpha".to_string());
+        // First call after invalidation computes + stores.
+        let first = s.visible_card_indices();
+        assert!(s.visible_cache.borrow().is_some(), "cache must repopulate");
+        // Second call returns the same memoized result.
+        let second = s.visible_card_indices();
+        assert_eq!(first, second);
+        // A new transcript card invalidates the cache (next call recomputes).
+        push_user_card(&mut s, "alphabet");
+        assert!(
+            s.visible_cache.borrow().is_none(),
+            "push_transcript must invalidate the cache"
+        );
+        // Recompute reflects the new card and re-memoizes.
+        let third = s.visible_card_indices();
+        assert_eq!(third.len(), 2, "alpha + alphabet match");
+        assert!(s.visible_cache.borrow().is_some());
+    }
+
+    // #228: pasting into an open SearchTranscript modal fills the search
+    // input buffer instead of being discarded.
+    #[test]
+    fn paste_routes_into_search_modal_input() {
+        let mut s = fresh_state();
+        s.layout.push_modal(TuiModal::SearchTranscript);
+        s.apply(TuiInbound::Paste("hello\nworld".to_string()));
+        // Newlines stripped; single-line buffer filled.
+        assert_eq!(s.search_input, "helloworld");
+    }
+
+    // #228: pasting into an open CommandPalette modal fills the palette
+    // input buffer.
+    #[test]
+    fn paste_routes_into_palette_input() {
+        let mut s = fresh_state();
+        s.open_palette();
+        s.apply(TuiInbound::Paste("hel\rlo".to_string()));
+        assert_eq!(s.palette.as_ref().unwrap().input, "hello");
+    }
+
+    // #228: non-text modals still drop pastes (no panic, no state change).
+    #[test]
+    fn paste_into_non_text_modal_is_noop() {
+        let mut s = fresh_state();
+        s.layout.push_modal(TuiModal::Help);
+        s.apply(TuiInbound::Paste("ignored".to_string()));
+        assert!(s.search_input.is_empty());
+        assert!(s.composer.buffer.is_empty());
+    }
+
+    // #153: Esc closing an unrelated modal must not wipe an underlying
+    // search query input / palette state. The catch-all previously
+    // cleared both on any modal Esc.
+    #[test]
+    fn esc_on_unrelated_modal_preserves_palette_state() {
+        let mut s = fresh_state();
+        s.open_palette();
+        if let Some(p) = s.palette.as_mut() {
+            p.input.push_str("foo");
+        }
+        // Layer an unrelated modal on top of the palette.
+        s.layout.push_modal(TuiModal::Help);
+        s.apply(TuiInbound::Key(KeyEvent::Esc));
+        // Help popped; palette state underneath is untouched.
+        assert!(matches!(
+            s.layout.current_modal(),
+            Some(TuiModal::CommandPalette)
+        ));
+        assert_eq!(
+            s.palette.as_ref().map(|p| p.input.as_str()),
+            Some("foo"),
+            "palette input must survive Esc on an unrelated modal"
+        );
+    }
+
+    // #153: Esc on the CommandPalette itself still clears palette state.
+    #[test]
+    fn esc_on_palette_clears_palette_state() {
+        let mut s = fresh_state();
+        s.open_palette();
+        if let Some(p) = s.palette.as_mut() {
+            p.input.push_str("foo");
+        }
+        s.apply(TuiInbound::Key(KeyEvent::Esc));
+        assert!(s.layout.current_modal().is_none());
+        assert!(s.palette.is_none());
     }
 }
