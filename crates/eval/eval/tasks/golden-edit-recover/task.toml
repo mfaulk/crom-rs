@@ -1,0 +1,32 @@
+id = "golden-edit-recover"
+title = "Golden: edit a config value and recover from a failing check"
+tags = ["golden", "recovery", "small"]
+suites = ["golden"]
+
+prompt = """
+The file data.txt must contain `value=42`. Inspect it, run the check
+`grep -q 'value=42' data.txt`, fix the file if the check fails, and verify the
+check passes.
+"""
+
+max_turns = 10
+timeout_secs = 60
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# Command oracle confirms the post-run workspace satisfies the requirement.
+# Behavior checks confirm the agent actually inspected, edited, and re-ran a
+# command — i.e. recovered from the initial failing check.
+[oracle]
+kind = "command"
+commands = ["grep -q 'value=42' data.txt"]
+
+[[oracle.behavior]]
+kind = "must_use_tool"
+tool = "Edit"
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "grep"

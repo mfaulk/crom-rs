@@ -1,0 +1,48 @@
+name: Eval (live provider)
+
+# Manual-only. Live-provider evals are informative, not a deterministic CI
+# gate, and cost real model tokens — so they never run on push/PR. Trigger this
+# workflow by hand from the Actions tab. It requires an ANTHROPIC_API_KEY
+# repository secret; without it the run skips cleanly.
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Suite to run'
+        required: false
+        default: 'rust-small'
+      provider:
+        description: 'Live provider name'
+        required: false
+        default: 'anthropic'
+
+jobs:
+  eval-live:
+    name: eval / live
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      # The runtime opt-in switch. Without this the harness reports live tasks
+      # as skipped rather than failing.
+      CODE_AGENT_EVAL_LIVE: '1'
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: eval-live
+      - name: Run live eval suite
+        run: |
+          cargo run --locked -p code-agent-cli -- eval run \
+            --suite "${{ inputs.suite }}" \
+            --provider "${{ inputs.provider }}" \
+            --allow-failures
+      - name: Upload eval artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-live-runs
+          path: target/code-agent-eval/runs
+          if-no-files-found: ignore

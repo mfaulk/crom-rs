@@ -1,0 +1,9 @@
+# Standalone workspace so the parent repo never absorbs this fixture crate.
+[workspace]
+
+[package]
+name = "adder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

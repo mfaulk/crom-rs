@@ -1,0 +1,30 @@
+id = "rust-add-regression-test"
+title = "Fix a bug and add a regression test"
+tags = ["rust", "bugfix", "tests", "small"]
+suites = ["rust-small"]
+
+prompt = """
+The function `slugify` mishandles consecutive separators, producing doubled
+dashes. Fix it, then add a regression test named `collapses_repeated_separators`
+that locks in the fix. Keep the public API unchanged.
+"""
+
+max_turns = 20
+timeout_secs = 240
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --all-targets"]
+
+[[oracle.assertions]]
+kind = "file_contains"
+path = "src/lib.rs"
+text = "collapses_repeated_separators"
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "cargo test"

@@ -1,0 +1,30 @@
+id = "plan-act-small-feature"
+title = "Add a small feature using explicit plan-then-act"
+tags = ["rust", "feature", "planning", "small"]
+suites = ["rust-small", "planning"]
+mode = "plan_then_act"
+
+prompt = """
+Add a `is_palindrome(&str) -> bool` function to the crate that ignores ASCII
+case and non-alphanumeric characters, then add a test for it. First produce a
+short plan, then implement it. Keep existing tests passing.
+"""
+
+max_turns = 24
+timeout_secs = 300
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --all-targets"]
+
+[[oracle.assertions]]
+kind = "file_contains"
+path = "src/lib.rs"
+text = "is_palindrome"
+
+[[oracle.behavior]]
+kind = "must_emit_plan"

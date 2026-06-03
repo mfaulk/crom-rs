@@ -1,0 +1,29 @@
+id = "rust-cli-arg-order"
+title = "Fix a CLI arg-parsing edge case spanning multiple files"
+tags = ["rust", "cli", "bugfix", "small"]
+suites = ["rust-small"]
+
+prompt = """
+The CLI fails when --output is passed after the input path (e.g. `app in.txt
+--output out.txt`). Fix the parser so flags may appear in any order. Do not
+change the public CLI syntax. Tests describe the expected behavior.
+"""
+
+max_turns = 24
+timeout_secs = 300
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --all-targets"]
+
+[[oracle.behavior]]
+kind = "must_use_tool"
+tool = "Read"
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "cargo test"

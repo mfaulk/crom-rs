@@ -1,4 +1,5 @@
 mod auth_cmd;
+mod eval_cmd;
 mod m9;
 mod plan_cmd;
 mod plugins;
@@ -163,6 +164,9 @@ enum Command {
     /// M12: run a coding task through the embeddable SDK (no TUI, no
     /// interactive auth, conservative side-effect defaults).
     HeadlessRun(sdk_cmd::HeadlessRunArgs),
+    /// M14: coding-agent capability evaluation harness.
+    #[command(subcommand)]
+    Eval(eval_cmd::EvalCommand),
 }
 
 #[derive(Parser, Debug)]
@@ -1456,6 +1460,7 @@ async fn main() -> ExitCode {
             plan_cmd::cmd_plans(&settings, cmd).await
         }
         Command::HeadlessRun(args) => sdk_cmd::cmd_headless_run(args).await,
+        Command::Eval(cmd) => eval_cmd::run(cmd).await,
     };
 
     match result {

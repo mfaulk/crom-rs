@@ -124,6 +124,33 @@ jobs:
         # (e.g. the fake MCP server in mcp-demo / tool-search-demo) are built.
         run: cargo check --locked --workspace --manifest-path examples/${{ matrix.example }}/Cargo.toml
 
+  eval:
+    name: eval / smoke (fake provider)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: eval
+      # Fast, deterministic, offline lane. Never runs live-provider evals:
+      # the live lane is gated at runtime by CODE_AGENT_EVAL_LIVE, which is
+      # not set here.
+      - name: Eval harness unit + integration tests
+        run: cargo test --locked -p code-agent-eval
+      - name: Eval smoke suite (fake provider)
+        run: cargo run --locked -p code-agent-cli -- eval run --suite smoke --provider fake
+      # Surface the artifact bundle when the smoke suite regresses so failures
+      # are debuggable from the CI run.
+      - name: Upload eval artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-runs
+          path: target/code-agent-eval/runs
+          if-no-files-found: ignore
+
   deny:
     name: security / cargo-deny
     runs-on: ubuntu-latest

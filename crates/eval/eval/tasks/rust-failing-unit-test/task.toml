@@ -1,0 +1,28 @@
+id = "rust-failing-unit-test"
+title = "Fix a small logic bug exposed by a failing test"
+tags = ["rust", "bugfix", "tests", "small"]
+suites = ["rust-small"]
+
+prompt = """
+A unit test is failing. Find and fix the logic bug so the tests pass. Do not
+weaken or delete the test.
+"""
+
+max_turns = 20
+timeout_secs = 240
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "rust"
+test = true
+
+[[oracle.behavior]]
+kind = "must_use_tool"
+tool = "Read"
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "cargo test"

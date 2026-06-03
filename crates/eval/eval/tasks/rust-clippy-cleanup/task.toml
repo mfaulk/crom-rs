@@ -1,0 +1,25 @@
+id = "rust-clippy-cleanup"
+title = "Make the code pass clippy with -D warnings"
+tags = ["rust", "clippy", "lint", "small"]
+suites = ["rust-small"]
+
+prompt = """
+The tests pass but `cargo clippy --all-targets -- -D warnings` fails. Resolve
+the clippy lints idiomatically without changing behavior or deleting tests.
+"""
+
+max_turns = 20
+timeout_secs = 300
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "rust"
+test = true
+clippy = true
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "clippy"
