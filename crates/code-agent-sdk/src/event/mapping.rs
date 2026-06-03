@@ -202,7 +202,11 @@ mod tests {
         match out {
             SdkEvent::AssistantMessage(e) => {
                 assert!(!e.text.contains(secret), "secret leaked: {}", e.text);
-                assert!(e.text.contains("<redacted"), "no redaction marker: {}", e.text);
+                assert!(
+                    e.text.contains("<redacted"),
+                    "no redaction marker: {}",
+                    e.text
+                );
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -240,7 +244,10 @@ mod tests {
         let secret = "sk-ant-abcdefghijklmnopqrstuvwxyz0123456789";
         let ev = SdkEvent::Diagnostic(DiagnosticEvent {
             run_id: RunId::new(),
-            diagnostic: crate::error::Diagnostic::error("run.boom", format!("failed with {secret}")),
+            diagnostic: crate::error::Diagnostic::error(
+                "run.boom",
+                format!("failed with {secret}"),
+            ),
         });
         let out = redact_event(&redactor, ev);
         match out {
