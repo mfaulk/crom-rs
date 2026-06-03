@@ -230,11 +230,20 @@ impl CredentialStore {
         account: StoredAccount,
         secret: &StoredCredentialSecret,
     ) -> Result<(), AuthError> {
-        self.backend
-            .put(&account.provider, &account.account_id, secret)?;
+        let provider = account.provider.clone();
+        let account_id = account.account_id.clone();
+        self.backend.put(&provider, &account_id, secret)?;
         let mut idx = self.index.lock().unwrap();
         idx.upsert(account);
-        self.persist_index(&idx)
+        if let Err(e) = self.persist_index(&idx) {
+            // The secret is already committed to the backend but the index
+            // that references it could not be persisted. Best-effort roll
+            // back the orphaned secret so it can't linger unreferenced;
+            // surface the original persistence error regardless.
+            let _ = self.backend.delete(&provider, &account_id);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn get_secret(
@@ -457,6 +466,44 @@ mod tests {
             .snapshot_index()
             .get(&acct.provider, &acct.account_id)
             .is_none());
+    }
+
+    #[test]
+    // If index persistence fails after the secret is written to the
+    // backend, `put` best-effort rolls back the backend write so no
+    // orphaned secret is left behind, and surfaces the original error.
+    fn put_rolls_back_secret_when_index_persist_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Make `index_path`'s parent a regular file so `create_dir_all`
+        // (and thus persist_index) fails while the backend write succeeds.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let index_path = blocker.join("index.json");
+
+        let backend = Arc::new(FakeKeychainBackend::default());
+        let store = CredentialStore {
+            mode: CredentialStoreMode::Auto,
+            allow_file_store: true,
+            backend: backend.clone(),
+            index: Arc::new(std::sync::Mutex::new(AccountIndex::default())),
+            index_path: Some(index_path),
+        };
+        let acct = sample_account(ProviderId::Anthropic, "orphan-check");
+        let secret = StoredCredentialSecret {
+            api_key: Some(SecretString::new("sk-orphan".into())),
+            ..Default::default()
+        };
+        let err = store.put(acct.clone(), &secret).unwrap_err();
+        // Original persistence error is surfaced.
+        assert_eq!(err.kind, AuthErrorKind::CredentialStoreUnavailable);
+        // The secret must not be orphaned in the backend.
+        assert!(
+            backend
+                .get(&acct.provider, &acct.account_id)
+                .unwrap()
+                .is_none(),
+            "secret should have been rolled back, not orphaned"
+        );
     }
 
     #[test]
