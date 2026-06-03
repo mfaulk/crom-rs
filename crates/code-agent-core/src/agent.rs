@@ -1266,6 +1266,32 @@ pub(crate) async fn run_loop(
             return Ok(());
         }
 
+        // #160: the consumer may have received the assistant message above and
+        // *then* dropped the stream — so the cancellable emit succeeded and the
+        // cancel flag is still clear, yet there is no longer anyone listening.
+        // Before running any tool (which may mutate the workspace or execute
+        // commands), confirm a receiver is still attached; if not, treat the
+        // drop as a cancellation and stop rather than doing side-effecting work
+        // for a consumer that is gone.
+        if cfg.cancel.load(Ordering::Acquire) || tx.is_closed() {
+            cfg.cancel.store(true, Ordering::Release);
+            handle_interrupt(
+                &tx,
+                &session_sink,
+                &telemetry_sink,
+                &session_id,
+                &cfg.run_id,
+                turns,
+                last_result_text.clone(),
+                total_usage.clone(),
+                pricing.as_ref(),
+                &hooks,
+                &options.cwd,
+            )
+            .await;
+            return Ok(());
+        }
+
         // Execute tool calls in (input) order. The model is allowed to
         // emit multiple tool_use blocks in one turn. Read-only tools
         // (`PermissionKind::ReadOnly`) can safely overlap their IO and
