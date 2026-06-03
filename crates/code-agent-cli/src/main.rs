@@ -5456,7 +5456,8 @@ fn resolve_stored_credential(
     // context so callers can distinguish "no credential" from a real store
     // failure via `not_logged_in_error` instead of string-matching.
     .map_err(|e| {
-        anyhow!("resolve {} credential: {}", provider, e).context(CredentialResolveErrorKind(e.kind))
+        anyhow!("resolve {} credential: {}", provider, e)
+            .context(CredentialResolveErrorKind(e.kind))
     })?;
     Ok(res.credential)
 }
@@ -8242,10 +8243,9 @@ mod provider_route_tests {
     // var) while a different store error is not — so it propagates.
     #[test]
     fn not_logged_in_error_is_distinguished_from_store_errors() {
-        let not_logged_in =
-            anyhow!("resolve anthropic credential: boom").context(CredentialResolveErrorKind(
-                code_agent_auth::AuthErrorKind::NotLoggedIn,
-            ));
+        let not_logged_in = anyhow!("resolve anthropic credential: boom").context(
+            CredentialResolveErrorKind(code_agent_auth::AuthErrorKind::NotLoggedIn),
+        );
         assert!(is_not_logged_in_error(&not_logged_in));
 
         // A real store failure carries a different kind and must propagate.
