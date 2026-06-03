@@ -175,9 +175,16 @@ impl TuiApp {
                             // `Some`. Clear the run as soon as we observe the
                             // terminal event so the next submit actually
                             // starts — treat it like `Ended`.
-                            let terminal = crate::event_adapter::map_sdk_event(&ev)
-                                .run_terminal
-                                .is_some();
+                            // Match the terminal variants directly rather
+                            // than building a full `SdkEventOutcome` (with its
+                            // preview allocations) just to read `run_terminal`
+                            // — this runs on every SDK event on the hot path.
+                            let terminal = matches!(
+                                ev,
+                                SdkEvent::RunCompleted(_)
+                                    | SdkEvent::RunFailed(_)
+                                    | SdkEvent::RunCancelled(_)
+                            );
                             self.state.apply(TuiInbound::sdk(ev));
                             if terminal {
                                 active_run = None;

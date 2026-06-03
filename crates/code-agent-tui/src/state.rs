@@ -600,6 +600,30 @@ impl TuiAppState {
     /// [`PASTE_WARN_BYTES`] and truncates when above
     /// [`PASTE_HARD_LIMIT`].
     fn apply_paste(&mut self, mut data: String) -> Vec<TuiAction> {
+        // Enforce the paste size cap *first*, before routing the payload into
+        // any buffer. The #228 modal routing below previously returned before
+        // this logic, so a bracketed paste into Search/CommandPalette could
+        // append an arbitrarily large clipboard payload to
+        // `search_input`/`palette.input` — which is re-rendered and filtered
+        // every frame and can stall the TUI. Capping up front covers the
+        // composer and both modals uniformly.
+        let original_len = data.len();
+        if original_len > PASTE_HARD_LIMIT {
+            // Truncate at a char boundary to keep the buffer valid UTF-8.
+            let mut cut = PASTE_HARD_LIMIT;
+            while cut > 0 && !data.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            data.truncate(cut);
+            self.push_activity(format!(
+                "paste truncated: {original_len} bytes > {PASTE_HARD_LIMIT} cap"
+            ));
+        } else if original_len > PASTE_WARN_BYTES {
+            self.push_activity(format!(
+                "large paste: {original_len} bytes (over {PASTE_WARN_BYTES} warn threshold)"
+            ));
+        }
+
         // #228: route bracketed-paste into the active text-input modal's
         // buffer instead of discarding it. The Search and CommandPalette
         // modals accept typed characters, so a paste into them should
@@ -628,22 +652,6 @@ impl TuiAppState {
         // another pane (e.g. the transcript), pasting is a no-op.
         if !matches!(self.layout.focus, FocusPane::Composer) {
             return Vec::new();
-        }
-        let original_len = data.len();
-        if original_len > PASTE_HARD_LIMIT {
-            // Truncate at a char boundary to keep the buffer valid UTF-8.
-            let mut cut = PASTE_HARD_LIMIT;
-            while cut > 0 && !data.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            data.truncate(cut);
-            self.push_activity(format!(
-                "paste truncated: {original_len} bytes > {PASTE_HARD_LIMIT} cap"
-            ));
-        } else if original_len > PASTE_WARN_BYTES {
-            self.push_activity(format!(
-                "large paste: {original_len} bytes (over {PASTE_WARN_BYTES} warn threshold)"
-            ));
         }
         // Insert at the cursor.
         let pos = self.composer.cursor.min(self.composer.buffer.len());
@@ -3242,6 +3250,18 @@ mod tests {
         s.open_palette();
         s.apply(TuiInbound::Paste("hel\rlo".to_string()));
         assert_eq!(s.palette.as_ref().unwrap().input, "hello");
+    }
+
+    // A huge paste routed into a text-input modal is capped by
+    // PASTE_HARD_LIMIT, just like the composer — the #228 modal routing must
+    // not bypass the size guard (an unbounded search_input stalls rendering).
+    #[test]
+    fn huge_paste_into_search_modal_is_capped() {
+        let mut s = fresh_state();
+        s.layout.push_modal(TuiModal::SearchTranscript);
+        let data: String = "x".repeat(PASTE_HARD_LIMIT * 2);
+        s.apply(TuiInbound::Paste(data));
+        assert_eq!(s.search_input.len(), PASTE_HARD_LIMIT);
     }
 
     // #228: non-text modals still drop pastes (no panic, no state change).
