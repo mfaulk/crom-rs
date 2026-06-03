@@ -234,13 +234,33 @@ impl CredentialStore {
         let account_id = account.account_id.clone();
         self.backend.put(&provider, &account_id, secret)?;
         let mut idx = self.index.lock().unwrap();
+        // Remember the prior state so a failed index write can be undone
+        // without destroying a credential.
+        let prior = idx.get(&provider, &account_id).cloned();
         idx.upsert(account);
         if let Err(e) = self.persist_index(&idx) {
             // The secret is already committed to the backend but the index
-            // that references it could not be persisted. Best-effort roll
-            // back the orphaned secret so it can't linger unreferenced;
-            // surface the original persistence error regardless.
-            let _ = self.backend.delete(&provider, &account_id);
+            // that references it could not be persisted. Roll back so we
+            // neither orphan a new secret nor destroy an existing one, and
+            // keep the in-memory index consistent with what's on disk.
+            // Surface the original persistence error regardless.
+            match prior {
+                // This was a *new* account: the on-disk index never
+                // referenced this secret, so it would linger unreferenced
+                // (#222). Delete it and drop the in-memory insert.
+                None => {
+                    let _ = self.backend.delete(&provider, &account_id);
+                    idx.remove(&provider, &account_id);
+                }
+                // This was an *update* (e.g. an OAuth token refresh). The
+                // on-disk index still references this key, so the freshly
+                // written secret is reachable and must NOT be deleted —
+                // doing so would wipe a valid credential. Restore the prior
+                // metadata so the in-memory index matches the persisted one.
+                Some(prev) => {
+                    idx.upsert(prev);
+                }
+            }
             return Err(e);
         }
         Ok(())
@@ -504,6 +524,61 @@ mod tests {
                 .is_none(),
             "secret should have been rolled back, not orphaned"
         );
+    }
+
+    #[test]
+    // #222 regression: rollback must only remove a *newly orphaned* secret.
+    // `put` is also used for updates (e.g. an OAuth token refresh); on an
+    // update the on-disk index still references the key, so the freshly
+    // written secret is reachable and must survive a failed index persist
+    // rather than being deleted (which would destroy a valid credential).
+    fn put_keeps_existing_secret_when_index_persist_fails_on_update() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(FakeKeychainBackend::default());
+        let index = Arc::new(std::sync::Mutex::new(AccountIndex::default()));
+        let acct = sample_account(ProviderId::Anthropic, "refresh-me");
+
+        // Phase 1: seed an existing account whose index persists cleanly.
+        let store_ok = CredentialStore {
+            mode: CredentialStoreMode::Auto,
+            allow_file_store: true,
+            backend: backend.clone(),
+            index: index.clone(),
+            index_path: Some(dir.path().join("index.json")),
+        };
+        let old_secret = StoredCredentialSecret {
+            api_key: Some(SecretString::new("sk-old".into())),
+            ..Default::default()
+        };
+        store_ok.put(acct.clone(), &old_secret).unwrap();
+
+        // Phase 2: an *update* to the same account whose index persist fails
+        // (the parent of `index_path` is a regular file, so create_dir_all
+        // errors). Shares the same backend + in-memory index as phase 1.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let store_bad = CredentialStore {
+            mode: CredentialStoreMode::Auto,
+            allow_file_store: true,
+            backend: backend.clone(),
+            index: index.clone(),
+            index_path: Some(blocker.join("index.json")),
+        };
+        let new_secret = StoredCredentialSecret {
+            api_key: Some(SecretString::new("sk-new".into())),
+            ..Default::default()
+        };
+        let err = store_bad.put(acct.clone(), &new_secret).unwrap_err();
+        assert_eq!(err.kind, AuthErrorKind::CredentialStoreUnavailable);
+
+        // The credential must NOT be destroyed by the failed update — and it
+        // reflects the freshly written value (still referenced by the
+        // unchanged on-disk index, so it is reachable rather than orphaned).
+        let got = backend
+            .get(&acct.provider, &acct.account_id)
+            .unwrap()
+            .expect("an existing secret must survive a failed index persist on update");
+        assert_eq!(got.api_key.as_ref().unwrap().expose(), "sk-new");
     }
 
     #[test]

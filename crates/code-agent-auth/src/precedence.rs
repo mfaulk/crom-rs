@@ -97,19 +97,7 @@ pub fn resolve_credential(inputs: AuthResolverInputs<'_>) -> Result<ResolvedAuth
         ))
     };
 
-    // Source B: explicit CLI account override (must be present in store).
-    let cli_account = match inputs.explicit_account.as_ref() {
-        Some(aid) => resolve_stored(aid)?,
-        None => None,
-    };
-
-    // Source C: active stored account.
-    let stored_active = match inputs.active_account {
-        Some(aid) => resolve_stored(aid)?,
-        None => None,
-    };
-
-    // Source D: env var API key.
+    // Source D: env var API key (no backend I/O).
     let env = provider_env_var(&provider).and_then(|name| {
         inputs.env.get(name).map(|val| ResolvedCredential::ApiKey {
             provider: provider.clone(),
@@ -118,49 +106,109 @@ pub fn resolve_credential(inputs: AuthResolverInputs<'_>) -> Result<ResolvedAuth
         })
     });
 
-    // Source E: any stored account for provider, most recent first.
-    let stored_first = match inputs.store {
-        Some(store) => {
-            let idx = store.snapshot_index();
-            let mut accounts: Vec<_> = idx.list_for(&provider).into_iter().cloned().collect();
-            accounts.sort_by_key(|a| std::cmp::Reverse(a.created_at));
-            let mut found = None;
-            for acct in accounts {
-                // Propagate genuine backend errors; skip accounts whose
-                // secret is simply absent or non-credential.
-                if let Some(secret) = store.get_secret(&provider, &acct.account_id)? {
-                    if let Some(cred) =
-                        secret_to_credential(&provider, &acct.account_id, &secret, Some(&acct))
-                    {
-                        found = Some(cred);
-                        break;
-                    }
-                }
-            }
-            found
+    // Sources B / C / E touch the credential backend. They are evaluated
+    // *lazily*, in precedence order, so a backend error from a source that a
+    // higher-precedence credential has already satisfied can never abort
+    // resolution or shadow a valid CLI key / env var. Only a source that is
+    // actually consulted (and is the highest-precedence one with anything to
+    // say) surfaces its error.
+
+    // Source B: explicit CLI account override (must be present in store).
+    let cli_account = || -> Result<Option<ResolvedCredential>, AuthError> {
+        match inputs.explicit_account.as_ref() {
+            Some(aid) => resolve_stored(aid),
+            None => Ok(None),
         }
-        None => None,
     };
 
-    let stored_any = stored_active.clone().or_else(|| stored_first.clone());
+    // Source C: active stored account.
+    let stored_active = || -> Result<Option<ResolvedCredential>, AuthError> {
+        match inputs.active_account {
+            Some(aid) => resolve_stored(aid),
+            None => Ok(None),
+        }
+    };
 
-    // Generic conflict warning if both env var and stored credential exist.
-    if env.is_some() && stored_any.is_some() {
-        if let Some(name) = provider_env_var(&provider) {
-            warnings.push(format!(
-                "{name} environment variable will override stored {provider} account under env-first precedence"
-            ));
+    // Source E: any stored account for provider, most recent first.
+    let stored_first = || -> Result<Option<ResolvedCredential>, AuthError> {
+        let Some(store) = inputs.store else {
+            return Ok(None);
+        };
+        let idx = store.snapshot_index();
+        let mut accounts: Vec<_> = idx.list_for(&provider).into_iter().cloned().collect();
+        accounts.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        for acct in accounts {
+            // Propagate genuine backend errors; skip accounts whose secret
+            // is simply absent or non-credential.
+            if let Some(secret) = store.get_secret(&provider, &acct.account_id)? {
+                if let Some(cred) =
+                    secret_to_credential(&provider, &acct.account_id, &secret, Some(&acct))
+                {
+                    return Ok(Some(cred));
+                }
+            }
+        }
+        Ok(None)
+    };
+
+    // Informational conflict warning when an env var would override a stored
+    // credential. A backend error while probing is swallowed here (the
+    // warning is best-effort and must not suppress resolution); a real error
+    // still surfaces from the precedence chain below if a store source is
+    // actually selected.
+    if env.is_some() {
+        let stored_present =
+            matches!(stored_active(), Ok(Some(_))) || matches!(stored_first(), Ok(Some(_)));
+        if stored_present {
+            if let Some(name) = provider_env_var(&provider) {
+                warnings.push(format!(
+                    "{name} environment variable will override stored {provider} account under env-first precedence"
+                ));
+            }
         }
     }
 
+    // Resolve in precedence order, short-circuiting at the first available
+    // credential so lower-precedence store lookups (and their errors) are
+    // only reached when nothing higher-precedence applies.
     let chosen = match inputs.mode {
-        AuthPrecedenceMode::ExplicitFirst => cli
-            .or(cli_account)
-            .or(stored_active.clone())
-            .or(env)
-            .or(stored_first),
-        AuthPrecedenceMode::EnvFirst => env.or(cli).or(cli_account).or(stored_any),
-        AuthPrecedenceMode::StoredFirst => stored_active.or(stored_first).or(cli).or(env),
+        AuthPrecedenceMode::ExplicitFirst => {
+            if let Some(c) = cli {
+                Some(c)
+            } else if let Some(c) = cli_account()? {
+                Some(c)
+            } else if let Some(c) = stored_active()? {
+                Some(c)
+            } else if let Some(c) = env {
+                Some(c)
+            } else {
+                stored_first()?
+            }
+        }
+        AuthPrecedenceMode::EnvFirst => {
+            if let Some(c) = env {
+                Some(c)
+            } else if let Some(c) = cli {
+                Some(c)
+            } else if let Some(c) = cli_account()? {
+                Some(c)
+            } else if let Some(c) = stored_active()? {
+                Some(c)
+            } else {
+                stored_first()?
+            }
+        }
+        AuthPrecedenceMode::StoredFirst => {
+            if let Some(c) = stored_active()? {
+                Some(c)
+            } else if let Some(c) = stored_first()? {
+                Some(c)
+            } else if let Some(c) = cli {
+                Some(c)
+            } else {
+                env
+            }
+        }
     };
 
     match chosen {
@@ -450,6 +498,107 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err.kind, AuthErrorKind::CredentialStoreUnavailable);
+    }
+
+    #[test]
+    // #221 regression: a backend error from a *lower-precedence* store
+    // source must not abort resolution when a higher-precedence credential
+    // is available. Under EnvFirst a valid env key outranks the active
+    // stored account, so a failing stored lookup must be skipped entirely
+    // rather than surfaced. (Previously every source was resolved eagerly
+    // with `?`, so the failing lookup shadowed the env key.)
+    fn store_error_does_not_shadow_higher_precedence_env_key() {
+        use std::sync::Arc;
+        let aid = AccountId::new("k1");
+        let acct = StoredAccount {
+            account_id: aid.clone(),
+            provider: ProviderId::Anthropic,
+            login_method: LoginMethodKind::ApiKey,
+            display_email: None,
+            workspace_id: None,
+            plan_type: None,
+            created_at: OffsetDateTime::now_utc(),
+            last_refresh_at: None,
+            expires_at: None,
+            scopes: vec![],
+            active: true,
+            metadata: serde_json::json!({}),
+            needs_reauth: false,
+        };
+        let store = CredentialStore {
+            mode: crate::types::CredentialStoreMode::Auto,
+            allow_file_store: true,
+            backend: Arc::new(FailingGetBackend),
+            index: Arc::new(std::sync::Mutex::new(crate::store::AccountIndex::default())),
+            index_path: None,
+        };
+        store.index.lock().unwrap().upsert(acct);
+        let mut env = BTreeMap::new();
+        env.insert("ANTHROPIC_API_KEY".into(), "env-key".into());
+        let res = resolve_credential(AuthResolverInputs {
+            provider: Some(ProviderId::Anthropic),
+            mode: AuthPrecedenceMode::EnvFirst,
+            explicit_api_key: None,
+            explicit_account: None,
+            active_account: Some(&aid),
+            env,
+            store: Some(&store),
+        })
+        .expect("env key should resolve despite a failing lower-precedence store");
+        match res.credential {
+            ResolvedCredential::ApiKey { source, .. } => {
+                assert!(matches!(source, CredentialSource::EnvVar(_)));
+            }
+            other => panic!("expected env ApiKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // #221 regression: an explicit CLI key is the highest-precedence source
+    // under ExplicitFirst, so a failing stored backend must never be
+    // consulted (and so never abort) when `--api-key` is supplied.
+    fn store_error_does_not_shadow_explicit_cli_key() {
+        use std::sync::Arc;
+        let aid = AccountId::new("k1");
+        let acct = StoredAccount {
+            account_id: aid.clone(),
+            provider: ProviderId::Anthropic,
+            login_method: LoginMethodKind::ApiKey,
+            display_email: None,
+            workspace_id: None,
+            plan_type: None,
+            created_at: OffsetDateTime::now_utc(),
+            last_refresh_at: None,
+            expires_at: None,
+            scopes: vec![],
+            active: true,
+            metadata: serde_json::json!({}),
+            needs_reauth: false,
+        };
+        let store = CredentialStore {
+            mode: crate::types::CredentialStoreMode::Auto,
+            allow_file_store: true,
+            backend: Arc::new(FailingGetBackend),
+            index: Arc::new(std::sync::Mutex::new(crate::store::AccountIndex::default())),
+            index_path: None,
+        };
+        store.index.lock().unwrap().upsert(acct);
+        let res = resolve_credential(AuthResolverInputs {
+            provider: Some(ProviderId::Anthropic),
+            mode: AuthPrecedenceMode::ExplicitFirst,
+            explicit_api_key: Some(SecretString::new("cli-key".into())),
+            explicit_account: None,
+            active_account: Some(&aid),
+            env: BTreeMap::new(),
+            store: Some(&store),
+        })
+        .expect("explicit cli key should resolve despite a failing store");
+        match res.credential {
+            ResolvedCredential::ApiKey { source, .. } => {
+                assert!(matches!(source, CredentialSource::Cli));
+            }
+            other => panic!("expected cli ApiKey, got {other:?}"),
+        }
     }
 
     #[test]
