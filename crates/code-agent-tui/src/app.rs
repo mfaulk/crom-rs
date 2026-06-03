@@ -13,6 +13,7 @@
 //! terminal — see `state.rs` for the bulk of behavioral coverage.
 
 use std::io::{self, Stdout, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,7 +112,17 @@ impl TuiApp {
         terminal.clear()?;
 
         let (input_tx, mut input_rx) = mpsc::channel::<TuiInbound>(64);
-        let input_task = spawn_input_task(input_tx);
+        // #154: a shared shutdown flag the input thread polls so it can
+        // exit cleanly. The thread runs a blocking `crossterm::event::read()`
+        // which `abort()` cannot interrupt — a JoinHandle abort only
+        // cancels at an await point, and a thread parked inside a blocking
+        // syscall has none. By polling with a timeout and checking this
+        // flag each tick, the thread observes the shutdown request and
+        // returns before the TerminalGuard restores the terminal, so a
+        // stray keystroke can't be read against (and corrupt) the
+        // post-exit terminal.
+        let input_shutdown = Arc::new(AtomicBool::new(false));
+        let input_task = spawn_input_task(input_tx, input_shutdown.clone());
 
         // Active run. None when idle. We pull events off `run.events` in
         // the select! loop and feed them into the reducer.
@@ -238,6 +249,12 @@ impl TuiApp {
                             reason: "superseded by a new approval".to_string(),
                         });
                     }
+                    // #177: the bridge is the single source of truth for an
+                    // approval that has a live SDK resolver. `open_approval_modal`
+                    // is idempotent on the modal stack, so if the
+                    // `SdkEvent::ApprovalRequired` reducer arm already opened a
+                    // resolver-less modal for this request, this call replaces it
+                    // with one whose resolver we own below — no duplicate modal.
                     self.state.open_approval_modal(
                         bridge_req.request.tool_name.clone(),
                         bridge_req.request.summary.clone(),
@@ -261,7 +278,25 @@ impl TuiApp {
             c.cancel();
         }
         drop(active_run);
-        input_task.abort();
+        // #154: signal the input thread to stop, then wait for it to
+        // actually return before restoring the terminal. The thread polls
+        // `input_shutdown` between event polls, so it observes the request
+        // within one poll interval and exits its loop. Joining here (rather
+        // than the old `abort()`, which cannot interrupt a thread parked in
+        // a blocking `event::read()`) guarantees no input read is in flight
+        // when `guard.leave()` puts the terminal back into cooked mode, so
+        // a stray keystroke during teardown can't be consumed against the
+        // restored terminal.
+        input_shutdown.store(true, Ordering::Relaxed);
+        // Close the receiver before joining. The input thread sends over a
+        // *bounded* channel; if it is parked in `blocking_send` on a full
+        // channel during an exit burst it never reaches the `input_shutdown`
+        // check, and while `input_rx` is still alive that send never errors —
+        // so `input_task.await` would hang forever, leaving the terminal in
+        // raw mode. Closing the receiver makes the pending/next send fail so
+        // the thread unblocks and exits.
+        input_rx.close();
+        let _ = input_task.await;
         guard.leave()?;
         Ok(())
     }
@@ -307,12 +342,7 @@ impl TuiApp {
                 // call) we still log the decision so reducer-only
                 // tests of the workbench remain useful.
                 TuiAction::ResolveApproval(decision) => {
-                    let sdk_decision = sdk_decision_from(decision.clone());
-                    let label = format!("approval decision: {decision:?}");
-                    self.state.push_activity(label);
-                    if let Some(resolver) = self.pending_resolver.take() {
-                        let _ = resolver.send(sdk_decision);
-                    }
+                    self.resolve_approval(decision);
                 }
                 // Plan decisions are not yet wired through `AgentRuntime`:
                 // the SDK has no `PlanDecisionCallback` / `approve_plan` API
@@ -321,6 +351,10 @@ impl TuiApp {
                 // operator can see the UI is reading the keys but not
                 // blocking the run. See #146 for the followup that adds
                 // a real callback.
+                //
+                // TODO(#146): wire a real PlanDecisionCallback through
+                // AgentRuntime so these arms can send an actual decision
+                // to the SDK instead of only logging a preview line.
                 TuiAction::ApprovePlan(plan_id) => {
                     self.state.push_activity(format_plan_preview_log(
                         "approve",
@@ -346,6 +380,33 @@ impl TuiApp {
         }
     }
 
+    /// Dispatch a resolved approval decision back to the SDK via the
+    /// stashed bridge resolver.
+    ///
+    /// #177: the approval modal is opened from two uncoordinated paths
+    /// (the bridge handler and the `SdkEvent::ApprovalRequired` reducer
+    /// arm). Only the bridge handler stashes a `pending_resolver`. When a
+    /// resolver is present we send the decision exactly once (the
+    /// `take()` guarantees it cannot be sent twice). When it is absent the
+    /// decision has nowhere to go — expected for reducer-only hosts with
+    /// no bridge, but a bug if a bridge is wired and the request was
+    /// already answered or never landed. Either way we surface a visible
+    /// diagnostic in the activity log rather than silently dropping the
+    /// decision.
+    fn resolve_approval(&mut self, decision: ApprovalDecisionAction) {
+        let sdk_decision = sdk_decision_from(decision.clone());
+        self.state
+            .push_activity(format!("approval decision: {decision:?}"));
+        if let Some(resolver) = self.pending_resolver.take() {
+            let _ = resolver.send(sdk_decision);
+        } else {
+            self.state.push_activity(format!(
+                "warning: approval decision ({decision:?}) had no pending request \
+                 to resolve; not sent to the SDK"
+            ));
+        }
+    }
+
     fn draw(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), TuiAppError> {
         let frame = crate::view::build_ui_frame(&self.state, &self.footer);
         draw(terminal, frame)?;
@@ -368,11 +429,41 @@ fn format_plan_preview_log(action: &str, plan_id: &str, detail: Option<&str>) ->
     }
 }
 
+/// Poll interval for the input thread's `crossterm::event::poll`. Short
+/// enough that a shutdown request is observed promptly (worst-case
+/// teardown latency), long enough that an idle terminal doesn't busy-spin.
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// #154: decide whether the input thread should keep looping. Pulled out
+/// as a free function so the shutdown-flag contract is unit-testable
+/// without a terminal: returns `false` (stop) once the shared flag is
+/// set, `true` (keep polling) otherwise.
+fn input_should_continue(shutdown: &AtomicBool) -> bool {
+    !shutdown.load(Ordering::Relaxed)
+}
+
 /// Spawn a blocking task that reads crossterm events and forwards them
 /// (decoded into our abstract composer `KeyEvent`) to the main loop.
-fn spawn_input_task(tx: mpsc::Sender<TuiInbound>) -> tokio::task::JoinHandle<()> {
+///
+/// #154: rather than parking in a blocking `crossterm::event::read()`
+/// (which `abort()` cannot interrupt), the thread polls with a timeout
+/// and checks `shutdown` each tick. When the main loop sets the flag on
+/// teardown, the thread observes it within one `INPUT_POLL_INTERVAL` and
+/// returns cleanly — before the terminal is restored.
+fn spawn_input_task(
+    tx: mpsc::Sender<TuiInbound>,
+    shutdown: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        loop {
+        while input_should_continue(&shutdown) {
+            // Wait up to INPUT_POLL_INTERVAL for an event. On timeout
+            // (`Ok(false)`) loop back to re-check the shutdown flag. A
+            // poll error means the terminal is gone, so stop.
+            match crossterm::event::poll(INPUT_POLL_INTERVAL) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
+            }
             match crossterm::event::read() {
                 Ok(CtEvent::Key(k)) => {
                     if matches!(k.kind, KeyEventKind::Release) {
@@ -631,5 +722,84 @@ mod tests {
             "got: {reject}"
         );
         assert!(reject.contains("no SDK callback yet"), "got: {reject}");
+    }
+
+    // #154: the input thread keeps polling until the shared shutdown
+    // flag is set, then stops. The blocking `event::read()` loop can't be
+    // exercised without a terminal, but this predicate is the load-bearing
+    // contract that lets the thread exit cleanly on teardown.
+    #[test]
+    fn input_thread_stops_when_shutdown_flag_set() {
+        let flag = AtomicBool::new(false);
+        assert!(
+            input_should_continue(&flag),
+            "should keep polling while flag is clear"
+        );
+        flag.store(true, Ordering::Relaxed);
+        assert!(
+            !input_should_continue(&flag),
+            "should stop once flag is set"
+        );
+    }
+
+    use crate::composer::ComposerState;
+    use code_agent_core::{ComposerConfig, StatusLineContext};
+    use code_agent_sdk::fake_provider::EchoFakeProvider;
+    use code_agent_sdk::ProviderConfig;
+
+    async fn test_app() -> TuiApp {
+        let runtime = AgentRuntime::builder()
+            .provider(ProviderConfig::fake(Arc::new(EchoFakeProvider)))
+            .build()
+            .await
+            .expect("runtime");
+        let state = TuiAppState::new(
+            ComposerState::new(ComposerConfig::default()),
+            "{run_status}".to_string(),
+            StatusLineContext::default(),
+        );
+        TuiApp::new(Arc::new(runtime), state)
+    }
+
+    // #177: a resolved decision with a stashed resolver is sent exactly
+    // once, and the resolver is consumed (so it can never fire twice).
+    #[tokio::test]
+    async fn resolve_approval_signals_resolver_once() {
+        let mut app = test_app().await;
+        let (tx, rx) = oneshot::channel::<ApprovalDecision>();
+        app.pending_resolver = Some(tx);
+        app.resolve_approval(ApprovalDecisionAction::Allow);
+        // Decision reached the SDK side exactly once.
+        assert_eq!(rx.await, Ok(ApprovalDecision::Allow));
+        // Resolver was consumed — a second resolve cannot double-send.
+        assert!(app.pending_resolver.is_none());
+        // No "no pending request" warning when a resolver was present.
+        assert!(
+            !app.state
+                .activity
+                .iter()
+                .any(|l| l.contains("no pending request")),
+            "should not warn when a resolver is present: {:?}",
+            app.state.activity
+        );
+    }
+
+    // #177: with no stashed resolver the decision is never silently
+    // dropped — a visible diagnostic is pushed to the activity log.
+    #[tokio::test]
+    async fn resolve_approval_without_resolver_warns_visibly() {
+        let mut app = test_app().await;
+        assert!(app.pending_resolver.is_none());
+        app.resolve_approval(ApprovalDecisionAction::Deny {
+            reason: "no".to_string(),
+        });
+        assert!(
+            app.state
+                .activity
+                .iter()
+                .any(|l| l.contains("no pending request to resolve")),
+            "missing-resolver decision must surface a diagnostic: {:?}",
+            app.state.activity
+        );
     }
 }
