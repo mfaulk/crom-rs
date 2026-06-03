@@ -4,9 +4,11 @@
 //! documentation. The provider sends conversations and tool definitions, then
 //! parses Server-Sent Events into normalized `ModelEvent`s.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use code_agent_core::{
     ContentBlock, MessageRole, ModelEvent, ModelProvider, ModelRequest, NativeToolSearchMode,
     ProviderError, TokenUsage, ToolCall, ToolResultContent,
@@ -49,9 +51,85 @@ impl AnthropicConfig {
     }
 }
 
+/// Outcome of a single Messages API POST, normalized so the retry loop in
+/// `stream_turn` can decide what to do without depending on `reqwest` types.
+///
+/// This is the seam that lets tests exercise `stream_turn` (retry policy,
+/// error-body capture, SSE plumbing) against canned byte streams, mirroring
+/// the `ChatCompletionsClient`/`GenerateContentClient` traits in the sibling
+/// OpenAI and Gemini providers. Anthropic differs in that a successful
+/// response is a *streaming* SSE body rather than a single JSON blob, so the
+/// success variant carries a byte stream instead of a `String`.
+pub(crate) enum MessagesResponse {
+    /// 2xx: the SSE byte stream to feed into `parse_sse`.
+    Stream(BoxStream<'static, Result<Bytes, ProviderError>>),
+    /// Non-2xx HTTP status with its (already read) response body.
+    Status {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    /// A network-shaped failure (connect/read timeout, connection error).
+    /// `retryable` mirrors `reqwest::Error::{is_timeout, is_connect}`.
+    Transport { message: String, retryable: bool },
+}
+
+/// Transport seam for the Anthropic Messages API. The production
+/// implementation (`ReqwestMessagesClient`) wraps `reqwest`; tests inject a
+/// mock that returns canned `MessagesResponse`s.
+#[async_trait]
+pub(crate) trait MessagesClient: Send + Sync {
+    async fn post_messages(
+        &self,
+        url: &str,
+        api_key: &str,
+        body: &Value,
+    ) -> Result<MessagesResponse, ProviderError>;
+}
+
+/// Real `reqwest`-backed client used in production.
+struct ReqwestMessagesClient {
+    client: reqwest::Client,
+}
+
+#[async_trait]
+impl MessagesClient for ReqwestMessagesClient {
+    async fn post_messages(
+        &self,
+        url: &str,
+        api_key: &str,
+        body: &Value,
+    ) -> Result<MessagesResponse, ProviderError> {
+        let req = self
+            .client
+            .post(url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(body);
+        match req.send().await {
+            Ok(r) if r.status().is_success() => {
+                let stream = r
+                    .bytes_stream()
+                    .map(|res| res.map_err(|e| ProviderError::Stream(format!("body: {e}"))));
+                Ok(MessagesResponse::Stream(Box::pin(stream)))
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_else(|_| "<no body>".into());
+                Ok(MessagesResponse::Status { status, body })
+            }
+            Err(e) => Ok(MessagesResponse::Transport {
+                message: format!("{e}"),
+                retryable: e.is_timeout() || e.is_connect(),
+            }),
+        }
+    }
+}
+
 pub struct AnthropicProvider {
     config: AnthropicConfig,
-    client: reqwest::Client,
+    client: Arc<dyn MessagesClient>,
 }
 
 impl AnthropicProvider {
@@ -66,7 +144,18 @@ impl AnthropicProvider {
             .read_timeout(config.read_timeout)
             .build()
             .map_err(|e| ProviderError::Other(format!("client build: {e}")))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client: Arc::new(ReqwestMessagesClient { client }),
+        })
+    }
+
+    /// Construct a provider over an arbitrary `MessagesClient`. Used by tests
+    /// to drive the retry loop and SSE pipeline against canned byte streams
+    /// without a live API.
+    #[cfg(test)]
+    fn with_client(config: AnthropicConfig, client: Arc<dyn MessagesClient>) -> Self {
+        Self { config, client }
     }
 }
 
@@ -83,27 +172,17 @@ impl ModelProvider for AnthropicProvider {
         let max_retries = self.config.max_retries;
 
         let mut attempt: u32 = 0;
-        let response = loop {
-            let req = client
-                .post(&url)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .json(&body);
-            let res = req.send().await;
-            match res {
-                Ok(r) if r.status().is_success() => break r,
-                Ok(r) => {
-                    let status = r.status();
+        let byte_stream = loop {
+            match client.post_messages(&url, &api_key, &body).await? {
+                MessagesResponse::Stream(s) => break s,
+                MessagesResponse::Status { status, body } => {
                     if !is_retryable(status) || attempt >= max_retries {
-                        let text = r.text().await.unwrap_or_else(|_| "<no body>".into());
-                        return Err(ProviderError::Http(format!("status {status}: {text}")));
+                        return Err(ProviderError::Http(format!("status {status}: {body}")));
                     }
                 }
-                Err(e) => {
-                    if !e.is_timeout() && !e.is_connect() || attempt >= max_retries {
-                        return Err(ProviderError::Http(format!("{e}")));
+                MessagesResponse::Transport { message, retryable } => {
+                    if !retryable || attempt >= max_retries {
+                        return Err(ProviderError::Http(message));
                     }
                 }
             }
@@ -111,7 +190,7 @@ impl ModelProvider for AnthropicProvider {
             tokio::time::sleep(retry_delay(attempt)).await;
         };
 
-        let stream = response.bytes_stream().eventsource().map(|res| match res {
+        let stream = byte_stream.eventsource().map(|res| match res {
             Ok(ev) => Ok(ev),
             Err(e) => Err(ProviderError::Stream(format!("sse: {e}"))),
         });
@@ -974,5 +1053,493 @@ mod tests {
             !saw_error,
             "no synthetic error for a complete stream (#170 regression)"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // parse_sse fixture tests
+    //
+    // Drive `parse_sse` directly with canned SSE `data:` frames and assert
+    // the produced `ModelEvent`s. Each `&str` is one SSE event's `data`
+    // payload (already split into frames), matching what
+    // `bytes_stream().eventsource()` yields upstream of `parse_sse`.
+    // ------------------------------------------------------------------
+
+    fn sse_event(data: &str) -> Result<eventsource_stream::Event, ProviderError> {
+        Ok(eventsource_stream::Event {
+            event: String::new(),
+            data: data.to_string(),
+            id: String::new(),
+            retry: None,
+        })
+    }
+
+    /// Collect every `ModelEvent`/error produced by `parse_sse` over a fixed
+    /// sequence of SSE `data:` frames.
+    async fn collect_events(frames: &[&str]) -> Vec<Result<ModelEvent, ProviderError>> {
+        let events: Vec<_> = frames.iter().map(|f| sse_event(f)).collect();
+        let stream = futures::stream::iter(events);
+        parse_sse(stream).collect().await
+    }
+
+    #[tokio::test]
+    // A text-delta-only stream produces MessageStart, the text deltas in
+    // order, and a final MessageStop carrying accumulated usage.
+    async fn parse_sse_text_delta_only() {
+        let out = collect_events(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":", world"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":5}}"#,
+            r#"{"type":"message_stop"}"#,
+        ])
+        .await;
+
+        let events: Vec<ModelEvent> = out.into_iter().map(|r| r.unwrap()).collect();
+        assert!(matches!(events[0], ModelEvent::MessageStart));
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Hello", ", world"]);
+        match events.last().unwrap() {
+            ModelEvent::MessageStop { stop_reason, usage } => {
+                assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+                let u = usage.as_ref().unwrap();
+                // input from message_start (10) + message_delta (0); output 0 + 5.
+                assert_eq!(u.input_tokens, 10);
+                assert_eq!(u.output_tokens, 5);
+            }
+            other => panic!("expected MessageStop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // input_json_delta fragments are reassembled into the final ToolCall input
+    // only on content_block_stop; no partial ToolCall is emitted mid-stream.
+    async fn parse_sse_tool_call_json_reassembly() {
+        let out = collect_events(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"/etc/hosts\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+        ])
+        .await;
+
+        let events: Vec<ModelEvent> = out.into_iter().map(|r| r.unwrap()).collect();
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "exactly one fully-formed ToolCall");
+        assert_eq!(calls[0].id, "toolu_1");
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].input["path"], "/etc/hosts");
+    }
+
+    #[tokio::test]
+    // Interleaved text and tool-call deltas across distinct block indices are
+    // each reassembled correctly; the ToolCall is emitted at its block stop.
+    async fn parse_sse_interleaved_text_and_tool_call() {
+        let out = collect_events(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me read it."}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"Grep","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"foo\"}"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+        ])
+        .await;
+
+        let events: Vec<ModelEvent> = out.into_iter().map(|r| r.unwrap()).collect();
+        // Order: MessageStart, TextDelta, ToolCall, MessageStop.
+        assert!(matches!(events[0], ModelEvent::MessageStart));
+        assert!(matches!(&events[1], ModelEvent::TextDelta { text } if text == "Let me read it."));
+        match &events[2] {
+            ModelEvent::ToolCall(c) => {
+                assert_eq!(c.name, "Grep");
+                assert_eq!(c.input["pattern"], "foo");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        assert!(matches!(events[3], ModelEvent::MessageStop { .. }));
+    }
+
+    #[tokio::test]
+    // message_delta usage is merged with message_start usage (including
+    // cache tokens via merge_cache) into the MessageStop's TokenUsage.
+    async fn parse_sse_usage_and_cache_merge() {
+        let out = collect_events(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0,"cache_creation_input_tokens":40,"cache_read_input_tokens":10}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":25,"cache_read_input_tokens":5}}"#,
+        ])
+        .await;
+
+        let events: Vec<ModelEvent> = out.into_iter().map(|r| r.unwrap()).collect();
+        match events.last().unwrap() {
+            ModelEvent::MessageStop { usage, .. } => {
+                let u = usage.as_ref().unwrap();
+                assert_eq!(u.input_tokens, 100);
+                assert_eq!(u.output_tokens, 25);
+                assert_eq!(u.cache_creation_input_tokens, Some(40));
+                // cache_read merged across both frames: 10 + 5.
+                assert_eq!(u.cache_read_input_tokens, Some(15));
+            }
+            other => panic!("expected MessageStop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // An `error` event terminates the stream with ProviderError::Stream
+    // carrying the server message, and nothing is emitted afterward.
+    async fn parse_sse_error_event_terminates() {
+        let out = collect_events(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            // Anything after the error must not be observed.
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"late"}}"#,
+        ])
+        .await;
+
+        // MessageStart, then the error; the trailing text_delta is dropped.
+        assert!(matches!(out[0], Ok(ModelEvent::MessageStart)));
+        match &out[1] {
+            Err(ProviderError::Stream(msg)) => assert_eq!(msg, "Overloaded"),
+            other => panic!("expected Stream error, got {other:?}"),
+        }
+        assert_eq!(out.len(), 2, "no events after the error frame");
+    }
+
+    #[tokio::test]
+    // A stream that opens a tool_use block but ends before content_block_stop
+    // surfaces a truncation error (regression-aligned with #170), and no
+    // ToolCall is produced.
+    async fn parse_sse_truncated_stream() {
+        let out = collect_events(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_9","name":"Bash","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"l"}}"#,
+        ])
+        .await;
+
+        assert!(
+            out.iter().any(|r| matches!(
+                r,
+                Err(ProviderError::Stream(m)) if m.contains("tool_use truncated")
+            )),
+            "truncated tool_use must surface a Stream error"
+        );
+        assert!(
+            !out.iter().any(|r| matches!(r, Ok(ModelEvent::ToolCall(_)))),
+            "no ToolCall from a truncated stream"
+        );
+    }
+
+    #[tokio::test]
+    // A malformed JSON `data:` frame is skipped (forward-compat tolerance):
+    // surrounding well-formed frames are still parsed normally.
+    async fn parse_sse_malformed_json_frame_is_skipped() {
+        let out = collect_events(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}}"#,
+            r#"{ this is not valid json at all "#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"b"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        ])
+        .await;
+
+        let events: Vec<ModelEvent> = out.into_iter().map(|r| r.unwrap()).collect();
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ModelEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["a", "b"],
+            "malformed frame skipped, rest parsed"
+        );
+        assert!(matches!(
+            events.last().unwrap(),
+            ModelEvent::MessageStop { .. }
+        ));
+    }
+
+    #[tokio::test]
+    // Syntactically-invalid reassembled tool_use JSON is surfaced as a
+    // structured `_invalid_tool_input` envelope rather than dropped.
+    async fn parse_sse_invalid_tool_json_envelope() {
+        let out = collect_events(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"Read","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{not json"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+        ])
+        .await;
+
+        let events: Vec<ModelEvent> = out.into_iter().map(|r| r.unwrap()).collect();
+        let call = events
+            .iter()
+            .find_map(|e| match e {
+                ModelEvent::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .expect("a ToolCall is still emitted");
+        assert!(
+            call.input.get("_invalid_tool_input").is_some(),
+            "invalid tool JSON wrapped in _invalid_tool_input envelope, got: {}",
+            call.input
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // stream_turn retry tests via the MessagesClient seam
+    // ------------------------------------------------------------------
+
+    /// A mock client that returns a queued sequence of `MessagesResponse`s,
+    /// recording how many times it was called. Each success frame becomes a
+    /// single-chunk SSE byte stream.
+    #[derive(Default)]
+    struct MockMessagesClient {
+        queue: std::sync::Mutex<std::collections::VecDeque<MockOutcome>>,
+        calls: std::sync::atomic::AtomicUsize,
+        captured_body: std::sync::Mutex<Option<Value>>,
+    }
+
+    enum MockOutcome {
+        /// 2xx: the SSE body, supplied as a list of `data:` frame payloads.
+        Ok(Vec<String>),
+        Status {
+            status: u16,
+            body: String,
+        },
+        Transport {
+            message: String,
+            retryable: bool,
+        },
+    }
+
+    #[async_trait]
+    impl MessagesClient for MockMessagesClient {
+        async fn post_messages(
+            &self,
+            _url: &str,
+            _api_key: &str,
+            body: &Value,
+        ) -> Result<MessagesResponse, ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.captured_body.lock().unwrap() = Some(body.clone());
+            let outcome = self
+                .queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock client called more times than queued outcomes");
+            match outcome {
+                MockOutcome::Ok(frames) => {
+                    // Encode each frame as a proper SSE `data:` line so the
+                    // `eventsource()` adapter in stream_turn reconstructs the
+                    // events exactly as it would from a real response body.
+                    let mut buf = String::new();
+                    for f in frames {
+                        buf.push_str("data: ");
+                        buf.push_str(&f);
+                        buf.push_str("\n\n");
+                    }
+                    let chunk: Result<Bytes, ProviderError> = Ok(Bytes::from(buf));
+                    let stream = futures::stream::iter(vec![chunk]);
+                    Ok(MessagesResponse::Stream(Box::pin(stream)))
+                }
+                MockOutcome::Status { status, body } => Ok(MessagesResponse::Status {
+                    status: reqwest::StatusCode::from_u16(status).unwrap(),
+                    body,
+                }),
+                MockOutcome::Transport { message, retryable } => {
+                    Ok(MessagesResponse::Transport { message, retryable })
+                }
+            }
+        }
+    }
+
+    fn test_config(max_retries: u32) -> AnthropicConfig {
+        AnthropicConfig {
+            api_key: "test-key".into(),
+            base_url: DEFAULT_BASE.into(),
+            connect_timeout: Duration::from_secs(1),
+            read_timeout: Duration::from_secs(1),
+            max_retries,
+        }
+    }
+
+    fn simple_request() -> ModelRequest {
+        ModelRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: None,
+            messages: vec![code_agent_core::Message::user_text("hi")],
+            tools: vec![],
+            deferred_tools: vec![],
+            tool_search_config: None,
+            max_tokens: 16,
+        }
+    }
+
+    fn ok_frames() -> Vec<String> {
+        vec![
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#
+                .to_string(),
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#
+                .to_string(),
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":1}}"#
+                .to_string(),
+        ]
+    }
+
+    #[tokio::test(start_paused = true)]
+    // A transient 429 is retried and the subsequent 200 streams normally.
+    async fn stream_turn_retries_on_429_then_succeeds() {
+        let client = Arc::new(MockMessagesClient::default());
+        client.queue.lock().unwrap().extend([
+            MockOutcome::Status {
+                status: 429,
+                body: "rate limited".into(),
+            },
+            MockOutcome::Ok(ok_frames()),
+        ]);
+        let provider = AnthropicProvider::with_client(test_config(2), client.clone());
+        let mut stream = provider.stream_turn(simple_request()).await.unwrap();
+        let mut got = Vec::new();
+        while let Some(ev) = stream.next().await {
+            got.push(ev.unwrap());
+        }
+        assert!(got
+            .iter()
+            .any(|e| matches!(e, ModelEvent::TextDelta { text } if text == "ok")));
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    // 5xx is retryable; exhausting max_retries surfaces the final status body.
+    async fn stream_turn_500_retries_exhausted() {
+        let client = Arc::new(MockMessagesClient::default());
+        for _ in 0..4 {
+            client.queue.lock().unwrap().push_back(MockOutcome::Status {
+                status: 500,
+                body: "boom".into(),
+            });
+        }
+        let provider = AnthropicProvider::with_client(test_config(2), client.clone());
+        let result = provider.stream_turn(simple_request()).await;
+        match result {
+            Err(ProviderError::Http(msg)) => assert!(msg.contains("500") && msg.contains("boom")),
+            Err(other) => panic!("expected Http error, got {other:?}"),
+            Ok(_) => panic!("expected Http error, got Ok"),
+        }
+        // 1 initial + 2 retries = 3 attempts.
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    // A non-retryable 4xx (400) aborts immediately with no retry.
+    async fn stream_turn_does_not_retry_on_400() {
+        let client = Arc::new(MockMessagesClient::default());
+        client.queue.lock().unwrap().push_back(MockOutcome::Status {
+            status: 400,
+            body: "bad request".into(),
+        });
+        let provider = AnthropicProvider::with_client(test_config(3), client.clone());
+        let result = provider.stream_turn(simple_request()).await;
+        assert!(matches!(result, Err(ProviderError::Http(_))));
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    // A retryable transport error (timeout/connect) is retried; a
+    // non-retryable transport error aborts immediately.
+    async fn stream_turn_retries_retryable_transport_error() {
+        let client = Arc::new(MockMessagesClient::default());
+        client.queue.lock().unwrap().extend([
+            MockOutcome::Transport {
+                message: "connect timeout".into(),
+                retryable: true,
+            },
+            MockOutcome::Ok(ok_frames()),
+        ]);
+        let provider = AnthropicProvider::with_client(test_config(2), client.clone());
+        let mut stream = provider.stream_turn(simple_request()).await.unwrap();
+        while let Some(ev) = stream.next().await {
+            ev.unwrap();
+        }
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    // A non-retryable transport error is surfaced immediately (single call).
+    async fn stream_turn_non_retryable_transport_error_aborts() {
+        let client = Arc::new(MockMessagesClient::default());
+        client
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(MockOutcome::Transport {
+                message: "tls handshake failed".into(),
+                retryable: false,
+            });
+        let provider = AnthropicProvider::with_client(test_config(3), client.clone());
+        let result = provider.stream_turn(simple_request()).await;
+        match result {
+            Err(ProviderError::Http(msg)) => assert!(msg.contains("tls handshake failed")),
+            Err(other) => panic!("expected Http error, got {other:?}"),
+            Ok(_) => panic!("expected Http error, got Ok"),
+        }
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    // is_retryable classifies 408/429/5xx as retryable and others not.
+    fn is_retryable_classifies_statuses() {
+        use reqwest::StatusCode;
+        assert!(is_retryable(StatusCode::REQUEST_TIMEOUT)); // 408
+        assert!(is_retryable(StatusCode::TOO_MANY_REQUESTS)); // 429
+        assert!(is_retryable(StatusCode::INTERNAL_SERVER_ERROR)); // 500
+        assert!(is_retryable(StatusCode::SERVICE_UNAVAILABLE)); // 503
+        assert!(!is_retryable(StatusCode::BAD_REQUEST)); // 400
+        assert!(!is_retryable(StatusCode::UNAUTHORIZED)); // 401
+        assert!(!is_retryable(StatusCode::NOT_FOUND)); // 404
+    }
+
+    #[tokio::test]
+    // fixture_stream yields exactly the events it is given, in order.
+    async fn fixture_stream_replays_events() {
+        let events = vec![
+            ModelEvent::MessageStart,
+            ModelEvent::TextDelta { text: "hi".into() },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            },
+        ];
+        let got: Vec<ModelEvent> = fixture_stream(events.clone())
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+        assert_eq!(got.len(), 3);
+        assert!(matches!(got[0], ModelEvent::MessageStart));
+        assert!(matches!(&got[1], ModelEvent::TextDelta { text } if text == "hi"));
+        assert!(matches!(got[2], ModelEvent::MessageStop { .. }));
     }
 }
