@@ -52,7 +52,7 @@ globset = "0.4"
 ignore = "0.4"
 regex = "1"
 camino = { version = "1", features = ["serde1"] }
-similar = "2"
+similar = "3"
 time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing", "macros"] }
 bytes = "1"
 tempfile = "3"
