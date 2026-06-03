@@ -184,6 +184,19 @@ pub struct LocalCheckpointStore {
     /// every snapshot. We update incrementally when a new blob is
     /// written.
     storage_cache: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Per-session async mutexes serializing the storage-cap
+    /// read-check-write window (cap check -> blob write ->
+    /// `note_blob_written`) inside `capture_one_path`. Without this, two
+    /// concurrent captures to *different* checkpoints in the same session
+    /// can both pass the `max_total_checkpoint_bytes_per_session` check
+    /// (the manifest lock is per-checkpoint, not per-session) and both
+    /// write, blowing past the cap. Acquired strictly *after* the manifest
+    /// lock so the two lock orders never invert.
+    ///
+    /// Stored as `Weak` for the same reason as `index_locks`.
+    storage_locks: tokio::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
 }
 
 impl LocalCheckpointStore {
@@ -194,6 +207,7 @@ impl LocalCheckpointStore {
             index_locks: tokio::sync::Mutex::new(Default::default()),
             manifest_locks: tokio::sync::Mutex::new(Default::default()),
             storage_cache: tokio::sync::Mutex::new(Default::default()),
+            storage_locks: tokio::sync::Mutex::new(Default::default()),
         }
     }
 
@@ -204,6 +218,7 @@ impl LocalCheckpointStore {
             index_locks: tokio::sync::Mutex::new(Default::default()),
             manifest_locks: tokio::sync::Mutex::new(Default::default()),
             storage_cache: tokio::sync::Mutex::new(Default::default()),
+            storage_locks: tokio::sync::Mutex::new(Default::default()),
         }
     }
 
@@ -228,6 +243,18 @@ impl LocalCheckpointStore {
         let key = format!("{}/{}", session_id, checkpoint_id);
         let mut g = self.manifest_locks.lock().await;
         lock_for_weak(&mut g, key)
+    }
+
+    /// Returns (and lazily creates) the per-session storage lock. Held by
+    /// `capture_one_path` across the cap check + blob write +
+    /// `note_blob_written` so concurrent captures to different checkpoints
+    /// in the same session can't both pass the cap and exceed it.
+    async fn storage_lock_for(
+        &self,
+        session_id: &SessionId,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut g = self.storage_locks.lock().await;
+        lock_for_weak(&mut g, session_id.to_string())
     }
 
     pub fn root(&self) -> &Path {
@@ -431,20 +458,36 @@ impl LocalCheckpointStore {
                 let hash = sha256_hex(&bytes);
                 let blob_path = self.blob_path(session_id, &hash)?;
                 if !blob_path.exists() {
-                    // Enforce session storage cap before writing.
-                    let used = self.session_storage_bytes(session_id).await?;
-                    let total_after = used.saturating_add(bytes.len() as u64);
-                    if total_after > self.limits.max_total_checkpoint_bytes_per_session {
-                        return Err(CheckpointError::SessionStorageLimit {
-                            used: total_after,
-                            limit: self.limits.max_total_checkpoint_bytes_per_session,
-                        });
+                    // Cap check + blob write + cache bump must be atomic per
+                    // session: the manifest lock held by the caller is
+                    // per-(session, checkpoint), so two captures to different
+                    // checkpoints in the same session could otherwise both
+                    // pass the cap check and both write, exceeding the cap
+                    // (#224). Serialize that window under a per-session
+                    // storage lock. This lock is always acquired AFTER the
+                    // manifest lock, so the two orders never invert and can't
+                    // deadlock.
+                    let storage_lock = self.storage_lock_for(session_id).await;
+                    let _sg = storage_lock.lock().await;
+                    // Re-check existence under the lock: a racing capture of
+                    // the *same* content may have written this blob while we
+                    // waited, in which case there's nothing to add.
+                    if !blob_path.exists() {
+                        // Enforce session storage cap before writing.
+                        let used = self.session_storage_bytes(session_id).await?;
+                        let total_after = used.saturating_add(bytes.len() as u64);
+                        if total_after > self.limits.max_total_checkpoint_bytes_per_session {
+                            return Err(CheckpointError::SessionStorageLimit {
+                                used: total_after,
+                                limit: self.limits.max_total_checkpoint_bytes_per_session,
+                            });
+                        }
+                        if let Some(parent) = blob_path.parent() {
+                            tokio::fs::create_dir_all(parent).await?;
+                        }
+                        atomic_write(&blob_path, &bytes).await?;
+                        self.note_blob_written(session_id, bytes.len() as u64).await;
                     }
-                    if let Some(parent) = blob_path.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    atomic_write(&blob_path, &bytes).await?;
-                    self.note_blob_written(session_id, bytes.len() as u64).await;
                 }
 
                 let modified_time = meta
@@ -605,7 +648,13 @@ impl CheckpointStore for LocalCheckpointStore {
         // every unlink fails (e.g. read-only manifests dir).
         let mut entries = self.load_index(&request.session_id).await?;
         let mut orphan_warn_count: usize = 0;
-        while entries.len() >= self.limits.max_checkpoints_per_session {
+        // Clamp the cap to >= 1 so a misconfigured `max_checkpoints_per_session
+        // == 0` (which only the CLI validates) degrades gracefully instead of
+        // making this `while entries.len() >= 0` loop spin and panic on
+        // `entries.remove(0)` once the index is empty (#229). With the clamp a
+        // zero cap behaves like a cap of one.
+        let max_checkpoints = self.limits.max_checkpoints_per_session.max(1);
+        while entries.len() >= max_checkpoints {
             let oldest = entries.remove(0);
             if let Err(err) = self
                 .delete_checkpoint_locked(&request.session_id, &oldest.checkpoint_id)
@@ -1517,6 +1566,138 @@ mod tests {
             .collect();
         assert!(paths.contains("a.txt"), "missing a.txt: {paths:?}");
         assert!(paths.contains("b.txt"), "missing b.txt: {paths:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // Two concurrent captures to *different* checkpoints in the same
+    // session, whose blobs together exceed the per-session storage cap,
+    // must not both succeed: the cap check + blob write window is
+    // serialized per session, so total stays within the cap (one capture
+    // is rejected with SessionStorageLimit). (#224)
+    async fn concurrent_captures_respect_session_storage_cap() {
+        let dir = TempDir::new().unwrap();
+        // Each distinct-content blob is 4096 bytes; cap at 6000 admits one
+        // but not both.
+        let limits = CheckpointLimits {
+            max_total_checkpoint_bytes_per_session: 6000,
+            ..Default::default()
+        };
+        let store = std::sync::Arc::new(LocalCheckpointStore::with_limits(
+            dir.path().to_path_buf(),
+            limits,
+        ));
+        let sid = SessionId::new();
+
+        let mk_ckpt = || {
+            let store = store.clone();
+            let sid = sid.clone();
+            async move {
+                store
+                    .create_checkpoint(CreateCheckpointRequest {
+                        session_id: sid,
+                        run_id: RunId::new(),
+                        cwd: store.root().to_path_buf(),
+                        description: None,
+                        user_message_id: None,
+                        git_state: None,
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let id1 = mk_ckpt().await;
+        let id2 = mk_ckpt().await;
+
+        // Distinct content so the blobs are NOT deduplicated; each is 4096
+        // bytes, so the pair (8192) exceeds the 6000-byte cap.
+        std::fs::write(dir.path().join("a.txt"), vec![b'A'; 4096]).unwrap();
+        std::fs::write(dir.path().join("b.txt"), vec![b'B'; 4096]).unwrap();
+
+        let mk_req = |ckpt: &CheckpointId, path: &str| CaptureBeforeToolRequest {
+            checkpoint_id: ckpt.clone(),
+            session_id: sid.clone(),
+            run_id: RunId::new(),
+            cwd: store.root().to_path_buf(),
+            tool_name: "Edit".into(),
+            tool_input: serde_json::json!({}),
+            paths: vec![WorkspaceRelativePath(path.into())],
+        };
+
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let r1 = mk_req(&id1, "a.txt");
+        let r2 = mk_req(&id2, "b.txt");
+        let (res1, res2) = tokio::join!(
+            tokio::spawn(async move { s1.capture_before_tool(r1).await }),
+            tokio::spawn(async move { s2.capture_before_tool(r2).await }),
+        );
+        let res1 = res1.unwrap();
+        let res2 = res2.unwrap();
+
+        // Exactly one capture must succeed; the other must be rejected with
+        // SessionStorageLimit. (Without the per-session lock both could
+        // pass the check and exceed the cap.)
+        let oks = res1.is_ok() as usize + res2.is_ok() as usize;
+        assert_eq!(
+            oks, 1,
+            "exactly one capture should succeed under the cap; res1={res1:?} res2={res2:?}",
+        );
+        let rejected = match (&res1, &res2) {
+            (Err(e), Ok(_)) | (Ok(_), Err(e)) => e,
+            _ => unreachable!("checked oks == 1 above"),
+        };
+        assert!(
+            matches!(rejected, CheckpointError::SessionStorageLimit { .. }),
+            "rejection should be SessionStorageLimit, got {rejected:?}",
+        );
+
+        // The invariant: on-disk blob total stays within the cap.
+        let total = store.session_storage_bytes(&sid).await.unwrap();
+        assert!(
+            total <= store.limits().max_total_checkpoint_bytes_per_session,
+            "blob total {total} exceeded cap {}",
+            store.limits().max_total_checkpoint_bytes_per_session,
+        );
+    }
+
+    #[tokio::test]
+    // A store constructed with `max_checkpoints_per_session == 0` (a
+    // misconfiguration the library constructors don't reject) must not
+    // panic in the retention trim loop. The cap is clamped to >= 1 so
+    // creating checkpoints degrades gracefully. (#229)
+    async fn zero_max_checkpoints_does_not_panic_in_trim() {
+        let dir = TempDir::new().unwrap();
+        let limits = CheckpointLimits {
+            max_checkpoints_per_session: 0,
+            ..Default::default()
+        };
+        let store = LocalCheckpointStore::with_limits(dir.path().to_path_buf(), limits);
+        let sid = SessionId::new();
+
+        // Create several checkpoints in a row. Pre-fix the first create
+        // with an empty index hit `while 0 >= 0` -> `entries.remove(0)`
+        // panic. With the clamp these all succeed.
+        for _ in 0..3 {
+            store
+                .create_checkpoint(CreateCheckpointRequest {
+                    session_id: sid.clone(),
+                    run_id: RunId::new(),
+                    cwd: store.root().to_path_buf(),
+                    description: None,
+                    user_message_id: None,
+                    git_state: None,
+                })
+                .await
+                .expect("create must not panic with zero cap");
+        }
+
+        // Clamp behaves like a cap of one: at most one checkpoint retained.
+        let list = store.list_checkpoints(&sid).await.unwrap();
+        assert!(
+            list.len() <= 1,
+            "zero cap clamped to 1 should keep at most one checkpoint, got {}",
+            list.len(),
+        );
     }
 
     #[test]
