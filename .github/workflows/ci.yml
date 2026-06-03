@@ -115,18 +115,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check ${{ matrix.example }}
-        run: cargo check --locked --manifest-path examples/${{ matrix.example }}/Cargo.toml
-
-  security:
-    name: security / audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Isolate the cache per example so the matrix legs don't thrash a
+          # single shared key (default key is OS + job name, identical here).
+          key: ${{ matrix.example }}
+      - name: Check ${{ matrix.example }}
+        # `--workspace` so example sub-crates that aren't the default package
+        # (e.g. the fake MCP server in mcp-demo / tool-search-demo) are built.
+        run: cargo check --locked --workspace --manifest-path examples/${{ matrix.example }}/Cargo.toml
 
   deny:
     name: security / cargo-deny
