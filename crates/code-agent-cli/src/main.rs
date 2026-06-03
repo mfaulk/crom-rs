@@ -2651,7 +2651,7 @@ fn skill_tool_is_allowed(options: &AgentOptions) -> bool {
         })
 }
 
-/// Build [`SlashExpansionOptions`] from the merged settings. CLI overrides
+/// Build [`code_agent_core::SlashExpansionOptions`] from the merged settings. CLI overrides
 /// land via `--no-slash-commands` (handled earlier) and the
 /// `slash_commands.allow_*` / `max_*` knobs in `.agent/settings.json`.
 fn slash_expansion_options_from_settings(
@@ -5227,7 +5227,7 @@ enum ProviderRoute {
 }
 
 /// Map a resolved provider id to a [`ProviderRoute`] by routing through
-/// the canonical [`ProviderId::parse`] so the set of known providers
+/// the canonical [`code_agent_auth::ProviderId::parse`] so the set of known providers
 /// cannot drift between the auth crate and the CLI runtime dispatch.
 ///
 /// Each first-party variant maps to its dedicated runtime when one

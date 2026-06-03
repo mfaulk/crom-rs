@@ -227,7 +227,7 @@ pub fn any_rule_grants_agent_tool(rules: &[ToolRule]) -> bool {
 
 /// Returns the list of tool names referenced by a definition's allow/disallow
 /// rules (only `ExactTool` and explicit MCP names — globs are not enumerated
-/// here). Used to surface "unknown tool" warnings against a [`ToolCatalog`].
+/// here). Used to surface "unknown tool" warnings against a [`crate::ToolCatalog`].
 pub fn referenced_tool_names(def: &AgentDefinition) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     if let Some(allowed) = &def.tools {

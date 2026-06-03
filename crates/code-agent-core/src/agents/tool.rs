@@ -226,7 +226,7 @@ pub struct SubagentRuntime {
     pub runtime_options: AgentRuntimeOptions,
     pub semaphore: Arc<Semaphore>,
     pub parent_event_tx: Mutex<Option<mpsc::Sender<AgentEvent>>>,
-    /// `std::sync::Mutex` (not tokio) so [`ActiveEntryGuard::drop`] can
+    /// `std::sync::Mutex` (not tokio) so `ActiveEntryGuard::drop` can
     /// lock-and-remove synchronously without spawning a detached task that
     /// may never run during runtime shutdown (#215). The critical sections
     /// are tiny (push/retain/clone) and never held across `.await`.

@@ -1122,7 +1122,7 @@ async fn cmd_marketplace_show(args: MarketplaceShowArgs) -> Result<()> {
     Ok(())
 }
 
-/// Produce a [`PluginRegistry`] for a normal `run`/`chat` invocation.
+/// Produce a [`code_agent_core::PluginRegistry`] for a normal `run`/`chat` invocation.
 /// `dev_plugin_dirs` carries `--plugin-dir` values; `force_disabled`
 /// honors `--no-plugins`.
 pub fn build_for_invocation(
@@ -1164,7 +1164,7 @@ impl std::fmt::Display for RegistrationWarning {
     }
 }
 
-/// Apply a [`PluginRuntimeBuild`] to the in-memory registries used by the
+/// Apply a [`code_agent_core::PluginRuntimeBuild`] to the in-memory registries used by the
 /// agent. Returns the merged plugin registry so the caller can attach
 /// it to `AgentOptions`, plus a list of [`RegistrationWarning`] entries
 /// for each skipped component (duplicate skill/agent names, MCP server
@@ -1219,7 +1219,7 @@ pub fn apply_to_registries(
     (build.registry, warnings)
 }
 
-/// Project the parts of a [`Settings`] back into a [`SettingsFile`] so
+/// Project the parts of a [`Settings`] back into a [`code_agent_core::SettingsFile`] so
 /// it can be JSON round-tripped (used by the plugin-defaults merge in
 /// `resolve_common`). Lossy by design: only the fields plugin defaults
 /// can affect are emitted.
@@ -1314,7 +1314,7 @@ fn recovery_to_settings(
     }
 }
 
-/// Apply a merged-back [`SettingsFile`] to a [`Settings`] struct,
+/// Apply a merged-back [`code_agent_core::SettingsFile`] to a [`Settings`] struct,
 /// preserving fields that were already set. Only fields that were
 /// previously unset or empty are populated from the file. Used by the
 /// plugin-defaults merge — plugin defaults must never override

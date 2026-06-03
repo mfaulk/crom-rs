@@ -59,7 +59,7 @@ impl InMemoryWorkspace {
         self.inner.read().await.files.clone()
     }
 
-    /// Replace the "initial" snapshot used for [`diff`]. Useful when you
+    /// Replace the "initial" snapshot used for [`Workspace::diff`]. Useful when you
     /// want to rebase the diff baseline.
     pub async fn reset_initial(&self) {
         let mut g = self.inner.write().await;

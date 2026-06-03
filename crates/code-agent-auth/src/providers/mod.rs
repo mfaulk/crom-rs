@@ -1,4 +1,4 @@
-//! Built-in [`AuthProvider`] implementations.
+//! Built-in [`crate::AuthProvider`] implementations.
 
 pub mod anthropic;
 pub mod codex;
