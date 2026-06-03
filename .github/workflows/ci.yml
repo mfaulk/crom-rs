@@ -150,7 +150,7 @@ jobs:
       # are debuggable from the CI run.
       - name: Upload eval artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eval-runs
           path: target/code-agent-eval/runs
