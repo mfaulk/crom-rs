@@ -23,6 +23,8 @@ use crate::workspace::WorkspaceSource;
 pub struct AgentRuntimeBuilder {
     provider: Option<ProviderConfig>,
     model: Option<String>,
+    system_prompt: Option<String>,
+    project_instructions: Option<String>,
     workspace: Option<WorkspaceSource>,
     storage: Option<Arc<dyn AgentStorage>>,
     approval_callback: Option<Arc<dyn ApprovalCallback>>,
@@ -61,6 +63,8 @@ impl AgentRuntimeBuilder {
         Self {
             provider: None,
             model: None,
+            system_prompt: None,
+            project_instructions: None,
             workspace: None,
             storage: None,
             approval_callback: None,
@@ -83,6 +87,20 @@ impl AgentRuntimeBuilder {
 
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    /// Runtime-level system prompt applied to every run. A per-request
+    /// [`crate::AgentRequest::system_prompt`] overrides this default.
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Runtime-level project instructions (appended after the system prompt
+    /// under an "AGENTS.md" heading by the core agent).
+    pub fn project_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.project_instructions = Some(instructions.into());
         self
     }
 
@@ -198,6 +216,8 @@ impl AgentRuntimeBuilder {
             provider,
             provider_id,
             default_model: model,
+            default_system_prompt: self.system_prompt,
+            default_project_instructions: self.project_instructions,
             workspace,
             storage,
             approval_callback: self.approval_callback,

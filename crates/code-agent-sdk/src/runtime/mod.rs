@@ -57,6 +57,10 @@ pub(crate) struct RuntimeInner {
     pub(crate) provider: Arc<dyn ModelProvider>,
     pub(crate) provider_id: ProviderId,
     pub(crate) default_model: String,
+    /// Runtime-level system prompt; a per-request override takes precedence.
+    pub(crate) default_system_prompt: Option<String>,
+    /// Runtime-level project instructions threaded into every run.
+    pub(crate) default_project_instructions: Option<String>,
     pub(crate) workspace: Option<Arc<dyn Workspace>>,
     pub(crate) storage: Arc<dyn AgentStorage>,
     pub(crate) approval_callback: Option<Arc<dyn ApprovalCallback>>,

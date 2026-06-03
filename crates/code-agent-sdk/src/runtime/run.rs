@@ -277,6 +277,13 @@ pub(crate) async fn execute_request(
     if let Some(root) = workspace_for_run.filesystem_root() {
         options.cwd = root;
     }
+    // System prompt: per-request override wins over the runtime-level
+    // default; project instructions come from the runtime.
+    options.system_prompt = request
+        .system_prompt
+        .clone()
+        .or_else(|| runtime.default_system_prompt.clone());
+    options.project_instructions = runtime.default_project_instructions.clone();
     let interactivity = request.interactivity.unwrap_or(runtime.interactivity);
     let approval_cb: Arc<dyn code_agent_core::PermissionCallback> =
         Arc::new(SdkPermissionCallback {
@@ -681,6 +688,8 @@ pub(crate) async fn execute_plan(
     if let Some(root) = workspace.filesystem_root() {
         options.cwd = root;
     }
+    options.system_prompt = runtime.default_system_prompt.clone();
+    options.project_instructions = runtime.default_project_instructions.clone();
     let planning = PlanningOptions {
         enabled: true,
         planning_mode: request.planning_mode,
@@ -779,6 +788,8 @@ pub(crate) async fn execute_act(
     if let Some(root) = workspace_for_run.filesystem_root() {
         options.cwd = root;
     }
+    options.system_prompt = runtime.default_system_prompt.clone();
+    options.project_instructions = runtime.default_project_instructions.clone();
     options.permission_callback = Some(Arc::new(SdkPermissionCallback {
         inner: runtime.approval_callback.clone(),
         policy: request.approval_policy,
