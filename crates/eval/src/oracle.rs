@@ -129,6 +129,10 @@ pub async fn evaluate(task: &EvalTask, workspace_dir: &Path, events: &[SdkEvent]
 pub async fn run_command(command: &str, dir: &Path, timeout: Duration) -> CommandResult {
     let start = std::time::Instant::now();
     let mut cmd = tokio::process::Command::new("sh");
+    // `kill_on_drop` terminates the `sh` wrapper when the timeout future is
+    // dropped. Note: `sh` does not forward the signal to its own children, so a
+    // long-running child (e.g. cargo) may briefly outlive the timeout — see the
+    // "known limitations" section of docs/eval.md.
     cmd.arg("-c")
         .arg(command)
         .current_dir(dir)
@@ -173,7 +177,13 @@ fn truncate(s: &str) -> String {
     if s.len() <= MAX_CAPTURE {
         return s.to_string();
     }
-    let mut out = s[..MAX_CAPTURE].to_string();
+    // Slice on a valid UTF-8 boundary: a fixed byte offset can land mid-codepoint
+    // (common in cargo's box-drawing / quoted output) and panic.
+    let end = (0..=MAX_CAPTURE)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    let mut out = s[..end].to_string();
     out.push_str("\n... [truncated]");
     out
 }
@@ -438,6 +448,18 @@ mod tests {
             !evaluate_behavior(&BehaviorSpec::MustEmitPlan, &events).passed,
             "no plan event present"
         );
+    }
+
+    #[test]
+    fn truncate_handles_multibyte_boundaries() {
+        // A string of multi-byte chars longer than the cap must not panic and
+        // must remain valid UTF-8 after truncation.
+        let s = "é".repeat(MAX_CAPTURE); // 2 bytes each → 2*MAX_CAPTURE bytes
+        let out = truncate(&s);
+        assert!(out.len() <= MAX_CAPTURE + "\n... [truncated]".len());
+        assert!(out.ends_with("[truncated]"));
+        // No panic and the prefix is valid UTF-8 (String guarantees this).
+        assert!(out.starts_with('é'));
     }
 
     #[test]

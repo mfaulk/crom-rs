@@ -158,8 +158,20 @@ fn cmd_list(args: EvalListArgs) -> Result<()> {
     Ok(())
 }
 
+/// Live provider names the harness knows how to drive. Anything else is almost
+/// certainly a typo and must be a hard error rather than a silent skip.
+const KNOWN_LIVE_PROVIDERS: &[&str] = &["anthropic"];
+
 async fn cmd_run(args: EvalRunArgs) -> Result<()> {
     let provider = ProviderMode::parse(&args.provider);
+    if let ProviderMode::Live(name) = &provider {
+        if !KNOWN_LIVE_PROVIDERS.contains(&name.as_str()) {
+            return Err(anyhow!(
+                "unknown provider '{name}'; expected one of: fake, golden, {}",
+                KNOWN_LIVE_PROVIDERS.join(", ")
+            ));
+        }
+    }
     let dir = resolve_tasks_dir(args.tasks_dir)?;
     let all = discover_tasks(&dir).map_err(|e| anyhow!("{e}"))?;
 

@@ -206,8 +206,22 @@ async fn drive_agent(
             use code_agent_sdk::AgentRunStatus;
             let errored = !matches!(run_result.status, AgentRunStatus::Completed);
             let timed_out = matches!(run_result.status, AgentRunStatus::TimedOut);
+            let mut events = collected;
+            // The SDK plan/act path returns the plan on the result rather than
+            // always emitting a `PlanCreated` into the event sink. Synthesize one
+            // so behavior oracles (`must_emit_plan`) and process scoring can
+            // observe that a plan was produced.
+            if let Some(plan) = run_result.plan.clone() {
+                let already = events.iter().any(|e| matches!(e, SdkEvent::PlanCreated(_)));
+                if !already {
+                    events.push(SdkEvent::PlanCreated(code_agent_sdk::event::PlanCreated {
+                        run_id: run_result.run_id.clone(),
+                        plan,
+                    }));
+                }
+            }
             Ok(RunOutcome {
-                events: collected,
+                events,
                 summary: run_result.summary,
                 timed_out,
                 errored,
@@ -320,7 +334,7 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         );
     }
 
-    let outcome = match drive_agent(task, &workspace_dir, config).await {
+    let mut outcome = match drive_agent(task, &workspace_dir, config).await {
         Ok(o) => o,
         Err(reason) => {
             // Could be a skip (provider unavailable) surfaced late, but build()
@@ -334,7 +348,17 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         }
     };
 
-    let patch = generate_patch(&workspace_dir).unwrap_or_default();
+    // A patch-generation failure (e.g. the agent broke or removed `.git`) is a
+    // broken workspace, not "no changes": surface it as an error rather than
+    // silently scoring an empty patch.
+    let patch = match generate_patch(&workspace_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            outcome.errored = true;
+            outcome.summary = format!("{}; patch generation failed: {e}", outcome.summary);
+            PatchInfo::default()
+        }
+    };
     let oracle_report = oracle::evaluate(task, &workspace_dir, &outcome.events).await;
 
     let turns_used = count_turns(&outcome.events);

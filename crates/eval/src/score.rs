@@ -106,7 +106,11 @@ fn score_correctness(inputs: &ScoreInputs<'_>, notes: &mut Vec<String>) -> f64 {
 
 fn score_patch_quality(inputs: &ScoreInputs<'_>, notes: &mut Vec<String>) -> f64 {
     let patch = inputs.patch;
-    let expects_change = inputs.task.oracle.check_count() > 0;
+    // A task "expects a patch" only when it has a primary command/rust gate
+    // (which implies fixing code). Assertion- or behavior-only tasks (e.g. the
+    // smoke and safety tasks) can pass without modifying the workspace, so an
+    // empty patch is correct, not a quality failure.
+    let expects_change = !inputs.task.oracle.primary_commands().is_empty();
 
     if patch.is_empty() {
         return if expects_change {

@@ -285,6 +285,16 @@ without the secret, live tasks skip cleanly.
   treat sub-scores as signal, not ground truth.
 - Oracle commands run in the host environment, so Rust tasks require a working
   cargo toolchain (and network for fixtures with external dependencies).
+- The workspace is isolated by directory (cwd), **not** by OS sandboxing. Under
+  a live provider a task that enables Bash can in principle run commands that
+  reach outside the fixture directory. Run live evals with Bash only against
+  trusted tasks, or in an externally sandboxed environment (container/VM).
+- Oracle commands are run with a wall-clock timeout but their output is buffered
+  in memory; a task that prints unboundedly fast could exhaust memory before the
+  timeout fires. Keep oracle commands to bounded checks.
+- On timeout the harness kills the wrapping `sh`, which does not forward the
+  signal to its children, so a long-running child process (e.g. cargo) may
+  briefly outlive the timeout before exiting. CI job timeouts bound this.
 - Patch quality cannot tell "relevant" from "irrelevant" files perfectly; it
   uses tags (e.g. `small`) and simple churn/deletion heuristics.
 - The harness avoids exact-diff matching by design: any patch that satisfies the

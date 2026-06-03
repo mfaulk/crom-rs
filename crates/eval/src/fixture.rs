@@ -100,12 +100,14 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), FixtureError> {
 /// Run a git command in `dir`, returning stdout on success.
 fn git(dir: &Path, args: &[&str]) -> Result<String, FixtureError> {
     let output = Command::new("git")
-        // Local identity + safe.directory so the baseline commit never depends
-        // on the host's global git config.
+        // Local identity, gpg-off, and safe.directory so git operations never
+        // depend on (or fail against) the host's global git config — important
+        // in CI containers where the directory owner may differ from the user.
         .args(["-c", "user.email=eval@code-agent.local"])
         .args(["-c", "user.name=code-agent-eval"])
         .args(["-c", "commit.gpgsign=false"])
         .args(["-c", "init.defaultBranch=main"])
+        .args(["-c", "safe.directory=*"])
         .current_dir(dir)
         .args(args)
         .output()
@@ -119,6 +121,9 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, FixtureError> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Name of the tag that pins the pristine baseline commit.
+const BASELINE_TAG: &str = "eval-baseline";
+
 /// Initialise a fresh git repo and create a baseline commit of the fixture.
 fn git_init_baseline(dir: &Path) -> Result<(), FixtureError> {
     git(dir, &["init", "-q"])?;
@@ -128,6 +133,9 @@ fn git_init_baseline(dir: &Path) -> Result<(), FixtureError> {
         dir,
         &["commit", "-q", "--allow-empty", "-m", "eval baseline"],
     )?;
+    // Pin the baseline so the final diff is anchored even if the agent makes
+    // its own commits, resets, or amends.
+    git(dir, &["tag", BASELINE_TAG])?;
     Ok(())
 }
 
@@ -137,11 +145,22 @@ fn git_init_baseline(dir: &Path) -> Result<(), FixtureError> {
 /// unified diff plus a summary. Staging mutates the index only; the working
 /// tree is left intact for inspection.
 pub fn generate_patch(workspace_dir: &Path) -> Result<PatchInfo, FixtureError> {
+    // Stage everything (so new and deleted files are captured), then diff the
+    // index against the pinned baseline tag. Diffing against the tag rather than
+    // HEAD keeps the patch anchored to the pristine fixture even if the agent
+    // created its own commits.
     git(workspace_dir, &["add", "-A"])?;
-    let unified_diff = git(workspace_dir, &["diff", "--cached"])?;
-    let stat = git(workspace_dir, &["diff", "--cached", "--stat"])?;
-    let numstat = git(workspace_dir, &["diff", "--cached", "--numstat"])?;
-    let name_status = git(workspace_dir, &["diff", "--cached", "--name-status"])?;
+    let base = &["diff", "--cached", BASELINE_TAG][..];
+    let unified_diff = git(workspace_dir, base)?;
+    let stat = git(workspace_dir, &["diff", "--cached", BASELINE_TAG, "--stat"])?;
+    let numstat = git(
+        workspace_dir,
+        &["diff", "--cached", BASELINE_TAG, "--numstat"],
+    )?;
+    let name_status = git(
+        workspace_dir,
+        &["diff", "--cached", BASELINE_TAG, "--name-status"],
+    )?;
 
     let mut info = PatchInfo {
         unified_diff,
