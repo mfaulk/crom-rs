@@ -1,0 +1,30 @@
+id = "rust-serde-edge-case"
+title = "Fix a JSON deserialization edge case"
+tags = ["rust", "serde", "json", "small"]
+suites = ["rust-small"]
+
+prompt = """
+Config parsing breaks when the optional `retries` field is missing from the
+JSON. It should default to 3 instead of failing. Fix the deserialization and
+keep the existing tests passing.
+"""
+
+max_turns = 20
+timeout_secs = 300
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --all-targets"]
+
+[[oracle.assertions]]
+kind = "file_contains"
+path = "src/lib.rs"
+text = "default"
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "cargo test"

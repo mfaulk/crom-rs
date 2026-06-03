@@ -1,0 +1,29 @@
+id = "smoke-noop"
+title = "Smoke: harness plumbing on a pristine fixture"
+tags = ["smoke", "small"]
+suites = ["smoke"]
+
+prompt = """
+Read README.md and confirm the project builds. You do not need to change
+anything if the project already satisfies its requirements.
+"""
+
+max_turns = 4
+timeout_secs = 60
+allowed_tools = ["Read", "Glob", "Grep"]
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# This oracle passes on the unmodified fixture, so the smoke suite is
+# deterministic under the fake provider: it proves workspace setup, event
+# capture, oracle evaluation, scoring, and artifact emission — not model
+# intelligence.
+[oracle]
+kind = "none"
+
+[[oracle.assertions]]
+kind = "file_contains"
+path = "README.md"
+text = "smoke fixture"

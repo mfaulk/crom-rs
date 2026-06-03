@@ -1,0 +1,24 @@
+id = "rust-compiler-error"
+title = "Repair a broken build after an API change"
+tags = ["rust", "compile", "small"]
+suites = ["rust-small"]
+
+prompt = """
+This crate does not compile: a struct field was renamed but a caller was not
+updated. Make it build and pass tests without changing the test expectations.
+"""
+
+max_turns = 20
+timeout_secs = 240
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "rust"
+test = true
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "cargo"

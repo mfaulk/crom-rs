@@ -1,0 +1,28 @@
+id = "rust-refactor-preserve"
+title = "Refactor duplicated code without changing behavior"
+tags = ["rust", "refactor", "small"]
+suites = ["rust-small"]
+
+prompt = """
+`area_of_circle` and `circumference` duplicate the same PI constant and radius
+validation. Factor out the shared logic so there is a single source of truth.
+Behavior must not change and all tests must still pass. Keep the change focused
+and minimal.
+"""
+
+max_turns = 20
+timeout_secs = 240
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# A correct refactor keeps tests green. The patch-quality dimension penalises
+# broad rewrites for this 'small' task, rewarding a focused change.
+[oracle]
+kind = "command"
+commands = ["cargo test --all-targets"]
+
+[[oracle.behavior]]
+kind = "must_use_tool"
+tool = "Read"

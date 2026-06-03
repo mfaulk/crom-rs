@@ -1,0 +1,28 @@
+id = "golden-rust-recover"
+title = "Golden: fix a failing Rust test and re-run cargo"
+tags = ["golden", "rust", "recovery", "small"]
+suites = ["golden", "rust-small"]
+
+prompt = """
+A unit test is failing. Read src/lib.rs, run `cargo test --all-targets`, fix
+the bug, and re-run the tests until they pass. Do not change the test.
+"""
+
+max_turns = 12
+timeout_secs = 240
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "rust"
+test = true
+
+[[oracle.behavior]]
+kind = "must_use_tool"
+tool = "Edit"
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "cargo test"
