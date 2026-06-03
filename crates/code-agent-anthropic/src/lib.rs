@@ -108,7 +108,7 @@ impl ModelProvider for AnthropicProvider {
                 }
             }
             attempt += 1;
-            tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+            tokio::time::sleep(retry_delay(attempt)).await;
         };
 
         let stream = response.bytes_stream().eventsource().map(|res| match res {
@@ -123,6 +123,14 @@ impl ModelProvider for AnthropicProvider {
 
 fn is_retryable(status: reqwest::StatusCode) -> bool {
     status.as_u16() == 408 || status.as_u16() == 429 || (500..=599).contains(&status.as_u16())
+}
+
+/// 250ms * 2^attempt, capped at 30s. Saturating and capped so a high
+/// configured `max_retries` cannot overflow the shift, mirroring the
+/// OpenAI provider's curve.
+fn retry_delay(attempt: u32) -> Duration {
+    let ms = 250u64.saturating_mul(1u64 << attempt.min(7)).min(30_000);
+    Duration::from_millis(ms)
 }
 
 #[derive(Serialize)]
@@ -594,6 +602,19 @@ pub fn fixture_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // Backoff grows then saturates at the 30s cap, and a large attempt count
+    // does not overflow the `1 << attempt` shift.
+    fn retry_delay_caps_and_does_not_overflow() {
+        assert_eq!(retry_delay(1), Duration::from_millis(500));
+        assert_eq!(retry_delay(2), Duration::from_millis(1000));
+        // Cap reached around attempt 7 (250 * 128 = 32_000 -> 30_000).
+        assert_eq!(retry_delay(7), Duration::from_millis(30_000));
+        // Very high attempt counts saturate rather than overflow/panic.
+        assert_eq!(retry_delay(64), Duration::from_millis(30_000));
+        assert_eq!(retry_delay(u32::MAX), Duration::from_millis(30_000));
+    }
 
     #[test]
     // Request body serialization preserves model, system prompt, tools, and message roles.
