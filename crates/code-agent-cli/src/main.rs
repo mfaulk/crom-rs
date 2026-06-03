@@ -5452,12 +5452,16 @@ fn resolve_stored_credential(
         env,
         store: Some(&store),
     })
-    // Preserve the typed `AuthErrorKind` (notably `NotLoggedIn`) as anyhow
-    // context so callers can distinguish "no credential" from a real store
-    // failure via `not_logged_in_error` instead of string-matching.
+    // Preserve the typed `AuthErrorKind` (notably `NotLoggedIn`) so callers
+    // can distinguish "no credential" from a real store failure via
+    // `is_not_logged_in_error` instead of string-matching. The typed kind is
+    // the *base* error (downcastable anywhere in the chain) and the
+    // descriptive message is the outer context, so a propagated failure still
+    // displays the actionable "resolve <provider> credential: …" headline
+    // rather than the bare kind marker.
     .map_err(|e| {
-        anyhow!("resolve {} credential: {}", provider, e)
-            .context(CredentialResolveErrorKind(e.kind))
+        anyhow::Error::new(CredentialResolveErrorKind(e.kind))
+            .context(format!("resolve {} credential: {}", provider, e))
     })?;
     Ok(res.credential)
 }
@@ -5473,6 +5477,8 @@ impl std::fmt::Display for CredentialResolveErrorKind {
         write!(f, "credential resolve kind: {}", self.0.as_str())
     }
 }
+
+impl std::error::Error for CredentialResolveErrorKind {}
 
 /// Returns true when `err` was produced by [`resolve_stored_credential`] for a
 /// provider that simply has no credential available (`NotLoggedIn`), as opposed
@@ -8243,16 +8249,28 @@ mod provider_route_tests {
     // var) while a different store error is not — so it propagates.
     #[test]
     fn not_logged_in_error_is_distinguished_from_store_errors() {
-        let not_logged_in = anyhow!("resolve anthropic credential: boom").context(
-            CredentialResolveErrorKind(code_agent_auth::AuthErrorKind::NotLoggedIn),
-        );
+        // Mirror the real construction in resolve_stored_credential: the typed
+        // kind is the base error, the descriptive message is the outer context.
+        let not_logged_in = anyhow::Error::new(CredentialResolveErrorKind(
+            code_agent_auth::AuthErrorKind::NotLoggedIn,
+        ))
+        .context("resolve anthropic credential: boom");
         assert!(is_not_logged_in_error(&not_logged_in));
 
         // A real store failure carries a different kind and must propagate.
-        let store_err = anyhow!("resolve anthropic credential: boom").context(
-            CredentialResolveErrorKind(code_agent_auth::AuthErrorKind::CredentialStoreUnavailable),
-        );
+        let store_err = anyhow::Error::new(CredentialResolveErrorKind(
+            code_agent_auth::AuthErrorKind::CredentialStoreUnavailable,
+        ))
+        .context("resolve anthropic credential: boom");
         assert!(!is_not_logged_in_error(&store_err));
+
+        // The descriptive message stays the user-facing headline; the bare
+        // kind marker must not shadow it.
+        assert_eq!(
+            store_err.to_string(),
+            "resolve anthropic credential: boom",
+            "the actionable message must be the outermost context"
+        );
 
         // An unrelated error (e.g. the store-build failure path, which has no
         // typed kind attached) is not treated as not-logged-in.
