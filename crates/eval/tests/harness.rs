@@ -55,6 +55,7 @@ async fn smoke_noop_passes_under_fake_provider() {
     let config = RunConfig {
         provider: ProviderMode::Fake,
         timeout_grace: Duration::from_secs(10),
+        ..RunConfig::default()
     };
     let result = run_task(task, &run, &config).await;
 
@@ -81,6 +82,7 @@ async fn golden_edit_recover_passes_and_recovers() {
     let config = RunConfig {
         provider: ProviderMode::Golden,
         timeout_grace: Duration::from_secs(20),
+        ..RunConfig::default()
     };
     let result = run_task(task, &run, &config).await;
 
@@ -117,6 +119,7 @@ async fn run_summary_is_written() {
     let config = RunConfig {
         provider: ProviderMode::Fake,
         timeout_grace: Duration::from_secs(10),
+        ..RunConfig::default()
     };
     let results = code_agent_eval::runner::run_tasks(&smoke, &run, &config).await;
     let summary = report::write_summaries(&run, "fake", &results).unwrap();

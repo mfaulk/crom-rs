@@ -9,6 +9,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::schema::{
+    default_schema_version, validate_schema_version, BehaviorRules, Capabilities, HiddenSpec,
+    PromptVariants, Quarantine, Visibility,
+};
+
 /// A resolved, ready-to-run evaluation task.
 #[derive(Debug, Clone)]
 pub struct EvalTask {
@@ -31,9 +36,78 @@ pub struct EvalTask {
     pub golden_script: Option<String>,
     /// Absolute path to the directory containing `task.toml` and the fixture.
     pub dir: PathBuf,
+
+    // --- M15 schema v2 additions (all default for v1 manifests) ---
+    /// Declared manifest schema version (1 for M14 manifests).
+    pub schema_version: u32,
+    /// Coarse task category (e.g. `bugfix`, `feature`, `refactor`).
+    pub category: Option<String>,
+    /// Difficulty label (e.g. `easy`, `medium`, `hard`).
+    pub difficulty: Option<String>,
+    /// Capability labels describing what the task exercises.
+    pub capabilities: Capabilities,
+    /// Behavior quality rules (advisory unless `enforce`).
+    pub behavior_rules: BehaviorRules,
+    /// Quarantine metadata, if the task is quarantined.
+    pub quarantine: Option<Quarantine>,
+    /// Visibility (public/private).
+    pub visibility: Visibility,
+    /// Named alternative prompt phrasings.
+    pub prompt_variants: PromptVariants,
+    /// Hidden verification (applied only after the agent completes).
+    pub hidden: Option<HiddenSpec>,
+    /// Paths that must exist/be created by a correct solution.
+    pub required_paths: Vec<String>,
+    /// Paths the agent must not modify (a change is a policy violation).
+    pub forbidden_paths: Vec<String>,
+    /// Optional oracle patch (relative path) that should solve the task.
+    pub oracle_patch: Option<String>,
+    /// Whether the task legitimately requires network access during verify.
+    pub requires_network: bool,
 }
 
 impl EvalTask {
+    /// Construct a task with sensible defaults for everything but `id`,
+    /// `title`, `prompt`, `oracle`, and `dir`. Used by adapters and tests so
+    /// new schema fields don't ripple into every call site.
+    pub fn minimal(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        prompt: impl Into<String>,
+        oracle: OracleSpec,
+        dir: impl Into<PathBuf>,
+    ) -> Self {
+        EvalTask {
+            id: id.into(),
+            title: title.into(),
+            description: None,
+            prompt: prompt.into(),
+            fixture: FixtureSpec::default(),
+            allowed_tools: Vec::new(),
+            max_turns: default_max_turns(),
+            timeout: Duration::from_secs(default_timeout_secs()),
+            oracle,
+            tags: Vec::new(),
+            mode: TaskMode::default(),
+            suites: Vec::new(),
+            golden_script: None,
+            dir: dir.into(),
+            schema_version: crate::schema::DEFAULT_SCHEMA_VERSION,
+            category: None,
+            difficulty: None,
+            capabilities: Capabilities::default(),
+            behavior_rules: BehaviorRules::default(),
+            quarantine: None,
+            visibility: Visibility::default(),
+            prompt_variants: PromptVariants::default(),
+            hidden: None,
+            required_paths: Vec::new(),
+            forbidden_paths: Vec::new(),
+            oracle_patch: None,
+            requires_network: false,
+        }
+    }
+
     /// The golden script name to look up for this task.
     pub fn golden_script_name(&self) -> &str {
         self.golden_script.as_deref().unwrap_or(&self.id)
@@ -42,6 +116,37 @@ impl EvalTask {
     /// Whether this task participates in the named suite.
     pub fn in_suite(&self, suite: &str) -> bool {
         self.suites.iter().any(|s| s == suite)
+    }
+
+    /// Whether this task is actively quarantined.
+    pub fn is_quarantined(&self) -> bool {
+        self.quarantine.as_ref().is_some_and(|q| q.is_active())
+    }
+
+    /// Whether this task is private.
+    pub fn is_private(&self) -> bool {
+        self.visibility.is_private()
+    }
+
+    /// Resolve the prompt for a requested variant. `None` => the default
+    /// prompt. `Some("random")` picks deterministically from `seed`. An unknown
+    /// variant name falls back to the default prompt.
+    pub fn resolved_prompt(&self, variant: Option<&str>, seed: u64) -> String {
+        match variant {
+            None => self.prompt.clone(),
+            Some("default") => self.prompt.clone(),
+            Some("random") => self
+                .prompt_variants
+                .pick_random(seed)
+                .and_then(|name| self.prompt_variants.get(name))
+                .unwrap_or(&self.prompt)
+                .to_string(),
+            Some(name) => self
+                .prompt_variants
+                .get(name)
+                .unwrap_or(&self.prompt)
+                .to_string(),
+        }
     }
 }
 
@@ -139,6 +244,14 @@ pub struct OracleSpec {
 }
 
 impl OracleSpec {
+    /// An oracle with no primary gate (assertions/behavior only).
+    pub fn default_none() -> Self {
+        OracleSpec {
+            kind: OracleKind::None,
+            ..Default::default()
+        }
+    }
+
     /// Expand the primary kind into a concrete command list. File assertions
     /// and behavior checks are evaluated separately.
     pub fn primary_commands(&self) -> Vec<String> {
@@ -238,6 +351,9 @@ fn default_timeout_secs() -> u64 {
 /// On-disk task manifest (`task.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
+    /// Manifest schema version. Absent (M14) => v1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub id: String,
     pub title: String,
     #[serde(default)]
@@ -256,22 +372,74 @@ pub struct Manifest {
     pub mode: TaskMode,
     #[serde(default)]
     pub suites: Vec<String>,
+    /// Single-suite alias merged into `suites` (v2 convenience).
+    #[serde(default)]
+    pub suite: Option<String>,
     #[serde(default)]
     pub golden_script: Option<String>,
     #[serde(default)]
     pub fixture: FixtureSpec,
     #[serde(default)]
     pub oracle: OracleSpec,
+
+    // --- v2 additions ---
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub difficulty: Option<String>,
+    #[serde(default)]
+    pub capabilities: Capabilities,
+    #[serde(default)]
+    pub behavior: BehaviorRules,
+    #[serde(default)]
+    pub quarantine: Option<Quarantine>,
+    #[serde(default)]
+    pub visibility: Visibility,
+    #[serde(default)]
+    pub prompt_variants: PromptVariants,
+    #[serde(default)]
+    pub hidden: Option<HiddenSpec>,
+    #[serde(default)]
+    pub required_paths: Vec<String>,
+    #[serde(default)]
+    pub forbidden_paths: Vec<String>,
+    #[serde(default)]
+    pub oracle_patch: Option<String>,
+    #[serde(default)]
+    pub requires_network: bool,
 }
 
 impl Manifest {
-    /// Parse a manifest from TOML text.
+    /// Parse a manifest from TOML text (no schema-version gating).
     pub fn from_toml(text: &str) -> Result<Self, TaskError> {
         toml::from_str(text).map_err(|e| TaskError::Parse(e.to_string()))
     }
 
+    /// Parse and validate a manifest, gating on the declared schema version.
+    pub fn from_toml_validated(text: &str, allow_future: bool) -> Result<Self, TaskError> {
+        let manifest = Self::from_toml(text)?;
+        validate_schema_version(manifest.schema_version, allow_future)
+            .map_err(TaskError::Schema)?;
+        if manifest.id.trim().is_empty() {
+            return Err(TaskError::Validation("task id is empty".to_string()));
+        }
+        if manifest.prompt.trim().is_empty() {
+            return Err(TaskError::Validation(format!(
+                "task '{}' has an empty prompt",
+                manifest.id
+            )));
+        }
+        Ok(manifest)
+    }
+
     /// Resolve a manifest against the directory containing it.
     pub fn into_task(self, dir: impl Into<PathBuf>) -> EvalTask {
+        let mut suites = self.suites;
+        if let Some(s) = self.suite {
+            if !suites.contains(&s) {
+                suites.push(s);
+            }
+        }
         EvalTask {
             id: self.id,
             title: self.title,
@@ -284,18 +452,32 @@ impl Manifest {
             oracle: self.oracle,
             tags: self.tags,
             mode: self.mode,
-            suites: self.suites,
+            suites,
             golden_script: self.golden_script,
             dir: dir.into(),
+            schema_version: self.schema_version,
+            category: self.category,
+            difficulty: self.difficulty,
+            capabilities: self.capabilities,
+            behavior_rules: self.behavior,
+            quarantine: self.quarantine,
+            visibility: self.visibility,
+            prompt_variants: self.prompt_variants,
+            hidden: self.hidden,
+            required_paths: self.required_paths,
+            forbidden_paths: self.forbidden_paths,
+            oracle_patch: self.oracle_patch,
+            requires_network: self.requires_network,
         }
     }
 }
 
-/// Load a single task from a `task.toml` file path.
+/// Load a single task from a `task.toml` file path, validating the schema.
 pub fn load_task(manifest_path: &Path) -> Result<EvalTask, TaskError> {
     let text = std::fs::read_to_string(manifest_path)
         .map_err(|e| TaskError::Io(format!("{}: {e}", manifest_path.display())))?;
-    let manifest = Manifest::from_toml(&text)?;
+    let manifest = Manifest::from_toml_validated(&text, false)
+        .map_err(|e| TaskError::Parse(format!("{}: {e}", manifest_path.display())))?;
     let dir = manifest_path
         .parent()
         .map(Path::to_path_buf)
@@ -339,6 +521,10 @@ pub enum TaskError {
     Io(String),
     #[error("task manifest parse error: {0}")]
     Parse(String),
+    #[error("unsupported schema: {0}")]
+    Schema(String),
+    #[error("task validation error: {0}")]
+    Validation(String),
 }
 
 #[cfg(test)]

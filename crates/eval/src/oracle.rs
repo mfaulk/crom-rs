@@ -91,28 +91,60 @@ impl OracleReport {
 }
 
 /// Evaluate every oracle for `task` against the post-run `workspace_dir` and
-/// the captured `events`.
+/// the captured `events`. Uses the local backend (commands run directly).
 pub async fn evaluate(task: &EvalTask, workspace_dir: &Path, events: &[SdkEvent]) -> OracleReport {
-    let timeout = Duration::from_secs(
+    let backend = crate::isolation::LocalBackend;
+    let timeout = task_command_timeout(task);
+    let limits = crate::isolation::CommandLimits {
+        timeout,
+        network: task.requires_network,
+        ..Default::default()
+    };
+    evaluate_oracle(&task.oracle, workspace_dir, events, &backend, &limits).await
+}
+
+/// Per-command timeout for a task's oracle.
+pub fn task_command_timeout(task: &EvalTask) -> Duration {
+    Duration::from_secs(
         task.oracle
             .command_timeout_secs
             .unwrap_or_else(|| task.timeout.as_secs().max(1)),
-    );
+    )
+}
 
+/// Evaluate an arbitrary [`OracleSpec`](crate::task::OracleSpec) against a
+/// workspace and event stream, running commands through the supplied isolation
+/// backend. This is the shared path used for both public and hidden verification.
+pub async fn evaluate_oracle(
+    oracle: &crate::task::OracleSpec,
+    workspace_dir: &Path,
+    events: &[SdkEvent],
+    backend: &dyn crate::isolation::IsolationBackend,
+    limits: &crate::isolation::CommandLimits,
+) -> OracleReport {
     let mut commands = Vec::new();
-    for cmd in task.oracle.primary_commands() {
-        commands.push(run_command(&cmd, workspace_dir, timeout).await);
+    for cmd in oracle.primary_commands() {
+        match backend.run(workspace_dir, &cmd, limits).await {
+            Ok(outcome) => commands.push(outcome.result),
+            Err(e) => commands.push(CommandResult {
+                command: cmd,
+                success: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: format!("isolation error: {e}"),
+                duration_ms: 0,
+                timed_out: false,
+            }),
+        }
     }
 
-    let assertions = task
-        .oracle
+    let assertions = oracle
         .assertions
         .iter()
         .map(|a| evaluate_assertion(a, workspace_dir))
         .collect();
 
-    let behavior = task
-        .oracle
+    let behavior = oracle
         .behavior
         .iter()
         .map(|b| evaluate_behavior(b, events))
@@ -161,6 +193,54 @@ pub async fn run_command(command: &str, dir: &Path, timeout: Duration) -> Comman
         },
         Err(_) => CommandResult {
             command: command.to_string(),
+            success: false,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("command timed out after {}s", timeout.as_secs()),
+            duration_ms: start.elapsed().as_millis() as u64,
+            timed_out: true,
+        },
+    }
+}
+
+/// Run a program with an explicit argv (no intermediate shell) in `dir` with a
+/// timeout, capturing output. Used by container backends so multi-word
+/// verification commands are not re-split by a wrapping `sh -c`.
+pub async fn run_argv(
+    program: &str,
+    args: &[String],
+    dir: &Path,
+    timeout: Duration,
+) -> CommandResult {
+    let start = std::time::Instant::now();
+    let display = format!("{program} {}", args.join(" "));
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null());
+
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) => CommandResult {
+            command: display,
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            stdout: truncate(&String::from_utf8_lossy(&output.stdout)),
+            stderr: truncate(&String::from_utf8_lossy(&output.stderr)),
+            duration_ms: start.elapsed().as_millis() as u64,
+            timed_out: false,
+        },
+        Ok(Err(e)) => CommandResult {
+            command: display,
+            success: false,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("failed to run command: {e}"),
+            duration_ms: start.elapsed().as_millis() as u64,
+            timed_out: false,
+        },
+        Err(_) => CommandResult {
+            command: display,
             success: false,
             exit_code: None,
             stdout: String::new(),
@@ -339,6 +419,22 @@ mod tests {
         let bad = run_command("exit 3", tmp.path(), Duration::from_secs(10)).await;
         assert!(!bad.success);
         assert_eq!(bad.exit_code, Some(3));
+    }
+
+    #[tokio::test]
+    async fn run_argv_preserves_multiword_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        // If args were re-split by a wrapping shell, this would print wrong
+        // output or fail. printf joins its args with the format spec.
+        let res = run_argv(
+            "printf",
+            &["%s-%s".into(), "cargo test".into(), "--all-targets".into()],
+            tmp.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(res.success);
+        assert_eq!(res.stdout, "cargo test---all-targets");
     }
 
     #[tokio::test]

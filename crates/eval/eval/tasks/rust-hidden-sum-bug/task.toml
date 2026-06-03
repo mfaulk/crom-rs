@@ -1,0 +1,53 @@
+schema_version = 2
+id = "rust-hidden-sum-bug"
+title = "Fix add() so it adds (verified by hidden tests)"
+category = "bugfix"
+difficulty = "easy"
+tags = ["rust", "single-file", "hidden-tests", "bugfix", "small"]
+suites = ["rust-mini"]
+
+prompt = """
+`add` in src/lib.rs is supposed to add two integers, but it returns the wrong
+result. Fix it. Keep the public signature unchanged.
+"""
+
+max_turns = 16
+timeout_secs = 300
+
+# Path policy: the fix belongs in src/lib.rs; the manifest must not change.
+# (Cargo.lock is intentionally not listed — the patch pipeline excludes it and
+# `cargo build` regenerates it as an artifact, so a lockfile rule could not fire.)
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/lib.rs"]
+
+# An oracle patch proves the task is solvable and lets `validate-task` confirm
+# the public + hidden checks pass for a correct solution.
+oracle_patch = "oracle.patch"
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# Public verification: the crate must compile. (No public tests reveal the bug.)
+[oracle]
+kind = "command"
+commands = ["cargo build"]
+
+# Hidden verification: overlay the hidden test, then run it. Hidden files are
+# never present in the workspace during the agent run.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]

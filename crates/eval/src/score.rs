@@ -301,31 +301,21 @@ fn round(v: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::oracle::{AssertionResult, CommandResult, OracleReport};
-    use crate::task::{FixtureSpec, OracleSpec};
+    use crate::task::OracleSpec;
     use std::path::PathBuf;
     use std::time::Duration;
 
     fn task() -> EvalTask {
-        EvalTask {
-            id: "t".into(),
-            title: "t".into(),
-            description: None,
-            prompt: "p".into(),
-            fixture: FixtureSpec::default(),
-            allowed_tools: vec![],
-            max_turns: 10,
-            timeout: Duration::from_secs(60),
-            oracle: OracleSpec {
-                kind: crate::task::OracleKind::Command,
-                commands: vec!["cargo test".into()],
-                ..Default::default()
-            },
-            tags: vec!["small".into()],
-            mode: TaskMode::ModifyWorkspace,
-            suites: vec![],
-            golden_script: None,
-            dir: PathBuf::from("."),
-        }
+        let oracle = OracleSpec {
+            kind: crate::task::OracleKind::Command,
+            commands: vec!["cargo test".into()],
+            ..Default::default()
+        };
+        let mut t = EvalTask::minimal("t", "t", "p", oracle, PathBuf::from("."));
+        t.max_turns = 10;
+        t.timeout = Duration::from_secs(60);
+        t.tags = vec!["small".into()];
+        t
     }
 
     fn passing_oracle() -> OracleReport {

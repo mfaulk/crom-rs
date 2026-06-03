@@ -22,6 +22,7 @@ time = { workspace = true }
 uuid = { workspace = true }
 similar = { workspace = true }
 regex = { workspace = true }
+tempfile = { workspace = true }
 
 code-agent-core = { workspace = true }
 code-agent-auth = { workspace = true }

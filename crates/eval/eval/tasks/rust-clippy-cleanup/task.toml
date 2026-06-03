@@ -1,7 +1,10 @@
+schema_version = 2
 id = "rust-clippy-cleanup"
 title = "Make the code pass clippy with -D warnings"
+category = "refactor"
+difficulty = "easy"
 tags = ["rust", "clippy", "lint", "small"]
-suites = ["rust-small"]
+suites = ["rust-small", "rust-mini"]
 
 prompt = """
 The tests pass but `cargo clippy --all-targets -- -D warnings` fails. Resolve
@@ -10,6 +13,9 @@ the clippy lints idiomatically without changing behavior or deleting tests.
 
 max_turns = 20
 timeout_secs = 300
+
+[capabilities]
+requires_test_feedback = true
 
 [fixture]
 kind = "copy_dir"

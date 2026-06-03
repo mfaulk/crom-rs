@@ -1,0 +1,45 @@
+schema_version = 2
+id = "prompt-variants-demo"
+title = "Prompt variants: same task phrased four ways"
+category = "negative"
+difficulty = "easy"
+tags = ["smoke", "negative", "small"]
+suites = ["smoke"]
+
+# Default prompt. Variants are selected via `--prompt-variant <name>` (or
+# `--prompt-variant random`).
+prompt = """
+Confirm README.md contains its marker. Make no changes if it is already present.
+"""
+
+max_turns = 4
+timeout_secs = 60
+allowed_tools = ["Read", "Glob", "Grep"]
+
+[prompt_variants]
+concise = "Check README.md has its marker; change nothing if so."
+verbose = """
+Carefully read README.md from top to bottom. Verify that the documented marker
+string is present. If, and only if, it is missing, add it; otherwise leave the
+repository untouched.
+"""
+bug_report = """
+A user reports the README marker may be missing. Investigate and confirm whether
+it is present. Do not make changes unless it is actually absent.
+"""
+customer_request = "Please make sure our README still has the required marker."
+
+[capabilities]
+negative_noop = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "none"
+
+[[oracle.assertions]]
+kind = "file_contains"
+path = "README.md"
+text = "VOK"

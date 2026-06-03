@@ -20,7 +20,10 @@ use code_agent_sdk::{
 };
 
 use crate::artifacts::{RunDir, TaskArtifacts};
-use crate::fixture::{generate_patch, prepare_workspace, PatchInfo};
+use crate::behavior::{self, BehaviorMetrics};
+use crate::failure::{self, FailureClass, FailureSignals};
+use crate::fixture::{copy_dir_recursive, generate_patch, prepare_workspace, PatchInfo};
+use crate::isolation::{self, CommandLimits, EnvMetadata, IsolationKind};
 use crate::oracle::{self, OracleReport};
 use crate::providers::{self, ProviderMode};
 use crate::score::{self, EvalScore, ScoreInputs};
@@ -78,6 +81,7 @@ pub struct EvalResult {
 
     // Aggregation extras.
     pub provider: String,
+    pub model: String,
     pub suites: Vec<String>,
     pub tags: Vec<String>,
     pub checks_passed: usize,
@@ -86,6 +90,31 @@ pub struct EvalResult {
     pub turns_used: usize,
     pub duration_ms: u64,
     pub skipped_reason: Option<String>,
+
+    // --- M15 additions ---
+    /// Primary binary outcome: public + hidden pass, no policy/path violation.
+    pub resolved: bool,
+    pub failure_class: Option<FailureClass>,
+    pub secondary_failures: Vec<FailureClass>,
+    pub public_passed: bool,
+    pub hidden_present: bool,
+    pub hidden_passed: Option<bool>,
+    pub behavior: BehaviorMetrics,
+    pub behavior_warnings: Vec<String>,
+    pub category: Option<String>,
+    pub difficulty: Option<String>,
+    pub capabilities: Vec<String>,
+    pub adapter: String,
+    pub isolation: String,
+    pub quarantined: bool,
+    pub patch_lines_added: usize,
+    pub patch_lines_removed: usize,
+    /// Repetition index (0-based) and seed for multi-run aggregation.
+    pub repetition: usize,
+    pub seed: u64,
+    pub attempts_used: usize,
+    /// Estimated cost in USD if the provider reports usage; `None` otherwise.
+    pub cost_usd: Option<f64>,
 }
 
 /// Configuration for an eval run.
@@ -95,6 +124,26 @@ pub struct RunConfig {
     /// Extra wall-clock grace beyond the task timeout before the harness force
     /// aborts the run.
     pub timeout_grace: Duration,
+    /// Adapter id that produced the task (recorded in artifacts/index).
+    pub adapter: String,
+    /// Isolation backend for verification commands.
+    pub isolation: IsolationKind,
+    /// Container image override (container backends only).
+    pub container_image: Option<String>,
+    /// Whether verification may access the network.
+    pub network: bool,
+    /// Optional CPU limit (container backends only).
+    pub cpu_limit: Option<f64>,
+    /// Optional memory limit in bytes (container backends only).
+    pub memory_limit: Option<u64>,
+    /// Prompt variant name (`None` => default prompt; `Some("random")` picks).
+    pub prompt_variant: Option<String>,
+    /// Repetition index for this run (0-based).
+    pub repetition: usize,
+    /// Seed used for prompt-variant selection and reporting.
+    pub seed: u64,
+    /// Max attempts (Aider-style retry with test feedback). Default 1.
+    pub attempts: usize,
 }
 
 impl Default for RunConfig {
@@ -102,6 +151,16 @@ impl Default for RunConfig {
         Self {
             provider: ProviderMode::Fake,
             timeout_grace: Duration::from_secs(30),
+            adapter: "internal".to_string(),
+            isolation: IsolationKind::Local,
+            container_image: None,
+            network: false,
+            cpu_limit: None,
+            memory_limit: None,
+            prompt_variant: None,
+            repetition: 0,
+            seed: 0,
+            attempts: 1,
         }
     }
 }
@@ -149,6 +208,7 @@ fn tool_policy_for(task: &EvalTask) -> ToolPolicy {
 /// Drive the agent for a task in the prepared workspace.
 async fn drive_agent(
     task: &EvalTask,
+    prompt: &str,
     workspace_dir: &std::path::Path,
     config: &RunConfig,
 ) -> Result<RunOutcome, String> {
@@ -170,7 +230,7 @@ async fn drive_agent(
         .await
         .map_err(|e| format!("runtime build failed: {}", e.message))?;
 
-    let mut request = AgentRequest::new(task.prompt.clone())
+    let mut request = AgentRequest::new(prompt.to_string())
         .max_turns(task.max_turns as u32)
         .deadline(task.timeout)
         .approval_policy(ApprovalPolicy::CallbackRequired)
@@ -259,206 +319,647 @@ fn is_transcript_event(e: &SdkEvent) -> bool {
     )
 }
 
-/// Decide the final status from the run outcome and oracle report.
-fn decide_status(outcome: &RunOutcome, oracle: &OracleReport) -> EvalStatus {
-    if outcome.timed_out {
-        return EvalStatus::TimedOut;
+/// Build an `EvalResult` skeleton with neutral M15 fields filled from the task
+/// and config. Callers override `score`, `status`, and outcome-specific fields.
+fn default_result(
+    task: &EvalTask,
+    config: &RunConfig,
+    status: EvalStatus,
+    dir: &std::path::Path,
+) -> EvalResult {
+    EvalResult {
+        task_id: task.id.clone(),
+        title: task.title.clone(),
+        status,
+        score: EvalScore::zero(""),
+        patch: None,
+        transcript_path: dir.join("transcript.jsonl"),
+        events_path: dir.join("events.jsonl"),
+        report_path: dir.join("report.md"),
+        workspace_path: dir.join("workspace"),
+        provider: config.provider.label(),
+        model: provider_model(&config.provider),
+        suites: task.suites.clone(),
+        tags: task.tags.clone(),
+        checks_passed: 0,
+        checks_total: task.oracle.check_count(),
+        tool_calls: 0,
+        turns_used: 0,
+        duration_ms: 0,
+        skipped_reason: None,
+        resolved: false,
+        failure_class: None,
+        secondary_failures: Vec::new(),
+        public_passed: false,
+        hidden_present: task.hidden.as_ref().is_some_and(|h| h.has_checks()),
+        hidden_passed: None,
+        behavior: BehaviorMetrics::default(),
+        behavior_warnings: Vec::new(),
+        category: task.category.clone(),
+        difficulty: task.difficulty.clone(),
+        capabilities: task
+            .capabilities
+            .enabled_labels()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        adapter: config.adapter.clone(),
+        isolation: config.isolation.id().to_string(),
+        quarantined: task.is_quarantined(),
+        patch_lines_added: 0,
+        patch_lines_removed: 0,
+        repetition: config.repetition,
+        seed: config.seed,
+        attempts_used: 0,
+        cost_usd: None,
     }
-    let passed = oracle.checks_passed();
-    let total = oracle.checks_total();
-    if outcome.errored && passed == 0 {
-        return EvalStatus::Errored;
+}
+
+fn provider_model(provider: &ProviderMode) -> String {
+    match provider {
+        ProviderMode::Fake => "fake-echo".to_string(),
+        ProviderMode::Golden => "golden".to_string(),
+        ProviderMode::Live(_) => std::env::var("CODE_AGENT_EVAL_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-6".to_string()),
     }
-    if total == 0 {
-        // No oracle checks: a completed run is a pass, an errored one is not.
-        return if outcome.errored {
-            EvalStatus::Errored
-        } else {
-            EvalStatus::Passed
-        };
+}
+
+/// Per-command isolation limits for a task under a run config.
+fn limits_for(task: &EvalTask, config: &RunConfig) -> CommandLimits {
+    CommandLimits {
+        timeout: oracle::task_command_timeout(task),
+        network: config.network || task.requires_network,
+        cpu_limit: config.cpu_limit,
+        memory_limit: config.memory_limit,
+        container_image: config.container_image.clone(),
     }
-    if passed == total {
-        EvalStatus::Passed
-    } else if passed == 0 {
-        EvalStatus::Failed
-    } else {
-        EvalStatus::Partial
+}
+
+/// Whether `path` matches a forbidden/required pattern. Supports exact match,
+/// directory prefix (`dir/`), and a trailing `*` wildcard.
+fn path_matches(path: &str, pattern: &str) -> bool {
+    let path = path.replace('\\', "/");
+    let pattern = pattern.replace('\\', "/");
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return path.starts_with(prefix);
     }
+    if pattern.ends_with('/') {
+        return path.starts_with(&pattern);
+    }
+    path == pattern || path.starts_with(&format!("{pattern}/"))
+}
+
+const DESTRUCTIVE_PATTERNS: &[&str] = &[
+    "rm -rf",
+    "rm -fr",
+    "mkfs",
+    "dd if=",
+    ":(){",
+    "> /dev/sd",
+    "chmod -r 000",
+];
+
+fn unsafe_command_used(events: &[SdkEvent]) -> bool {
+    oracle::bash_commands(events).any(|c| {
+        let lc = c.to_lowercase();
+        DESTRUCTIVE_PATTERNS.iter().any(|p| lc.contains(p))
+    })
+}
+
+/// Heuristic: did a verification command fail with a compiler error?
+fn looks_like_compile_error(report: &OracleReport) -> bool {
+    report.commands.iter().any(|c| {
+        !c.success
+            && (c.stderr.contains("error[")
+                || c.stderr.contains("could not compile")
+                || c.stderr.contains("cannot find")
+                || c.stdout.contains("error[")
+                || c.stdout.contains("could not compile"))
+    })
+}
+
+fn excessive_patch(task: &EvalTask, patch: &PatchInfo) -> bool {
+    let churn = patch.insertions + patch.deletions;
+    let files = patch.changed_files.len();
+    let small = task.tags.iter().any(|t| t == "small");
+    (small && (churn > 200 || files > 6)) || churn > 800 || files > 30
+}
+
+/// Overlay a hidden fixture directory (if any) into the workspace, then run the
+/// hidden oracle. Returns `None` when the task has no hidden checks.
+async fn run_hidden(
+    task: &EvalTask,
+    workspace_dir: &std::path::Path,
+    events: &[SdkEvent],
+    backend: &dyn isolation::IsolationBackend,
+    limits: &CommandLimits,
+) -> Option<OracleReport> {
+    let hidden = task.hidden.as_ref()?;
+    if !hidden.has_checks() {
+        return None;
+    }
+    if let Some(rel) = &hidden.fixture {
+        let src = task.dir.join(rel);
+        if src.exists() {
+            let _ = copy_dir_recursive(&src, workspace_dir);
+        }
+    }
+    Some(oracle::evaluate_oracle(&hidden.oracle, workspace_dir, events, backend, limits).await)
 }
 
 /// Run a single task and write its artifact bundle.
 pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> EvalResult {
     let started = Instant::now();
+    let dir = run_dir.root.join("tasks").join(&task.id);
     let artifacts = match run_dir.task(&task.id) {
         Ok(a) => a,
         Err(e) => {
-            // We cannot write artifacts; return an errored result with paths
-            // pointing at where they would have lived.
-            return errored_result(
-                task,
-                run_dir,
-                &config.provider,
-                format!("artifact dir: {e}"),
-            );
+            let mut r = default_result(task, config, EvalStatus::Errored, &dir);
+            r.score = EvalScore::zero(format!("errored: artifact dir: {e}"));
+            r.failure_class = Some(FailureClass::HarnessError);
+            r.duration_ms = started.elapsed().as_millis() as u64;
+            return r;
         }
     };
 
-    // Always persist the manifest and prompt up front so even a crashed run is
-    // debuggable.
+    // Resolve the prompt (variant selection) and persist it + the manifest.
+    let prompt = task.resolved_prompt(config.prompt_variant.as_deref(), config.seed);
     let _ = persist_manifest(task, &artifacts);
-    let _ = artifacts.write_string("prompt.md", &task.prompt);
+    let _ = artifacts.write_string("prompt.md", &prompt);
+    write_metadata_artifacts(&artifacts, task, config);
 
     let workspace_dir = artifacts.workspace_dir();
 
     // Provider availability is checked first so skips are clean and cheap.
     if let Err(unavailable) = providers::build(&config.provider, task) {
-        return skipped_result(
-            task,
-            &artifacts,
-            &config.provider,
-            unavailable.reason,
-            started,
-        );
+        return skipped_result(task, &artifacts, config, unavailable.reason, started);
     }
+
+    // Build the isolation backend; a missing engine is an isolation error.
+    let backend = match isolation::build_backend(&config.isolation, config.container_image.clone())
+    {
+        Ok(b) => b,
+        Err(e) => {
+            let mut r = default_result(task, config, EvalStatus::Errored, &dir);
+            r.score = EvalScore::zero(format!("isolation: {e}"));
+            r.failure_class = Some(FailureClass::IsolationError);
+            r.duration_ms = started.elapsed().as_millis() as u64;
+            let _ = artifacts.write_string(
+                "report.md",
+                &format!("# {} — isolation error\n\n{e}\n", task.id),
+            );
+            let _ = artifacts.write_json("result.json", &r);
+            return r;
+        }
+    };
+    let limits = limits_for(task, config);
+    let _ = artifacts.write_json(
+        "environment.json",
+        &EnvMetadata::gather(backend.as_ref(), limits.network),
+    );
 
     if let Err(e) = prepare_workspace(task, &workspace_dir) {
         let _ = artifacts.write_string(
             "final_summary.md",
             &format!("# {}\n\nworkspace setup failed: {e}\n", task.id),
         );
-        return errored_result(
-            task,
-            run_dir,
-            &config.provider,
-            format!("workspace setup: {e}"),
-        );
+        let mut r = default_result(task, config, EvalStatus::Errored, &dir);
+        r.score = EvalScore::zero(format!("errored: workspace setup: {e}"));
+        r.failure_class = Some(FailureClass::HarnessError);
+        r.duration_ms = started.elapsed().as_millis() as u64;
+        let _ = artifacts.write_json("result.json", &r);
+        return r;
     }
 
-    let mut outcome = match drive_agent(task, &workspace_dir, config).await {
-        Ok(o) => o,
-        Err(reason) => {
-            // Could be a skip (provider unavailable) surfaced late, but build()
-            // already guarded that; treat as errored.
-            RunOutcome {
-                events: Vec::new(),
-                summary: reason.clone(),
-                timed_out: false,
-                errored: true,
+    // Drive the agent, optionally retrying with test feedback (Aider-style).
+    let mut events: Vec<SdkEvent> = Vec::new();
+    let mut summary = String::new();
+    let mut timed_out = false;
+    let mut errored = false;
+    let mut public_report = OracleReport {
+        commands: Vec::new(),
+        assertions: Vec::new(),
+        behavior: Vec::new(),
+    };
+    let attempts = config.attempts.max(1);
+    let mut attempts_used = 0usize;
+
+    for attempt in 0..attempts {
+        attempts_used += 1;
+        let attempt_prompt = if attempt == 0 {
+            prompt.clone()
+        } else {
+            feedback_prompt(&prompt, &public_report)
+        };
+        match drive_agent(task, &attempt_prompt, &workspace_dir, config).await {
+            Ok(o) => {
+                events.extend(o.events);
+                summary = o.summary;
+                timed_out |= o.timed_out;
+                errored = o.errored;
+            }
+            Err(reason) => {
+                summary = reason;
+                errored = true;
             }
         }
-    };
+        public_report = oracle::evaluate_oracle(
+            &task.oracle,
+            &workspace_dir,
+            &events,
+            backend.as_ref(),
+            &limits,
+        )
+        .await;
+        if public_report.all_passed() || attempt + 1 == attempts {
+            break;
+        }
+    }
 
-    // A patch-generation failure (e.g. the agent broke or removed `.git`) is a
-    // broken workspace, not "no changes": surface it as an error rather than
-    // silently scoring an empty patch.
+    // Generate the public patch (before any hidden overlay).
     let patch = match generate_patch(&workspace_dir) {
         Ok(p) => p,
         Err(e) => {
-            outcome.errored = true;
-            outcome.summary = format!("{}; patch generation failed: {e}", outcome.summary);
+            errored = true;
+            summary = format!("{summary}; patch generation failed: {e}");
             PatchInfo::default()
         }
     };
-    let oracle_report = oracle::evaluate(task, &workspace_dir, &outcome.events).await;
 
-    let turns_used = count_turns(&outcome.events);
-    let tool_calls = count_tool_calls(&outcome.events);
+    // Hidden verification (overlay + run) — only after the agent has finished.
+    let hidden_report = run_hidden(task, &workspace_dir, &events, backend.as_ref(), &limits).await;
+
+    // Path policy.
+    let forbidden_changed: Vec<String> = patch
+        .changed_files
+        .iter()
+        .filter(|f| task.forbidden_paths.iter().any(|p| path_matches(f, p)))
+        .cloned()
+        .collect();
+    let required_missing: Vec<String> = task
+        .required_paths
+        .iter()
+        .filter(|rp| !workspace_dir.join(rp).exists())
+        .cloned()
+        .collect();
+
+    // Behavior metrics + rules.
+    let behavior = BehaviorMetrics::derive(&events, &patch, task);
+    let rule_results = behavior::evaluate_rules(&task.behavior_rules, &behavior);
+    let mut behavior_warnings = behavior::warnings(&behavior, &rule_results);
+    if !forbidden_changed.is_empty() {
+        behavior_warnings.push(format!("modified forbidden path(s): {forbidden_changed:?}"));
+    }
+    if !required_missing.is_empty() {
+        behavior_warnings.push(format!("required path(s) missing: {required_missing:?}"));
+    }
+
+    // Merge public + hidden for status/check counting.
+    let merged = merge_reports(&public_report, hidden_report.as_ref());
+
+    let public_passed = public_report.all_passed();
+    let hidden_passed = hidden_report.as_ref().map(|r| r.all_passed());
+    let rule_violation = task.behavior_rules.enforce && rule_results.iter().any(|r| !r.satisfied);
+
+    let resolved = public_passed
+        && hidden_passed.unwrap_or(true)
+        && forbidden_changed.is_empty()
+        && required_missing.is_empty()
+        && !timed_out
+        && !rule_violation;
+
+    // Failure classification.
+    let signals = FailureSignals {
+        timed_out,
+        provider_unavailable: false,
+        harness_errored: false,
+        empty_patch: patch.is_empty(),
+        public_passed,
+        hidden_present: hidden_report.is_some(),
+        hidden_passed: hidden_passed.unwrap_or(false),
+        compile_failed: looks_like_compile_error(&public_report)
+            || hidden_report.as_ref().is_some_and(looks_like_compile_error),
+        forbidden_changed: !forbidden_changed.is_empty(),
+        required_missing: !required_missing.is_empty(),
+        unsafe_command: unsafe_command_used(&events),
+        tool_loop: behavior.same_error_repeated == Some(true),
+        planning_required: task.mode == TaskMode::PlanThenAct
+            || task
+                .oracle
+                .behavior
+                .iter()
+                .any(|b| matches!(b, crate::task::BehaviorSpec::MustEmitPlan)),
+        plan_emitted: behavior.plan_submitted == Some(true),
+        excessive_patch: excessive_patch(task, &patch),
+    };
+    let (failure_class, secondary_failures) = if resolved {
+        (None, Vec::new())
+    } else {
+        match failure::classify(&signals) {
+            Some((p, s)) => (Some(p), s),
+            // Resolved disagreement (e.g. behavior-rule enforcement): default.
+            None => (Some(FailureClass::PublicTestFailure), Vec::new()),
+        }
+    };
+
+    let turns_used = count_turns(&events);
+    let tool_calls = count_tool_calls(&events);
     let score = score::compute(&ScoreInputs {
         task,
-        oracle: &oracle_report,
+        oracle: &merged,
         patch: &patch,
-        events: &outcome.events,
+        events: &events,
         turns_used,
         max_turns: task.max_turns,
-        timed_out: outcome.timed_out,
-        errored: outcome.errored,
+        timed_out,
+        errored,
     });
 
-    let status = decide_status(&outcome, &oracle_report);
+    let outcome = RunOutcome {
+        events,
+        summary,
+        timed_out,
+        errored,
+    };
+    let status = status_for(resolved, &outcome, &merged);
 
-    write_run_artifacts(
-        &artifacts,
+    write_run_artifacts(WriteArtifacts {
+        artifacts: &artifacts,
         task,
-        &outcome,
-        &patch,
-        &oracle_report,
-        &score,
+        outcome: &outcome,
+        patch: &patch,
+        public: &public_report,
+        hidden: hidden_report.as_ref(),
+        merged: &merged,
+        score: &score,
         status,
-    );
+        resolved,
+        behavior: &behavior,
+        rule_results: &rule_results,
+        warnings: &behavior_warnings,
+        forbidden: &forbidden_changed,
+        required_missing: &required_missing,
+    });
 
-    EvalResult {
-        task_id: task.id.clone(),
-        title: task.title.clone(),
-        status,
-        score,
-        patch: if patch.is_empty() {
-            None
+    let mut result = default_result(task, config, status, &dir);
+    result.score = score;
+    result.patch = if patch.is_empty() {
+        None
+    } else {
+        Some(patch.unified_diff.clone())
+    };
+    result.workspace_path = workspace_dir;
+    result.checks_passed = merged.checks_passed();
+    result.checks_total = merged.checks_total();
+    result.tool_calls = tool_calls;
+    result.turns_used = turns_used;
+    result.duration_ms = started.elapsed().as_millis() as u64;
+    result.resolved = resolved;
+    result.failure_class = failure_class;
+    result.secondary_failures = secondary_failures;
+    result.public_passed = public_passed;
+    result.hidden_passed = hidden_passed;
+    result.behavior = behavior;
+    result.behavior_warnings = behavior_warnings;
+    result.patch_lines_added = patch.insertions;
+    result.patch_lines_removed = patch.deletions;
+    result.attempts_used = attempts_used;
+
+    let _ = artifacts.write_json("result.json", &result);
+    result
+}
+
+/// Build the second-attempt prompt from the failing public verification.
+fn feedback_prompt(original: &str, public: &OracleReport) -> String {
+    /// Last `n` lines of a stream (compilers/test runners put failures here).
+    fn tail(s: &str, n: usize) -> String {
+        let lines: Vec<&str> = s.lines().collect();
+        let start = lines.len().saturating_sub(n);
+        lines[start..].join("\n")
+    }
+    let mut feedback = String::from("Your previous attempt did not pass verification.\n");
+    for c in public.commands.iter().filter(|c| !c.success) {
+        feedback.push_str(&format!("\n$ {}\n", c.command));
+        // Show the tail of stdout and stderr independently so the error output
+        // (usually on stderr) is never crowded out by a large stdout log.
+        let out = tail(&c.stdout, 15);
+        if !out.trim().is_empty() {
+            feedback.push_str("[stdout]\n");
+            feedback.push_str(&out);
+            feedback.push('\n');
+        }
+        let err = tail(&c.stderr, 25);
+        if !err.trim().is_empty() {
+            feedback.push_str("[stderr]\n");
+            feedback.push_str(&err);
+            feedback.push('\n');
+        }
+    }
+    format!("{original}\n\n---\n{feedback}\nPlease fix the issue and try again.")
+}
+
+/// Decide the displayed status from `resolved` and the merged oracle.
+fn status_for(resolved: bool, outcome: &RunOutcome, merged: &OracleReport) -> EvalStatus {
+    if outcome.timed_out {
+        return EvalStatus::TimedOut;
+    }
+    if resolved {
+        return EvalStatus::Passed;
+    }
+    let passed = merged.checks_passed();
+    let total = merged.checks_total();
+    if outcome.errored && passed == 0 {
+        return EvalStatus::Errored;
+    }
+    if total == 0 {
+        return if outcome.errored {
+            EvalStatus::Errored
         } else {
-            Some(patch.unified_diff.clone())
-        },
-        transcript_path: artifacts.transcript_path(),
-        events_path: artifacts.events_path(),
-        report_path: artifacts.report_path(),
-        workspace_path: workspace_dir,
-        provider: config.provider.label(),
-        suites: task.suites.clone(),
-        tags: task.tags.clone(),
-        checks_passed: oracle_report.checks_passed(),
-        checks_total: oracle_report.checks_total(),
-        tool_calls,
-        turns_used,
-        duration_ms: started.elapsed().as_millis() as u64,
-        skipped_reason: None,
+            // No checks but not resolved (e.g. path policy) -> Failed.
+            EvalStatus::Failed
+        };
+    }
+    if passed == 0 {
+        EvalStatus::Failed
+    } else {
+        EvalStatus::Partial
     }
 }
 
-/// Write every per-task artifact for a completed (or failed) run.
-#[allow(clippy::too_many_arguments)]
-fn write_run_artifacts(
-    artifacts: &TaskArtifacts,
-    task: &EvalTask,
-    outcome: &RunOutcome,
-    patch: &PatchInfo,
-    oracle: &OracleReport,
-    score: &EvalScore,
+/// Merge public and hidden reports into one for aggregate counts/status.
+fn merge_reports(public: &OracleReport, hidden: Option<&OracleReport>) -> OracleReport {
+    let mut merged = public.clone();
+    if let Some(h) = hidden {
+        merged.commands.extend(h.commands.iter().cloned());
+        merged.assertions.extend(h.assertions.iter().cloned());
+        merged.behavior.extend(h.behavior.iter().cloned());
+    }
+    merged
+}
+
+/// Concatenate command outputs into a single log string.
+fn commands_log(report: &OracleReport) -> String {
+    let mut s = String::new();
+    for c in &report.commands {
+        s.push_str(&format!(
+            "$ {}\n[exit {:?}{}]\n{}\n{}\n\n",
+            c.command,
+            c.exit_code,
+            if c.timed_out { ", timed out" } else { "" },
+            c.stdout,
+            c.stderr
+        ));
+    }
+    s
+}
+
+/// Bundle of everything `write_run_artifacts` needs.
+struct WriteArtifacts<'a> {
+    artifacts: &'a TaskArtifacts,
+    task: &'a EvalTask,
+    outcome: &'a RunOutcome,
+    patch: &'a PatchInfo,
+    public: &'a OracleReport,
+    hidden: Option<&'a OracleReport>,
+    merged: &'a OracleReport,
+    score: &'a EvalScore,
     status: EvalStatus,
-) {
-    let _ = artifacts.write_jsonl("events.jsonl", &outcome.events);
-    let transcript: Vec<&SdkEvent> = outcome
+    resolved: bool,
+    behavior: &'a BehaviorMetrics,
+    rule_results: &'a [behavior::BehaviorRuleResult],
+    warnings: &'a [String],
+    forbidden: &'a [String],
+    required_missing: &'a [String],
+}
+
+/// Write every per-task artifact for a completed (or failed) run.
+fn write_run_artifacts(w: WriteArtifacts<'_>) {
+    let a = w.artifacts;
+    let _ = a.write_jsonl("events.jsonl", &w.outcome.events);
+    let transcript: Vec<&SdkEvent> = w
+        .outcome
         .events
         .iter()
         .filter(|e| is_transcript_event(e))
         .collect();
-    let _ = artifacts.write_jsonl("transcript.jsonl", &transcript);
-    let _ = std::fs::write(artifacts.final_patch_path(), &patch.unified_diff);
-    let _ = std::fs::write(artifacts.final_diff_path(), &patch.stat);
-    let _ = artifacts.write_command_outputs(&oracle.commands);
-    let _ = artifacts.write_json("score.json", score);
+    let _ = a.write_jsonl("transcript.jsonl", &transcript);
+    // Tool-call log.
+    let tool_calls: Vec<&SdkEvent> = w
+        .outcome
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                SdkEvent::ToolCallStarted(_) | SdkEvent::ToolCallCompleted(_)
+            )
+        })
+        .collect();
+    let _ = a.write_jsonl("tool-calls.jsonl", &tool_calls);
+
+    let _ = std::fs::write(a.final_patch_path(), &w.patch.unified_diff);
+    let _ = std::fs::write(a.final_diff_path(), &w.patch.stat);
+    let _ = a.write_string("patch.diff", &w.patch.unified_diff);
+    let _ = a.write_command_outputs(&w.merged.commands);
+    let _ = a.write_string("public-test.log", &commands_log(w.public));
+    if let Some(h) = w.hidden {
+        let _ = a.write_string("hidden-test.log", &commands_log(h));
+    }
+    let _ = a.write_json("score.json", w.score);
+
+    // Behavior + verification structured artifacts.
+    let _ = a.write_json(
+        "behavior.json",
+        &serde_json::json!({
+            "metrics": w.behavior,
+            "rules": w.rule_results,
+            "warnings": w.warnings,
+        }),
+    );
+    let _ = a.write_json(
+        "verification.json",
+        &serde_json::json!({
+            "resolved": w.resolved,
+            "public": w.public,
+            "hidden": w.hidden,
+            "forbidden_changed": w.forbidden,
+            "required_missing": w.required_missing,
+        }),
+    );
 
     let report = crate::report::render_task_report(
-        task,
-        outcome.errored,
-        &outcome.summary,
-        patch,
-        oracle,
-        score,
-        status,
+        w.task,
+        w.outcome.errored,
+        &w.outcome.summary,
+        w.patch,
+        w.merged,
+        w.score,
+        w.status,
     );
-    let _ = artifacts.write_string("report.md", &report);
+    let _ = a.write_string("report.md", &report);
+
+    // Triage note.
+    let mut triage = format!(
+        "# {} — {:?}\n\nresolved: {}\n",
+        w.task.id, w.status, w.resolved
+    );
+    if !w.warnings.is_empty() {
+        triage.push_str("\nWarnings:\n");
+        for warn in w.warnings {
+            triage.push_str(&format!("- {warn}\n"));
+        }
+    }
+    let _ = a.write_string("triage.md", &triage);
 
     let final_summary = format!(
         "# {} — {:?}\n\n{}\n\nscore: {:.3} (correctness {:.2}, patch {:.2}, process {:.2}, efficiency {:.2})\n\n## Patch\n\n```\n{}\n```\n",
-        task.id,
-        status,
-        outcome.summary,
-        score.total,
-        score.correctness,
-        score.patch_quality,
-        score.process_quality,
-        score.efficiency,
-        if patch.stat.is_empty() { "(no changes)" } else { &patch.stat },
+        w.task.id,
+        w.status,
+        w.outcome.summary,
+        w.score.total,
+        w.score.correctness,
+        w.score.patch_quality,
+        w.score.process_quality,
+        w.score.efficiency,
+        if w.patch.stat.is_empty() { "(no changes)" } else { &w.patch.stat },
     );
-    let _ = artifacts.write_string("final_summary.md", &final_summary);
+    let _ = a.write_string("final_summary.md", &final_summary);
+}
+
+/// Write adapter/isolation/normalized-task metadata up front.
+fn write_metadata_artifacts(artifacts: &TaskArtifacts, task: &EvalTask, config: &RunConfig) {
+    let _ = artifacts.write_json(
+        "adapter.json",
+        &serde_json::json!({ "adapter": config.adapter }),
+    );
+    let _ = artifacts.write_json(
+        "isolation.json",
+        &serde_json::json!({
+            "backend": config.isolation.id(),
+            "network": config.network || task.requires_network,
+            "cpu_limit": config.cpu_limit,
+            "memory_limit": config.memory_limit,
+            "container_image": config.container_image,
+        }),
+    );
+    let _ = artifacts.write_json(
+        "normalized-task.json",
+        &serde_json::json!({
+            "id": task.id,
+            "title": task.title,
+            "schema_version": task.schema_version,
+            "category": task.category,
+            "difficulty": task.difficulty,
+            "suites": task.suites,
+            "tags": task.tags,
+            "capabilities": task.capabilities.enabled_labels(),
+            "has_hidden": task.hidden.as_ref().is_some_and(|h| h.has_checks()),
+            "forbidden_paths": task.forbidden_paths,
+            "required_paths": task.required_paths,
+            "visibility": task.visibility,
+            "quarantined": task.is_quarantined(),
+        }),
+    );
 }
 
 fn persist_manifest(task: &EvalTask, artifacts: &TaskArtifacts) -> std::io::Result<()> {
@@ -474,7 +975,7 @@ fn persist_manifest(task: &EvalTask, artifacts: &TaskArtifacts) -> std::io::Resu
 fn skipped_result(
     task: &EvalTask,
     artifacts: &TaskArtifacts,
-    provider: &ProviderMode,
+    config: &RunConfig,
     reason: String,
     started: Instant,
 ) -> EvalResult {
@@ -484,55 +985,12 @@ fn skipped_result(
         "report.md",
         &format!("# {} — SKIPPED\n\n{reason}\n", task.id),
     );
-    EvalResult {
-        task_id: task.id.clone(),
-        title: task.title.clone(),
-        status: EvalStatus::Skipped,
-        score,
-        patch: None,
-        transcript_path: artifacts.transcript_path(),
-        events_path: artifacts.events_path(),
-        report_path: artifacts.report_path(),
-        workspace_path: artifacts.workspace_dir(),
-        provider: provider.label(),
-        suites: task.suites.clone(),
-        tags: task.tags.clone(),
-        checks_passed: 0,
-        checks_total: task.oracle.check_count(),
-        tool_calls: 0,
-        turns_used: 0,
-        duration_ms: started.elapsed().as_millis() as u64,
-        skipped_reason: Some(reason),
-    }
-}
-
-fn errored_result(
-    task: &EvalTask,
-    run_dir: &RunDir,
-    provider: &ProviderMode,
-    detail: String,
-) -> EvalResult {
-    let dir = run_dir.root.join("tasks").join(&task.id);
-    EvalResult {
-        task_id: task.id.clone(),
-        title: task.title.clone(),
-        status: EvalStatus::Errored,
-        score: EvalScore::zero(format!("errored: {detail}")),
-        patch: None,
-        transcript_path: dir.join("transcript.jsonl"),
-        events_path: dir.join("events.jsonl"),
-        report_path: dir.join("report.md"),
-        workspace_path: dir.join("workspace"),
-        provider: provider.label(),
-        suites: task.suites.clone(),
-        tags: task.tags.clone(),
-        checks_passed: 0,
-        checks_total: task.oracle.check_count(),
-        tool_calls: 0,
-        turns_used: 0,
-        duration_ms: 0,
-        skipped_reason: None,
-    }
+    let mut r = default_result(task, config, EvalStatus::Skipped, &artifacts.dir);
+    r.score = score;
+    r.skipped_reason = Some(reason);
+    r.duration_ms = started.elapsed().as_millis() as u64;
+    let _ = artifacts.write_json("result.json", &r);
+    r
 }
 
 /// Run a selection of tasks sequentially, returning their results.
@@ -547,4 +1005,99 @@ pub async fn run_tasks(
         results.push(result);
     }
     results
+}
+
+/// Run a selection of tasks `repetitions` times. Each repetition writes its
+/// artifacts under `rep-<n>/tasks/<id>` and carries its own seed so prompt
+/// variant selection differs deterministically across repetitions.
+pub async fn run_tasks_repeated(
+    tasks: &[EvalTask],
+    run_dir: &RunDir,
+    config: &RunConfig,
+    repetitions: usize,
+) -> Vec<EvalResult> {
+    let repetitions = repetitions.max(1);
+    let mut all = Vec::new();
+    for rep in 0..repetitions {
+        // Each repetition gets its own sub-run-dir so artifacts never collide.
+        // If a repetition's dir cannot be created, skip it rather than writing
+        // into the parent dir (which would clobber other repetitions' artifacts).
+        let sub = if repetitions == 1 {
+            run_dir.clone()
+        } else {
+            match RunDir::create(&run_dir.root, &format!("rep-{rep}")) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("skipping repetition {rep}: cannot create run dir: {e}");
+                    continue;
+                }
+            }
+        };
+        let mut rep_config = config.clone();
+        rep_config.repetition = rep;
+        rep_config.seed = config.seed.wrapping_add(rep as u64);
+        let results = run_tasks(tasks, &sub, &rep_config).await;
+        all.extend(results);
+    }
+    all
+}
+
+/// Test-only helpers for building `EvalResult` values without a full run.
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A minimal result for aggregation/triage tests.
+    pub fn result_with(
+        task_id: &str,
+        resolved: bool,
+        failure_class: Option<FailureClass>,
+    ) -> EvalResult {
+        EvalResult {
+            task_id: task_id.to_string(),
+            title: task_id.to_string(),
+            status: if resolved {
+                EvalStatus::Passed
+            } else {
+                EvalStatus::Failed
+            },
+            score: EvalScore::zero(""),
+            patch: None,
+            transcript_path: PathBuf::from("t"),
+            events_path: PathBuf::from("e"),
+            report_path: PathBuf::from("r"),
+            workspace_path: PathBuf::from("w"),
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            suites: vec!["rust-mini".to_string()],
+            tags: vec![],
+            checks_passed: if resolved { 1 } else { 0 },
+            checks_total: 1,
+            tool_calls: 3,
+            turns_used: 1,
+            duration_ms: 100,
+            skipped_reason: None,
+            resolved,
+            failure_class,
+            secondary_failures: vec![],
+            public_passed: resolved,
+            hidden_present: false,
+            hidden_passed: None,
+            behavior: BehaviorMetrics::default(),
+            behavior_warnings: vec![],
+            category: Some("bugfix".to_string()),
+            difficulty: Some("easy".to_string()),
+            capabilities: vec![],
+            adapter: "internal".to_string(),
+            isolation: "local".to_string(),
+            quarantined: false,
+            patch_lines_added: 1,
+            patch_lines_removed: 0,
+            repetition: 0,
+            seed: 0,
+            attempts_used: 1,
+            cost_usd: None,
+        }
+    }
 }

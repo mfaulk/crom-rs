@@ -1,5 +1,8 @@
+schema_version = 2
 id = "smoke-noop"
 title = "Smoke: harness plumbing on a pristine fixture"
+category = "negative"
+difficulty = "easy"
 tags = ["smoke", "small"]
 suites = ["smoke"]
 
@@ -11,6 +14,9 @@ anything if the project already satisfies its requirements.
 max_turns = 4
 timeout_secs = 60
 allowed_tools = ["Read", "Glob", "Grep"]
+
+[capabilities]
+negative_noop = true
 
 [fixture]
 kind = "copy_dir"

@@ -115,6 +115,35 @@ pub struct TaskSummary {
     pub turns_used: usize,
     pub duration_ms: u64,
     pub provider: String,
+    // M15 additions.
+    #[serde(default)]
+    pub resolved: bool,
+    #[serde(default)]
+    pub failure_class: Option<crate::failure::FailureClass>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub adapter: String,
+    #[serde(default)]
+    pub isolation: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub quarantined: bool,
+    #[serde(default)]
+    pub behavior_warnings: usize,
+}
+
+/// A resolved-rate aggregation bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggBucket {
+    pub key: String,
+    pub total: usize,
+    pub resolved: usize,
 }
 
 /// Machine-readable summary of a whole run (`summary.json`).
@@ -131,6 +160,55 @@ pub struct RunSummary {
     pub skipped: usize,
     pub mean_score: f64,
     pub tasks: Vec<TaskSummary>,
+    // M15 additions.
+    #[serde(default)]
+    pub resolved: usize,
+    #[serde(default)]
+    pub quarantined: usize,
+    #[serde(default)]
+    pub failure_classes: std::collections::BTreeMap<String, usize>,
+    #[serde(default)]
+    pub by_category: Vec<AggBucket>,
+    #[serde(default)]
+    pub by_tag: Vec<AggBucket>,
+    #[serde(default)]
+    pub by_capability: Vec<AggBucket>,
+    #[serde(default)]
+    pub by_adapter: Vec<AggBucket>,
+    #[serde(default)]
+    pub by_isolation: Vec<AggBucket>,
+    #[serde(default)]
+    pub by_provider: Vec<AggBucket>,
+    #[serde(default)]
+    pub by_model: Vec<AggBucket>,
+}
+
+/// Aggregate resolved-rate by a key extractor (possibly multi-valued).
+fn aggregate_by<'a, F>(tasks: &'a [TaskSummary], key_of: F) -> Vec<AggBucket>
+where
+    F: Fn(&'a TaskSummary) -> Vec<String>,
+{
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for t in tasks {
+        if matches!(t.status, EvalStatus::Skipped) {
+            continue;
+        }
+        for key in key_of(t) {
+            let e = map.entry(key).or_insert((0, 0));
+            e.0 += 1;
+            if t.resolved {
+                e.1 += 1;
+            }
+        }
+    }
+    map.into_iter()
+        .map(|(key, (total, resolved))| AggBucket {
+            key,
+            total,
+            resolved,
+        })
+        .collect()
 }
 
 impl RunSummary {
@@ -147,6 +225,16 @@ impl RunSummary {
             skipped: 0,
             mean_score: 0.0,
             tasks: Vec::new(),
+            resolved: 0,
+            quarantined: 0,
+            failure_classes: std::collections::BTreeMap::new(),
+            by_category: Vec::new(),
+            by_tag: Vec::new(),
+            by_capability: Vec::new(),
+            by_adapter: Vec::new(),
+            by_isolation: Vec::new(),
+            by_provider: Vec::new(),
+            by_model: Vec::new(),
         };
         let mut score_sum = 0.0;
         for r in results {
@@ -157,6 +245,18 @@ impl RunSummary {
                 EvalStatus::Errored => summary.errored += 1,
                 EvalStatus::TimedOut => summary.timed_out += 1,
                 EvalStatus::Skipped => summary.skipped += 1,
+            }
+            if r.resolved {
+                summary.resolved += 1;
+            }
+            if r.quarantined {
+                summary.quarantined += 1;
+            }
+            if let Some(fc) = r.failure_class {
+                *summary
+                    .failure_classes
+                    .entry(fc.key().to_string())
+                    .or_insert(0) += 1;
             }
             score_sum += r.score.total;
             summary.tasks.push(TaskSummary {
@@ -170,11 +270,31 @@ impl RunSummary {
                 turns_used: r.turns_used,
                 duration_ms: r.duration_ms,
                 provider: r.provider.clone(),
+                resolved: r.resolved,
+                failure_class: r.failure_class,
+                category: r.category.clone(),
+                tags: r.tags.clone(),
+                capabilities: r.capabilities.clone(),
+                adapter: r.adapter.clone(),
+                isolation: r.isolation.clone(),
+                model: r.model.clone(),
+                quarantined: r.quarantined,
+                behavior_warnings: r.behavior_warnings.len(),
             });
         }
         if !results.is_empty() {
             summary.mean_score = (score_sum / results.len() as f64 * 1000.0).round() / 1000.0;
         }
+        // Aggregations (exclude skipped tasks).
+        summary.by_category = aggregate_by(&summary.tasks, |t| {
+            vec![t.category.clone().unwrap_or_else(|| "uncategorized".into())]
+        });
+        summary.by_tag = aggregate_by(&summary.tasks, |t| t.tags.clone());
+        summary.by_capability = aggregate_by(&summary.tasks, |t| t.capabilities.clone());
+        summary.by_adapter = aggregate_by(&summary.tasks, |t| vec![t.adapter.clone()]);
+        summary.by_isolation = aggregate_by(&summary.tasks, |t| vec![t.isolation.clone()]);
+        summary.by_provider = aggregate_by(&summary.tasks, |t| vec![t.provider.clone()]);
+        summary.by_model = aggregate_by(&summary.tasks, |t| vec![t.model.clone()]);
         summary
     }
 
@@ -183,6 +303,10 @@ impl RunSummary {
         let mut s = String::new();
         s.push_str(&format!("# Eval run `{}`\n\n", self.run_id));
         s.push_str(&format!("- provider: **{}**\n", self.provider));
+        s.push_str(&format!(
+            "- resolved: **{}/{}**\n",
+            self.resolved, self.total
+        ));
         s.push_str(&format!(
             "- {} tasks: {} passed, {} partial, {} failed, {} errored, {} timed out, {} skipped\n",
             self.total,
@@ -193,14 +317,19 @@ impl RunSummary {
             self.timed_out,
             self.skipped
         ));
+        if self.quarantined > 0 {
+            s.push_str(&format!("- quarantined: {}\n", self.quarantined));
+        }
         s.push_str(&format!("- mean score: {:.3}\n\n", self.mean_score));
-        s.push_str("| task | status | score | checks | tools | turns | ms |\n");
-        s.push_str("|------|--------|-------|--------|-------|-------|----|\n");
+
+        s.push_str("| task | status | resolved | score | checks | tools | turns | ms |\n");
+        s.push_str("|------|--------|----------|-------|--------|-------|-------|----|\n");
         for t in &self.tasks {
             s.push_str(&format!(
-                "| {} | {} | {:.3} | {}/{} | {} | {} | {} |\n",
+                "| {} | {} | {} | {:.3} | {}/{} | {} | {} | {} |\n",
                 t.task_id,
                 t.status.symbol().trim(),
+                if t.resolved { "yes" } else { "no" },
                 t.score,
                 t.checks_passed,
                 t.checks_total,
@@ -209,8 +338,64 @@ impl RunSummary {
                 t.duration_ms
             ));
         }
+        s.push('\n');
+
+        if !self.failure_classes.is_empty() {
+            s.push_str("## Failure classes\n\n");
+            for (k, v) in &self.failure_classes {
+                s.push_str(&format!("- {k}: {v}\n"));
+            }
+            s.push('\n');
+        }
+
+        render_buckets(&mut s, "By category", &self.by_category);
+        render_buckets(&mut s, "By capability", &self.by_capability);
+        render_buckets(&mut s, "By tag", &self.by_tag);
+        render_buckets(&mut s, "By adapter", &self.by_adapter);
+        render_buckets(&mut s, "By isolation", &self.by_isolation);
+        render_buckets(&mut s, "By provider", &self.by_provider);
+        render_buckets(&mut s, "By model", &self.by_model);
+
+        // Behavior summary: passed-but-risky, failed-without-validation, etc.
+        let risky: Vec<&TaskSummary> = self
+            .tasks
+            .iter()
+            .filter(|t| t.resolved && t.behavior_warnings > 0)
+            .collect();
+        if !risky.is_empty() {
+            s.push_str("## Resolved but risky behavior\n\n");
+            for t in risky {
+                s.push_str(&format!(
+                    "- {} ({} warning(s))\n",
+                    t.task_id, t.behavior_warnings
+                ));
+            }
+            s.push('\n');
+        }
         s
     }
+}
+
+/// Render a resolved-rate bucket table when non-empty.
+fn render_buckets(s: &mut String, title: &str, buckets: &[AggBucket]) {
+    if buckets.is_empty() {
+        return;
+    }
+    s.push_str(&format!("## {title}\n\n"));
+    s.push_str("| key | resolved | total | rate |\n");
+    s.push_str("|-----|----------|-------|------|\n");
+    for b in buckets {
+        let rate = if b.total > 0 {
+            b.resolved as f64 / b.total as f64
+        } else {
+            0.0
+        };
+        s.push_str(&format!(
+            "| {} | {} | {} | {:.2} |\n",
+            b.key, b.resolved, b.total, rate
+        ));
+    }
+    s.push('\n');
 }
 
 /// Write `summary.json` and `summary.md` for a run.
@@ -301,36 +486,26 @@ pub fn compare(baseline: &RunSummary, candidate: &RunSummary) -> String {
 mod tests {
     use super::*;
     use crate::score::EvalScore;
-    use std::path::PathBuf;
 
     fn result(id: &str, status: EvalStatus, score: f64) -> EvalResult {
-        EvalResult {
-            task_id: id.to_string(),
-            title: id.to_string(),
-            status,
-            score: EvalScore {
-                total: score,
-                correctness: score,
-                patch_quality: score,
-                process_quality: score,
-                efficiency: score,
-                notes: vec![],
-            },
-            patch: None,
-            transcript_path: PathBuf::from("t"),
-            events_path: PathBuf::from("e"),
-            report_path: PathBuf::from("r"),
-            workspace_path: PathBuf::from("w"),
-            provider: "fake".to_string(),
-            suites: vec![],
-            tags: vec![],
-            checks_passed: if status == EvalStatus::Passed { 1 } else { 0 },
-            checks_total: 1,
-            tool_calls: 2,
-            turns_used: 1,
-            duration_ms: 100,
-            skipped_reason: None,
-        }
+        let resolved = status == EvalStatus::Passed;
+        let mut r = crate::runner::test_support::result_with(id, resolved, None);
+        r.status = status;
+        r.score = EvalScore {
+            total: score,
+            correctness: score,
+            patch_quality: score,
+            process_quality: score,
+            efficiency: score,
+            notes: vec![],
+        };
+        r.suites = vec![];
+        r.category = None;
+        r.tags = vec![];
+        r.checks_passed = if resolved { 1 } else { 0 };
+        r.checks_total = 1;
+        r.tool_calls = 2;
+        r
     }
 
     #[test]

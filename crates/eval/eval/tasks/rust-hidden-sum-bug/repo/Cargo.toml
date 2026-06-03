@@ -1,0 +1,7 @@
+# Empty [workspace] table keeps the parent workspace from absorbing this fixture.
+[workspace]
+
+[package]
+name = "hidden_sum"
+version = "0.1.0"
+edition = "2021"

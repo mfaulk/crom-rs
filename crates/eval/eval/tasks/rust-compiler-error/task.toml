@@ -1,7 +1,10 @@
+schema_version = 2
 id = "rust-compiler-error"
 title = "Repair a broken build after an API change"
-tags = ["rust", "compile", "small"]
-suites = ["rust-small"]
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "compile", "small", "multi-file"]
+suites = ["rust-small", "rust-mini"]
 
 prompt = """
 This crate does not compile: a struct field was renamed but a caller was not
@@ -10,6 +13,11 @@ updated. Make it build and pass tests without changing the test expectations.
 
 max_turns = 20
 timeout_secs = 240
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
 
 [fixture]
 kind = "copy_dir"

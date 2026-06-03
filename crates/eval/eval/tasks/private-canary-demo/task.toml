@@ -1,0 +1,31 @@
+schema_version = 2
+id = "private-canary-demo"
+title = "Private suite demo (omitted from default listings)"
+category = "negative"
+difficulty = "easy"
+tags = ["private", "negative", "small"]
+suites = ["private"]
+visibility = "private"
+
+prompt = """
+Confirm README.md still contains its marker. Make no changes if present.
+"""
+
+max_turns = 4
+timeout_secs = 60
+allowed_tools = ["Read", "Glob", "Grep"]
+
+[capabilities]
+negative_noop = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "none"
+
+[[oracle.assertions]]
+kind = "file_contains"
+path = "README.md"
+text = "PRIV"

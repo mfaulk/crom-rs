@@ -23,18 +23,36 @@
 //! - [`artifacts`] — per-run / per-task artifact bundle.
 //! - [`report`] — human-readable reports and run summaries.
 
+pub mod adapter;
 pub mod artifacts;
+pub mod behavior;
+pub mod external;
+pub mod failure;
 pub mod fixture;
+pub mod index;
+pub mod isolation;
+pub mod multirun;
 pub mod oracle;
 pub mod providers;
 pub mod report;
 pub mod runner;
+pub mod schema;
 pub mod score;
 pub mod task;
+pub mod triage;
+pub mod validate;
 
+pub use adapter::{AdapterRegistry, EvalAdapter};
+pub use behavior::BehaviorMetrics;
+pub use failure::FailureClass;
+pub use isolation::{EnvMetadata, IsolationBackend, LocalBackend};
 pub use oracle::{AssertionResult, BehaviorResult, CommandResult, OracleReport};
 pub use providers::{ProviderMode, ProviderSetup, ProviderUnavailable};
 pub use runner::{EvalResult, EvalStatus, RunConfig};
+pub use schema::{
+    BehaviorRules, Capabilities, HiddenSpec, PromptVariants, Quarantine, Visibility,
+    SUPPORTED_SCHEMA_VERSIONS,
+};
 pub use score::EvalScore;
 pub use task::{
     AssertionSpec, BehaviorSpec, EvalTask, FixtureKind, FixtureSpec, OracleKind, OracleSpec,

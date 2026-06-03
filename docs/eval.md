@@ -1,10 +1,68 @@
-# Coding-Agent Capability Evaluation Harness (M14)
+# Coding-Agent Capability Evaluation Harness (M14 + M15)
 
 The eval harness runs the agent against controlled coding tasks in isolated
 workspaces, scores the result, and emits debuggable artifacts. It answers a
 question unit tests cannot: **given a realistic repository task, can the agent
 inspect code, plan, edit files, run checks, recover from failures, and produce
 a correct patch?**
+
+M15 extends the M14 harness into an adapter-based, schema-versioned,
+isolation-aware, flake-aware, behavior-aware, regression-tracking platform.
+Companion docs:
+
+- [eval-schema.md](eval-schema.md) — the task manifest schema (v1 + v2).
+- [eval-adapters.md](eval-adapters.md) — adapters (internal, directory, and the
+  external benchmark MVPs).
+- [eval-isolation.md](eval-isolation.md) — isolation backends and environment
+  metadata.
+
+## What's new in M15
+
+- **Schema v2** with capability labels, behavior rules, hidden verification,
+  quarantine, visibility, prompt variants, and required/forbidden path policy.
+  M14 (v1) manifests still parse and run unchanged.
+- **Adapters** (`eval adapters`): `internal`, `directory`, plus MVP `swebench`,
+  `aider`, and `terminal` adapters that run local benchmark-style slices through
+  the same pipeline.
+- **Isolation backends** (`--isolation local|docker|podman`) with recorded
+  environment metadata; `local` is the default and works everywhere.
+- **Validation** (`eval validate-task`, `eval validate-suite [--repeat N]`) with
+  flake detection and canary checks (leak detection).
+- **Hidden verification**: checks (and an optional fixture overlay) applied only
+  *after* the agent completes, so the agent cannot overfit to them.
+- **Behavior metrics** derived from the event/patch timeline (read-before-write,
+  test-after-edit, deleted tests, blind edits, lockfile changes, …).
+- **Primary `resolved` score** plus a structured **failure taxonomy**.
+- **Multi-run statistics** (`--repetitions k`): pass@1 / pass@k, per-task
+  variance, failure-class distribution.
+- **Regression index** (`target/code-agent-eval/index.jsonl`) feeding
+  `eval history`, `eval trend`, `eval regressions`, `eval task-history`.
+- **Triage** (`eval triage`, `eval show`, `eval open`).
+
+## M15 command reference
+
+```console
+$ code-agent eval adapters
+$ code-agent eval run <suite|task> --adapter internal
+$ code-agent eval run <path> --adapter directory
+$ code-agent eval run <suite> --isolation local --network false
+$ code-agent eval run <suite> --repetitions 5
+$ code-agent eval run <suite> --prompt-variant concise
+$ code-agent eval run <path> --adapter aider --attempts 2
+$ code-agent eval validate-task <id-or-path>
+$ code-agent eval validate-suite <suite> --repeat 5
+$ code-agent eval history
+$ code-agent eval trend <suite>
+$ code-agent eval regressions --baseline <run-or-sha> --candidate <run-or-sha>
+$ code-agent eval task-history <task-id>
+$ code-agent eval triage <run-id>
+$ code-agent eval show <run-id> <task-id>
+$ code-agent eval open <run-id> <task-id>
+```
+
+A run that uses repetitions writes per-repetition artifacts under
+`<run-id>/rep-<n>/tasks/<task-id>/` and aggregate stats to
+`<run-id>/repetitions.json`.
 
 The harness lives in the `code-agent-eval` crate (`crates/eval`) and is exposed
 through the `code-agent eval` CLI. It drives the agent exclusively through the

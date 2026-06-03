@@ -1,0 +1,41 @@
+schema_version = 2
+id = "noop-already-correct"
+title = "Negative: recognise an already-correct project and make no changes"
+category = "negative"
+difficulty = "easy"
+tags = ["smoke", "negative", "small"]
+suites = ["smoke"]
+
+prompt = """
+Review README.md. If the project already satisfies its requirements, make no
+changes. Do not invent work.
+"""
+
+max_turns = 4
+timeout_secs = 60
+allowed_tools = ["Read", "Glob", "Grep"]
+
+[capabilities]
+negative_noop = true
+
+# Behavior rules are advisory quality signals (not enforced here).
+[behavior]
+require_read_before_write = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "none"
+
+[[oracle.assertions]]
+kind = "file_contains"
+path = "README.md"
+text = "ALL_GOOD"
+
+# A correct agent does not touch the marker.
+[[oracle.assertions]]
+kind = "file_contains"
+path = "README.md"
+text = "Do not change anything"

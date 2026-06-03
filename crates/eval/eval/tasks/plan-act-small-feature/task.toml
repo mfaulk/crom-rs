@@ -1,7 +1,10 @@
+schema_version = 2
 id = "plan-act-small-feature"
 title = "Add a small feature using explicit plan-then-act"
+category = "feature"
+difficulty = "medium"
 tags = ["rust", "feature", "planning", "small"]
-suites = ["rust-small", "planning"]
+suites = ["rust-small", "planning", "rust-mini"]
 mode = "plan_then_act"
 
 prompt = """
@@ -12,6 +15,9 @@ short plan, then implement it. Keep existing tests passing.
 
 max_turns = 24
 timeout_secs = 300
+
+[capabilities]
+requires_test_feedback = true
 
 [fixture]
 kind = "copy_dir"

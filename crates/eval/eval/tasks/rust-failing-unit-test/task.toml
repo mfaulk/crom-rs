@@ -1,7 +1,10 @@
+schema_version = 2
 id = "rust-failing-unit-test"
 title = "Fix a small logic bug exposed by a failing test"
+category = "bugfix"
+difficulty = "easy"
 tags = ["rust", "bugfix", "tests", "small"]
-suites = ["rust-small"]
+suites = ["rust-small", "rust-mini"]
 
 prompt = """
 A unit test is failing. Find and fix the logic bug so the tests pass. Do not
@@ -10,6 +13,10 @@ weaken or delete the test.
 
 max_turns = 20
 timeout_secs = 240
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
 
 [fixture]
 kind = "copy_dir"

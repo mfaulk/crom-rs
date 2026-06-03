@@ -1,7 +1,10 @@
+schema_version = 2
 id = "rust-cli-arg-order"
 title = "Fix a CLI arg-parsing edge case spanning multiple files"
-tags = ["rust", "cli", "bugfix", "small"]
-suites = ["rust-small"]
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "cli", "bugfix", "small", "multi-file"]
+suites = ["rust-small", "rust-mini"]
 
 prompt = """
 The CLI fails when --output is passed after the input path (e.g. `app in.txt
@@ -11,6 +14,12 @@ change the public CLI syntax. Tests describe the expected behavior.
 
 max_turns = 24
 timeout_secs = 300
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_cli_execution = true
 
 [fixture]
 kind = "copy_dir"

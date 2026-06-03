@@ -1,7 +1,10 @@
+schema_version = 2
 id = "rust-refactor-preserve"
 title = "Refactor duplicated code without changing behavior"
+category = "refactor"
+difficulty = "medium"
 tags = ["rust", "refactor", "small"]
-suites = ["rust-small"]
+suites = ["rust-small", "rust-mini"]
 
 prompt = """
 `area_of_circle` and `circumference` duplicate the same PI constant and radius
@@ -12,6 +15,11 @@ and minimal.
 
 max_turns = 20
 timeout_secs = 240
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
 
 [fixture]
 kind = "copy_dir"
