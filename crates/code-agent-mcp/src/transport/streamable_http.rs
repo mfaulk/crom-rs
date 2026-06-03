@@ -145,16 +145,19 @@ impl StreamableHttpMcpTransport {
         if !expect_response || body.trim().is_empty() {
             return Ok(None);
         }
-        let value = if content_type.contains("text/event-stream") {
-            parse_sse_json(&body)?
+        if content_type.contains("text/event-stream") {
+            // A streamable-HTTP server may emit notification/progress events
+            // ahead of the actual JSON-RPC response, so scan every SSE event
+            // and return the response rather than blindly taking the first.
+            parse_sse_response(&body).map(Some)
         } else {
-            serde_json::from_str::<Value>(&body)?
-        };
-        match parse_json_rpc_value(value)? {
-            JsonRpcMessage::Response(resp) => Ok(Some(resp)),
-            other => Err(McpError::InvalidJsonRpc(format!(
-                "expected JSON-RPC response, got {other:?}"
-            ))),
+            let value = serde_json::from_str::<Value>(&body)?;
+            match parse_json_rpc_value(value)? {
+                JsonRpcMessage::Response(resp) => Ok(Some(resp)),
+                other => Err(McpError::InvalidJsonRpc(format!(
+                    "expected JSON-RPC response, got {other:?}"
+                ))),
+            }
         }
     }
 }
@@ -183,23 +186,102 @@ impl McpTransport for StreamableHttpMcpTransport {
     }
 }
 
-fn parse_sse_json(body: &str) -> McpResult<Value> {
-    let mut data = String::new();
-    for line in body.lines() {
-        if let Some(rest) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
+/// Iterate every SSE event in `body` and return the first one whose `data`
+/// parses as a JSON-RPC *response* (as opposed to a leading notification or
+/// progress event). Errors only if no event in the body is a response.
+fn parse_sse_response(body: &str) -> McpResult<JsonRpcResponse> {
+    let mut saw_event = false;
+    let mut last_err: Option<McpError> = None;
+    for data in sse_event_data(body) {
+        saw_event = true;
+        let value: Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(McpError::from(e));
+                continue;
             }
-            data.push_str(rest.trim_start());
-        }
-        if line.trim().is_empty() && !data.trim().is_empty() {
-            break;
+        };
+        match parse_json_rpc_value(value) {
+            Ok(JsonRpcMessage::Response(resp)) => return Ok(resp),
+            Ok(_) => {}
+            Err(e) => last_err = Some(e),
         }
     }
-    if data.trim().is_empty() {
+    if !saw_event {
         return Err(McpError::InvalidJsonRpc(
             "text/event-stream response contained no data".into(),
         ));
     }
-    serde_json::from_str(&data).map_err(McpError::from)
+    Err(last_err.unwrap_or_else(|| {
+        McpError::InvalidJsonRpc(
+            "text/event-stream response contained no JSON-RPC response event".into(),
+        )
+    }))
+}
+
+/// Split an SSE body into the concatenated `data:` payload of each event.
+/// Events are delimited by blank lines; multi-line `data:` fields within an
+/// event are joined with `\n` per the SSE spec.
+fn sse_event_data(body: &str) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut current = String::new();
+    let mut has_data = false;
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            if has_data {
+                events.push(std::mem::take(&mut current));
+            }
+            current.clear();
+            has_data = false;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            if has_data {
+                current.push('\n');
+            }
+            current.push_str(rest.trim_start());
+            has_data = true;
+        }
+    }
+    if has_data {
+        events.push(current);
+    }
+    events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    // A leading notification SSE event must not shadow the real response: the
+    // parser scans all events and returns the JSON-RPC response.
+    fn parse_sse_response_skips_leading_notification() {
+        let body = "event: message\n\
+                    data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":1}}\n\
+                    \n\
+                    event: message\n\
+                    data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\
+                    \n";
+        let resp = parse_sse_response(body).expect("response event must be selected");
+        assert_eq!(resp.id, Some(crate::protocol::JsonRpcId::Number(7)));
+        assert_eq!(resp.result, Some(serde_json::json!({"ok": true})));
+    }
+
+    #[test]
+    // Multi-line data fields within a single event are joined per the SSE spec.
+    fn parse_sse_response_joins_multiline_data() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\n\
+                    data: \"result\":{\"v\":2}}\n\
+                    \n";
+        let resp = parse_sse_response(body).expect("multiline response parses");
+        assert_eq!(resp.id, Some(crate::protocol::JsonRpcId::Number(1)));
+    }
+
+    #[test]
+    // A body containing only notifications yields an error, not a false response.
+    fn parse_sse_response_errors_without_response() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
+        assert!(parse_sse_response(body).is_err());
+    }
 }
