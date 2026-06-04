@@ -1523,4 +1523,465 @@ mod tests {
             warnings[0]
         );
     }
+
+    // --- compare_version_strings: numeric-aware ordering -----------------
+
+    #[test]
+    // Differing segment counts: a strict prefix is the *smaller* version,
+    // and trailing non-numeric (pre-release-ish) segments fall back to
+    // lexical compare instead of panicking.
+    fn version_compare_segment_counts_and_non_numeric() {
+        use std::cmp::Ordering;
+        // 1.2 is older than 1.2.0 (fewer segments => Less).
+        assert_eq!(compare_version_strings("1.2", "1.2.0"), Ordering::Less);
+        assert_eq!(compare_version_strings("1.2.0", "1.2"), Ordering::Greater);
+        // Numeric segments dominate lexical: "9" < "10".
+        assert_eq!(compare_version_strings("1.9.0", "1.10.0"), Ordering::Less);
+        // Non-numeric segment falls back to lexical compare (no parse panic).
+        assert_eq!(
+            compare_version_strings("1.0.0-alpha", "1.0.0-beta"),
+            Ordering::Less
+        );
+        // A numeric segment is *not* equal to a non-numeric one; the
+        // fallback lexical compare decides deterministically.
+        assert_eq!(
+            compare_version_strings("1.x", "1.0"),
+            "x".cmp("0"),
+            "non-numeric vs numeric segment must use lexical fallback"
+        );
+    }
+
+    // --- upsert_enabled_entry: happy + idempotent + unhappy --------------
+
+    fn entry(name: &str) -> EnabledPluginEntry {
+        EnabledPluginEntry {
+            name: name.to_string(),
+            version: Some("1.0.0".to_string()),
+            scope: Some("project".to_string()),
+        }
+    }
+
+    #[test]
+    // Enabling records the install in enabled_plugins and keeps the plugin
+    // out of disabled_plugins.
+    fn upsert_enabled_records_install_and_not_disabled() {
+        let mut v = serde_json::json!({});
+        upsert_enabled_entry(&mut v, &entry("alpha"), true).unwrap();
+        let arr = v["plugins"]["enabled_plugins"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "alpha");
+        assert_eq!(arr[0]["version"], "1.0.0");
+        // No disabled list created (or it does not contain the plugin).
+        assert!(v["plugins"]
+            .get("disabled_plugins")
+            .and_then(|d| d.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    // Disabling still records the install (so prune keeps the cache) but
+    // also adds the plugin to disabled_plugins so the runtime won't load it.
+    fn upsert_disabled_records_install_and_marks_disabled() {
+        let mut v = serde_json::json!({});
+        upsert_enabled_entry(&mut v, &entry("beta"), false).unwrap();
+        let enabled = v["plugins"]["enabled_plugins"].as_array().unwrap();
+        assert_eq!(
+            enabled.len(),
+            1,
+            "install must be recorded even when disabled"
+        );
+        let disabled = v["plugins"]["disabled_plugins"].as_array().unwrap();
+        assert_eq!(disabled, &[serde_json::Value::String("beta".into())]);
+    }
+
+    #[test]
+    // Re-upserting the same plugin must not duplicate the enabled entry or
+    // the disabled marker; the latest record replaces the prior one.
+    fn upsert_is_idempotent_on_repeat() {
+        let mut v = serde_json::json!({});
+        upsert_enabled_entry(&mut v, &entry("gamma"), false).unwrap();
+        upsert_enabled_entry(&mut v, &entry("gamma"), false).unwrap();
+        assert_eq!(v["plugins"]["enabled_plugins"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["plugins"]["disabled_plugins"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    // Enabling a plugin that was previously disabled clears it from
+    // disabled_plugins (re-enable path).
+    fn upsert_enable_clears_prior_disabled_marker() {
+        let mut v = serde_json::json!({});
+        upsert_enabled_entry(&mut v, &entry("delta"), false).unwrap();
+        upsert_enabled_entry(&mut v, &entry("delta"), true).unwrap();
+        let disabled = v["plugins"]["disabled_plugins"].as_array().unwrap();
+        assert!(
+            !disabled.iter().any(|x| x == "delta"),
+            "re-enable must remove the disabled marker, got {disabled:?}"
+        );
+    }
+
+    #[test]
+    // Malformed settings: a non-object root is rejected with a clear error
+    // rather than silently producing a corrupt file.
+    fn upsert_rejects_non_object_root() {
+        let mut v = serde_json::json!([1, 2, 3]);
+        let err = upsert_enabled_entry(&mut v, &entry("x"), true).unwrap_err();
+        assert!(
+            err.to_string().contains("root must be a JSON object"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    // Malformed settings: `plugins` present but not an object is rejected.
+    fn upsert_rejects_non_object_plugins() {
+        let mut v = serde_json::json!({ "plugins": "not-an-object" });
+        let err = upsert_enabled_entry(&mut v, &entry("x"), true).unwrap_err();
+        assert!(
+            err.to_string().contains("`plugins` must be an object"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    // Malformed settings: `enabled_plugins` present but not a list is
+    // rejected (unexpected-type input).
+    fn upsert_rejects_non_list_enabled_plugins() {
+        let mut v = serde_json::json!({ "plugins": { "enabled_plugins": {} } });
+        let err = upsert_enabled_entry(&mut v, &entry("x"), true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`plugins.enabled_plugins` must be a list"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    // Malformed settings on the disabled path: `disabled_plugins` present
+    // but not a list is rejected when disabling.
+    fn upsert_rejects_non_list_disabled_plugins() {
+        let mut v = serde_json::json!({ "plugins": { "disabled_plugins": 7 } });
+        let err = upsert_enabled_entry(&mut v, &entry("x"), false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`plugins.disabled_plugins` must be a list"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // --- remove_enabled_entry --------------------------------------------
+
+    #[test]
+    // Removal drops the plugin from both enabled_plugins and
+    // disabled_plugins, and leaves co-resident plugins untouched.
+    fn remove_enabled_entry_clears_both_lists() {
+        let mut v = serde_json::json!({});
+        upsert_enabled_entry(&mut v, &entry("keep"), true).unwrap();
+        upsert_enabled_entry(&mut v, &entry("drop"), false).unwrap();
+        remove_enabled_entry(&mut v, "drop");
+        let enabled = v["plugins"]["enabled_plugins"].as_array().unwrap();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0]["name"], "keep");
+        let disabled = v["plugins"]["disabled_plugins"].as_array().unwrap();
+        assert!(!disabled.iter().any(|x| x == "drop"));
+    }
+
+    #[test]
+    // Removing from a settings value with no `plugins` key is a no-op and
+    // must not panic.
+    fn remove_enabled_entry_tolerates_missing_plugins() {
+        let mut v = serde_json::json!({ "model": "x" });
+        remove_enabled_entry(&mut v, "anything");
+        assert_eq!(v, serde_json::json!({ "model": "x" }));
+    }
+
+    // --- apply_local_settings_overlay: safety semantics ------------------
+
+    fn settings_with_plugins(p: code_agent_core::PluginsSettingsConfig) -> Settings {
+        Settings {
+            plugins: Some(p),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    // settings.local.json must NOT override a safety toggle already set in
+    // user/project (only fills unset scalars).
+    fn local_overlay_does_not_override_set_safety_toggle() {
+        let mut s = settings_with_plugins(code_agent_core::PluginsSettingsConfig {
+            allow_plugin_bin_path: Some(false), // already locked down
+            ..Default::default()
+        });
+        let local = code_agent_core::SettingsFile {
+            plugins: Some(code_agent_core::PluginsSettingsConfig {
+                allow_plugin_bin_path: Some(true), // local tries to widen
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_local_settings_overlay(&mut s, local);
+        assert_eq!(
+            s.plugins.unwrap().allow_plugin_bin_path,
+            Some(false),
+            "local overlay must never widen a safety toggle already set"
+        );
+    }
+
+    #[test]
+    // When the target toggle is unset, the local overlay fills it in.
+    fn local_overlay_fills_unset_safety_toggle() {
+        let mut s = Settings::default();
+        let local = code_agent_core::SettingsFile {
+            plugins: Some(code_agent_core::PluginsSettingsConfig {
+                allow_plugin_mcp: Some(true),
+                max_plugins: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_local_settings_overlay(&mut s, local);
+        let p = s.plugins.unwrap();
+        assert_eq!(p.allow_plugin_mcp, Some(true));
+        assert_eq!(p.max_plugins, Some(5));
+    }
+
+    #[test]
+    // enabled_plugins is additive: a new plugin is appended, and a local
+    // entry that shares a name replaces (upserts) the target's entry rather
+    // than duplicating it.
+    fn local_overlay_enabled_plugins_upsert_and_append() {
+        let mut s = settings_with_plugins(code_agent_core::PluginsSettingsConfig {
+            enabled_plugins: Some(vec![EnabledPluginEntry {
+                name: "shared".into(),
+                version: Some("1.0.0".into()),
+                scope: Some("project".into()),
+            }]),
+            ..Default::default()
+        });
+        let local = code_agent_core::SettingsFile {
+            plugins: Some(code_agent_core::PluginsSettingsConfig {
+                enabled_plugins: Some(vec![
+                    EnabledPluginEntry {
+                        name: "shared".into(),
+                        version: Some("2.0.0".into()), // newer; should replace
+                        scope: Some("local".into()),
+                    },
+                    EnabledPluginEntry {
+                        name: "fresh".into(),
+                        version: Some("0.1.0".into()),
+                        scope: Some("local".into()),
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_local_settings_overlay(&mut s, local);
+        let list = s.plugins.unwrap().enabled_plugins.unwrap();
+        assert_eq!(list.len(), 2, "shared must upsert, fresh must append");
+        let shared = list.iter().find(|e| e.name == "shared").unwrap();
+        assert_eq!(shared.version.as_deref(), Some("2.0.0"));
+        assert!(list.iter().any(|e| e.name == "fresh"));
+    }
+
+    #[test]
+    // disabled_plugins and marketplaces concatenate without introducing
+    // duplicates.
+    fn local_overlay_lists_dedup() {
+        let mut s = settings_with_plugins(code_agent_core::PluginsSettingsConfig {
+            disabled_plugins: Some(vec!["a".into()]),
+            marketplaces: Some(vec![PathBuf::from("/m/one.json")]),
+            ..Default::default()
+        });
+        let local = code_agent_core::SettingsFile {
+            plugins: Some(code_agent_core::PluginsSettingsConfig {
+                disabled_plugins: Some(vec!["a".into(), "b".into()]),
+                marketplaces: Some(vec![
+                    PathBuf::from("/m/one.json"),
+                    PathBuf::from("/m/two.json"),
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_local_settings_overlay(&mut s, local);
+        let p = s.plugins.unwrap();
+        assert_eq!(p.disabled_plugins.unwrap(), vec!["a", "b"]);
+        assert_eq!(
+            p.marketplaces.unwrap(),
+            vec![PathBuf::from("/m/one.json"), PathBuf::from("/m/two.json")]
+        );
+    }
+
+    #[test]
+    // plugin_config keys from local overlay are merged into the target map.
+    fn local_overlay_merges_plugin_config() {
+        let mut s = Settings::default();
+        s.plugin_config.insert("kept".into(), serde_json::json!(1));
+        let mut pc = std::collections::BTreeMap::new();
+        pc.insert("added".to_string(), serde_json::json!("v"));
+        let local = code_agent_core::SettingsFile {
+            plugin_config: Some(pc),
+            ..Default::default()
+        };
+        apply_local_settings_overlay(&mut s, local);
+        assert_eq!(s.plugin_config.get("kept"), Some(&serde_json::json!(1)));
+        assert_eq!(s.plugin_config.get("added"), Some(&serde_json::json!("v")));
+    }
+
+    // --- read_settings_json: parsing happy/unhappy (file-backed) ---------
+
+    #[test]
+    // A missing settings file resolves to an empty object rather than an
+    // error, so first-time installs don't blow up.
+    fn read_settings_missing_file_is_empty_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.json");
+        let v = read_settings_json(&path).unwrap();
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    // An empty (zero-byte) settings file is treated as an empty object.
+    fn read_settings_empty_file_is_empty_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"").unwrap();
+        let v = read_settings_json(&path).unwrap();
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    // Malformed JSON is rejected with a context-bearing parse error, and
+    // the error references the offending path.
+    fn read_settings_malformed_json_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{ not valid json ").unwrap();
+        let err = read_settings_json(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parse") && msg.contains("settings.json"),
+            "expected a parse error naming the file, got: {msg}"
+        );
+    }
+
+    // --- user_config_home: env precedence (nextest-safe scoping) ---------
+
+    #[test]
+    // CODE_AGENT_CONFIG_HOME takes precedence over XDG_CONFIG_HOME and HOME.
+    // Uses temp_env scoped mutation (no raw std::env::set_var) so the test
+    // is safe under nextest's process-per-test isolation.
+    fn user_config_home_prefers_explicit_override() {
+        temp_env::with_vars(
+            [
+                ("CODE_AGENT_CONFIG_HOME", Some("/explicit/cfg")),
+                ("XDG_CONFIG_HOME", Some("/xdg")),
+                ("HOME", Some("/home/u")),
+            ],
+            || {
+                assert_eq!(user_config_home(), Some(PathBuf::from("/explicit/cfg")));
+            },
+        );
+    }
+
+    #[test]
+    // With no explicit override, XDG_CONFIG_HOME is used and suffixed with
+    // the app subdir.
+    fn user_config_home_uses_xdg_then_home() {
+        temp_env::with_vars(
+            [
+                ("CODE_AGENT_CONFIG_HOME", None::<&str>),
+                ("XDG_CONFIG_HOME", Some("/xdg")),
+                ("HOME", Some("/home/u")),
+            ],
+            || {
+                assert_eq!(user_config_home(), Some(PathBuf::from("/xdg/code-agent")));
+            },
+        );
+        temp_env::with_vars(
+            [
+                ("CODE_AGENT_CONFIG_HOME", None::<&str>),
+                ("XDG_CONFIG_HOME", None::<&str>),
+                ("HOME", Some("/home/u")),
+            ],
+            || {
+                assert_eq!(
+                    user_config_home(),
+                    Some(PathBuf::from("/home/u/.config/code-agent"))
+                );
+            },
+        );
+    }
+
+    #[test]
+    // With none of the env vars set, there is no resolvable config home.
+    fn user_config_home_none_when_env_absent() {
+        temp_env::with_vars(
+            [
+                ("CODE_AGENT_CONFIG_HOME", None::<&str>),
+                ("XDG_CONFIG_HOME", None::<&str>),
+                ("HOME", None::<&str>),
+            ],
+            || {
+                assert_eq!(user_config_home(), None);
+            },
+        );
+    }
+
+    // --- settings_path_for_scope: scope -> path mapping ------------------
+
+    #[test]
+    // Project/Managed scopes write to .agent/settings.json; Local writes to
+    // settings.local.json; all are confined under the workspace dir.
+    fn settings_path_for_scope_maps_project_and_local() {
+        let cwd = Path::new("/ws");
+        let proj = settings_path_for_scope(cwd, PluginScope::Project).unwrap();
+        assert_eq!(proj, PathBuf::from("/ws/.agent/settings.json"));
+        let managed = settings_path_for_scope(cwd, PluginScope::Managed).unwrap();
+        assert_eq!(managed, PathBuf::from("/ws/.agent/settings.json"));
+        let local = settings_path_for_scope(cwd, PluginScope::Local).unwrap();
+        assert_eq!(local, PathBuf::from("/ws/.agent/settings.local.json"));
+        // The resolved path stays inside the workspace (no traversal).
+        assert!(proj.starts_with(cwd));
+        assert!(local.starts_with(cwd));
+    }
+
+    #[test]
+    // User scope requires a resolvable config home; with the env cleared it
+    // errors instead of silently picking a path outside the user's control.
+    fn settings_path_for_scope_user_requires_config_home() {
+        temp_env::with_vars(
+            [
+                ("CODE_AGENT_CONFIG_HOME", None::<&str>),
+                ("XDG_CONFIG_HOME", None::<&str>),
+                ("HOME", None::<&str>),
+            ],
+            || {
+                let err = settings_path_for_scope(Path::new("/ws"), PluginScope::User).unwrap_err();
+                assert!(
+                    err.to_string().contains("user-config home"),
+                    "unexpected error: {err}"
+                );
+            },
+        );
+    }
+
+    // --- parse_scope: lenient parse + rejection --------------------------
+
+    #[test]
+    // Known scope names parse case-insensitively; an unknown token is
+    // rejected with the offending value echoed back.
+    fn parse_scope_accepts_known_rejects_unknown() {
+        assert!(matches!(
+            parse_scope("Project").unwrap(),
+            PluginScope::Project
+        ));
+        assert!(matches!(parse_scope("local").unwrap(), PluginScope::Local));
+        let err = parse_scope("bogus").unwrap_err();
+        assert!(err.to_string().contains("bogus"), "got: {err}");
+    }
 }
