@@ -171,10 +171,18 @@ pub(crate) async fn execute_request(
             r = execute_plan(runtime.clone(), plan_req) => r?,
             _ = cancellation.cancelled() => {
                 let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                // A deadline-driven cancel must surface as TimedOut, not
+                // Cancelled, on the plan-only path too — mirroring the regular
+                // run finalization (#212 / #40).
+                let status = if deadline_fired.load(Ordering::SeqCst) {
+                    AgentRunStatus::TimedOut
+                } else {
+                    AgentRunStatus::Cancelled
+                };
                 return Ok(AgentRunResult {
                     run_id,
                     session_id,
-                    status: AgentRunStatus::Cancelled,
+                    status,
                     summary: String::new(),
                     artifacts: CodeArtifacts::empty(),
                     patch: None,
@@ -253,6 +261,7 @@ pub(crate) async fn execute_request(
                 metadata,
                 started,
                 "plan generation cancelled",
+                deadline_fired.load(Ordering::SeqCst),
             )),
         };
         let act_req = ActRequest {
@@ -278,6 +287,7 @@ pub(crate) async fn execute_request(
                 metadata,
                 started,
                 "plan act cancelled",
+                deadline_fired.load(Ordering::SeqCst),
             )),
         };
     }
@@ -677,6 +687,7 @@ pub(crate) async fn execute_request(
 /// the SDK can return immediately without waiting for the underlying
 /// core driver to wind down (#145, #155 follow-up: covers the plan/act
 /// paths the codex reviewer flagged as still uncancellable).
+#[allow(clippy::too_many_arguments)]
 fn cancelled_result(
     run_id: RunId,
     session_id: Option<SessionId>,
@@ -685,12 +696,21 @@ fn cancelled_result(
     metadata: crate::request::RequestMetadata,
     started: Instant,
     reason: &str,
+    timed_out: bool,
 ) -> AgentRunResult {
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    // A deadline-driven cancel must surface as TimedOut, not Cancelled, on the
+    // plan-then-act paths too — mirroring the regular run finalization
+    // (#212 / #40).
+    let status = if timed_out {
+        AgentRunStatus::TimedOut
+    } else {
+        AgentRunStatus::Cancelled
+    };
     AgentRunResult {
         run_id,
         session_id,
-        status: AgentRunStatus::Cancelled,
+        status,
         summary: String::new(),
         artifacts: CodeArtifacts::empty(),
         patch: None,
