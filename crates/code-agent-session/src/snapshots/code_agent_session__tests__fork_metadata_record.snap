@@ -1,0 +1,14 @@
+---
+source: crates/code-agent-session/src/lib.rs
+expression: fork
+---
+{
+  "schema_version": 1,
+  "timestamp": "2026-06-04T00:00:00Z",
+  "cwd": "/work/project",
+  "session_id": "sess-fixed-0001",
+  "payload": {
+    "kind": "fork_metadata",
+    "source_session_id": "sess-source-0000"
+  }
+}

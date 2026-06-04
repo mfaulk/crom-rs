@@ -843,4 +843,173 @@ mod tests {
         assert!(validate_model_id("foo bar").is_err());
         assert!(validate_model_id("a:generateContent?key=evil").is_err());
     }
+
+    // ------------------------------------------------------------------
+    // Snapshot tests (insta): lock the FULL serialized generateContent
+    // request body wire shape.
+    // ------------------------------------------------------------------
+
+    /// Representative request exercising every `build_body` branch:
+    /// system_instruction, a user prompt, an assistant turn with a
+    /// functionCall, a function response (with the gemini- prefix
+    /// stripped), and a declared functionDeclarations tool.
+    fn representative_request() -> ModelRequest {
+        use code_agent_core::{ContentBlock, ConvToolResult, Message, MessageRole};
+        ModelRequest {
+            model: "gemini-1.5-pro".into(),
+            system: Some("You are a careful coding agent.".into()),
+            messages: vec![
+                Message::user_text("read foo"),
+                Message {
+                    role: MessageRole::Assistant,
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "Reading.".into(),
+                        },
+                        ContentBlock::ToolUse(ToolCall {
+                            id: "gemini-Read#0".into(),
+                            name: "Read".into(),
+                            input: serde_json::json!({"path": "foo"}),
+                        }),
+                    ],
+                },
+                Message {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::ToolResult(ConvToolResult {
+                        tool_use_id: "gemini-Read#0".into(),
+                        content: vec![ToolResultContent::Text {
+                            text: "hello world".into(),
+                        }],
+                        is_error: false,
+                    })],
+                },
+            ],
+            tools: vec![ToolSchema {
+                name: "Read".into(),
+                description: "read a file".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                }),
+            }],
+            deferred_tools: vec![],
+            tool_search_config: None,
+            max_tokens: 512,
+        }
+    }
+
+    #[test]
+    // Snapshot the entire serialized Gemini generateContent request body.
+    fn snapshot_build_body() {
+        let body = build_body(&representative_request());
+        insta::assert_json_snapshot!(body);
+    }
+
+    // ------------------------------------------------------------------
+    // Property tests (proptest): `generate_response_to_events` must never
+    // panic and must produce a coherent event stream; `validate_model_id`
+    // must never panic and must never accept a URL-altering identifier.
+    // ------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Arbitrary-but-plausible generateContent response JSON: missing
+    /// fields, multiple candidates, text and/or functionCall parts (incl.
+    /// parallel calls to the same function), and optional usageMetadata.
+    fn generate_response_json_strategy() -> impl Strategy<Value = Value> {
+        let part = prop_oneof![
+            ".{0,16}".prop_map(|t| serde_json::json!({"text": t})),
+            (
+                "[A-Za-z_]{1,8}",
+                prop_oneof![
+                    Just(serde_json::json!({"path": "x"})),
+                    Just(serde_json::json!({})),
+                    Just(serde_json::json!([1, 2])),
+                ]
+            )
+                .prop_map(|(name, args)| serde_json::json!({
+                    "functionCall": {"name": name, "args": args}
+                })),
+        ];
+        let candidate = (
+            proptest::collection::vec(part, 0..5),
+            prop_oneof![
+                Just(serde_json::Value::Null),
+                Just(serde_json::json!("STOP")),
+                Just(serde_json::json!("TOOL_CALL")),
+            ],
+        )
+            .prop_map(|(parts, finish_reason)| {
+                serde_json::json!({
+                    "content": {"parts": parts},
+                    "finishReason": finish_reason,
+                })
+            });
+        (
+            proptest::collection::vec(candidate, 0..3),
+            prop_oneof![
+                Just(serde_json::Value::Null),
+                (0u64..1000, 0u64..1000).prop_map(|(p, c)| serde_json::json!({
+                    "promptTokenCount": p, "candidatesTokenCount": c
+                })),
+            ],
+        )
+            .prop_map(|(candidates, usage)| {
+                serde_json::json!({"candidates": candidates, "usageMetadata": usage})
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // generate_response_to_events must NEVER panic and must produce a
+        // coherent stream. Invariants:
+        //  - first event is MessageStart, last is MessageStop;
+        //  - every ToolCall id is unique within the stream, non-empty, and
+        //    round-trips back to its original function name via
+        //    strip_gemini_id_prefix (ids preserved, #172 disambiguation
+        //    holds even for parallel calls to the same function).
+        #[test]
+        fn generate_response_to_events_never_panics_and_is_coherent(json in generate_response_json_strategy()) {
+            let resp: GenerateResponse = match serde_json::from_value(json) {
+                Ok(r) => r,
+                Err(_) => return Ok(()),
+            };
+            let events = generate_response_to_events(resp);
+
+            let first_is_start = matches!(events.first(), Some(ModelEvent::MessageStart));
+            let last_is_stop = matches!(events.last(), Some(ModelEvent::MessageStop { .. }));
+            prop_assert!(first_is_start, "first event must be MessageStart");
+            prop_assert!(last_is_stop, "last event must be MessageStop");
+
+            let mut seen_ids = std::collections::HashSet::new();
+            for e in &events {
+                if let ModelEvent::ToolCall(tc) = e {
+                    prop_assert!(!tc.id.is_empty(), "tool call id must be non-empty");
+                    prop_assert!(tc.id.starts_with(GEMINI_TOOL_CALL_ID_PREFIX), "synthetic id must carry prefix");
+                    prop_assert!(seen_ids.insert(tc.id.clone()), "tool call ids must be unique within a response (#172)");
+                    // The wire-form name recovered from the id matches the
+                    // declared function name (round-trip preserved).
+                    prop_assert_eq!(strip_gemini_id_prefix(&tc.id), tc.name.clone());
+                }
+            }
+        }
+
+        // validate_model_id must NEVER panic on arbitrary strings, and any
+        // accepted id must contain ONLY the URL-safe charset [A-Za-z0-9._-]
+        // (so it can never rewrite the request path or smuggle a query).
+        #[test]
+        fn validate_model_id_never_accepts_url_altering_input(s in ".{0,40}") {
+            // A rejected id (Err) is fine; we only constrain accepted ids.
+            if let Ok(accepted) = validate_model_id(&s) {
+                prop_assert_eq!(accepted, s.as_str());
+                prop_assert!(!s.is_empty());
+                prop_assert!(
+                    s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+                    "accepted model id {s:?} contains a disallowed byte"
+                );
+            }
+        }
+    }
 }

@@ -910,4 +910,178 @@ mod tests {
         assert_eq!(tool_call.input, Value::Object(Default::default()));
         assert!(!matches!(tool_call.input, Value::String(_)));
     }
+
+    // ------------------------------------------------------------------
+    // Snapshot tests (insta): lock the FULL serialized Chat Completions
+    // request body wire shape.
+    // ------------------------------------------------------------------
+
+    /// Representative request exercising every `build_body` branch:
+    /// system prompt, a user prompt, an assistant turn carrying a
+    /// tool_use, a tool result (flattened into a `role:"tool"` message),
+    /// an error tool result (ERROR: prefix), and declared tools.
+    fn representative_request() -> ModelRequest {
+        use code_agent_core::{ContentBlock, ConvToolResult, Message, MessageRole};
+        ModelRequest {
+            model: "gpt-4.1".into(),
+            system: Some("You are a careful coding agent.".into()),
+            messages: vec![
+                Message::user_text("read foo and bar"),
+                Message {
+                    role: MessageRole::Assistant,
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "On it.".into(),
+                        },
+                        ContentBlock::ToolUse(ToolCall {
+                            id: "call_42".into(),
+                            name: "Read".into(),
+                            input: serde_json::json!({"path": "foo"}),
+                        }),
+                    ],
+                },
+                Message {
+                    role: MessageRole::User,
+                    content: vec![
+                        ContentBlock::ToolResult(ConvToolResult {
+                            tool_use_id: "call_42".into(),
+                            content: vec![ToolResultContent::Text {
+                                text: "hello world".into(),
+                            }],
+                            is_error: false,
+                        }),
+                        ContentBlock::ToolResult(ConvToolResult {
+                            tool_use_id: "call_43".into(),
+                            content: vec![ToolResultContent::Text {
+                                text: "permission denied".into(),
+                            }],
+                            is_error: true,
+                        }),
+                    ],
+                },
+            ],
+            tools: vec![ToolSchema {
+                name: "Read".into(),
+                description: "read a file".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                }),
+            }],
+            deferred_tools: vec![],
+            tool_search_config: None,
+            max_tokens: 512,
+        }
+    }
+
+    #[test]
+    // Snapshot the entire serialized OpenAI Chat Completions request body.
+    fn snapshot_build_body() {
+        let body = build_body(&representative_request());
+        insta::assert_json_snapshot!(body);
+    }
+
+    // ------------------------------------------------------------------
+    // Property tests (proptest): `chat_response_to_events` must never
+    // panic and must produce a coherent event stream on arbitrary input.
+    // ------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Strategy producing arbitrary-but-plausible Chat Completions JSON:
+    /// missing fields, multiple choices, null content, varied tool-call
+    /// argument strings (valid JSON, empty, garbage), and optional usage.
+    fn chat_response_json_strategy() -> impl Strategy<Value = Value> {
+        let tool_call = (
+            "[a-z_0-9]{1,8}",
+            "[A-Za-z_]{1,8}",
+            prop_oneof![
+                Just("{\"path\":\"x\"}".to_string()),
+                Just("".to_string()),
+                Just("   ".to_string()),
+                Just("not json".to_string()),
+                Just("[1,2,3]".to_string()),
+            ],
+        )
+            .prop_map(|(id, name, args)| {
+                serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                })
+            });
+        let message = (
+            prop_oneof![
+                Just(serde_json::Value::Null),
+                ".{0,16}".prop_map(serde_json::Value::String),
+            ],
+            proptest::collection::vec(tool_call, 0..4),
+        )
+            .prop_map(|(content, tool_calls)| {
+                serde_json::json!({"content": content, "tool_calls": tool_calls})
+            });
+        let choice = (
+            message,
+            prop_oneof![
+                Just(serde_json::Value::Null),
+                Just(serde_json::json!("stop")),
+                Just(serde_json::json!("tool_calls")),
+            ],
+        )
+            .prop_map(|(message, finish_reason)| {
+                serde_json::json!({"message": message, "finish_reason": finish_reason})
+            });
+        (
+            proptest::collection::vec(choice, 0..3),
+            prop_oneof![
+                Just(serde_json::Value::Null),
+                (0u64..1000, 0u64..1000).prop_map(|(p, c)| {
+                    serde_json::json!({"prompt_tokens": p, "completion_tokens": c})
+                }),
+            ],
+        )
+            .prop_map(|(choices, usage)| serde_json::json!({"choices": choices, "usage": usage}))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // chat_response_to_events must NEVER panic on arbitrary
+        // (well-typed-but-unusual) response bodies and must produce a
+        // coherent event stream. Invariants:
+        //  - the first event is always MessageStart and the last is
+        //    always MessageStop (well-formed envelope);
+        //  - every ToolCall preserves a non-empty id/name and its input
+        //    is never a bare empty string (#44: empty args -> {});
+        //  - no panic from JSON re-parsing of arbitrary argument strings.
+        #[test]
+        fn chat_response_to_events_never_panics_and_is_coherent(json in chat_response_json_strategy()) {
+            // The deserialize itself must not panic; skip inputs that do
+            // not fit the typed schema (the production path returns an
+            // error there, which is out of scope for this parser fn).
+            let resp: ChatResponse = match serde_json::from_value(json) {
+                Ok(r) => r,
+                Err(_) => return Ok(()),
+            };
+            let events = chat_response_to_events(resp);
+
+            let first_is_start = matches!(events.first(), Some(ModelEvent::MessageStart));
+            let last_is_stop = matches!(events.last(), Some(ModelEvent::MessageStop { .. }));
+            prop_assert!(first_is_start, "first event must be MessageStart");
+            prop_assert!(last_is_stop, "last event must be MessageStop");
+            for e in &events {
+                if let ModelEvent::ToolCall(tc) = e {
+                    prop_assert!(!tc.id.is_empty(), "tool call id preserved");
+                    prop_assert!(!tc.name.is_empty(), "tool call name preserved");
+                    // Empty/whitespace arguments must map to {}, never a
+                    // bare String("") that breaks object deserializers.
+                    prop_assert!(
+                        !matches!(&tc.input, Value::String(s) if s.trim().is_empty()),
+                        "empty args must become an object, not an empty string"
+                    );
+                }
+            }
+        }
+    }
 }

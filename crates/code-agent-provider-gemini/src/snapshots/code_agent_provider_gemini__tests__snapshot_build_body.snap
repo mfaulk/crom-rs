@@ -1,0 +1,78 @@
+---
+source: crates/code-agent-provider-gemini/src/lib.rs
+expression: body
+---
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "read foo"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "parts": [
+        {
+          "text": "Reading."
+        },
+        {
+          "functionCall": {
+            "args": {
+              "path": "foo"
+            },
+            "name": "Read"
+          }
+        }
+      ],
+      "role": "model"
+    },
+    {
+      "parts": [
+        {
+          "functionResponse": {
+            "name": "Read",
+            "response": {
+              "isError": false,
+              "output": "hello world"
+            }
+          }
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 512
+  },
+  "system_instruction": {
+    "parts": [
+      {
+        "text": "You are a careful coding agent."
+      }
+    ],
+    "role": "system"
+  },
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "description": "read a file",
+          "name": "Read",
+          "parameters": {
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

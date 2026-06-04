@@ -1542,4 +1542,263 @@ mod tests {
         assert!(matches!(&got[1], ModelEvent::TextDelta { text } if text == "hi"));
         assert!(matches!(got[2], ModelEvent::MessageStop { .. }));
     }
+
+    // ------------------------------------------------------------------
+    // Snapshot tests (insta): lock the FULL serialized request body so any
+    // unintended field rename/addition/removal is caught.
+    // ------------------------------------------------------------------
+
+    /// A representative request exercising every `build_body` branch:
+    /// system prompt, multi-turn messages, a tool_use + tool_result
+    /// round-trip, declared tools, and Anthropic-native BM25 deferred
+    /// tools (`tool_search` + a `deferred` tool).
+    fn representative_request() -> ModelRequest {
+        use code_agent_core::provider::ToolSchema;
+        use code_agent_core::{ContentBlock, ConvToolResult, Message, MessageRole, ToolCall};
+        ModelRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: Some("You are a careful coding agent.".into()),
+            messages: vec![
+                Message::user_text("read /etc/hosts"),
+                Message {
+                    role: MessageRole::Assistant,
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "Reading it now.".into(),
+                        },
+                        ContentBlock::ToolUse(ToolCall {
+                            id: "toolu_abc".into(),
+                            name: "Read".into(),
+                            input: serde_json::json!({"path": "/etc/hosts"}),
+                        }),
+                    ],
+                },
+                Message {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::ToolResult(ConvToolResult {
+                        tool_use_id: "toolu_abc".into(),
+                        content: vec![code_agent_core::ToolResultContent::Text {
+                            text: "127.0.0.1 localhost".into(),
+                        }],
+                        is_error: false,
+                    })],
+                },
+            ],
+            tools: vec![ToolSchema {
+                name: "SearchTools".into(),
+                description: "search the tool catalog".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                }),
+            }],
+            deferred_tools: vec![ToolSchema {
+                name: "mcp__github__list_issues".into(),
+                description: "List GitHub issues".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            tool_search_config: Some(code_agent_core::ToolSearchProviderConfig {
+                native_mode: NativeToolSearchMode::AnthropicBm25,
+                local_search_enabled: true,
+                strategy: code_agent_core::ToolSearchStrategy::Hybrid,
+            }),
+            max_tokens: 1024,
+        }
+    }
+
+    #[test]
+    // Snapshot the entire serialized Anthropic request body wire shape.
+    fn snapshot_build_body() {
+        let body = build_body(&representative_request());
+        insta::assert_json_snapshot!(body);
+    }
+
+    // ------------------------------------------------------------------
+    // Property tests (proptest): `parse_sse` must never panic and must
+    // produce a coherent event stream on arbitrary-but-plausible input.
+    // ------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// One SSE `data:` frame, modeled as the kinds the parser understands
+    /// plus deliberately malformed/forward-incompatible frames. The
+    /// generated strategy emits these in arbitrary order with missing or
+    /// extra fields so the parser's tolerance/robustness is exercised.
+    #[derive(Debug, Clone)]
+    enum FuzzFrame {
+        MessageStart,
+        ContentBlockStartText(u32),
+        ContentBlockStartTool {
+            index: u32,
+            id: String,
+            name: String,
+        },
+        TextDelta {
+            index: u32,
+            text: String,
+        },
+        JsonDelta {
+            index: u32,
+            partial: String,
+        },
+        ContentBlockStop(u32),
+        MessageDelta {
+            stop: Option<String>,
+        },
+        MessageStop,
+        Ping,
+        Error(String),
+        Garbage(String),
+        Empty,
+    }
+
+    fn frame_to_data(f: &FuzzFrame) -> String {
+        match f {
+            FuzzFrame::MessageStart => r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#.to_string(),
+            FuzzFrame::ContentBlockStartText(i) => serde_json::json!({
+                "type":"content_block_start","index":i,
+                "content_block":{"type":"text","text":""}
+            }).to_string(),
+            FuzzFrame::ContentBlockStartTool { index, id, name } => serde_json::json!({
+                "type":"content_block_start","index":index,
+                "content_block":{"type":"tool_use","id":id,"name":name,"input":{}}
+            }).to_string(),
+            FuzzFrame::TextDelta { index, text } => serde_json::json!({
+                "type":"content_block_delta","index":index,
+                "delta":{"type":"text_delta","text":text}
+            }).to_string(),
+            FuzzFrame::JsonDelta { index, partial } => serde_json::json!({
+                "type":"content_block_delta","index":index,
+                "delta":{"type":"input_json_delta","partial_json":partial}
+            }).to_string(),
+            FuzzFrame::ContentBlockStop(i) => serde_json::json!({
+                "type":"content_block_stop","index":i
+            }).to_string(),
+            FuzzFrame::MessageDelta { stop } => serde_json::json!({
+                "type":"message_delta","delta":{"stop_reason":stop}
+            }).to_string(),
+            FuzzFrame::MessageStop => r#"{"type":"message_stop"}"#.to_string(),
+            FuzzFrame::Ping => r#"{"type":"ping"}"#.to_string(),
+            FuzzFrame::Error(msg) => serde_json::json!({
+                "type":"error","error":{"type":"overloaded_error","message":msg}
+            }).to_string(),
+            FuzzFrame::Garbage(s) => s.clone(),
+            FuzzFrame::Empty => String::new(),
+        }
+    }
+
+    fn frame_strategy() -> impl Strategy<Value = FuzzFrame> {
+        // Tool ids/names from a small alphabet; indices kept small so
+        // blocks collide and interleave. `partial` includes both valid
+        // JSON fragments and junk to drive the reassembly error path.
+        let id = "[a-z_]{1,6}";
+        let name = "[A-Za-z_]{1,6}";
+        prop_oneof![
+            Just(FuzzFrame::MessageStart),
+            (0u32..3).prop_map(FuzzFrame::ContentBlockStartText),
+            (0u32..3, id, name).prop_map(|(index, id, name)| {
+                FuzzFrame::ContentBlockStartTool { index, id, name }
+            }),
+            (0u32..3, ".{0,12}").prop_map(|(index, text)| FuzzFrame::TextDelta { index, text }),
+            (
+                0u32..3,
+                prop_oneof![
+                    Just("{\"k\":1}".to_string()),
+                    Just("{\"path\":".to_string()),
+                    Just("\"v\"}".to_string()),
+                    Just("not json".to_string()),
+                    Just(String::new()),
+                ]
+            )
+                .prop_map(|(index, partial)| FuzzFrame::JsonDelta { index, partial }),
+            (0u32..3).prop_map(FuzzFrame::ContentBlockStop),
+            prop_oneof![
+                Just(FuzzFrame::MessageDelta { stop: None }),
+                Just(FuzzFrame::MessageDelta {
+                    stop: Some("end_turn".into())
+                }),
+                Just(FuzzFrame::MessageDelta {
+                    stop: Some("tool_use".into())
+                }),
+            ],
+            Just(FuzzFrame::MessageStop),
+            Just(FuzzFrame::Ping),
+            ".{0,12}".prop_map(FuzzFrame::Error),
+            prop_oneof![
+                Just(FuzzFrame::Garbage("{ not valid".to_string())),
+                Just(FuzzFrame::Garbage("[]".to_string())),
+                Just(FuzzFrame::Garbage(
+                    "{\"type\":\"future_event\"}".to_string()
+                )),
+            ],
+            Just(FuzzFrame::Empty),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // parse_sse must NEVER panic and must produce a coherent event
+        // stream for arbitrary frame sequences (out-of-order, missing
+        // fields, garbage, truncation). Invariants asserted:
+        //  - the spawned task never panics (the runtime drives it to
+        //    completion without an unwrap-blowup);
+        //  - any emitted ToolCall carries a non-empty id/name that was
+        //    declared by a matching content_block_start (ids preserved,
+        //    no partial-state corruption);
+        //  - at most one error is emitted and it is always the final item
+        //    (the stream terminates cleanly on error / truncation).
+        #[test]
+        fn parse_sse_never_panics_and_is_coherent(frames in proptest::collection::vec(frame_strategy(), 0..24)) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                // Collect every (id, name) announced by a content_block_start
+                // tool frame. We collect *all* of them (not keyed by index)
+                // because a block index may be reused across the stream, so
+                // an emitted ToolCall need only match some declared start.
+                let mut declared: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                for f in &frames {
+                    if let FuzzFrame::ContentBlockStartTool { index: _, id, name } = f {
+                        declared.insert((id.clone(), name.clone()));
+                    }
+                }
+
+                let datas: Vec<String> = frames.iter().map(frame_to_data).collect();
+                let events: Vec<_> = datas.iter().map(|d| sse_event(d)).collect();
+                let stream = futures::stream::iter(events);
+                let out: Vec<Result<ModelEvent, ProviderError>> = parse_sse(stream).collect().await;
+
+                let mut saw_terminal_err = false;
+                for (i, item) in out.iter().enumerate() {
+                    match item {
+                        Ok(ModelEvent::ToolCall(tc)) => {
+                            // No error may precede a successful event.
+                            prop_assert!(!saw_terminal_err, "event after terminal error");
+                            // Ids/names are preserved from a declared block.
+                            prop_assert!(!tc.id.is_empty(), "tool call id must be non-empty");
+                            prop_assert!(!tc.name.is_empty(), "tool call name must be non-empty");
+                            prop_assert!(
+                                declared.contains(&(tc.id.clone(), tc.name.clone())),
+                                "emitted ToolCall {tc:?} was never declared by a content_block_start"
+                            );
+                        }
+                        Ok(_) => {
+                            prop_assert!(!saw_terminal_err, "event after terminal error");
+                        }
+                        Err(_) => {
+                            // An error (server error frame OR truncation
+                            // synthetic) must be the LAST item produced.
+                            saw_terminal_err = true;
+                            prop_assert_eq!(i, out.len() - 1, "error must be the final emitted item");
+                        }
+                    }
+                }
+                Ok(())
+            }).unwrap();
+        }
+    }
 }

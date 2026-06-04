@@ -1,0 +1,82 @@
+---
+source: crates/code-agent-anthropic/src/lib.rs
+expression: body
+---
+{
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "read /etc/hosts",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "Reading it now.",
+          "type": "text"
+        },
+        {
+          "id": "toolu_abc",
+          "input": {
+            "path": "/etc/hosts"
+          },
+          "name": "Read",
+          "type": "tool_use"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "content": [
+            {
+              "text": "127.0.0.1 localhost",
+              "type": "text"
+            }
+          ],
+          "is_error": false,
+          "tool_use_id": "toolu_abc",
+          "type": "tool_result"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "claude-sonnet-4-6",
+  "stream": true,
+  "system": "You are a careful coding agent.",
+  "tool_search": {
+    "type": "bm25"
+  },
+  "tools": [
+    {
+      "description": "search the tool catalog",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "SearchTools"
+    },
+    {
+      "deferred": true,
+      "description": "List GitHub issues",
+      "input_schema": {
+        "type": "object"
+      },
+      "name": "mcp__github__list_issues"
+    }
+  ]
+}

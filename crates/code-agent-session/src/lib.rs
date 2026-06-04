@@ -1534,4 +1534,72 @@ mod tests {
         let summary = summarize_session(&store, &fork).await.unwrap();
         assert_eq!(summary.source_session_id.as_deref(), Some(source.as_str()));
     }
+
+    // ------------------------------------------------------------------
+    // Snapshot tests (insta): lock the FULL serialized on-disk JSONL
+    // record shape so an unintended field rename/addition/removal in
+    // SessionRecord / SessionPayload is caught.
+    //
+    // A fixed timestamp / cwd / session_id keep the snapshots
+    // deterministic (the production `now_iso()` clock would otherwise
+    // change every run).
+    // ------------------------------------------------------------------
+
+    /// Build a record with stable, non-clock-derived identity fields.
+    fn fixed_record(payload: SessionPayload) -> SessionRecord {
+        SessionRecord::new(
+            "2026-06-04T00:00:00Z".to_string(),
+            PathBuf::from("/work/project"),
+            "sess-fixed-0001".to_string(),
+            payload,
+        )
+    }
+
+    #[test]
+    // Snapshot a representative assistant-message Event record: the most
+    // common payload, carrying text + a tool_use block.
+    fn snapshot_assistant_message_record() {
+        use code_agent_core::{AssistantContent, AssistantMessage, ToolCall};
+        let rec = fixed_record(SessionPayload::Event(AgentEvent::AssistantMessage(
+            AssistantMessage {
+                content: vec![
+                    AssistantContent::Text {
+                        text: "Reading the file now.".into(),
+                    },
+                    AssistantContent::ToolUse(ToolCall {
+                        id: "toolu_1".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({"path": "/etc/hosts"}),
+                    }),
+                ],
+                stop_reason: Some("tool_use".into()),
+            },
+        )));
+        insta::assert_json_snapshot!(rec);
+    }
+
+    #[test]
+    // Snapshot the non-Event payload variants (the lineage/provenance
+    // markers) so their wire tags and fields are locked too.
+    fn snapshot_marker_records() {
+        let user_prompt = fixed_record(SessionPayload::UserPrompt {
+            text: "do the thing".into(),
+        });
+        let fork = fixed_record(SessionPayload::ForkMetadata {
+            source_session_id: "sess-source-0000".into(),
+        });
+        let settings = fixed_record(SessionPayload::SettingsSnapshot {
+            settings_summary: "model=claude-sonnet-4-6 permission=ask".into(),
+        });
+        let subagent = fixed_record(SessionPayload::SubagentMetadata {
+            parent_session_id: "sess-parent-0000".into(),
+            parent_run_id: "run-0000".into(),
+            parent_tool_call_id: "toolu_parent".into(),
+            agent_name: "code-reviewer".into(),
+        });
+        insta::assert_json_snapshot!("user_prompt_record", user_prompt);
+        insta::assert_json_snapshot!("fork_metadata_record", fork);
+        insta::assert_json_snapshot!("settings_snapshot_record", settings);
+        insta::assert_json_snapshot!("subagent_metadata_record", subagent);
+    }
 }
