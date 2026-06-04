@@ -192,7 +192,12 @@ fn substitute_with_bash_aware_quoting(
     let mut i = 0;
     let mut in_bash = false;
     while i < bytes.len() {
-        let c = bytes[i] as char;
+        let b = bytes[i];
+        // Token delimiters are all ASCII; non-ASCII lead/continuation bytes
+        // (>= 0x80) never match one, so we only need the byte value for the
+        // delimiter checks below. Non-token text is copied as the original
+        // UTF-8 slice (never byte-as-char) to preserve multi-byte chars (#39).
+        let c = b as char;
 
         // Track entry/exit of `!`...`` regions. We only flip to `in_bash`
         // when we see the opening `!\``; the closing `\`` flips us back.
@@ -259,10 +264,29 @@ fn substitute_with_bash_aware_quoting(
             }
         }
 
-        out.push(c);
-        i += 1;
+        // Ordinary (non-token) text: copy the whole UTF-8 char as a slice so
+        // multi-byte scalars survive intact instead of becoming mojibake (#39).
+        // `i` is on a char boundary here because every branch above advances
+        // past complete ASCII tokens only.
+        let char_len = utf8_char_len(b);
+        out.push_str(&body[i..i + char_len]);
+        i += char_len;
     }
     Ok(out)
+}
+
+/// Number of bytes in the UTF-8 sequence whose lead byte is `b`. Continuation
+/// bytes (`0b10xx_xxxx`) are treated as length 1 so a malformed stream still
+/// advances; well-formed input never reaches this branch with a continuation
+/// byte because the scanner only lands on char boundaries.
+fn utf8_char_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
 }
 
 /// POSIX-safe single-quote escape: `it's a "trick"` becomes
@@ -352,8 +376,10 @@ async fn expand_bash_blocks_to_placeholders(
             outputs.push(output);
             i = start + rel_end + 1;
         } else {
-            out.push(c);
-            i += 1;
+            // Non-token text: copy the whole UTF-8 char as a slice (#39).
+            let char_len = utf8_char_len(bytes[i]);
+            out.push_str(&body[i..i + char_len]);
+            i += char_len;
         }
     }
     Ok((out, outputs))
@@ -452,8 +478,10 @@ async fn expand_bash_blocks(
             out.push_str(&output);
             i = start + rel_end + 1;
         } else {
-            out.push(c);
-            i += 1;
+            // Non-token text: copy the whole UTF-8 char as a slice (#39).
+            let char_len = utf8_char_len(bytes[i]);
+            out.push_str(&body[i..i + char_len]);
+            i += char_len;
         }
     }
     Ok(out)
@@ -516,8 +544,10 @@ async fn expand_file_refs(
             out.push_str("\n--- end ---\n");
             i = end;
         } else {
-            out.push(c);
-            i += 1;
+            // Non-token text: copy the whole UTF-8 char as a slice (#39).
+            let char_len = utf8_char_len(bytes[i]);
+            out.push_str(&body[i..i + char_len]);
+            i += char_len;
         }
     }
     Ok(out)
@@ -623,6 +653,58 @@ mod tests {
         assert!(r.expanded_prompt.contains("list=$ARGUMENTS_LIST"));
         // Bare $ARGUMENTS (followed by space or end) expands.
         assert!(r.expanded_prompt.contains("all=foo end=foo"));
+    }
+
+    #[tokio::test]
+    // A body with no expansion tokens passes through byte-for-byte, including
+    // multi-byte UTF-8 (accents, emoji, CJK) which previously became mojibake
+    // when each byte was reinterpreted as a Latin-1 char (#39).
+    async fn non_ascii_body_round_trips_unchanged() {
+        let parsed = parse_slash_command("/review").unwrap();
+        let exec = FakeExecutor {
+            files: Default::default(),
+            bash: Default::default(),
+            invocations: Mutex::new(Vec::new()),
+        };
+        let original = "café ☕ done — 日本語 🦀";
+        let r = expand_custom_command(
+            &parsed,
+            &cmd(original),
+            &SlashExpansionOptions::default(),
+            &exec,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r.expanded_prompt.contains(original),
+            "non-ASCII text was corrupted: {:?}",
+            r.expanded_prompt
+        );
+    }
+
+    #[tokio::test]
+    // A positional ($1) adjacent to non-ASCII text still substitutes while the
+    // surrounding multi-byte text is preserved exactly (#39).
+    async fn positional_adjacent_to_non_ascii_preserves_text() {
+        let parsed = parse_slash_command("/review main").unwrap();
+        let exec = FakeExecutor {
+            files: Default::default(),
+            bash: Default::default(),
+            invocations: Mutex::new(Vec::new()),
+        };
+        let r = expand_custom_command(
+            &parsed,
+            &cmd("café $1 ☕"),
+            &SlashExpansionOptions::default(),
+            &exec,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r.expanded_prompt.contains("café main ☕"),
+            "unexpected expansion: {:?}",
+            r.expanded_prompt
+        );
     }
 
     #[tokio::test]

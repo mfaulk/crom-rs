@@ -38,7 +38,7 @@ impl SdkEventMapper {
                     text,
                 })
             }),
-            AgentEvent::AssistantTextDelta(delta) => full.then(|| {
+            AgentEvent::AssistantTextDelta { text: delta } => full.then(|| {
                 SdkEvent::AssistantTextDelta(AssistantTextDelta {
                     run_id: self.run_id.clone(),
                     delta: delta.clone(),

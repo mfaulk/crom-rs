@@ -5706,10 +5706,10 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
                 println!("[init] session {}", init.session_id);
             }
         }
-        AgentEvent::AssistantTextDelta(t) => {
-            print!("{t}");
+        AgentEvent::AssistantTextDelta { text } => {
+            print!("{text}");
             let _ = std::io::stdout().flush();
-            current_text.push_str(t);
+            current_text.push_str(text);
         }
         AgentEvent::AssistantMessage(_) => {
             if !current_text.is_empty() {

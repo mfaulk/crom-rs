@@ -1072,7 +1072,11 @@ pub(crate) async fn run_loop(
                     // stream) was dropped. Treat that as an implicit cancel
                     // so the loop stops streaming work nobody is reading
                     // (#160). The next iteration's cancel check breaks out.
-                    if tx.send(AgentEvent::AssistantTextDelta(text)).await.is_err() {
+                    if tx
+                        .send(AgentEvent::AssistantTextDelta { text })
+                        .await
+                        .is_err()
+                    {
                         cfg.cancel.store(true, Ordering::Release);
                     }
                 }

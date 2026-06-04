@@ -109,7 +109,7 @@ pub fn render_event_card(event: &AgentEvent) -> EventCard {
                 ..Default::default()
             }
         }
-        AgentEvent::AssistantTextDelta(delta) => EventCard {
+        AgentEvent::AssistantTextDelta { text: delta } => EventCard {
             kind: "assistant_delta",
             headline: "...".to_string(),
             body: vec![delta.clone()],
@@ -370,7 +370,9 @@ mod tests {
     #[test]
     // Unknown text deltas render without panicking.
     fn delta_card() {
-        let event = AgentEvent::AssistantTextDelta("partial".into());
+        let event = AgentEvent::AssistantTextDelta {
+            text: "partial".into(),
+        };
         let card = render_event_card(&event);
         assert_eq!(card.kind, "assistant_delta");
     }

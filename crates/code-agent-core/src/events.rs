@@ -22,7 +22,9 @@ use crate::usage::TokenUsage;
 pub enum AgentEvent {
     SystemInit(SystemInit),
     AssistantMessage(AssistantMessage),
-    AssistantTextDelta(String),
+    AssistantTextDelta {
+        text: String,
+    },
     ToolCallStarted(ToolCallStarted),
     ToolCallCompleted(ToolCallCompleted),
     ToolCallDenied(ToolCallDenied),
@@ -955,4 +957,29 @@ pub struct CompactBoundary {
     pub trigger: CompactionTrigger,
     /// One-line summary of the older context (the body persisted to history).
     pub summary_preview: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression for #38: `AssistantTextDelta` was a newtype-of-primitive
+    // variant, which serde cannot serialize under internal tagging
+    // (`#[serde(tag = "type")]`). It is now a struct variant, so
+    // `serde_json::to_string` succeeds and emits both the type tag and the
+    // text payload.
+    #[test]
+    fn assistant_text_delta_serializes_under_internal_tag() {
+        let event = AgentEvent::AssistantTextDelta { text: "hi".into() };
+        let json = serde_json::to_string(&event)
+            .expect("AssistantTextDelta must serialize under internal tagging");
+        assert!(
+            json.contains("\"type\":\"assistant_text_delta\""),
+            "missing type tag: {json}"
+        );
+        assert!(
+            json.contains("\"text\":\"hi\""),
+            "missing text field: {json}"
+        );
+    }
 }
