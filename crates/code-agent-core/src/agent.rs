@@ -1172,15 +1172,7 @@ pub(crate) async fn run_loop(
         }
 
         // Build assistant message and append to conversation.
-        let mut assistant_blocks: Vec<AssistantContent> = Vec::new();
-        if !text_buf.is_empty() {
-            assistant_blocks.push(AssistantContent::Text {
-                text: text_buf.clone(),
-            });
-        }
-        for c in &tool_calls {
-            assistant_blocks.push(AssistantContent::ToolUse(c.clone()));
-        }
+        let assistant_blocks = build_assistant_blocks(&text_buf, &tool_calls);
         let assistant_msg = AssistantMessage {
             content: assistant_blocks.clone(),
             stop_reason: stop_reason.clone(),
@@ -1198,13 +1190,7 @@ pub(crate) async fn run_loop(
         )
         .await;
 
-        let conv_blocks: Vec<ContentBlock> = assistant_blocks
-            .iter()
-            .map(|b| match b {
-                AssistantContent::Text { text } => ContentBlock::Text { text: text.clone() },
-                AssistantContent::ToolUse(c) => ContentBlock::ToolUse(c.clone()),
-            })
-            .collect();
+        let conv_blocks = assistant_blocks_to_content(&assistant_blocks);
         conversation.push(Message {
             role: MessageRole::Assistant,
             content: conv_blocks,
@@ -2499,6 +2485,41 @@ fn hook_decision_reason(d: &HookAggregateDecision) -> Option<String> {
     }
 }
 
+/// Assemble the assistant message content for a turn from the accumulated
+/// text and the tool-use calls the model emitted, in the order the Anthropic
+/// API expects: a single leading text block (omitted when empty) followed by
+/// the tool-use blocks in input order. This ordering is load-bearing — the
+/// matching `tool_result` blocks in the next user message must follow the
+/// `tool_use` blocks in the same order.
+pub(crate) fn build_assistant_blocks(
+    text_buf: &str,
+    tool_calls: &[ToolCall],
+) -> Vec<AssistantContent> {
+    let mut assistant_blocks: Vec<AssistantContent> = Vec::new();
+    if !text_buf.is_empty() {
+        assistant_blocks.push(AssistantContent::Text {
+            text: text_buf.to_string(),
+        });
+    }
+    for c in tool_calls {
+        assistant_blocks.push(AssistantContent::ToolUse(c.clone()));
+    }
+    assistant_blocks
+}
+
+/// Project the streamed [`AssistantContent`] blocks onto the conversation's
+/// [`ContentBlock`] representation, preserving order one-for-one. Text maps to
+/// `Text`, tool-use maps to `ToolUse`; no block is dropped or reordered.
+pub(crate) fn assistant_blocks_to_content(blocks: &[AssistantContent]) -> Vec<ContentBlock> {
+    blocks
+        .iter()
+        .map(|b| match b {
+            AssistantContent::Text { text } => ContentBlock::Text { text: text.clone() },
+            AssistantContent::ToolUse(c) => ContentBlock::ToolUse(c.clone()),
+        })
+        .collect()
+}
+
 async fn emit(
     tx: &mpsc::Sender<AgentEvent>,
     sink: &Option<Arc<dyn SessionSink>>,
@@ -2617,8 +2638,10 @@ async fn push_tool_result_user(
 mod tests {
     use super::*;
     use crate::errors::ToolError;
+    use crate::hooks::{HookCallRecord, HookError, HookOutput};
     use crate::permission::PermissionKind;
     use crate::tool::{ToolContext, ToolResult};
+    use crate::tool_catalog::ToolSearchStrategy;
 
     struct StubTool {
         name: String,
@@ -2690,6 +2713,276 @@ mod tests {
                 "yak".to_string(),
                 "zebra".to_string(),
             ]
+        );
+    }
+
+    // ----- content-block merging -----
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    /// `build_assistant_blocks` must emit the leading text block first, then the
+    /// tool-use blocks in the exact order the model produced them. The Anthropic
+    /// API requires `tool_result` blocks in the following user message to follow
+    /// `tool_use` blocks in input order, so this ordering is load-bearing.
+    #[test]
+    fn build_assistant_blocks_orders_text_then_tools_in_input_order() {
+        let calls = vec![call("a", "Read"), call("b", "Bash"), call("c", "Edit")];
+        let blocks = build_assistant_blocks("hello world", &calls);
+
+        assert_eq!(blocks.len(), 4);
+        match &blocks[0] {
+            AssistantContent::Text { text } => assert_eq!(text, "hello world"),
+            other => panic!("expected leading text block, got {other:?}"),
+        }
+        let tool_ids: Vec<&str> = blocks[1..]
+            .iter()
+            .map(|b| match b {
+                AssistantContent::ToolUse(c) => c.id.as_str(),
+                other => panic!("expected tool-use block, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(tool_ids, vec!["a", "b", "c"]);
+    }
+
+    /// Empty assistant text must NOT produce a leading text block — the agent
+    /// loop guards on `!text_buf.is_empty()`, and an empty text block would be a
+    /// wasted (and on some providers invalid) content block.
+    #[test]
+    fn build_assistant_blocks_omits_empty_text() {
+        let calls = vec![call("only", "Read")];
+        let blocks = build_assistant_blocks("", &calls);
+
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(blocks[0], AssistantContent::ToolUse(_)));
+    }
+
+    /// A pure-text turn (no tool calls) yields exactly one text block.
+    #[test]
+    fn build_assistant_blocks_text_only() {
+        let blocks = build_assistant_blocks("final answer", &[]);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(blocks[0], AssistantContent::Text { .. }));
+    }
+
+    /// `assistant_blocks_to_content` projects each streamed block onto its
+    /// conversation `ContentBlock` counterpart one-for-one, preserving order and
+    /// dropping nothing. This is what gets persisted into the conversation and
+    /// replayed to the provider on the next turn.
+    #[test]
+    fn assistant_blocks_to_content_preserves_order_and_kind() {
+        let blocks = vec![
+            AssistantContent::Text {
+                text: "t".to_string(),
+            },
+            AssistantContent::ToolUse(call("x", "Read")),
+            AssistantContent::ToolUse(call("y", "Bash")),
+        ];
+        let content = assistant_blocks_to_content(&blocks);
+
+        assert_eq!(content.len(), 3);
+        assert!(matches!(&content[0], ContentBlock::Text { text } if text == "t"));
+        match (&content[1], &content[2]) {
+            (ContentBlock::ToolUse(a), ContentBlock::ToolUse(b)) => {
+                assert_eq!(a.id, "x");
+                assert_eq!(b.id, "y");
+            }
+            other => panic!("expected two tool-use blocks in order, got {other:?}"),
+        }
+    }
+
+    // ----- hook outcome / reason mapping (the agent's hook event surface) -----
+
+    fn hook_rec(out: Result<HookOutput, HookError>) -> HookCallRecord {
+        HookCallRecord {
+            event: HookEventName::PreToolUse,
+            tool_name: Some("Bash".to_string()),
+            output: out,
+        }
+    }
+
+    /// `hook_outcome_kind` maps each aggregate decision onto the event-facing
+    /// `HookOutcomeKind`. The `has_added_context` flag is the only thing that
+    /// distinguishes a plain `Continue` from an `AddContext` outcome (the
+    /// aggregate decision itself is `Continue` in both cases).
+    #[test]
+    fn hook_outcome_kind_maps_each_decision() {
+        assert_eq!(
+            hook_outcome_kind(
+                &HookAggregateDecision::Allow {
+                    updated_input: None
+                },
+                false
+            ),
+            HookOutcomeKind::Allow
+        );
+        assert_eq!(
+            hook_outcome_kind(
+                &HookAggregateDecision::Deny {
+                    reason: "nope".into()
+                },
+                false
+            ),
+            HookOutcomeKind::Deny
+        );
+        assert_eq!(
+            hook_outcome_kind(
+                &HookAggregateDecision::Ask {
+                    reason: "confirm".into()
+                },
+                false
+            ),
+            HookOutcomeKind::Ask
+        );
+        assert_eq!(
+            hook_outcome_kind(&HookAggregateDecision::Continue, false),
+            HookOutcomeKind::Continue
+        );
+        // Same Continue decision, but added context flips the reported outcome.
+        assert_eq!(
+            hook_outcome_kind(&HookAggregateDecision::Continue, true),
+            HookOutcomeKind::AddContext
+        );
+        // added-context flag is ignored for non-Continue decisions.
+        assert_eq!(
+            hook_outcome_kind(
+                &HookAggregateDecision::Allow {
+                    updated_input: None
+                },
+                true
+            ),
+            HookOutcomeKind::Allow
+        );
+    }
+
+    /// `hook_decision_reason` surfaces the deny/ask reason verbatim, a fixed
+    /// "allow" string for Allow, and nothing for Continue.
+    #[test]
+    fn hook_decision_reason_extracts_reason() {
+        assert_eq!(
+            hook_decision_reason(&HookAggregateDecision::Allow {
+                updated_input: None
+            })
+            .as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            hook_decision_reason(&HookAggregateDecision::Deny {
+                reason: "blocked by policy".into()
+            })
+            .as_deref(),
+            Some("blocked by policy")
+        );
+        assert_eq!(
+            hook_decision_reason(&HookAggregateDecision::Ask {
+                reason: "needs confirmation".into()
+            })
+            .as_deref(),
+            Some("needs confirmation")
+        );
+        assert_eq!(hook_decision_reason(&HookAggregateDecision::Continue), None);
+    }
+
+    /// End-to-end hook fan-out → emitted outcome: `Deny` wins over every other
+    /// decision regardless of registration order. This pins the combination the
+    /// agent loop reports via `aggregate` + `hook_outcome_kind` for the
+    /// PreToolUse/PostToolUse/Stop events.
+    #[test]
+    fn aggregate_then_outcome_deny_wins_over_allow_and_ask() {
+        let records = vec![
+            hook_rec(Ok(HookOutput::Allow {
+                updated_input: None,
+            })),
+            hook_rec(Ok(HookOutput::Ask {
+                reason: "ask".into(),
+            })),
+            hook_rec(Ok(HookOutput::Deny {
+                reason: "deny".into(),
+            })),
+        ];
+        let (decision, added) = aggregate(&records);
+        assert_eq!(hook_outcome_kind(&decision, false), HookOutcomeKind::Deny);
+        assert_eq!(hook_decision_reason(&decision).as_deref(), Some("deny"));
+        assert!(added.0.is_empty());
+    }
+
+    /// A hook returning `Err` is surfaced as a denial (not silently ignored),
+    /// and the agent reports a `Deny` outcome carrying the error text (#156).
+    #[test]
+    fn aggregate_then_outcome_hook_error_becomes_deny() {
+        let records = vec![hook_rec(Err(HookError::Other("boom".into())))];
+        let (decision, _) = aggregate(&records);
+        assert_eq!(hook_outcome_kind(&decision, false), HookOutcomeKind::Deny);
+        assert_eq!(
+            hook_decision_reason(&decision).as_deref(),
+            Some("hook error: boom")
+        );
+    }
+
+    /// `AddContext`-only hooks leave the aggregate decision at `Continue` but
+    /// concatenate their content in registration order; the agent reports the
+    /// `AddContext` outcome because `has_added_context` is true.
+    #[test]
+    fn aggregate_then_outcome_add_context_in_order() {
+        let records = vec![
+            hook_rec(Ok(HookOutput::AddContext {
+                content: "first".into(),
+            })),
+            hook_rec(Ok(HookOutput::AddContext {
+                content: "second".into(),
+            })),
+        ];
+        let (decision, added) = aggregate(&records);
+        assert_eq!(added.0, "first\n\nsecond");
+        assert_eq!(
+            hook_outcome_kind(&decision, !added.0.is_empty()),
+            HookOutcomeKind::AddContext
+        );
+        assert_eq!(hook_decision_reason(&decision), None);
+    }
+
+    // ----- tool-search input parsing -----
+
+    /// `tool_search_started_from_input` requires a string `query`; without it
+    /// there is no search to report and it returns None.
+    #[test]
+    fn tool_search_started_requires_query() {
+        let input = serde_json::json!({ "limit": 3 });
+        assert!(tool_search_started_from_input(&input, ToolSearchStrategy::Hybrid).is_none());
+    }
+
+    /// With only a query, limit defaults to 5 and source_filter is absent; the
+    /// strategy is threaded through unchanged.
+    #[test]
+    fn tool_search_started_defaults_limit() {
+        let input = serde_json::json!({ "query": "edit files" });
+        let started =
+            tool_search_started_from_input(&input, ToolSearchStrategy::Bm25).expect("some");
+        assert_eq!(started.query, "edit files");
+        assert_eq!(started.limit, 5);
+        assert_eq!(started.strategy, ToolSearchStrategy::Bm25);
+        assert!(started.source_filter.is_none());
+    }
+
+    /// Explicit limit and an `mcp:<server>` source filter are parsed through.
+    #[test]
+    fn tool_search_started_parses_limit_and_source_filter() {
+        let input = serde_json::json!({
+            "query": "search",
+            "limit": 12,
+            "source_filter": "mcp:github",
+        });
+        let started =
+            tool_search_started_from_input(&input, ToolSearchStrategy::Regex).expect("some");
+        assert_eq!(started.limit, 12);
+        assert_eq!(
+            started.source_filter,
+            Some(ToolSourceFilter::McpServer("github".to_string()))
         );
     }
 }
