@@ -84,12 +84,20 @@ fn step_marker(status: PlanStepStatus) -> &'static str {
     }
 }
 
-/// Render the plan-approval modal: shows the headline summary, every
-/// mutating tool the plan requests, validation commands, and the
-/// keyboard action menu.
+/// Render the plan-created informational notice: shows the headline
+/// summary, every mutating file the plan requests, and validation
+/// commands, followed by a disclaimer that approval gating is not yet
+/// wired to the TUI.
+///
+/// #27: this notice deliberately advertises NO approve/reject/revise
+/// keys. The SDK auto-approves plans internally and exposes no
+/// host-callable decision surface, so an "\[a\] approve / \[r\] reject"
+/// menu would lie — the run proceeds regardless of any keypress. A real
+/// host-side PlanDecisionCallback (issue #27 option 1) is the follow-up
+/// that would reintroduce an enforced decision menu.
 pub fn format_plan_approval_modal(plan: &PlanDocument) -> Vec<String> {
     let mut out = Vec::new();
-    out.push(format!("Approve plan {} v{}?", plan.id, plan.version));
+    out.push(format!("Plan {} v{} created", plan.id, plan.version));
     out.push(format!("  title:    {}", plan.title));
     if !plan.summary.is_empty() {
         out.push(format!("  summary:  {}", plan.summary));
@@ -170,19 +178,18 @@ pub fn format_plan_approval_modal(plan: &PlanDocument) -> Vec<String> {
         }
     }
     out.push(String::new());
-    // SDK does not yet expose a plan-decision callback that the TUI can
-    // call (#146). Until it does, the keys read but cannot block the
-    // run — say so explicitly so the modal does not mislead operators.
-    // Keep each line under 80 columns so the modal renders on a default
-    // terminal without wrapping (review feedback).
-    out.push("  (informational: plan approval is not yet wired to the SDK;".into());
-    out.push("   the run will continue regardless of which key is pressed)".into());
-    out.push("  * = preview only".into());
-    // Keymap is the source of truth in `state::handle_plan_approval_key`:
-    // a → approve, r → reject, u → revise. Older copy showed e/n/x as
-    // well, but those keys have no handler and would mislead operators
-    // (#146 review feedback). Keep this in sync with state.rs.
-    out.push("  [a] approve*  [r] reject*  [u] revise*".into());
+    // #27: this is an INFORMATIONAL notice — the SDK auto-approves the
+    // plan internally and exposes no host-callable decision surface, so
+    // the TUI cannot block, reject, or revise the plan yet. Advertise no
+    // decision keys; say so explicitly so the notice does not mislead
+    // operators into thinking a keystroke gated execution. Keep each line
+    // under 80 columns so the modal renders on a default terminal without
+    // wrapping (review feedback).
+    out.push("  The plan was created and the run will proceed.".into());
+    out.push("  Approval gating is not yet wired to the TUI, so".into());
+    out.push("  this plan cannot be blocked or revised from here.".into());
+    out.push(String::new());
+    out.push("  Press Esc (or any key) to dismiss this notice.".into());
     out
 }
 
@@ -314,26 +321,32 @@ mod tests {
     }
 
     #[test]
-    // Approval modal renders the menu and warns that the keys are not
-    // yet wired through to the SDK (issue #146 honest-UX fix). Each
-    // line also fits a default 80-col terminal.
-    fn approval_modal_has_menu() {
+    // #27: the plan-created notice is informational only. It must NOT
+    // advertise any approve/reject/revise affordance (those handlers were
+    // no-ops while the SDK auto-approved internally, so the keys lied
+    // about gating execution), and it must state that gating is not wired.
+    // Each line also fits a default 80-col terminal.
+    fn approval_modal_is_informational_only() {
         let p = small_plan();
         let lines = format_plan_approval_modal(&p);
-        // Keymap matches `state::handle_plan_approval_key` exactly.
-        assert!(lines.iter().any(|l| l.contains("[a] approve*")
-            && l.contains("[r] reject*")
-            && l.contains("[u] revise*")));
+        // No decision-key affordance may be advertised: the old copy
+        // showed `[a] approve* [r] reject* [u] revise*` (preview-only),
+        // which implied the keystrokes gated execution.
         assert!(
-            !lines.iter().any(|l| l.contains("[n] reject")
-                || l.contains("[e] edit")
-                || l.contains("[x] export")),
-            "stale unsupported keys must not appear, got: {lines:?}"
+            !lines.iter().any(|l| l.contains("[a]")
+                || l.contains("[r]")
+                || l.contains("[u]")
+                || l.to_lowercase().contains("approve")
+                || l.to_lowercase().contains("preview")),
+            "informational notice must not advertise decision keys, got: {lines:?}"
         );
-        assert!(lines.iter().any(|l| l.contains("preview only")));
         assert!(
-            lines.iter().any(|l| l.contains("not yet wired to the SDK")),
-            "expected SDK-not-wired disclaimer, got: {lines:?}"
+            lines.iter().any(|l| l.contains("not yet wired to the TUI")),
+            "expected gating-not-wired disclaimer, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("the run will proceed")),
+            "notice must say the run proceeds, got: {lines:?}"
         );
         for l in &lines {
             assert!(

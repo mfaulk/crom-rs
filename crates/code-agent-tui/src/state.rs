@@ -12,7 +12,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 
-use code_agent_core::plan::{PlanDocument, PlanId};
+use code_agent_core::plan::PlanDocument;
 use code_agent_core::StatusLineContext;
 use code_agent_sdk::patch::PatchSet;
 use code_agent_sdk::SdkEvent;
@@ -76,18 +76,15 @@ pub enum TuiAction {
     /// `ApprovalRequired` request id; the reducer does not own that
     /// channel.
     ResolveApproval(ApprovalDecisionAction),
-    /// M13 Phase E: approve the current plan. Host forwards to the
-    /// SDK's plan-approval surface.
-    ApprovePlan(PlanId),
-    /// M13 Phase E: reject the current plan with an optional reason.
-    RejectPlan {
-        plan_id: PlanId,
-        reason: Option<String>,
-    },
-    /// M13 Phase E: request a plan revision. Phase E does not yet
-    /// collect free-form input; the host receives the action with an
-    /// empty hint and may decide how to gather more.
-    RevisePlan { plan_id: PlanId, hint: String },
+    // #27: the former `ApprovePlan` / `RejectPlan` / `RevisePlan`
+    // variants were removed. The SDK has no host-callable plan-decision
+    // surface yet, so those actions only fed no-op handlers in app.rs
+    // while the plan auto-approved internally — pressing "reject" still
+    // let the run proceed. To stop the UI lying, the plan-approval modal
+    // is now a dismissible informational notice that binds no decision
+    // keys. Wiring a real host-side PlanDecisionCallback (issue #27
+    // option 1) is the tracked follow-up that would reintroduce a
+    // decision action with actual enforcement.
 }
 
 /// Reducer-side mirror of the SDK's `ApprovalDecision`. We don't depend
@@ -769,8 +766,18 @@ impl TuiAppState {
         // Tab-to-accept convention). Route modal keys *before* the
         // global Tab cycle for that case so the cycle doesn't fire
         // behind the modal.
-        let palette_active = matches!(self.layout.current_modal(), Some(TuiModal::CommandPalette));
-        if !palette_active {
+        //
+        // #27 (Codex P2): the plan-approval notice promises "any key"
+        // dismisses it, so Tab/ShiftTab must reach the modal handler
+        // (which dismisses) rather than being eaten by the global focus
+        // cycle behind the modal. Treat it like the palette: skip the
+        // global Tab cycle while that notice is the active modal.
+        let modal_owns_tab = match self.layout.current_modal() {
+            Some(TuiModal::CommandPalette) => true,
+            Some(TuiModal::Custom { id, .. }) => id == PLAN_APPROVAL_MODAL_ID,
+            _ => false,
+        };
+        if !modal_owns_tab {
             match k {
                 KeyEvent::Tab => {
                     self.layout.focus = self.layout.focus.next(
@@ -921,6 +928,27 @@ impl TuiAppState {
                 );
                 vec![TuiAction::ResolveApproval(decision)]
             }
+            // #27: the plan-approval modal is a dismissible informational
+            // notice whose copy promises "Press Esc (or any key) to
+            // dismiss". Route *every* key kind (Enter, Tab, arrows,
+            // Backspace, Esc, chars, …) to the dismiss handler so the
+            // claim is literally true — previously only `Char(_)` was
+            // routed here and other decoded keys fell through to the
+            // generic no-op arm, doing nothing. Match before the generic
+            // Esc arm so Esc still dismisses it via the same path.
+            //
+            // EXCEPTION: Ctrl+C must NOT be swallowed by this catch-all.
+            // It is the global cancel/exit gesture and must keep working
+            // even while the notice is open; excluding it here lets it
+            // fall through to the `(_, KeyEvent::CtrlC)` arm below, which
+            // cancels a running run (or exits when idle). Without this
+            // guard the catch-all (placed before the CtrlC arm) would
+            // merely dismiss the modal and drop the cancel — a regression.
+            (TuiModal::Custom { id, .. }, k)
+                if id == PLAN_APPROVAL_MODAL_ID && k != KeyEvent::CtrlC =>
+            {
+                self.handle_plan_approval_key()
+            }
             (closed, KeyEvent::Esc) => {
                 let _ = self.layout.pop_modal();
                 // #153: only clear the state that belongs to the modal
@@ -970,10 +998,6 @@ impl TuiAppState {
             // M13 Phase E: tool-approval modal keys.
             (TuiModal::Custom { id, .. }, KeyEvent::Char(c)) if id == APPROVAL_MODAL_ID => {
                 self.handle_approval_key(c)
-            }
-            // M13 Phase E: plan-approval modal keys.
-            (TuiModal::Custom { id, .. }, KeyEvent::Char(c)) if id == PLAN_APPROVAL_MODAL_ID => {
-                self.handle_plan_approval_key(c)
             }
             // M13 Phase H: command palette interactivity.
             (TuiModal::CommandPalette, KeyEvent::Char(c)) => {
@@ -1102,44 +1126,21 @@ impl TuiAppState {
         vec![TuiAction::ResolveApproval(decision)]
     }
 
-    fn handle_plan_approval_key(&mut self, c: char) -> Vec<TuiAction> {
-        // #226: a/r/u must always close the modal, even when there is no
-        // `current_plan` to attach the decision to. Removing the modal up
-        // front (before the early return for `None`) means the operator is
-        // never stranded with a modal that only Esc can dismiss. An
-        // unrecognized key still leaves the modal open so a stray keypress
-        // doesn't dismiss the prompt.
-        match c.to_ascii_lowercase() {
-            'a' | 'r' | 'u' => {}
-            _ => return Vec::new(),
-        }
+    fn handle_plan_approval_key(&mut self) -> Vec<TuiAction> {
+        // #27: the plan-approval modal is an INFORMATIONAL notice only.
+        // The SDK auto-approves plans internally and exposes no
+        // host-callable decision surface yet, so any key that claimed to
+        // approve/reject/revise would lie — the run proceeds regardless.
+        // We therefore bind no decision keys: ANY key (Esc, Enter, Tab,
+        // arrows, chars, …) simply dismisses the notice — matching the
+        // "Press Esc (or any key) to dismiss" copy — and NO decision
+        // action is emitted. Wiring a real PlanDecisionCallback that can
+        // actually gate execution is the tracked follow-up (issue #27
+        // option 1).
         let _ = self
             .layout
             .remove_custom_modals_by_id(PLAN_APPROVAL_MODAL_ID);
-        let plan_id = match &self.current_plan {
-            Some(p) => p.id.clone(),
-            None => return Vec::new(),
-        };
-        let (action, kind) = match c.to_ascii_lowercase() {
-            'a' => (TuiAction::ApprovePlan(plan_id), "approve"),
-            'r' => (
-                TuiAction::RejectPlan {
-                    plan_id,
-                    reason: None,
-                },
-                "reject",
-            ),
-            'u' => (
-                TuiAction::RevisePlan {
-                    plan_id,
-                    hint: String::new(),
-                },
-                "revise",
-            ),
-            _ => return Vec::new(),
-        };
-        debug!(target: "code_agent_tui", decision_kind = kind, "plan_approval_decision");
-        vec![action]
+        Vec::new()
     }
 
     /// Transcript-focused navigation. Returns `Some(actions)` when the
@@ -1409,34 +1410,38 @@ impl TuiAppState {
         match ev {
             SdkEvent::PlanCreated(p) => {
                 self.current_plan = Some(p.plan.clone());
-                // Route the plan dashboard into view and surface an
-                // informational modal. The SDK does not yet expose a
-                // plan-decision callback, so the a/r/u keys only emit
-                // an activity log line — they cannot actually block,
-                // reject, or revise the plan. Label the keys "preview"
-                // so the UI does not lie about its effect (#146).
-                // Each body line is kept under 80 columns so the modal
-                // renders cleanly on a default terminal.
+                // #27: route the plan dashboard into view and surface a
+                // purely INFORMATIONAL notice. The SDK auto-approves the
+                // plan internally and exposes no host-callable decision
+                // surface, so the TUI cannot block, reject, or revise a
+                // plan yet. The notice therefore advertises NO
+                // approve/reject/revise keys — earlier copy showed
+                // `[a] approve* [r] reject* [u] revise*`, which implied
+                // the keystrokes gated execution even though the handlers
+                // were no-ops and the run proceeded regardless. The notice
+                // is dismissed with Esc (or any key). Each body line is
+                // kept under 80 columns so the modal renders cleanly on a
+                // default terminal.
                 //
-                // TODO(#146): wire a real PlanDecisionCallback through
-                // AgentRuntime so the operator's approve/reject/revise
-                // keypress can actually gate execution. That change spans
-                // sdk + core and is intentionally out of scope for this
-                // crate-exclusive fix; until it lands the modal must stay
-                // informational and the keys preview-only.
+                // TODO(#27): wire a real PlanDecisionCallback through
+                // AgentRuntime (issue #27 option 1) so an operator's
+                // approve/reject/revise can actually gate execution. That
+                // change spans sdk + core and is intentionally out of scope
+                // for this crate-exclusive fix; until it lands the modal
+                // must stay informational and bind no decision keys.
                 self.layout.side_panel.mode = SidePanelMode::Plan;
                 self.layout.side_panel.visible = true;
                 self.layout.push_modal(TuiModal::Custom {
                     id: PLAN_APPROVAL_MODAL_ID.to_string(),
-                    title: "Plan ready for review".to_string(),
+                    title: "Plan created (informational)".to_string(),
                     body: vec![
                         format!("Plan: {}", p.plan.title.clone()),
                         String::new(),
-                        "  (informational: plan approval is not yet wired to the SDK;".to_string(),
-                        "   the run will continue regardless of which key is pressed)".to_string(),
+                        "  The plan was created and the run will proceed.".to_string(),
+                        "  Approval gating is not yet wired to the TUI, so".to_string(),
+                        "  this plan cannot be blocked or revised from here.".to_string(),
                         String::new(),
-                        "  * = preview only".to_string(),
-                        "  [a] approve*  [r] reject*  [u] revise*".to_string(),
+                        "  Press Esc (or any key) to dismiss this notice.".to_string(),
                     ],
                 });
             }
@@ -3202,12 +3207,15 @@ mod tests {
         assert_eq!(s.transcript.first().unwrap().headline, "10");
     }
 
-    // The plan-approval modal pushed on `SdkEvent::PlanCreated` must
-    // tell the operator that pressing a/r/u is informational only —
-    // the SDK has no plan-decision callback yet (#146), so the run
-    // continues regardless of which key the operator presses.
+    // #27: the modal pushed on `SdkEvent::PlanCreated` must be a purely
+    // informational notice. It must NOT advertise approve/reject/revise
+    // keys (the handlers were no-ops while the SDK auto-approved the plan
+    // internally, so those affordances lied about gating execution), and
+    // it must state that approval gating is not yet wired and the run
+    // will proceed. Pinning this prevents a silent regression to the old
+    // lying copy.
     #[test]
-    fn plan_approval_modal_carries_informational_disclaimer() {
+    fn plan_created_modal_is_informational_notice() {
         use code_agent_core::plan::{new_plan_id, PlanDocument};
         use code_agent_sdk::event::PlanCreated;
 
@@ -3221,7 +3229,7 @@ mod tests {
         let modal = s
             .layout
             .current_modal()
-            .expect("plan-approval modal should be open");
+            .expect("plan-created notice should be open");
         let body = match modal {
             TuiModal::Custom { id, body, .. } => {
                 assert_eq!(id, PLAN_APPROVAL_MODAL_ID);
@@ -3229,18 +3237,24 @@ mod tests {
             }
             other => panic!("expected Custom modal, got {other:?}"),
         };
+        // No decision-key affordance may be advertised: the old copy
+        // showed `[a] approve* [r] reject* [u] revise*` (preview-only),
+        // which implied the keystrokes gated execution.
         assert!(
-            body.iter().any(|l| l.contains("informational")),
-            "modal must label itself informational, got: {body:?}"
+            !body.iter().any(|l| l.contains("[a]")
+                || l.contains("[r]")
+                || l.contains("[u]")
+                || l.to_lowercase().contains("approve")
+                || l.to_lowercase().contains("preview")),
+            "notice must not advertise decision keys, got: {body:?}"
         );
         assert!(
-            body.iter().any(|l| l.contains("preview only")),
-            "modal must explain `*` legend, got: {body:?}"
+            body.iter().any(|l| l.contains("not yet wired")),
+            "notice must say gating is not wired, got: {body:?}"
         );
         assert!(
-            body.iter()
-                .any(|l| l.contains("[a] approve*") && l.contains("[r] reject*")),
-            "keys must be suffixed `*` to indicate preview, got: {body:?}"
+            body.iter().any(|l| l.contains("will proceed")),
+            "notice must say the run proceeds, got: {body:?}"
         );
         // Each body line must fit a default 80-col terminal so the
         // modal does not wrap or truncate (review feedback).
@@ -3253,39 +3267,40 @@ mod tests {
         }
     }
 
-    // #226: a/r/u must close the plan-approval modal even when
-    // `current_plan` is None. Before the fix the handler early-returned
-    // before removing the modal, stranding the operator (only Esc closed
-    // it).
+    // #27 (was #226): pressing a key on the plan-created notice must
+    // dismiss it without emitting any action, regardless of whether a
+    // `current_plan` is set. The notice is informational only — no key
+    // implies a decision was enforced.
     #[test]
-    fn plan_approval_keys_close_modal_when_no_current_plan() {
+    fn plan_created_notice_key_dismisses_without_action_no_plan() {
         for key in ['a', 'r', 'u'] {
             let mut s = fresh_state();
-            // Push the plan-approval modal without seeding `current_plan`.
+            // Push the notice without seeding `current_plan`.
             s.layout.push_modal(TuiModal::Custom {
                 id: PLAN_APPROVAL_MODAL_ID.to_string(),
-                title: "Plan ready for review".to_string(),
-                body: vec!["[a] approve* [r] reject* [u] revise*".to_string()],
+                title: "Plan created (informational)".to_string(),
+                body: vec!["The plan was created and the run will proceed.".to_string()],
             });
             assert!(s.current_plan.is_none());
             let actions = s.apply(TuiInbound::Key(KeyEvent::Char(key)));
-            // No plan → no decision action, but the modal must be gone.
+            // Informational notice → never any action, modal must be gone.
             assert!(
                 actions.is_empty(),
-                "no plan should yield no action for {key}"
+                "informational notice must yield no action for {key}, got: {actions:?}"
             );
             assert!(
                 s.layout.current_modal().is_none(),
-                "modal must close for key {key} even with no current_plan"
+                "notice must close for key {key}"
             );
         }
     }
 
-    // #226 companion: with a plan present, a/r/u still emit the decision
-    // action and close the modal (regression guard for the reordered
-    // handler).
+    // #27: with a plan present, a/r/u must STILL emit no decision action
+    // (the run auto-proceeds; the keys cannot block it). This pins the
+    // honest behavior so the modal can't silently regress to emitting an
+    // Approve/Reject/Revise that lies about gating execution.
     #[test]
-    fn plan_approval_keys_emit_action_with_current_plan() {
+    fn plan_created_notice_key_emits_no_decision_with_plan() {
         use code_agent_core::plan::{new_plan_id, PlanDocument};
         use code_agent_sdk::event::PlanCreated;
 
@@ -3298,10 +3313,140 @@ mod tests {
         assert!(s.current_plan.is_some());
         let actions = s.apply(TuiInbound::Key(KeyEvent::Char('a')));
         assert!(
-            matches!(actions.as_slice(), [TuiAction::ApprovePlan(_)]),
-            "expected ApprovePlan, got {actions:?}"
+            actions.is_empty(),
+            "notice must emit no decision action, got: {actions:?}"
         );
         assert!(s.layout.current_modal().is_none());
+    }
+
+    // #27 (Codex P2): the notice copy promises "Press Esc (or any key) to
+    // dismiss this notice", so EVERY key kind — not just `Char(_)` — must
+    // dismiss it. Previously only chars were routed to the dismiss
+    // handler; Enter / Tab / arrows / Backspace fell through to the
+    // generic no-op modal arm and did nothing, making "any key"
+    // inaccurate. Pin that all non-char keys (and Esc) now dismiss the
+    // notice with no action so the copy stays honest.
+    #[test]
+    fn plan_created_notice_any_key_dismisses_without_action() {
+        let keys = [
+            KeyEvent::Enter,
+            KeyEvent::Tab,
+            KeyEvent::Up,
+            KeyEvent::Down,
+            KeyEvent::Backspace,
+            KeyEvent::Esc,
+        ];
+        for key in keys {
+            let mut s = fresh_state();
+            s.layout.push_modal(TuiModal::Custom {
+                id: PLAN_APPROVAL_MODAL_ID.to_string(),
+                title: "Plan created (informational)".to_string(),
+                body: vec!["The plan was created and the run will proceed.".to_string()],
+            });
+            let actions = s.apply(TuiInbound::Key(key));
+            assert!(
+                actions.is_empty(),
+                "informational notice must yield no action for {key:?}, got: {actions:?}"
+            );
+            assert!(
+                s.layout.current_modal().is_none(),
+                "notice must close for non-char key {key:?}"
+            );
+        }
+    }
+
+    // Regression (Gemini review): Ctrl+C must NOT be swallowed by the
+    // plan-notice "any key dismisses" catch-all. The catch-all sits before
+    // the global `(_, KeyEvent::CtrlC)` modal arm, so without an explicit
+    // exclusion it would intercept Ctrl+C and merely dismiss the notice,
+    // silently dropping the cancel gesture. Pin that while the notice is
+    // open: Ctrl+C while a run is in progress cancels the run (the global
+    // modal-CtrlC behavior), exactly as it does without the notice open. A
+    // non-Ctrl+C key (Enter) still dismisses the notice.
+    #[test]
+    fn plan_created_notice_ctrl_c_cancels_not_dismiss() {
+        // Running: Ctrl+C must cancel the run, not silently dismiss.
+        // This is the regression: the catch-all would have intercepted
+        // Ctrl+C and dismissed the modal, dropping the CancelRun.
+        let mut s = fresh_state();
+        s.run_status = RunStatus::Running;
+        s.layout.push_modal(TuiModal::Custom {
+            id: PLAN_APPROVAL_MODAL_ID.to_string(),
+            title: "Plan created (informational)".to_string(),
+            body: vec!["The plan was created and the run will proceed.".to_string()],
+        });
+        let actions = s.apply(TuiInbound::Key(KeyEvent::CtrlC));
+        assert_eq!(
+            actions,
+            vec![TuiAction::CancelRun],
+            "Ctrl+C over the plan notice while running must cancel, not dismiss"
+        );
+
+        // Idle: Ctrl+C falls through to the global modal-CtrlC arm, which
+        // is a deliberate no-op while a modal is open (it does not exit out
+        // from under a modal). The point of this assertion is the inverse of
+        // the regression: Ctrl+C is NOT treated as an "any key" dismiss — it
+        // yields no action and the notice stays open rather than being
+        // silently popped by the catch-all.
+        let mut s = fresh_state();
+        assert_eq!(s.run_status, RunStatus::Idle);
+        s.layout.push_modal(TuiModal::Custom {
+            id: PLAN_APPROVAL_MODAL_ID.to_string(),
+            title: "Plan created (informational)".to_string(),
+            body: vec!["The plan was created and the run will proceed.".to_string()],
+        });
+        let actions = s.apply(TuiInbound::Key(KeyEvent::CtrlC));
+        assert!(
+            actions.is_empty(),
+            "Ctrl+C over an idle plan notice must yield no action, got: {actions:?}"
+        );
+        assert!(
+            s.layout.current_modal().is_some(),
+            "Ctrl+C must not be swallowed by the dismiss catch-all (notice should remain)"
+        );
+
+        // Sanity: a non-Ctrl+C key still dismisses the notice with no action.
+        let mut s = fresh_state();
+        s.layout.push_modal(TuiModal::Custom {
+            id: PLAN_APPROVAL_MODAL_ID.to_string(),
+            title: "Plan created (informational)".to_string(),
+            body: vec!["The plan was created and the run will proceed.".to_string()],
+        });
+        let actions = s.apply(TuiInbound::Key(KeyEvent::Enter));
+        assert!(
+            actions.is_empty(),
+            "Enter must dismiss the notice with no action, got: {actions:?}"
+        );
+        assert!(
+            s.layout.current_modal().is_none(),
+            "Enter must close the plan notice"
+        );
+    }
+
+    // #27 (Codex P2): guard that the dismiss copy and the routing agree.
+    // The notice must advertise "any key" dismissal — if a future change
+    // narrows routing back to chars only, the copy here should be tightened
+    // in lockstep (and this assertion updated).
+    #[test]
+    fn plan_created_notice_copy_promises_any_key() {
+        use code_agent_core::plan::{new_plan_id, PlanDocument};
+        use code_agent_sdk::event::PlanCreated;
+
+        let mut s = fresh_state();
+        let plan = PlanDocument::new_draft(new_plan_id(), "demo", "u");
+        s.apply(TuiInbound::sdk(SdkEvent::PlanCreated(PlanCreated {
+            run_id: rid(),
+            plan,
+        })));
+        let body = match s.layout.current_modal().expect("notice open") {
+            TuiModal::Custom { body, .. } => body.clone(),
+            other => panic!("expected Custom modal, got {other:?}"),
+        };
+        assert!(
+            body.iter()
+                .any(|l| l.contains("Esc") && l.contains("any key")),
+            "notice must promise Esc-or-any-key dismissal, got: {body:?}"
+        );
     }
 
     // #227: under an active search filter, the visibility cache must

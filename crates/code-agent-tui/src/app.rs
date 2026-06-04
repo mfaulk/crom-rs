@@ -341,40 +341,18 @@ impl TuiApp {
                 // `ApprovalRequired` event without a matching bridge
                 // call) we still log the decision so reducer-only
                 // tests of the workbench remain useful.
+                // #27: the former ApprovePlan/RejectPlan/RevisePlan arms
+                // were removed along with their TuiAction variants. They
+                // only logged a "[preview]" line while the SDK
+                // auto-approved the plan internally, so an operator who
+                // "rejected" a plan still saw it run — the UI lied about
+                // gating execution. The plan-approval modal is now an
+                // informational notice that emits no decision action.
+                // Wiring a real host-side PlanDecisionCallback that can
+                // actually block a run is the tracked follow-up
+                // (issue #27 option 1).
                 TuiAction::ResolveApproval(decision) => {
                     self.resolve_approval(decision);
-                }
-                // Plan decisions are not yet wired through `AgentRuntime`:
-                // the SDK has no `PlanDecisionCallback` / `approve_plan` API
-                // for the TUI to call. We surface the keypress as an
-                // activity-log line and prefix it `[preview]` so the
-                // operator can see the UI is reading the keys but not
-                // blocking the run. See #146 for the followup that adds
-                // a real callback.
-                //
-                // TODO(#146): wire a real PlanDecisionCallback through
-                // AgentRuntime so these arms can send an actual decision
-                // to the SDK instead of only logging a preview line.
-                TuiAction::ApprovePlan(plan_id) => {
-                    self.state.push_activity(format_plan_preview_log(
-                        "approve",
-                        plan_id.as_str(),
-                        None,
-                    ));
-                }
-                TuiAction::RejectPlan { plan_id, reason } => {
-                    self.state.push_activity(format_plan_preview_log(
-                        "reject",
-                        plan_id.as_str(),
-                        Some(reason.as_deref().unwrap_or("no reason")),
-                    ));
-                }
-                TuiAction::RevisePlan { plan_id, hint } => {
-                    self.state.push_activity(format_plan_preview_log(
-                        "revise",
-                        plan_id.as_str(),
-                        Some(if hint.is_empty() { "<no hint>" } else { &hint }),
-                    ));
                 }
             }
         }
@@ -411,21 +389,6 @@ impl TuiApp {
         let frame = crate::view::build_ui_frame(&self.state, &self.footer);
         draw(terminal, frame)?;
         Ok(())
-    }
-}
-
-/// Render the activity-log line for a (currently-no-op) plan decision.
-///
-/// Until the SDK exposes a `PlanDecisionCallback` (#146), the TUI's
-/// approve/reject/revise keys cannot block the run. The activity log
-/// line is the only operator-visible signal that their keypress was
-/// observed at all, so it must be prefixed `[preview]` and tagged
-/// `(no SDK callback yet)` so the operator cannot mistake it for a
-/// real effect.
-fn format_plan_preview_log(action: &str, plan_id: &str, detail: Option<&str>) -> String {
-    match detail {
-        Some(d) => format!("[preview] {action} plan: {plan_id} ({d}) (no SDK callback yet)"),
-        None => format!("[preview] {action} plan: {plan_id} (no SDK callback yet)"),
     }
 }
 
@@ -703,26 +666,6 @@ pub async fn drive_single_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The plan-preview log line MUST advertise itself as preview-only
-    // and call out the missing SDK callback. A future edit that drops
-    // either signal would lie about a real effect to the operator (#146).
-    #[test]
-    fn plan_preview_log_advertises_preview_and_missing_callback() {
-        let approve = format_plan_preview_log("approve", "plan_abc", None);
-        assert!(
-            approve.starts_with("[preview] approve plan: plan_abc"),
-            "got: {approve}"
-        );
-        assert!(approve.contains("no SDK callback yet"), "got: {approve}");
-
-        let reject = format_plan_preview_log("reject", "plan_abc", Some("not now"));
-        assert!(
-            reject.starts_with("[preview] reject plan: plan_abc (not now)"),
-            "got: {reject}"
-        );
-        assert!(reject.contains("no SDK callback yet"), "got: {reject}");
-    }
 
     // #154: the input thread keeps polling until the shared shutdown
     // flag is set, then stops. The blocking `event::read()` loop can't be
