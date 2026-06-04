@@ -857,17 +857,17 @@ async fn fs_session_store_child_helpers() {
     let parent = store.create(dir.path()).await.unwrap();
     let child = code_agent_core::SessionId::new();
 
-    let rec = code_agent_session::SessionRecord {
-        timestamp: code_agent_session::now_iso(),
-        cwd: dir.path().to_path_buf(),
-        session_id: child.to_string(),
-        payload: code_agent_session::SessionPayload::SubagentMetadata {
+    let rec = code_agent_session::SessionRecord::new(
+        code_agent_session::now_iso(),
+        dir.path().to_path_buf(),
+        child.to_string(),
+        code_agent_session::SessionPayload::SubagentMetadata {
             parent_session_id: parent.to_string(),
             parent_run_id: "r".into(),
             parent_tool_call_id: "c".into(),
             agent_name: "rev".into(),
         },
-    };
+    );
     store.append_child(&parent, &child, rec).await.unwrap();
 
     let listed = store.list_children(&parent).await.unwrap();

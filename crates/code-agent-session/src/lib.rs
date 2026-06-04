@@ -15,12 +15,69 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+pub mod migrations;
 pub mod recovery;
 pub use recovery::{
     acquire_lock, append_recovery_marker, classify_state, detect_state, load_records_resilient,
     lock_path_for, read_lock, release_lock, write_lock, RecoveryMarker, RunLock,
     SessionRecoveryInfo,
 };
+
+/// Current on-disk schema version stamped on every newly written
+/// [`SessionRecord`]. Version `0` is reserved for pre-versioning JSONL that
+/// predates this field (such records deserialize as v0 via
+/// `default_schema_version`); version `1` is the first explicitly versioned
+/// format.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// Default schema version applied when a JSONL record lacks the
+/// `schema_version` field. Pre-versioning records (written before the field
+/// existed) load as v0 so older sessions keep replaying.
+fn default_schema_version() -> u32 {
+    0
+}
+
+/// Lightweight view over a JSONL line that reads ONLY the `schema_version`
+/// field, ignoring every other field. This lets the load/recovery paths
+/// detect a future-version record *before* attempting the full
+/// [`SessionRecord`] deserialize.
+///
+/// This matters because schema versioning exists to guard *future breaking
+/// changes*. A future breaking change (a new [`SessionPayload`] variant, a
+/// changed field type) makes `from_str::<SessionRecord>` FAIL — so without
+/// this pre-parse probe a future-version line would fall into the "corrupt
+/// line" path and be silently skipped instead of surfacing the loud
+/// [`SessionError::UnsupportedSchemaVersion`].
+#[derive(serde::Deserialize)]
+struct SchemaVersionProbe {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
+}
+
+/// Pre-parse schema-version gate applied to every JSONL session line before
+/// the full [`SessionRecord`] deserialize.
+///
+/// If the line parses as a [`SchemaVersionProbe`] and its `schema_version`
+/// exceeds [`CURRENT_SCHEMA_VERSION`], this returns
+/// [`SessionError::UnsupportedSchemaVersion`] so a future-version record is a
+/// hard error rather than a skipped/corrupt line.
+///
+/// If the probe itself fails to parse (genuinely malformed JSON), this returns
+/// `Ok(())`: the caller's existing handling decides whether to error or skip
+/// the corrupt line. The version gate only ever *adds* a loud failure for
+/// detected future versions; it never suppresses the resilient skip path for
+/// same/old-version corruption.
+pub(crate) fn check_schema_version_line(line: &str) -> Result<(), SessionError> {
+    if let Ok(probe) = serde_json::from_str::<SchemaVersionProbe>(line) {
+        if probe.schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(SessionError::UnsupportedSchemaVersion {
+                found: probe.schema_version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -32,16 +89,62 @@ pub enum SessionError {
     NotFound(String),
     #[error("invalid session id")]
     InvalidId,
+    /// A record was written by a newer build whose schema version is ahead of
+    /// what this build understands. Loading is refused rather than silently
+    /// dropping fields the newer format may carry.
+    #[error(
+        "session record schema version {found} is newer than this build supports \
+         (max {supported}); upgrade the agent to load this session"
+    )]
+    UnsupportedSchemaVersion { found: u32, supported: u32 },
     #[error("{0}")]
     Other(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
+    /// On-disk schema version for this record. Absent in pre-versioning JSONL,
+    /// which deserializes as v0 (see `default_schema_version`).
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub timestamp: String,
     pub cwd: PathBuf,
     pub session_id: String,
     pub payload: SessionPayload,
+}
+
+impl SessionRecord {
+    /// Construct a record stamped with [`CURRENT_SCHEMA_VERSION`]. All write
+    /// paths build records through this so new JSONL is always versioned.
+    pub fn new(
+        timestamp: String,
+        cwd: PathBuf,
+        session_id: String,
+        payload: SessionPayload,
+    ) -> Self {
+        Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            timestamp,
+            cwd,
+            session_id,
+            payload,
+        }
+    }
+
+    /// Validate a freshly deserialized record's schema version against this
+    /// build. Records at or below [`CURRENT_SCHEMA_VERSION`] are accepted (and
+    /// migrated forward through [`migrations::migrate_record`]); records from a
+    /// newer build fail loudly with [`SessionError::UnsupportedSchemaVersion`].
+    pub fn validate_schema_version(self) -> Result<Self, SessionError> {
+        if self.schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(SessionError::UnsupportedSchemaVersion {
+                found: self.schema_version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+        let from = self.schema_version;
+        migrations::migrate_record(self, from)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,8 +294,11 @@ impl FsSessionStore {
             if line.trim().is_empty() {
                 continue;
             }
+            // Pre-parse version gate: a future-version line is a hard error
+            // even if it would fail the full SessionRecord parse below.
+            check_schema_version_line(&line)?;
             let rec: SessionRecord = serde_json::from_str(&line)?;
-            out.push(rec);
+            out.push(rec.validate_schema_version()?);
         }
         Ok(out)
     }
@@ -280,8 +386,11 @@ impl SessionStore for FsSessionStore {
             if line.trim().is_empty() {
                 continue;
             }
+            // Pre-parse version gate: a future-version line is a hard error
+            // even if it would fail the full SessionRecord parse below.
+            check_schema_version_line(&line)?;
             let rec: SessionRecord = serde_json::from_str(&line)?;
-            out.push(rec);
+            out.push(rec.validate_schema_version()?);
         }
         Ok(out)
     }
@@ -351,12 +460,12 @@ impl SessionSinkAdapter {
 #[async_trait]
 impl SessionSink for SessionSinkAdapter {
     async fn record(&self, session_id: &SessionId, event: &AgentEvent) -> Result<(), AgentError> {
-        let record = SessionRecord {
-            timestamp: now_iso(),
-            cwd: self.cwd.clone(),
-            session_id: session_id.to_string(),
-            payload: SessionPayload::Event(event.clone()),
-        };
+        let record = SessionRecord::new(
+            now_iso(),
+            self.cwd.clone(),
+            session_id.to_string(),
+            SessionPayload::Event(event.clone()),
+        );
         self.store
             .append(session_id, record)
             .await
@@ -386,12 +495,12 @@ impl ChildSessionSinkAdapter {
 #[async_trait]
 impl SessionSink for ChildSessionSinkAdapter {
     async fn record(&self, session_id: &SessionId, event: &AgentEvent) -> Result<(), AgentError> {
-        let record = SessionRecord {
-            timestamp: now_iso(),
-            cwd: self.cwd.clone(),
-            session_id: session_id.to_string(),
-            payload: SessionPayload::Event(event.clone()),
-        };
+        let record = SessionRecord::new(
+            now_iso(),
+            self.cwd.clone(),
+            session_id.to_string(),
+            SessionPayload::Event(event.clone()),
+        );
         self.store
             .append_child(&self.parent_session_id, session_id, record)
             .await
@@ -446,12 +555,7 @@ impl code_agent_core::ChildSessionSinkFactory for FsChildSessionSinkFactory {
             agent_name: metadata.agent_name.clone(),
         };
         Box::pin(async move {
-            let record = SessionRecord {
-                timestamp: now_iso(),
-                cwd,
-                session_id: child.to_string(),
-                payload,
-            };
+            let record = SessionRecord::new(now_iso(), cwd, child.to_string(), payload);
             store
                 .append_child(&parent, &child, record)
                 .await
@@ -473,14 +577,14 @@ pub async fn append_user_prompt(
     session_id: &SessionId,
     prompt: &str,
 ) -> Result<(), SessionError> {
-    let record = SessionRecord {
-        timestamp: now_iso(),
-        cwd: cwd.to_path_buf(),
-        session_id: session_id.to_string(),
-        payload: SessionPayload::UserPrompt {
+    let record = SessionRecord::new(
+        now_iso(),
+        cwd.to_path_buf(),
+        session_id.to_string(),
+        SessionPayload::UserPrompt {
             text: prompt.to_string(),
         },
-    };
+    );
     store.append(session_id, record).await
 }
 
@@ -491,14 +595,14 @@ pub async fn append_fork_metadata(
     new_session_id: &SessionId,
     source_session_id: &SessionId,
 ) -> Result<(), SessionError> {
-    let record = SessionRecord {
-        timestamp: now_iso(),
-        cwd: cwd.to_path_buf(),
-        session_id: new_session_id.to_string(),
-        payload: SessionPayload::ForkMetadata {
+    let record = SessionRecord::new(
+        now_iso(),
+        cwd.to_path_buf(),
+        new_session_id.to_string(),
+        SessionPayload::ForkMetadata {
             source_session_id: source_session_id.to_string(),
         },
-    };
+    );
     store.append(new_session_id, record).await
 }
 
@@ -509,14 +613,14 @@ pub async fn append_settings_snapshot(
     session_id: &SessionId,
     settings_summary: &str,
 ) -> Result<(), SessionError> {
-    let record = SessionRecord {
-        timestamp: now_iso(),
-        cwd: cwd.to_path_buf(),
-        session_id: session_id.to_string(),
-        payload: SessionPayload::SettingsSnapshot {
+    let record = SessionRecord::new(
+        now_iso(),
+        cwd.to_path_buf(),
+        session_id.to_string(),
+        SessionPayload::SettingsSnapshot {
             settings_summary: settings_summary.to_string(),
         },
-    };
+    );
     store.append(session_id, record).await
 }
 
@@ -545,13 +649,14 @@ pub async fn fork_session(
             continue;
         }
         // Keep the original timestamp but rewrite the session id so the
-        // new file references itself, not the source.
-        let copied = SessionRecord {
-            timestamp: r.timestamp,
-            cwd: cwd.to_path_buf(),
-            session_id: new_id.to_string(),
-            payload: r.payload,
-        };
+        // new file references itself, not the source. The copy is a freshly
+        // written record, so it is stamped with the current schema version.
+        let copied = SessionRecord::new(
+            r.timestamp,
+            cwd.to_path_buf(),
+            new_id.to_string(),
+            r.payload,
+        );
         store.append(&new_id, copied).await?;
     }
     Ok(new_id)
@@ -837,12 +942,12 @@ mod tests {
             content: vec![code_agent_core::AssistantContent::Text { text: "hi".into() }],
             stop_reason: Some("end_turn".into()),
         });
-        let rec = SessionRecord {
-            timestamp: now_iso(),
-            cwd: dir.path().to_path_buf(),
-            session_id: id.to_string(),
-            payload: SessionPayload::Event(event),
-        };
+        let rec = SessionRecord::new(
+            now_iso(),
+            dir.path().to_path_buf(),
+            id.to_string(),
+            SessionPayload::Event(event),
+        );
         store.append(&id, rec).await.unwrap();
 
         let records = store.load(&id).await.unwrap();
@@ -890,14 +995,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = FsSessionStore::new(dir.path());
         let bad = SessionId::from("foo/bar".to_string());
-        let rec = SessionRecord {
-            timestamp: now_iso(),
-            cwd: dir.path().to_path_buf(),
-            session_id: bad.to_string(),
-            payload: SessionPayload::UserPrompt {
+        let rec = SessionRecord::new(
+            now_iso(),
+            dir.path().to_path_buf(),
+            bad.to_string(),
+            SessionPayload::UserPrompt {
                 text: "x".to_string(),
             },
-        };
+        );
         let err = store
             .append(&bad, rec)
             .await
@@ -916,14 +1021,14 @@ mod tests {
 
     // Helper: build a single SessionRecord with the given id.
     fn rec_for(dir: &TempDir, id: &SessionId) -> SessionRecord {
-        SessionRecord {
-            timestamp: now_iso(),
-            cwd: dir.path().to_path_buf(),
-            session_id: id.to_string(),
-            payload: SessionPayload::UserPrompt {
+        SessionRecord::new(
+            now_iso(),
+            dir.path().to_path_buf(),
+            id.to_string(),
+            SessionPayload::UserPrompt {
                 text: "x".to_string(),
             },
-        }
+        )
     }
 
     #[tokio::test]
@@ -1029,12 +1134,12 @@ mod tests {
         store
             .append(
                 &id,
-                SessionRecord {
-                    timestamp: now_iso(),
-                    cwd: dir.path().to_path_buf(),
-                    session_id: id.to_string(),
-                    payload: SessionPayload::Event(am),
-                },
+                SessionRecord::new(
+                    now_iso(),
+                    dir.path().to_path_buf(),
+                    id.to_string(),
+                    SessionPayload::Event(am),
+                ),
             )
             .await
             .unwrap();
@@ -1061,12 +1166,12 @@ mod tests {
             usage: None,
             total_cost_usd: Some(cost),
         };
-        SessionRecord {
-            timestamp: now_iso(),
-            cwd: dir.path().to_path_buf(),
-            session_id: session_id.to_string(),
-            payload: SessionPayload::Event(AgentEvent::Result(res)),
-        }
+        SessionRecord::new(
+            now_iso(),
+            dir.path().to_path_buf(),
+            session_id.to_string(),
+            SessionPayload::Event(AgentEvent::Result(res)),
+        )
     }
 
     #[tokio::test]
@@ -1202,12 +1307,12 @@ mod tests {
         store
             .append(
                 &id,
-                SessionRecord {
-                    timestamp: now_iso(),
-                    cwd: dir.path().to_path_buf(),
-                    session_id: id.to_string(),
-                    payload: SessionPayload::Event(am),
-                },
+                SessionRecord::new(
+                    now_iso(),
+                    dir.path().to_path_buf(),
+                    id.to_string(),
+                    SessionPayload::Event(am),
+                ),
             )
             .await
             .unwrap();
@@ -1303,12 +1408,12 @@ mod tests {
             store
                 .append(
                     &id,
-                    SessionRecord {
-                        timestamp: now_iso(),
-                        cwd: dir.path().to_path_buf(),
-                        session_id: id.to_string(),
-                        payload: SessionPayload::Event(ev),
-                    },
+                    SessionRecord::new(
+                        now_iso(),
+                        dir.path().to_path_buf(),
+                        id.to_string(),
+                        SessionPayload::Event(ev),
+                    ),
                 )
                 .await
                 .unwrap();

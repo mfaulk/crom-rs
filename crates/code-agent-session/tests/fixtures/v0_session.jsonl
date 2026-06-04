@@ -1,0 +1,2 @@
+{"timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/v0-session","session_id":"00000000000000000000000000000000","payload":{"kind":"user_prompt","text":"hello from a pre-versioning session"}}
+{"timestamp":"2026-01-01T00:00:01Z","cwd":"/tmp/v0-session","session_id":"00000000000000000000000000000000","payload":{"kind":"event","type":"assistant_message","content":[{"kind":"text","text":"hi"}],"stop_reason":"end_turn"}}

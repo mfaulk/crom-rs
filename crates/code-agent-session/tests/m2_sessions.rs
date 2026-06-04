@@ -261,12 +261,12 @@ async fn session_summary_sums_cost_across_runs() {
         store
             .append(
                 &id,
-                SessionRecord {
-                    timestamp: now_iso(),
-                    cwd: cwd.clone(),
-                    session_id: id.to_string(),
-                    payload: SessionPayload::Event(AgentEvent::Result(res)),
-                },
+                SessionRecord::new(
+                    now_iso(),
+                    cwd.clone(),
+                    id.to_string(),
+                    SessionPayload::Event(AgentEvent::Result(res)),
+                ),
             )
             .await
             .unwrap();

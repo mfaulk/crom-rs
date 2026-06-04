@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::io::AsyncBufReadExt;
 
-use crate::{FsSessionStore, SessionError, SessionPayload, SessionRecord};
+use crate::{
+    check_schema_version_line, FsSessionStore, SessionError, SessionPayload, SessionRecord,
+};
 
 /// Snapshot of an active run, persisted as a `*.lock` file alongside the
 /// session JSONL. The file is short and human-readable.
@@ -226,7 +228,16 @@ pub async fn detect_state(
         // to decide whether this session has any records and whether it
         // ended in a `Result` event. This caps the scan at ~64KB even for
         // multi-megabyte session logs.
-        let probe = tail_probe(&path).await.unwrap_or_default();
+        //
+        // A future-version record must propagate loudly so recovery does not
+        // silently classify a session it cannot fully understand. Genuine I/O
+        // errors (unreadable tail) stay best-effort: fall back to the default
+        // probe so a transient read failure doesn't abort the whole scan.
+        let probe = match tail_probe(&path).await {
+            Ok(p) => p,
+            Err(e @ SessionError::UnsupportedSchemaVersion { .. }) => return Err(e),
+            Err(_) => TailProbe::default(),
+        };
         let state = classify_state_lite(probe, lock.as_ref(), now_unix, stale_after_seconds);
         out.push(SessionRecoveryInfo {
             session_id: id,
@@ -299,7 +310,7 @@ pub(crate) fn classify_state_lite(
 /// fast even on multi-megabyte session logs.
 const TAIL_BYTES: u64 = 64 * 1024;
 
-async fn tail_probe(path: &Path) -> std::io::Result<TailProbe> {
+async fn tail_probe(path: &Path) -> Result<TailProbe, SessionError> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
     if !path.exists() {
         return Ok(TailProbe::default());
@@ -329,6 +340,11 @@ async fn tail_probe(path: &Path) -> std::io::Result<TailProbe> {
             continue;
         }
         has_records = true;
+        // Pre-parse version gate, so recovery state detection rejects a
+        // future-version session loudly instead of silently classifying it.
+        // A future breaking change can make the full `SessionRecord` parse
+        // below fail; the probe still reads `schema_version` and hard-errors.
+        check_schema_version_line(trimmed)?;
         if !trimmed.contains("\"result\"") {
             continue;
         }
@@ -369,8 +385,20 @@ pub async fn load_records_resilient(
         if line.trim().is_empty() {
             continue;
         }
+        // Pre-parse version gate FIRST. A future-version line must be a hard
+        // error, NOT a skipped "corrupt" line — even when a future breaking
+        // change makes the full `SessionRecord` parse below fail. Without this
+        // the resilient loader would silently drop future-version records into
+        // `skipped`, defeating the whole point of versioning. The gate only
+        // fires for lines whose `schema_version` is detectably > current; a
+        // genuinely malformed line at a known version still parses as a probe
+        // failure here (Ok) and falls through to the skip path below.
+        check_schema_version_line(&line)?;
         match serde_json::from_str::<SessionRecord>(&line) {
-            Ok(rec) => out.push(rec),
+            // A well-formed record from a newer build is not "corrupt" — it is
+            // a record we must not silently drop. Surface it as a hard error
+            // rather than counting it as a skipped/truncated line.
+            Ok(rec) => out.push(rec.validate_schema_version()?),
             Err(_) => {
                 skipped = skipped.saturating_add(1);
             }
@@ -408,12 +436,12 @@ pub async fn append_recovery_marker(
         records_recovered,
         records_skipped,
     });
-    let record = SessionRecord {
-        timestamp: now_iso(),
-        cwd: cwd.to_path_buf(),
-        session_id: session_id.to_string(),
-        payload: SessionPayload::Event(event),
-    };
+    let record = SessionRecord::new(
+        now_iso(),
+        cwd.to_path_buf(),
+        session_id.to_string(),
+        SessionPayload::Event(event),
+    );
     store.append(session_id, record).await
 }
 
@@ -493,11 +521,11 @@ mod tests {
     // Sessions with a Result but no lock are Complete.
     async fn classify_complete() {
         let id = SessionId::new();
-        let rec = SessionRecord {
-            timestamp: now_iso(),
-            cwd: PathBuf::from("/tmp"),
-            session_id: id.to_string(),
-            payload: SessionPayload::Event(AgentEvent::Result(AgentResult {
+        let rec = SessionRecord::new(
+            now_iso(),
+            PathBuf::from("/tmp"),
+            id.to_string(),
+            SessionPayload::Event(AgentEvent::Result(AgentResult {
                 subtype: ResultSubtype::Success,
                 result: None,
                 session_id: id.clone(),
@@ -506,7 +534,7 @@ mod tests {
                 usage: Some(TokenUsage::default()),
                 total_cost_usd: None,
             })),
-        };
+        );
         let state = classify_state(&[rec], None, 1_000_000, 60);
         assert_eq!(state, S::Complete);
     }
@@ -529,11 +557,11 @@ mod tests {
     async fn classify_crashed_when_result_and_lock() {
         let id = SessionId::new();
         let lock = RunLock::new(&id, "r");
-        let rec = SessionRecord {
-            timestamp: now_iso(),
-            cwd: PathBuf::from("/tmp"),
-            session_id: id.to_string(),
-            payload: SessionPayload::Event(AgentEvent::Result(AgentResult {
+        let rec = SessionRecord::new(
+            now_iso(),
+            PathBuf::from("/tmp"),
+            id.to_string(),
+            SessionPayload::Event(AgentEvent::Result(AgentResult {
                 subtype: ResultSubtype::Success,
                 result: None,
                 session_id: id.clone(),
@@ -542,7 +570,7 @@ mod tests {
                 usage: None,
                 total_cost_usd: None,
             })),
-        };
+        );
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let state = classify_state(&[rec], Some(&lock), now, 60);
         assert_eq!(state, S::Crashed);
@@ -576,11 +604,11 @@ mod tests {
                 .unwrap();
         }
         // Then write a Result event at the very end.
-        let rec = SessionRecord {
-            timestamp: now_iso(),
-            cwd: dir.path().to_path_buf(),
-            session_id: id.to_string(),
-            payload: SessionPayload::Event(AgentEvent::Result(AgentResult {
+        let rec = SessionRecord::new(
+            now_iso(),
+            dir.path().to_path_buf(),
+            id.to_string(),
+            SessionPayload::Event(AgentEvent::Result(AgentResult {
                 subtype: ResultSubtype::Success,
                 result: None,
                 session_id: id.clone(),
@@ -589,7 +617,7 @@ mod tests {
                 usage: None,
                 total_cost_usd: None,
             })),
-        };
+        );
         store.append(&id, rec).await.unwrap();
         let path =
             FsSessionStore::sessions_dir_for(dir.path()).join(format!("{}.jsonl", id.as_str()));
