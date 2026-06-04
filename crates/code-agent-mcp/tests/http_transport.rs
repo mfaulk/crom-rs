@@ -75,7 +75,12 @@ async fn start_server(mode: Mode) -> (String, Arc<Mutex<Vec<String>>>) {
                 let mut body = vec![0u8; len];
                 let _ = stream.read_exact(&mut body).await;
                 if matches!(mode, Mode::Timeout) {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    // Withhold the response just long enough that the client's
+                    // (much smaller) read timeout fires first. This only needs
+                    // to exceed the client timeout under test (50ms), so keep
+                    // it to the minimum that reliably wins the race rather than
+                    // a multi-second wait that would linger after the test.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     return;
                 }
                 let request: serde_json::Value = serde_json::from_slice(&body).unwrap();

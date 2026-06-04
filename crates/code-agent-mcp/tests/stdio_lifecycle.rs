@@ -4,9 +4,35 @@ use std::time::Duration;
 
 use code_agent_mcp::{McpClient, McpError, McpLimits, McpServerConfig, StdioMcpServerConfig};
 
+fn fake_manifest() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-mcp-server/Cargo.toml")
+}
+
+static BUILD_FAKE_SERVER: std::sync::Once = std::sync::Once::new();
+
+/// Pre-builds the fake MCP server fixture once per test binary so the
+/// `cargo run` used to launch it is a near-instant no-op spawn rather than a
+/// build that races other concurrent spawns under load (#35).
+fn ensure_fake_server_built() {
+    BUILD_FAKE_SERVER.call_once(|| {
+        let status = std::process::Command::new("cargo")
+            .args([
+                "build",
+                "--quiet",
+                "--manifest-path",
+                &fake_manifest().display().to_string(),
+            ])
+            .status()
+            .expect("failed to spawn cargo build for fake-mcp-server fixture");
+        assert!(
+            status.success(),
+            "pre-building the fake-mcp-server fixture failed"
+        );
+    });
+}
+
 fn fake_server_config() -> StdioMcpServerConfig {
-    let manifest =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-mcp-server/Cargo.toml");
+    let manifest = fake_manifest();
     StdioMcpServerConfig {
         command: "cargo".into(),
         args: vec![
@@ -23,6 +49,7 @@ fn fake_server_config() -> StdioMcpServerConfig {
 }
 
 async fn fake_client(config: StdioMcpServerConfig) -> McpClient {
+    ensure_fake_server_built();
     McpClient::connect(
         "fake",
         &McpServerConfig::Stdio(config),
@@ -72,8 +99,23 @@ async fn tools_call_returns_text_result() {
 async fn stderr_is_logged_and_redacted() {
     let mut client = fake_client(fake_server_config()).await;
     client.initialize().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let logs = client.drain_logs();
+    // The server's stderr line is captured asynchronously. Instead of sleeping
+    // a fixed interval and hoping it arrived, poll-drain (accumulating across
+    // drains, since `drain_logs` consumes) until the redacted line shows up,
+    // bounded by an overall deadline so a real failure still fails loudly.
+    let mut logs = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        logs.extend(client.drain_logs());
+        if logs.iter().any(|l| l.message.contains("[REDACTED]")) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server stderr was never captured as a log; got: {logs:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert!(logs.iter().any(|l| l.message.contains("[REDACTED]")));
     assert!(!logs
         .iter()

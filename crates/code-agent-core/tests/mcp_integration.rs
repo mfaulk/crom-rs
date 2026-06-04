@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use code_agent_core::{
@@ -10,9 +10,42 @@ use code_agent_core::{
 };
 use futures::stream::{self, BoxStream, StreamExt};
 
+fn fake_manifest() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../code-agent-mcp/tests/fixtures/fake-mcp-server/Cargo.toml")
+}
+
+static BUILD_FAKE_SERVER: std::sync::Once = std::sync::Once::new();
+
+/// Pre-builds the fake MCP server fixture once per test binary.
+///
+/// The fixture is its own (excluded) workspace, so the `cargo run` used to
+/// launch it would otherwise build on first spawn. Under full-suite
+/// parallelism several tests spawn it at once, and racing `cargo build`
+/// invocations contend on the cargo lock and on CPU/memory, which
+/// intermittently SIGKILLed the spawned server before it became ready (#35).
+/// Building once up front makes each later `cargo run` a near-instant no-op
+/// spawn, removing that contention before discovery's startup timeout applies.
+fn ensure_fake_server_built() {
+    BUILD_FAKE_SERVER.call_once(|| {
+        let status = std::process::Command::new("cargo")
+            .args([
+                "build",
+                "--quiet",
+                "--manifest-path",
+                &fake_manifest().display().to_string(),
+            ])
+            .status()
+            .expect("failed to spawn cargo build for fake-mcp-server fixture");
+        assert!(
+            status.success(),
+            "pre-building the fake-mcp-server fixture failed"
+        );
+    });
+}
+
 fn fake_mcp_options() -> McpOptions {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../code-agent-mcp/tests/fixtures/fake-mcp-server/Cargo.toml");
+    let manifest = fake_manifest();
     McpOptions {
         enabled: true,
         servers: BTreeMap::from([(
@@ -65,6 +98,7 @@ impl ModelProvider for CapturingProvider {
 #[tokio::test]
 // Discovered MCP tools are registered with `mcp__server__tool` names.
 async fn discovered_mcp_tools_register_as_agent_tools() {
+    ensure_fake_server_built();
     let provider = Arc::new(CapturingProvider::new(vec![vec![
         ModelEvent::TextDelta {
             text: "done".into(),
@@ -98,6 +132,7 @@ async fn discovered_mcp_tools_register_as_agent_tools() {
 #[tokio::test]
 // MCP tool calls flow through the normal agent loop and return tool results.
 async fn mcp_tool_call_runs_through_agent_loop() {
+    ensure_fake_server_built();
     let provider = Arc::new(CapturingProvider::new(vec![
         vec![
             ModelEvent::ToolCall(code_agent_core::ToolCall {
@@ -148,9 +183,14 @@ async fn mcp_tool_call_runs_through_agent_loop() {
     }));
 }
 
-/// Tiny MCP server that injects a synthetic init delay so the test can
-/// measure whether discovery runs in parallel.
-async fn start_slow_mcp(init_delay: Duration) -> String {
+/// Tiny MCP server whose `initialize` handler rendezvouses on a shared
+/// barrier before responding. When several of these are discovered in
+/// parallel every `initialize` reaches the barrier and all are released
+/// together; if discovery ran sequentially the first server would block on a
+/// barrier its peers never reach, hanging the run (caught by the test's outer
+/// timeout). This proves parallel discovery deterministically without timing
+/// wall-clock latency.
+async fn start_slow_mcp(barrier: Arc<tokio::sync::Barrier>) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -160,6 +200,7 @@ async fn start_slow_mcp(init_delay: Duration) -> String {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
+            let barrier = barrier.clone();
             tokio::spawn(async move {
                 let mut header_bytes = Vec::new();
                 let mut buf = [0u8; 1];
@@ -192,7 +233,9 @@ async fn start_slow_mcp(init_delay: Duration) -> String {
                 let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
                 let payload = match method {
                     "initialize" => {
-                        tokio::time::sleep(init_delay).await;
+                        // Block until every peer server's initialize is also
+                        // in flight. Only true parallel discovery releases it.
+                        barrier.wait().await;
                         serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -231,15 +274,18 @@ async fn start_slow_mcp(init_delay: Duration) -> String {
 }
 
 #[tokio::test]
-// MCP server discovery runs in parallel: with three servers that each
-// add a 500ms init delay, the registration phase finishes in well under
-// 3*500ms (the sequential bound).
+// MCP server discovery runs in parallel: three servers share a barrier whose
+// `initialize` only unblocks once all three are concurrently in flight. If
+// discovery were sequential the first would block forever and the run would
+// hang, so completing at all proves parallelism (no wall-clock thresholds).
 async fn mcp_discovery_runs_in_parallel() {
-    let delay = Duration::from_millis(500);
+    // Sized for the three servers; every initialize must arrive before any
+    // is released.
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let urls = [
-        start_slow_mcp(delay).await,
-        start_slow_mcp(delay).await,
-        start_slow_mcp(delay).await,
+        start_slow_mcp(barrier.clone()).await,
+        start_slow_mcp(barrier.clone()).await,
+        start_slow_mcp(barrier.clone()).await,
     ];
 
     let mut servers = BTreeMap::new();
@@ -263,9 +309,14 @@ async fn mcp_discovery_runs_in_parallel() {
     };
 
     let mut registry = ToolRegistry::new();
-    let started = Instant::now();
-    let report = code_agent_core::register_mcp_tools(&mut registry, &options).await;
-    let elapsed = started.elapsed();
+    // A sequential discovery regression would deadlock on the shared barrier;
+    // bound the whole call so that surfaces as a clear failure, not a hang.
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        code_agent_core::register_mcp_tools(&mut registry, &options),
+    )
+    .await
+    .expect("discovery must run in parallel: register_mcp_tools hung (barrier deadlock)");
 
     assert_eq!(report.statuses.len(), 3);
     assert!(
@@ -280,13 +331,6 @@ async fn mcp_discovery_runs_in_parallel() {
             .map(|s| (&s.name, &s.status, &s.error))
             .collect::<Vec<_>>()
     );
-    // Sequential would be ~1500ms. Parallel completes in ~500ms with
-    // some overhead. The generous 1100ms ceiling tolerates CI jitter
-    // while still strongly distinguishing the two regimes.
-    assert!(
-        elapsed < Duration::from_millis(1100),
-        "discovery must run in parallel: elapsed={elapsed:?}"
-    );
 }
 
 #[tokio::test]
@@ -296,8 +340,8 @@ async fn mcp_discovery_runs_in_parallel() {
 // discovery path previously dropped these logs on the floor, which was
 // a regression vs. the sequential path.
 async fn failed_discovery_surfaces_drained_logs() {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../code-agent-mcp/tests/fixtures/fake-mcp-server/Cargo.toml");
+    ensure_fake_server_built();
+    let manifest = fake_manifest();
     let mut env = BTreeMap::new();
     env.insert("FAKE_MCP_MODE".into(), "invalid-json-with-stderr".into());
     let options = McpOptions {

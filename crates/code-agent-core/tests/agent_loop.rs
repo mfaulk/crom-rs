@@ -696,18 +696,24 @@ async fn eager_mode_does_not_register_search_tools() {
         .any(|event| matches!(event, AgentEvent::ToolSearchCompleted(_))));
 }
 
-struct SleepTool {
+/// A tool that blocks on a shared [`tokio::sync::Barrier`] before returning.
+/// When `N` of these run *concurrently* every invocation reaches the barrier
+/// and all are released together; if they run *sequentially* the first one
+/// waits for peers that never arrive and the agent loop hangs (caught by the
+/// test's outer timeout). This proves parallelism deterministically without
+/// measuring wall-clock time.
+struct BarrierTool {
     name: &'static str,
-    duration: Duration,
+    barrier: Arc<tokio::sync::Barrier>,
 }
 
 #[async_trait]
-impl Tool for SleepTool {
+impl Tool for BarrierTool {
     fn name(&self) -> &str {
         self.name
     }
     fn description(&self) -> &str {
-        "sleep then echo"
+        "rendezvous on a barrier then echo"
     }
     fn input_schema(&self) -> serde_json::Value {
         json!({"type": "object"})
@@ -720,16 +726,17 @@ impl Tool for SleepTool {
         _input: serde_json::Value,
         _ctx: code_agent_core::ToolContext,
     ) -> Result<code_agent_core::ToolResult, ToolError> {
-        tokio::time::sleep(self.duration).await;
+        self.barrier.wait().await;
         Ok(code_agent_core::ToolResult::ok_text("done"))
     }
 }
 
 #[tokio::test]
-// Multiple tool_use blocks in one model turn run concurrently: with two
-// 500ms tools the turn must finish in well under 1s (the sequential
-// bound), and both `tool_result` blocks must appear in the conversation
-// paired to the original `tool_use_id` order.
+// Multiple tool_use blocks in one model turn run concurrently: two tools that
+// rendezvous on a shared barrier only complete if they run at the same time.
+// If the loop ran them sequentially the first would block on a barrier its
+// peer never reaches, and the run would hang (caught by the outer timeout).
+// Both `tool_result` blocks must appear paired to the original `tool_use_id`.
 async fn multiple_tool_calls_run_in_parallel() {
     let provider = Arc::new(ScriptedProvider::new(vec![
         vec![
@@ -756,14 +763,17 @@ async fn multiple_tool_calls_run_in_parallel() {
             },
         ],
     ]));
+    // A barrier sized for the two concurrent tool calls. Both must reach it
+    // before either returns, so the run only completes under true parallelism.
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let mut tools = ToolRegistry::new();
-    tools.register(Arc::new(SleepTool {
+    tools.register(Arc::new(BarrierTool {
         name: "Slow1",
-        duration: Duration::from_millis(500),
+        barrier: barrier.clone(),
     }));
-    tools.register(Arc::new(SleepTool {
+    tools.register(Arc::new(BarrierTool {
         name: "Slow2",
-        duration: Duration::from_millis(500),
+        barrier: barrier.clone(),
     }));
     let opts = AgentOptions {
         max_turns: Some(4),
@@ -771,17 +781,11 @@ async fn multiple_tool_calls_run_in_parallel() {
         ..AgentOptions::default()
     };
 
-    let started = Instant::now();
-    let events = run(provider, opts, tools, "go").await;
-    let elapsed = started.elapsed();
-
-    // Sequential would be at least 1000ms. Parallel completes in ~500ms
-    // plus some scheduling overhead. The 900ms ceiling clearly
-    // distinguishes the two regimes while leaving CI jitter slack.
-    assert!(
-        elapsed < Duration::from_millis(900),
-        "tool calls must run in parallel: elapsed={elapsed:?}"
-    );
+    // A sequential regression would deadlock on the barrier; bound the whole
+    // run so that manifests as a clear failure rather than a hang.
+    let events = tokio::time::timeout(Duration::from_secs(10), run(provider, opts, tools, "go"))
+        .await
+        .expect("tool calls must run in parallel: run did not finish (barrier deadlock)");
 
     let user_results: Vec<_> = events
         .iter()
@@ -807,11 +811,13 @@ async fn multiple_tool_calls_run_in_parallel() {
 }
 
 /// A `Mutating` tool that records `(name, "start"|"end")` events in a shared
-/// log around a 300ms sleep so a test can detect overlap between concurrent
-/// invocations.
+/// log around a cooperative yield point. The yield gives the runtime an
+/// opportunity to interleave a concurrently-running peer between this tool's
+/// `start` and `end` markers, so if the loop ever (wrongly) parallelized
+/// mutating tools the recorded trace would show overlapping start/start
+/// events. No wall-clock sleep is needed to detect the race.
 struct TracingMutatingTool {
     name: &'static str,
-    duration: Duration,
     log: Arc<Mutex<Vec<(String, &'static str)>>>,
 }
 
@@ -838,7 +844,12 @@ impl Tool for TracingMutatingTool {
             .lock()
             .unwrap()
             .push((self.name.to_string(), "start"));
-        tokio::time::sleep(self.duration).await;
+        // Yield several times: if a peer were running concurrently the
+        // scheduler would run it here, interleaving its `start` between our
+        // `start` and `end`. Under correct serialization nothing else runs.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
         self.log
             .lock()
             .unwrap()
@@ -882,12 +893,10 @@ async fn mutating_tool_calls_run_sequentially_within_turn() {
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(TracingMutatingTool {
         name: "Mut1",
-        duration: Duration::from_millis(300),
         log: log.clone(),
     }));
     tools.register(Arc::new(TracingMutatingTool {
         name: "Mut2",
-        duration: Duration::from_millis(300),
         log: log.clone(),
     }));
     let opts = AgentOptions {

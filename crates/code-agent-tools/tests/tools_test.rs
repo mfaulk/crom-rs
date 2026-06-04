@@ -318,16 +318,25 @@ async fn bash_timeout_reaps_grandchildren() {
         .execute(json!({"command": cmd}), ctx_for(&dir))
         .await
         .unwrap();
-    // Give the kill signal a moment to propagate.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The kill signal propagates asynchronously to the process group. Rather
+    // than sleeping a fixed interval and hoping it landed, poll until the
+    // recorded grandchild pid is gone (`kill(pid, 0)` returns ESRCH), bounded
+    // by an overall deadline so a real leak still fails loudly.
     let pid_str = std::fs::read_to_string(&marker).unwrap_or_default();
     let pid: i32 = pid_str.trim().parse().expect("grandchild pid recorded");
-    // kill(pid, 0) returns ESRCH when the process is gone.
-    let alive = unsafe { libc::kill(pid, 0) } == 0;
-    assert!(
-        !alive,
-        "grandchild pid {pid} still alive after Bash timeout"
-    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        // kill(pid, 0) returns ESRCH (==> != 0) once the process is gone.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "grandchild pid {pid} still alive after Bash timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 #[tokio::test]

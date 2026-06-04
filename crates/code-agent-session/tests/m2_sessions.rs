@@ -15,6 +15,24 @@ use code_agent_session::{
 use futures::stream::{self, BoxStream};
 use tempfile::TempDir;
 
+/// Polls `cond` until it returns `true`, sleeping briefly between checks, and
+/// panics with `msg` if `deadline` (a total budget) elapses first. This keeps
+/// condition-based waits fast on the happy path while still failing loudly.
+async fn wait_until<F, Fut>(deadline: std::time::Duration, msg: &str, mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    loop {
+        if cond().await {
+            return;
+        }
+        assert!(start.elapsed() < deadline, "timed out waiting: {msg}");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 #[derive(Clone)]
 struct TextProvider {
     text: String,
@@ -102,9 +120,26 @@ async fn continue_uses_latest_session() {
     let store: Arc<dyn SessionStore> = Arc::new(FsSessionStore::new(cwd.clone()));
     let id1 = store.create(&cwd).await.unwrap();
     append_user_prompt(&*store, &cwd, &id1, "p1").await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let id2 = store.create(&cwd).await.unwrap();
-    append_user_prompt(&*store, &cwd, &id2, "p2").await.unwrap();
+    // `latest_for_cwd` orders by file mtime, which has coarse resolution on
+    // some filesystems. Rather than sleeping a fixed interval to force a
+    // distinct mtime, re-touch id2 (each append flushes and bumps its mtime)
+    // until it is observably the latest. This converges immediately once the
+    // clock ticks past id1's mtime and fails loudly if it never does.
+    wait_until(
+        std::time::Duration::from_secs(5),
+        "id2 to become latest",
+        || {
+            let store = store.clone();
+            let cwd = cwd.clone();
+            let id2 = id2.clone();
+            async move {
+                append_user_prompt(&*store, &cwd, &id2, "p2").await.unwrap();
+                store.latest_for_cwd(&cwd).await.unwrap().as_ref() == Some(&id2)
+            }
+        },
+    )
+    .await;
     let latest = store.latest_for_cwd(&cwd).await.unwrap().unwrap();
     assert_eq!(latest.as_str(), id2.as_str());
 }

@@ -18,7 +18,16 @@ fn main() {
         return;
     }
     if mode == "sleep" {
-        std::thread::sleep(std::time::Duration::from_secs(10));
+        // Block long enough that any startup timeout under test fires before
+        // we would ever respond. The delay is configurable via
+        // `FAKE_MCP_STARTUP_DELAY_MS` so the scenario is explicit and tunable;
+        // it defaults to a value that comfortably exceeds the startup timeouts
+        // exercised by the tests (tens of milliseconds).
+        let delay_ms = std::env::var("FAKE_MCP_STARTUP_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10_000);
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         return;
     }
 

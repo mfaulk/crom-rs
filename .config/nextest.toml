@@ -1,0 +1,25 @@
+# nextest configuration.
+#
+# Bounds the parallelism of the MCP integration tests that spawn the
+# `fake-mcp-server` fixture as a child process. Under full-suite parallelism
+# many of these spawn `cargo run` for the (separately-workspaced) fixture at
+# once; the resulting CPU/memory and cargo-lock contention intermittently
+# SIGKILLed the spawned server before it became ready (#35). Capping how many
+# run concurrently removes that resource contention. (Plain `cargo test` does
+# not read this file; CI runs via nextest.)
+
+[test-groups]
+mcp-subprocess = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# Match the test binaries that spawn the fake-mcp-server subprocess:
+#   - code-agent-mcp   :: tests/stdio_lifecycle.rs
+#   - code-agent-cli   :: tests/mcp_cli.rs
+#   - code-agent-core  :: tests/mcp_integration.rs
+# `binary_id` is "<package>::<binary>" for integration test binaries.
+filter = """
+    binary_id(=code-agent-mcp::stdio_lifecycle)
+    | binary_id(=code-agent-cli::mcp_cli)
+    | binary_id(=code-agent-core::mcp_integration)
+"""
+test-group = 'mcp-subprocess'
