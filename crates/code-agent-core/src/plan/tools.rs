@@ -116,8 +116,16 @@ impl Tool for SubmitPlanTool {
     }
 
     async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolResult, ToolError> {
-        let parsed: SubmitPlanInput = serde_json::from_value(input)
-            .map_err(|e| ToolError::InvalidInput(format!("SubmitPlan input: {e}")))?;
+        let parsed: SubmitPlanInput = serde_json::from_value(input).map_err(|e| {
+            // serde's Display names the offending field/path (e.g.
+            // "missing field `tool_name`"); surface it verbatim so a model
+            // can see exactly which JSON field its payload was missing or
+            // had the wrong type for, rather than a generic parse failure.
+            ToolError::InvalidInput(format!(
+                "SubmitPlan input failed to deserialize: {e}. \
+                 Check the field named in this error against the tool's input schema."
+            ))
+        })?;
         let mut plan = self.base_plan.lock().await.clone();
         let result = parsed
             .into_plan(&mut plan, &self.options)
@@ -139,7 +147,76 @@ impl Tool for SubmitPlanTool {
 }
 
 /// Public schema of the SubmitPlan tool.
+///
+/// The nested-array item schemas below are derived directly from the
+/// `Raw*` deserializer structs so the advertised schema and what
+/// `serde_json::from_value` actually requires stay in sync. A `required`
+/// entry here MUST correspond to a non-`#[serde(default)]` field on the
+/// matching `Raw*` struct; optional (`#[serde(default)]`) fields are
+/// advertised under `properties` but omitted from `required`.
 pub fn submit_plan_tool_definition() -> Value {
+    // `RawFileRef`: required `path`, `access`; optional `reason`.
+    let file_ref_item = json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "access": {"type": "string"},
+            "reason": {"type": "string"}
+        },
+        "required": ["path", "access"]
+    });
+    // `RawToolUse`: required `tool_name`; rest optional.
+    let tool_use_item = json!({
+        "type": "object",
+        "properties": {
+            "tool_name": {"type": "string"},
+            "permission_kind": {"type": "string"},
+            "input_constraints": {},
+            "reason": {"type": "string"}
+        },
+        "required": ["tool_name"]
+    });
+    // `RawCommand`: required `command`; rest optional.
+    let command_item = json!({
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "command_regex": {"type": "string"},
+            "cwd": {"type": "string"},
+            "reason": {"type": "string"}
+        },
+        "required": ["command"]
+    });
+    // `RawValidation`: required `description`; `command` optional,
+    // `required` optional (defaults to true).
+    let validation_item = json!({
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "description": {"type": "string"},
+            "required": {"type": "boolean"}
+        },
+        "required": ["description"]
+    });
+    // `RawCheckpoint`: required `description`; `checkpoint_id` optional.
+    let checkpoint_item = json!({
+        "type": "object",
+        "properties": {
+            "description": {"type": "string"},
+            "checkpoint_id": {"type": "string"}
+        },
+        "required": ["description"]
+    });
+    // `RawRisk`: required `level`, `description`; `mitigation` optional.
+    let risk_item = json!({
+        "type": "object",
+        "properties": {
+            "level": {"type": "string"},
+            "description": {"type": "string"},
+            "mitigation": {"type": "string"}
+        },
+        "required": ["level", "description"]
+    });
     json!({
         "type": "object",
         "properties": {
@@ -150,18 +227,11 @@ pub fn submit_plan_tool_definition() -> Value {
             "constraints": {"type": "array", "items": {"type": "string"}},
             "files": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "access": {"type": "string"},
-                        "reason": {"type": "string"}
-                    },
-                    "required": ["path", "access"]
-                }
+                "items": file_ref_item
             },
             "steps": {
                 "type": "array",
+                // `RawStep`: required `id`, `title`, `kind`; rest optional.
                 "items": {
                     "type": "object",
                     "properties": {
@@ -169,19 +239,21 @@ pub fn submit_plan_tool_definition() -> Value {
                         "title": {"type": "string"},
                         "description": {"type": "string"},
                         "kind": {"type": "string"},
-                        "expected_tools": {"type": "array"},
-                        "expected_files": {"type": "array"},
-                        "expected_commands": {"type": "array"},
+                        "expected_tools": {"type": "array", "items": tool_use_item},
+                        "expected_files": {"type": "array", "items": file_ref_item},
+                        "expected_commands": {"type": "array", "items": command_item},
+                        "expected_outcome": {"type": "string"},
                         "risk": {"type": "string"},
-                        "requires_user_approval": {"type": "boolean"}
+                        "requires_user_approval": {"type": "boolean"},
+                        "validation": validation_item
                     },
                     "required": ["id", "title", "kind"]
                 }
             },
-            "requested_tools": {"type": "array"},
-            "validations": {"type": "array"},
-            "checkpoints": {"type": "array"},
-            "risks": {"type": "array"},
+            "requested_tools": {"type": "array", "items": tool_use_item},
+            "validations": {"type": "array", "items": validation_item},
+            "checkpoints": {"type": "array", "items": checkpoint_item},
+            "risks": {"type": "array", "items": risk_item},
             "rollback_plan": {"type": "string"},
             "success_criteria": {"type": "array", "items": {"type": "string"}}
         },
@@ -1215,5 +1287,119 @@ mod tests {
         // And the summary must be valid UTF-8 (implicit since it's a String,
         // but assert chars().count() works without panic on the result).
         let _ = r.plan.summary.chars().count();
+    }
+
+    #[tokio::test]
+    // A payload that populates every nested array
+    // (validations/checkpoints/expected_tools/expected_commands/risks/
+    // requested_tools) following the item shapes the schema now advertises
+    // must deserialize and execute without a missing-field error. Pre-fix
+    // the schema advertised these as bare `{"type":"array"}`, so a model
+    // following the schema (omitting required item fields) would be
+    // rejected by `serde_json::from_value`.
+    async fn submit_plan_accepts_fully_populated_nested_arrays() {
+        let base = PlanDocument::new_draft(crate::plan::artifact::new_plan_id(), "", "x");
+        let handle = SubmitPlanHandle::new();
+        let tool = SubmitPlanTool::new(base, handle.clone(), PlanningOptions::default());
+        let r = tool
+            .execute(
+                json!({
+                    "title": "fully specified plan",
+                    "steps": [{
+                        "id": "1",
+                        "title": "do the work",
+                        "kind": "execute",
+                        "expected_tools": [{"tool_name": "Bash"}],
+                        "expected_commands": [{"command": "cargo test"}],
+                        "expected_files": [{"path": "src/lib.rs", "access": "read"}]
+                    }],
+                    "requested_tools": [{"tool_name": "Bash"}],
+                    "validations": [{"description": "tests pass", "command": "cargo test"}],
+                    "checkpoints": [{"description": "build is green"}],
+                    "risks": [{"level": "medium", "description": "could break the build"}]
+                }),
+                ctx(),
+            )
+            .await
+            .expect("fully-populated nested arrays should deserialize and execute");
+        assert!(!r.is_error);
+        let snap = handle.snapshot().await.unwrap();
+        assert_eq!(snap.plan.steps.len(), 1);
+        assert_eq!(snap.plan.steps[0].expected_tools.len(), 1);
+        assert_eq!(snap.plan.steps[0].expected_commands.len(), 1);
+        assert_eq!(snap.plan.requested_tools.len(), 1);
+        assert_eq!(snap.plan.validations.len(), 1);
+        assert_eq!(snap.plan.checkpoints.len(), 1);
+        assert_eq!(snap.plan.risks.len(), 1);
+    }
+
+    #[test]
+    // Every nested array in the published schema must carry an `items`
+    // object schema (not a bare `{"type":"array"}`), and the item
+    // `required` lists must match the corresponding `Raw*` struct's
+    // required fields. This keeps the advertised schema in sync with what
+    // the deserializer demands.
+    fn submit_plan_schema_nested_arrays_have_item_schemas() {
+        let schema = submit_plan_tool_definition();
+        let props = &schema["properties"];
+
+        // Helper: assert an array property has an object `items` schema
+        // whose `required` array contains the given field names.
+        let assert_item_required = |arr: &Value, want: &[&str]| {
+            let items = &arr["items"];
+            assert!(
+                items.is_object(),
+                "expected an object `items` schema, got: {items}"
+            );
+            assert_eq!(items["type"], "object", "items should be an object schema");
+            let required = items["required"]
+                .as_array()
+                .expect("items.required must be an array");
+            let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
+            for field in want {
+                assert!(
+                    required.contains(field),
+                    "items.required {required:?} should contain `{field}`"
+                );
+            }
+        };
+
+        // Top-level nested arrays.
+        assert_item_required(&props["requested_tools"], &["tool_name"]);
+        assert_item_required(&props["validations"], &["description"]);
+        assert_item_required(&props["checkpoints"], &["description"]);
+        assert_item_required(&props["risks"], &["level", "description"]);
+        assert_item_required(&props["files"], &["path", "access"]);
+
+        // Per-step nested arrays.
+        let step_props = &props["steps"]["items"]["properties"];
+        assert!(
+            props["steps"]["items"].is_object(),
+            "steps.items must be an object schema"
+        );
+        assert_item_required(&step_props["expected_tools"], &["tool_name"]);
+        assert_item_required(&step_props["expected_commands"], &["command"]);
+        assert_item_required(&step_props["expected_files"], &["path", "access"]);
+
+        // No nested array should be advertised as a bare
+        // `{"type":"array"}` with no `items`.
+        for key in [
+            "requested_tools",
+            "validations",
+            "checkpoints",
+            "risks",
+            "files",
+        ] {
+            assert!(
+                props[key].get("items").is_some(),
+                "schema property `{key}` is a bare array with no `items` schema"
+            );
+        }
+        for key in ["expected_tools", "expected_commands", "expected_files"] {
+            assert!(
+                step_props[key].get("items").is_some(),
+                "step schema property `{key}` is a bare array with no `items` schema"
+            );
+        }
     }
 }
