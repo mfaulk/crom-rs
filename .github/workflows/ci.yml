@@ -156,6 +156,36 @@ jobs:
           path: target/code-agent-eval/runs
           if-no-files-found: ignore
 
+  coverage:
+    name: coverage (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Non-gating: a coverage-tooling or flaky-test failure must never block a
+    # PR. `fail_ci_if_error: false` only stops a Codecov *upload* error from
+    # failing; `continue-on-error` makes the whole job (incl. the collection
+    # step) non-blocking, so coverage stays purely informational (#21).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov, cargo-nextest
+      # Non-gating: measure + track coverage. cargo-llvm-cov drives nextest,
+      # matching the test lane's runner, and emits lcov for Codecov.
+      - name: Collect coverage
+        run: cargo llvm-cov nextest --locked --workspace --all-targets --all-features --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+
   deny:
     name: security / cargo-deny
     runs-on: ubuntu-latest
