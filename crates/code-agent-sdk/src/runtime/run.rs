@@ -653,17 +653,11 @@ pub(crate) async fn execute_request(
         duration_ms,
     };
 
-    if cancellation.is_cancelled() && status == AgentRunStatus::Completed {
-        status = AgentRunStatus::Cancelled;
-    }
-    // A deadline-driven cancellation is reported as `TimedOut` rather than
-    // `Cancelled`. The watcher sets `deadline_fired` before cancelling, so
-    // any cancellation observed here that coincides with the flag is a
-    // timeout (#212). External cancels leave the flag clear and stay
-    // `Cancelled`.
-    if status == AgentRunStatus::Cancelled && deadline_fired.load(Ordering::SeqCst) {
-        status = AgentRunStatus::TimedOut;
-    }
+    status = finalize_cancel_status(
+        status,
+        cancellation.is_cancelled(),
+        deadline_fired.load(Ordering::SeqCst),
+    );
 
     let summary = if final_summary.is_empty() {
         match status {
@@ -694,6 +688,34 @@ pub(crate) async fn execute_request(
         metadata,
         changed_files,
     })
+}
+
+/// Resolve the terminal status after the regular run loop, applying the two
+/// cancellation demotions the finalization path performs (#212, #149):
+///
+/// - An external/budget cancel that arrived while the run otherwise reported
+///   `Completed` demotes to `Cancelled` (the loop broke on cancel before the
+///   core `Result` event landed, so `Completed` is stale).
+/// - A cancel that coincides with the deadline-watcher flag (`deadline_fired`)
+///   is a deadline expiry and surfaces as `TimedOut` rather than `Cancelled`.
+///   External cancels leave the flag clear and stay `Cancelled`.
+///
+/// A status that is already terminal in some other way (e.g. `Failed` from a
+/// budget breach, `ValidationFailed`) is sticky and is never overwritten here
+/// — the deadline demotion only ever upgrades a `Cancelled` to `TimedOut`.
+pub(crate) fn finalize_cancel_status(
+    status: AgentRunStatus,
+    is_cancelled: bool,
+    deadline_fired: bool,
+) -> AgentRunStatus {
+    let mut status = status;
+    if is_cancelled && status == AgentRunStatus::Completed {
+        status = AgentRunStatus::Cancelled;
+    }
+    if status == AgentRunStatus::Cancelled && deadline_fired {
+        status = AgentRunStatus::TimedOut;
+    }
+    status
 }
 
 /// Build a minimal `AgentRunResult` representing a cancelled SDK run.
@@ -1288,6 +1310,243 @@ impl code_agent_core::plan::PlanStore for InMemoryPlanStore {
     }
     async fn writable(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    //! Branch coverage for the run finalization helpers that decide the
+    //! terminal status: `finalize_cancel_status` (the
+    //! `Completed`→`Cancelled`→`TimedOut` demotion chain, #212/#149) and
+    //! `cancelled_result` (the plan/act cancel short-circuit's TimedOut vs
+    //! Cancelled mapping, #212/#40). These are the pure state decisions the
+    //! single integration file never isolates.
+
+    use super::*;
+
+    // A clean completion with no cancellation stays Completed.
+    #[test]
+    fn finalize_completed_without_cancel_stays_completed() {
+        let s = finalize_cancel_status(AgentRunStatus::Completed, false, false);
+        assert_eq!(s, AgentRunStatus::Completed);
+    }
+
+    // An external cancel observed while the status is still the loop's
+    // default `Completed` demotes to `Cancelled` (the loop broke on cancel
+    // before the core Result event upgraded the status).
+    #[test]
+    fn finalize_external_cancel_demotes_completed_to_cancelled() {
+        let s = finalize_cancel_status(AgentRunStatus::Completed, true, false);
+        assert_eq!(s, AgentRunStatus::Cancelled);
+    }
+
+    // A cancel that coincides with the deadline-watcher flag is a deadline
+    // expiry and surfaces as TimedOut rather than Cancelled (#212).
+    #[test]
+    fn finalize_deadline_cancel_becomes_timed_out() {
+        let s = finalize_cancel_status(AgentRunStatus::Completed, true, true);
+        assert_eq!(s, AgentRunStatus::TimedOut);
+    }
+
+    // The deadline flag alone (no cancellation observed) must NOT change a
+    // Completed status: only a Cancelled status is upgraded to TimedOut.
+    // Pins the `status == Cancelled` guard so a stray flag can't time-out a
+    // run that actually finished.
+    #[test]
+    fn finalize_deadline_flag_without_cancel_keeps_completed() {
+        let s = finalize_cancel_status(AgentRunStatus::Completed, false, true);
+        assert_eq!(s, AgentRunStatus::Completed);
+    }
+
+    // A sticky Failed status (e.g. a budget breach) is never overwritten by
+    // the cancellation demotions, even if the run was also cancelled and the
+    // deadline fired. This is the budget-Failed sticky guard: cancelling the
+    // run to stop it after a budget breach must not relabel it as
+    // Cancelled/TimedOut (#149).
+    #[test]
+    fn finalize_failed_is_sticky_under_cancel_and_deadline() {
+        let s = finalize_cancel_status(AgentRunStatus::Failed, true, true);
+        assert_eq!(s, AgentRunStatus::Failed);
+    }
+
+    // ValidationFailed is likewise sticky — it is terminal and not a
+    // Cancelled, so neither demotion applies.
+    #[test]
+    fn finalize_validation_failed_is_sticky() {
+        let s = finalize_cancel_status(AgentRunStatus::ValidationFailed, true, true);
+        assert_eq!(s, AgentRunStatus::ValidationFailed);
+    }
+
+    fn meta() -> crate::request::RequestMetadata {
+        crate::request::RequestMetadata::default()
+    }
+
+    // cancelled_result with timed_out=false yields Cancelled, an empty
+    // summary, and exactly one run.cancelled warning diagnostic carrying the
+    // supplied reason.
+    #[test]
+    fn cancelled_result_maps_external_cancel_to_cancelled() {
+        let r = cancelled_result(
+            RunId::new(),
+            None,
+            code_agent_auth::ProviderId::Fake,
+            "fake-model".to_string(),
+            meta(),
+            Instant::now(),
+            "plan generation cancelled",
+            false,
+        );
+        assert_eq!(r.status, AgentRunStatus::Cancelled);
+        assert!(r.summary.is_empty());
+        assert_eq!(r.diagnostics.len(), 1);
+        assert_eq!(r.diagnostics[0].code, "run.cancelled");
+        assert!(r.diagnostics[0]
+            .message
+            .contains("plan generation cancelled"));
+        assert_eq!(r.events_summary.diagnostics_count, 1);
+    }
+
+    // cancelled_result with timed_out=true (the deadline-driven plan/act
+    // cancel) surfaces TimedOut, mirroring the regular-run finalization.
+    #[test]
+    fn cancelled_result_maps_deadline_cancel_to_timed_out() {
+        let r = cancelled_result(
+            RunId::new(),
+            None,
+            code_agent_auth::ProviderId::Fake,
+            "fake-model".to_string(),
+            meta(),
+            Instant::now(),
+            "plan act cancelled",
+            true,
+        );
+        assert_eq!(r.status, AgentRunStatus::TimedOut);
+        assert_eq!(r.diagnostics.len(), 1);
+    }
+}
+
+#[cfg(all(test, feature = "fake-provider"))]
+mod budget_tests {
+    //! End-to-end coverage of the `max_tool_calls` budget gate boundary in
+    //! `execute_request`. The gate trips only once the running tool-call
+    //! count *exceeds* the cap (`tool_calls > max`), so a run that uses
+    //! exactly `max` calls still completes while `max + 1` fails with the
+    //! `budget.max_tool_calls_exceeded` diagnostic, and that diagnostic is
+    //! pushed at most once (#149). Driven with the scripted fake provider so
+    //! the tool-call count is deterministic.
+
+    use super::*;
+    use crate::fake_provider::ScriptedFakeProvider;
+    use crate::policy::{BuiltinToolSet, SideEffectPolicy, ToolPolicy};
+    use crate::request::AgentRequest;
+    use crate::{AgentRuntime, AllowAllApprovals, InteractivityMode, ProviderConfig, RunBudgets};
+    use code_agent_core::{ModelEvent, TokenUsage, ToolCall};
+
+    /// A scripted provider that issues `n` Write tool calls (each to a
+    /// distinct file) across `n` turns, then a final text turn. Each Write is
+    /// counted as one tool call by the runtime's `ToolCallStarted` tracking.
+    fn provider_with_writes(n: usize) -> ScriptedFakeProvider {
+        let mut turns: Vec<Vec<ModelEvent>> = Vec::new();
+        for i in 0..n {
+            turns.push(vec![
+                ModelEvent::ToolCall(ToolCall {
+                    id: format!("w{i}"),
+                    name: "Write".into(),
+                    input: serde_json::json!({
+                        "file_path": format!("f{i}.txt"),
+                        "content": "x\n",
+                    }),
+                }),
+                ModelEvent::MessageStop {
+                    stop_reason: Some("tool_use".into()),
+                    usage: Some(TokenUsage::default()),
+                },
+            ]);
+        }
+        turns.push(vec![
+            ModelEvent::TextDelta {
+                text: "done".into(),
+            },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: Some(TokenUsage::default()),
+            },
+        ]);
+        ScriptedFakeProvider::new(turns)
+    }
+
+    async fn run_with_budget(writes: usize, max_tool_calls: u32) -> AgentRunResult {
+        // Point the run at a temp-dir filesystem workspace so the Write tool's
+        // disk writes are isolated and never litter the crate's source tree.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let runtime = AgentRuntime::builder()
+            .provider(ProviderConfig::fake(Arc::new(provider_with_writes(writes))))
+            .workspace(crate::workspace::WorkspaceSource::filesystem(dir.path()))
+            .tool_policy(ToolPolicy {
+                enable_builtin_tools: BuiltinToolSet::cli_defaults(),
+                side_effect_policy: SideEffectPolicy::full(),
+                ..Default::default()
+            })
+            .interactivity(InteractivityMode::Headless)
+            .approval_callback(Arc::new(AllowAllApprovals))
+            .build()
+            .await
+            .expect("build runtime");
+        runtime
+            .run_once(
+                AgentRequest::new("write files")
+                    .interactivity(InteractivityMode::Headless)
+                    .max_turns((writes + 2) as u32)
+                    .budgets(RunBudgets::default().with_max_tool_calls(max_tool_calls)),
+            )
+            .await
+            .expect("run completes")
+    }
+
+    // Exactly `max` tool calls: the gate uses `> max`, so a run that uses its
+    // full allowance is NOT failed and emits no budget diagnostic.
+    #[tokio::test]
+    async fn exactly_max_tool_calls_is_not_failed() {
+        let result = run_with_budget(2, 2).await;
+        assert_ne!(
+            result.status,
+            AgentRunStatus::Failed,
+            "a run at exactly max_tool_calls must not be Failed"
+        );
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "budget.max_tool_calls_exceeded"),
+            "no budget diagnostic expected at the allowance boundary"
+        );
+    }
+
+    // `max + 1` tool calls: the gate trips. The run ends in a terminal
+    // non-success state and records exactly one
+    // `budget.max_tool_calls_exceeded` diagnostic — the #149 one-shot guard
+    // prevents the duplicate diagnostics that earlier re-fired on every event
+    // after the cap was crossed. (The exact terminal status is Failed or
+    // Cancelled depending on whether the post-gate `cancel()` is observed by
+    // the loop's select before it breaks; both are non-success, so we pin the
+    // diagnostic-once invariant rather than the racy status.)
+    #[tokio::test]
+    async fn exceeding_max_tool_calls_fails_once() {
+        let result = run_with_budget(2, 1).await;
+        assert!(
+            matches!(
+                result.status,
+                AgentRunStatus::Failed | AgentRunStatus::Cancelled
+            ),
+            "expected a terminal non-success status, got {:?}",
+            result.status
+        );
+        let count = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "budget.max_tool_calls_exceeded")
+            .count();
+        assert_eq!(count, 1, "budget diagnostic must be pushed exactly once");
     }
 }
 

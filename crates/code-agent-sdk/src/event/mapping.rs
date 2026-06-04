@@ -183,7 +183,9 @@ fn redact_json_strings(redactor: &dyn SecretRedactor, value: &mut serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use code_agent_core::conversation::{AssistantContent, AssistantMessage};
+    use crate::event::EventVerbosity;
+    use code_agent_core::conversation::{AssistantContent, AssistantMessage, ToolCall};
+    use code_agent_core::events::{ToolCallStarted, UserToolResult};
 
     /// Minimal verbosity suppresses assistant messages.
     #[test]
@@ -209,7 +211,115 @@ mod tests {
             stop_reason: None,
         });
         let out = mapper.map(&ev).unwrap();
-        matches!(out, SdkEvent::AssistantMessage(_));
+        assert!(matches!(out, SdkEvent::AssistantMessage(_)));
+    }
+
+    fn mapper(v: EventVerbosity) -> SdkEventMapper {
+        SdkEventMapper::new(RunId::new(), v)
+    }
+
+    fn tool_started() -> AgentEvent {
+        AgentEvent::ToolCallStarted(ToolCallStarted {
+            call: ToolCall {
+                id: "t1".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"file_path": "a.txt"}),
+            },
+        })
+    }
+
+    /// AssistantTextDelta is a Full-only event: suppressed under Minimal and
+    /// Standard, mapped under Full. Pins the `full.then(..)` gate.
+    #[test]
+    fn assistant_text_delta_is_full_only() {
+        let ev = AgentEvent::AssistantTextDelta {
+            text: "chunk".into(),
+        };
+        assert!(mapper(EventVerbosity::Minimal).map(&ev).is_none());
+        assert!(mapper(EventVerbosity::Standard).map(&ev).is_none());
+        let out = mapper(EventVerbosity::Full)
+            .map(&ev)
+            .expect("full maps delta");
+        match out {
+            SdkEvent::AssistantTextDelta(d) => assert_eq!(d.delta, "chunk"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// ToolCallStarted is a Standard+ event: suppressed under Minimal, mapped
+    /// under Standard and Full, carrying the call's name/id/input.
+    #[test]
+    fn tool_call_started_is_standard_plus() {
+        assert!(mapper(EventVerbosity::Minimal)
+            .map(&tool_started())
+            .is_none());
+        for v in [EventVerbosity::Standard, EventVerbosity::Full] {
+            let out = mapper(v)
+                .map(&tool_started())
+                .expect("standard+ maps tool start");
+            match out {
+                SdkEvent::ToolCallStarted(e) => {
+                    assert_eq!(e.tool_name, "Read");
+                    assert_eq!(e.tool_use_id, "t1");
+                    assert_eq!(
+                        e.input.get("file_path").and_then(|v| v.as_str()),
+                        Some("a.txt")
+                    );
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    /// ToolCallDenied always maps to a Diagnostic regardless of verbosity —
+    /// even under Minimal, where every other mapped event is suppressed. The
+    /// arm returns `Some(..)` unconditionally rather than gating on verbosity.
+    #[test]
+    fn tool_call_denied_maps_under_every_verbosity() {
+        let ev = AgentEvent::ToolCallDenied(code_agent_core::events::ToolCallDenied {
+            tool_use_id: "t9".into(),
+            tool_name: "Bash".into(),
+            reason: "blocked by policy".into(),
+        });
+        for v in [
+            EventVerbosity::Minimal,
+            EventVerbosity::Standard,
+            EventVerbosity::Full,
+        ] {
+            let out = mapper(v).map(&ev).expect("denied always maps");
+            match out {
+                SdkEvent::Diagnostic(d) => {
+                    assert_eq!(d.diagnostic.code, "tool.permission_denied");
+                    assert!(d.diagnostic.message.contains("blocked by policy"));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    /// An otherwise-unmapped internal event (UserToolResult) is dropped under
+    /// Minimal/Standard but wrapped as an opaque `Internal` SdkEvent under
+    /// Full, with `kind` taken from the serialized `type` tag.
+    #[test]
+    fn unmapped_event_wraps_as_internal_only_under_full() {
+        let ev = AgentEvent::UserToolResult(UserToolResult {
+            tool_use_id: "t1".into(),
+            tool_name: "Read".into(),
+            content: "ok".into(),
+            is_error: false,
+        });
+        assert!(mapper(EventVerbosity::Minimal).map(&ev).is_none());
+        assert!(mapper(EventVerbosity::Standard).map(&ev).is_none());
+        let out = mapper(EventVerbosity::Full)
+            .map(&ev)
+            .expect("full wraps unmapped events");
+        match out {
+            SdkEvent::Internal(e) => {
+                assert!(!e.kind.is_empty(), "kind should derive from type tag");
+                assert!(e.payload.is_object());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     /// redact_event scrubs a known secret pattern out of assistant text

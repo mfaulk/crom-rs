@@ -292,3 +292,101 @@ async fn materialize_provider(
 // Verify `ProviderId` is in scope.
 #[allow(dead_code)]
 fn _provider_id(_p: ProviderId) {}
+
+#[cfg(all(test, feature = "fake-provider"))]
+mod tests {
+    //! Builder validation beyond `builder_without_provider_fails`: the
+    //! `materialize_provider` branches that reject not-yet-wired provider
+    //! configs (OpenAI/Gemini/OAuth/FromAuthStore) with a stable error code,
+    //! the External/Fake success branches and their default model ids, and
+    //! the explicit-model-override-wins rule.
+
+    use super::*;
+    use crate::fake_provider::EchoFakeProvider;
+    use crate::provider::{ProviderConfig, SecretString};
+    use crate::AgentSdkErrorKind;
+    use code_agent_core::ModelProvider;
+
+    fn fake() -> ProviderConfig {
+        ProviderConfig::fake(Arc::new(EchoFakeProvider))
+    }
+
+    fn secret(s: &str) -> SecretString {
+        SecretString::new(s.to_string())
+    }
+
+    // A Fake provider builds and falls back to the "fake-model" default id
+    // when no model is configured.
+    #[tokio::test]
+    async fn fake_provider_builds_with_default_model() {
+        let rt = AgentRuntime::builder()
+            .provider(fake())
+            .build()
+            .await
+            .expect("fake provider builds");
+        assert_eq!(rt.default_model(), "fake-model");
+        assert_eq!(rt.provider_id().as_str(), "fake");
+    }
+
+    // An explicit `.model(..)` overrides the provider's default model id.
+    #[tokio::test]
+    async fn explicit_model_overrides_default() {
+        let rt = AgentRuntime::builder()
+            .provider(fake())
+            .model("custom-model-x")
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(rt.default_model(), "custom-model-x");
+    }
+
+    // The External branch builds from a prepared ModelProvider and reports
+    // the "external-model" default id.
+    #[tokio::test]
+    async fn external_provider_builds() {
+        let provider: Arc<dyn ModelProvider> = Arc::new(EchoFakeProvider);
+        let rt = AgentRuntime::builder()
+            .provider(ProviderConfig::external(provider))
+            .build()
+            .await
+            .expect("external provider builds");
+        assert_eq!(rt.default_model(), "external-model");
+    }
+
+    async fn assert_invalid_request(cfg: ProviderConfig, expect_code: &str) {
+        let err = AgentRuntime::builder()
+            .provider(cfg)
+            .build()
+            .await
+            .expect_err("not-yet-wired provider must fail to build");
+        assert_eq!(err.kind, AgentSdkErrorKind::InvalidRequest);
+        // The structured error code is carried on the injected diagnostic.
+        assert_eq!(
+            err.diagnostics.first().map(|d| d.code.as_str()),
+            Some(expect_code),
+            "unexpected error code: {err}"
+        );
+    }
+
+    // OpenAI API-key config is not wired through the SDK builder yet and must
+    // fail with a stable, specific InvalidRequest code (not a panic / generic
+    // error) so callers can branch on it.
+    #[tokio::test]
+    async fn openai_api_key_not_wired() {
+        assert_invalid_request(
+            ProviderConfig::openai_api_key(secret("sk-test")),
+            "provider.openai_not_wired",
+        )
+        .await;
+    }
+
+    // Gemini API-key config: same not-wired contract.
+    #[tokio::test]
+    async fn gemini_api_key_not_wired() {
+        assert_invalid_request(
+            ProviderConfig::gemini_api_key(secret("g-test")),
+            "provider.gemini_not_wired",
+        )
+        .await;
+    }
+}
