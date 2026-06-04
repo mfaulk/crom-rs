@@ -1102,27 +1102,32 @@ mod tests {
     // Doctor reports a fail when ANTHROPIC_API_KEY is missing.
     async fn doctor_fails_without_api_key() {
         let dir = TempDir::new().unwrap();
-        let _g = EnvGuard::new("ANTHROPIC_API_KEY");
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        let report = run_doctor(dir.path(), &Settings::default(), true).await;
-        let api = report
-            .checks
-            .iter()
-            .find(|c| c.id == "provider.api_key")
-            .unwrap();
-        assert_eq!(api.status, DoctorStatus::Fail);
+        temp_env::async_with_vars([("ANTHROPIC_API_KEY", None::<&str>)], async {
+            let report = run_doctor(dir.path(), &Settings::default(), true).await;
+            let api = report
+                .checks
+                .iter()
+                .find(|c| c.id == "provider.api_key")
+                .unwrap();
+            assert_eq!(api.status, DoctorStatus::Fail);
+        })
+        .await;
     }
 
     #[tokio::test]
     // Doctor JSON output is valid and doesn't expose the raw key value.
     async fn doctor_json_output_redacts_secret() {
         let dir = TempDir::new().unwrap();
-        let _g = EnvGuard::new("ANTHROPIC_API_KEY");
-        std::env::set_var("ANTHROPIC_API_KEY", "sk-XXXXXXXXXXXXXXXXXXXX");
-        let report = run_doctor(dir.path(), &Settings::default(), true).await;
-        let s = serde_json::to_string(&report.checks).unwrap();
-        assert!(!s.contains("sk-XXXXXXXX"));
-        assert!(s.contains("provider.api_key"));
+        temp_env::async_with_vars(
+            [("ANTHROPIC_API_KEY", Some("sk-XXXXXXXXXXXXXXXXXXXX"))],
+            async {
+                let report = run_doctor(dir.path(), &Settings::default(), true).await;
+                let s = serde_json::to_string(&report.checks).unwrap();
+                assert!(!s.contains("sk-XXXXXXXX"));
+                assert!(s.contains("provider.api_key"));
+            },
+        )
+        .await;
     }
 
     #[test]
@@ -1201,37 +1206,5 @@ mod tests {
     fn config_formatter_runs() {
         let lines = format_effective_config(&Settings::default());
         assert!(lines.iter().any(|l| l.contains("Effective configuration")));
-    }
-
-    /// Restores an env var on drop so tests don't leak global state.
-    /// Holds a process-global mutex while alive so two tests touching
-    /// the same env var (e.g. ANTHROPIC_API_KEY) cannot interleave under
-    /// `cargo test` parallel execution.
-    struct EnvGuard {
-        key: String,
-        prior: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    impl EnvGuard {
-        fn new(key: &str) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            Self {
-                key: key.to_string(),
-                prior: std::env::var(key).ok(),
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prior {
-                Some(v) => std::env::set_var(&self.key, v),
-                None => std::env::remove_var(&self.key),
-            }
-        }
     }
 }

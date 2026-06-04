@@ -916,33 +916,6 @@ pub async fn format_logout(
 mod tests {
     use super::*;
 
-    /// Sets an env var for the test's duration and restores the prior value
-    /// (or unsets it) on drop, so settings-isolation doesn't leak across tests.
-    struct EnvVarGuard {
-        key: String,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self {
-                key: key.to_string(),
-                prev,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var(&self.key, v),
-                None => std::env::remove_var(&self.key),
-            }
-        }
-    }
-
     #[tokio::test]
     // /login fake --api-key=demo stores a credential and marks the fake provider active.
     async fn slash_login_fake_api_key_stores_credential() {
@@ -968,34 +941,41 @@ mod tests {
         // ~/.config/code-agent/settings.json could opt the file store in and
         // make the negative arm below spuriously succeed.
         let cfg_home = tempfile::TempDir::new().unwrap();
-        let _cfg_guard = EnvVarGuard::set("CODE_AGENT_CONFIG_HOME", cfg_home.path());
+        temp_env::async_with_vars(
+            [(
+                "CODE_AGENT_CONFIG_HOME",
+                Some(cfg_home.path().to_str().unwrap()),
+            )],
+            async {
+                // No flag, no settings -> file store stays disabled, so a login
+                // (which writes a secret) fails via the no-op backend.
+                let dir = tempfile::TempDir::new().unwrap();
+                let err = handle_login_slash("fake --api-key=demo", dir.path(), false)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("credential store"),
+                    "expected credential-store error, got: {err}"
+                );
 
-        // No flag, no settings -> file store stays disabled, so a login
-        // (which writes a secret) fails via the no-op backend.
-        let dir = tempfile::TempDir::new().unwrap();
-        let err = handle_login_slash("fake --api-key=demo", dir.path(), false)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("credential store"),
-            "expected credential-store error, got: {err}"
-        );
-
-        // Same call, but a project settings.json opts the file store in.
-        let dir = tempfile::TempDir::new().unwrap();
-        let agent_dir = dir.path().join(".agent");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(
-            agent_dir.join("settings.json"),
-            r#"{ "auth": { "allow_file_credential_store": true } }"#,
+                // Same call, but a project settings.json opts the file store in.
+                let dir = tempfile::TempDir::new().unwrap();
+                let agent_dir = dir.path().join(".agent");
+                std::fs::create_dir_all(&agent_dir).unwrap();
+                std::fs::write(
+                    agent_dir.join("settings.json"),
+                    r#"{ "auth": { "allow_file_credential_store": true } }"#,
+                )
+                .unwrap();
+                let out = handle_login_slash("fake --api-key=demo", dir.path(), false)
+                    .await
+                    .unwrap();
+                assert!(out.contains("Active provider: fake"));
+                let store = build_store(dir.path(), false).unwrap();
+                assert_eq!(store.snapshot_index().list_for(&ProviderId::Fake).len(), 1);
+            },
         )
-        .unwrap();
-        let out = handle_login_slash("fake --api-key=demo", dir.path(), false)
-            .await
-            .unwrap();
-        assert!(out.contains("Active provider: fake"));
-        let store = build_store(dir.path(), false).unwrap();
-        assert_eq!(store.snapshot_index().list_for(&ProviderId::Fake).len(), 1);
+        .await;
     }
 
     #[tokio::test]

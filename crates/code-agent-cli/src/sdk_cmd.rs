@@ -227,27 +227,25 @@ mod tests {
     /// `--provider anthropic` without an API key returns an error.
     #[tokio::test]
     async fn missing_anthropic_key_errors() {
-        // Make sure env var isn't set.
-        let prev = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        let dir = tempfile::TempDir::new().unwrap();
-        let args = HeadlessRunArgs {
-            prompt: "hello".into(),
-            cwd: dir.path().to_path_buf(),
-            provider: "anthropic".into(),
-            api_key: None,
-            model: None,
-            max_turns: 1,
-            deadline_secs: None,
-            apply_patch: false,
-            allow_bash: false,
-            auto_approve: false,
-            plan_only: false,
-        };
-        let res = cmd_headless_run(args).await;
-        assert!(res.is_err());
-        if let Some(k) = prev {
-            std::env::set_var("ANTHROPIC_API_KEY", k);
-        }
+        // Make sure env var isn't set for the duration of the call.
+        temp_env::async_with_vars([("ANTHROPIC_API_KEY", None::<&str>)], async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let args = HeadlessRunArgs {
+                prompt: "hello".into(),
+                cwd: dir.path().to_path_buf(),
+                provider: "anthropic".into(),
+                api_key: None,
+                model: None,
+                max_turns: 1,
+                deadline_secs: None,
+                apply_patch: false,
+                allow_bash: false,
+                auto_approve: false,
+                plan_only: false,
+            };
+            let res = cmd_headless_run(args).await;
+            assert!(res.is_err());
+        })
+        .await;
     }
 }

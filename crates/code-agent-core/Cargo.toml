@@ -25,4 +25,5 @@ code-agent-mcp = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+temp-env = { workspace = true }
 code-agent-session = { workspace = true }

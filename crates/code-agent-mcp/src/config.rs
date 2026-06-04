@@ -795,33 +795,36 @@ mod tests {
     #[test]
     // Environment interpolation replaces exactly `${VAR}` placeholders.
     fn environment_interpolation_works() {
-        std::env::set_var("CODE_AGENT_MCP_TEST_TOKEN", "abc123secretxyz");
-        let dir = TempDir::new().unwrap();
-        let settings = McpSettingsConfig {
-            enabled: Some(true),
-            servers: BTreeMap::from([(
-                "fake".into(),
-                McpServerConfig::Stdio(StdioMcpServerConfig {
-                    command: "fake".into(),
-                    args: vec!["${CODE_AGENT_MCP_TEST_TOKEN}".into()],
-                    env: BTreeMap::from([("TOKEN".into(), "${CODE_AGENT_MCP_TEST_TOKEN}".into())]),
-                    cwd: None,
-                    startup_timeout: None,
-                    request_timeout: None,
-                }),
-            )]),
-            ..McpSettingsConfig::default()
-        };
-        let options =
-            load_mcp_options(dir.path(), Some(&settings), None, None, None, None).unwrap();
-        match options.servers.get("fake").unwrap() {
-            McpServerConfig::Stdio(c) => {
-                assert_eq!(c.args[0], "abc123secretxyz");
-                assert_eq!(c.env["TOKEN"], "abc123secretxyz");
+        temp_env::with_var("CODE_AGENT_MCP_TEST_TOKEN", Some("abc123secretxyz"), || {
+            let dir = TempDir::new().unwrap();
+            let settings = McpSettingsConfig {
+                enabled: Some(true),
+                servers: BTreeMap::from([(
+                    "fake".into(),
+                    McpServerConfig::Stdio(StdioMcpServerConfig {
+                        command: "fake".into(),
+                        args: vec!["${CODE_AGENT_MCP_TEST_TOKEN}".into()],
+                        env: BTreeMap::from([(
+                            "TOKEN".into(),
+                            "${CODE_AGENT_MCP_TEST_TOKEN}".into(),
+                        )]),
+                        cwd: None,
+                        startup_timeout: None,
+                        request_timeout: None,
+                    }),
+                )]),
+                ..McpSettingsConfig::default()
+            };
+            let options =
+                load_mcp_options(dir.path(), Some(&settings), None, None, None, None).unwrap();
+            match options.servers.get("fake").unwrap() {
+                McpServerConfig::Stdio(c) => {
+                    assert_eq!(c.args[0], "abc123secretxyz");
+                    assert_eq!(c.env["TOKEN"], "abc123secretxyz");
+                }
+                _ => panic!("expected stdio"),
             }
-            _ => panic!("expected stdio"),
-        }
-        std::env::remove_var("CODE_AGENT_MCP_TEST_TOKEN");
+        });
     }
 
     #[test]

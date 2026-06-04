@@ -213,14 +213,14 @@ mod tests {
     #[test]
     // Process env vars resolve via std::env.
     fn substitutes_env_var() {
-        std::env::set_var("PLUGIN_VARS_TEST_VAL", "abc");
-        let p = ctx("/r", "/d");
-        let c = PluginVarContext::new(&p);
-        assert_eq!(
-            substitute_str("${PLUGIN_VARS_TEST_VAL}", "f", &c).unwrap(),
-            "abc"
-        );
-        std::env::remove_var("PLUGIN_VARS_TEST_VAL");
+        temp_env::with_var("PLUGIN_VARS_TEST_VAL", Some("abc"), || {
+            let p = ctx("/r", "/d");
+            let c = PluginVarContext::new(&p);
+            assert_eq!(
+                substitute_str("${PLUGIN_VARS_TEST_VAL}", "f", &c).unwrap(),
+                "abc"
+            );
+        });
     }
 
     #[test]
