@@ -14,6 +14,9 @@ enum Mode {
     Sse,
     Timeout,
     Error,
+    /// Stateful server: assigns an `Mcp-Session-Id` on the first response and
+    /// 404s any later request that does not echo it back.
+    Session,
 }
 
 async fn start_server(mode: Mode) -> (String, Arc<Mutex<Vec<String>>>) {
@@ -21,12 +24,15 @@ async fn start_server(mode: Mode) -> (String, Arc<Mutex<Vec<String>>>) {
     let addr = listener.local_addr().unwrap();
     let headers_seen = Arc::new(Mutex::new(Vec::new()));
     let seen = headers_seen.clone();
+    // Server-side record of the session id handed out in Session mode.
+    let assigned_session: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
             let seen = seen.clone();
+            let assigned_session = assigned_session.clone();
             tokio::spawn(async move {
                 let mut header_bytes = Vec::new();
                 let mut buf = [0u8; 1];
@@ -38,6 +44,25 @@ async fn start_server(mode: Mode) -> (String, Arc<Mutex<Vec<String>>>) {
                 }
                 let headers = String::from_utf8_lossy(&header_bytes).to_string();
                 seen.lock().unwrap().push(headers.clone());
+                let incoming_session = headers.lines().find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.eq_ignore_ascii_case("mcp-session-id")
+                        .then(|| v.trim().to_string())
+                });
+                if matches!(mode, Mode::Session) {
+                    // Once a session is assigned, every request must echo it.
+                    let expected = assigned_session.lock().unwrap().clone();
+                    if let Some(expected) = expected {
+                        if incoming_session.as_deref() != Some(expected.as_str()) {
+                            let _ = write_raw(
+                                &mut stream,
+                                "HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing",
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
                 let len = headers
                     .lines()
                     .find_map(|line| {
@@ -99,7 +124,19 @@ async fn start_server(mode: Mode) -> (String, Arc<Mutex<Vec<String>>>) {
                     }),
                 };
                 let body = payload.to_string();
-                if matches!(mode, Mode::Sse) {
+                if matches!(mode, Mode::Session) && method == "initialize" {
+                    // Assign and return a session id on the initialize response.
+                    let session = "sess-abc-123".to_string();
+                    *assigned_session.lock().unwrap() = Some(session.clone());
+                    let _ = write_raw(
+                        &mut stream,
+                        &format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: {session}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                    )
+                    .await;
+                } else if matches!(mode, Mode::Sse) {
                     let event = format!("event: message\ndata: {body}\n\n");
                     let _ = write_response(&mut stream, "text/event-stream", &event).await;
                 } else {
@@ -194,6 +231,27 @@ async fn http_error_is_structured() {
     let mut client = http_client(url, Duration::from_secs(2)).await;
     let err = client.initialize().await.unwrap_err();
     assert!(matches!(err, McpError::Http { status: 500, .. }));
+}
+
+#[tokio::test]
+// A stateful server assigns an Mcp-Session-Id on initialize and 404s any
+// later request that omits it; the transport must capture and resend it (#42).
+async fn captures_and_resends_session_id() {
+    let (url, headers) = start_server(Mode::Session).await;
+    let mut client = http_client(url, Duration::from_secs(2)).await;
+    client.initialize().await.unwrap();
+    // Without resending the captured session id, this would 404.
+    let tools = client.list_tools().await.unwrap();
+    assert_eq!(tools[0].name, "search");
+
+    let recorded = headers.lock().unwrap();
+    // The initialize request has no session id yet; the follow-up tools/list
+    // request must echo the assigned one.
+    let last = recorded.last().unwrap().to_ascii_lowercase();
+    assert!(
+        last.contains("mcp-session-id: sess-abc-123"),
+        "tools/list request must resend the session id, got:\n{last}"
+    );
 }
 
 #[test]

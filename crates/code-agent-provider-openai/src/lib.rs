@@ -388,8 +388,16 @@ fn chat_response_to_events(resp: ChatResponse) -> Vec<ModelEvent> {
             }
         }
         for tc in choice.message.tool_calls {
-            let input: Value = serde_json::from_str(&tc.function.arguments)
-                .unwrap_or_else(|_| Value::String(tc.function.arguments.clone()));
+            // OpenAI returns `arguments: ""` for no-arg tool calls; `from_str("")`
+            // errors and would fall back to `Value::String("")`, which breaks
+            // downstream object deserializers. Treat empty/whitespace-only
+            // arguments as an empty JSON object instead.
+            let input: Value = if tc.function.arguments.trim().is_empty() {
+                Value::Object(Default::default())
+            } else {
+                serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or_else(|_| Value::String(tc.function.arguments.clone()))
+            };
             events.push(ModelEvent::ToolCall(ToolCall {
                 id: tc.id,
                 name: tc.function.name,
@@ -871,5 +879,35 @@ mod tests {
         let s = body["messages"][0]["content"].as_str().unwrap().to_string();
         assert!(s.starts_with("ERROR:"));
         assert!(s.contains("permission denied"));
+    }
+
+    #[test]
+    // OpenAI sends `arguments: ""` for no-arg tool calls; the converted
+    // ToolCall input must be an empty JSON object, not an empty string,
+    // so downstream object deserializers don't choke (#44).
+    fn empty_tool_call_arguments_become_empty_object() {
+        let resp: ChatResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "now", "arguments": "" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+        let events = chat_response_to_events(resp);
+        let tool_call = events
+            .iter()
+            .find_map(|e| match e {
+                ModelEvent::ToolCall(tc) => Some(tc),
+                _ => None,
+            })
+            .expect("a ToolCall event");
+        assert_eq!(tool_call.input, Value::Object(Default::default()));
+        assert!(!matches!(tool_call.input, Value::String(_)));
     }
 }

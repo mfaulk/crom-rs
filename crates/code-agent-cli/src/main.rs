@@ -5519,6 +5519,9 @@ impl ReqwestOpenAiTransport {
     fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(StdDuration::from_secs(30))
+            // 120s overall request timeout matches the Anthropic read budget;
+            // without it a stalled non-streaming endpoint hangs the agent forever.
+            .timeout(StdDuration::from_secs(120))
             .build()
             .context("openai client build")?;
         Ok(Self { client })
@@ -5589,6 +5592,9 @@ impl ReqwestGeminiTransport {
     fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(StdDuration::from_secs(30))
+            // 120s overall request timeout matches the Anthropic read budget;
+            // without it a stalled non-streaming endpoint hangs the agent forever.
+            .timeout(StdDuration::from_secs(120))
             .build()
             .context("gemini client build")?;
         Ok(Self { client })

@@ -16,6 +16,12 @@ pub struct StreamableHttpMcpTransport {
     endpoint: Url,
     headers: HeaderMap,
     protocol_version: Option<String>,
+    /// Session id returned by a stateful server on the `initialize`
+    /// response via the `Mcp-Session-Id` header. Per the Streamable-HTTP
+    /// spec the client MUST echo it back on every subsequent request, or
+    /// stateful servers reject those requests with 404. Captured inside
+    /// `post_json` (which takes `&self`), hence the interior mutability.
+    session_id: std::sync::Mutex<Option<String>>,
     timeout: std::time::Duration,
     secrets: Vec<String>,
     /// Per-response byte cap. Once the body stream exceeds this we abort
@@ -60,6 +66,7 @@ impl StreamableHttpMcpTransport {
             endpoint,
             headers,
             protocol_version: None,
+            session_id: std::sync::Mutex::new(None),
             timeout,
             secrets,
             max_result_bytes,
@@ -97,6 +104,16 @@ impl StreamableHttpMcpTransport {
         if let Some(version) = &self.protocol_version {
             request = request.header("MCP-Protocol-Version", version);
         }
+        // Echo the negotiated session id (if any) on every request so
+        // stateful servers don't 404 follow-up calls.
+        if let Some(session) = self
+            .session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            request = request.header("Mcp-Session-Id", session);
+        }
         let response = request.send().await.map_err(|e| {
             if e.is_timeout() {
                 McpError::timeout(self.timeout)
@@ -105,6 +122,19 @@ impl StreamableHttpMcpTransport {
             }
         })?;
         let status = response.status();
+        // Capture the session id assigned by a stateful server (typically on
+        // the `initialize` response). Only the first one is stored; later
+        // responses don't reassign it.
+        if let Some(session) = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            let mut stored = self.session_id.lock().unwrap_or_else(|e| e.into_inner());
+            if stored.is_none() {
+                *stored = Some(session.to_string());
+            }
+        }
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
