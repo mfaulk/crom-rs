@@ -826,24 +826,24 @@ async fn run_subagent(
     let tool_call_count = counter_tool_calls.load(Ordering::Acquire);
     let final_subtype_value = *final_subtype.lock().await;
 
-    // 7. Determine final status. Precedence:
-    //   1. JoinHandle timeout/panic (unconditional override).
-    //   2. Global cancel flag (parent triggered cancellation).
-    //   3. Child's own terminal Result subtype (Success / ErrorMaxTurns /
-    //      ErrorDuringExecution / Cancelled).
-    //   4. Fallback: assume succeeded if the loop completed but emitted no
-    //      Result event (defensive).
-    let status = match join_outcome {
-        Some(s) => s,
-        None if runtime.cancel_flag.load(Ordering::Acquire) => SubagentStatus::Cancelled,
-        None => match final_subtype_value {
-            Some(crate::events::ResultSubtype::Success) => SubagentStatus::Succeeded,
-            Some(crate::events::ResultSubtype::ErrorMaxTurns)
-            | Some(crate::events::ResultSubtype::ErrorDuringExecution) => SubagentStatus::Failed,
-            Some(crate::events::ResultSubtype::Cancelled) => SubagentStatus::Cancelled,
-            None => SubagentStatus::Succeeded,
-        },
-    };
+    // 7. Determine final status. A child that produced a terminal Result is
+    // classified by that result, never overridden by a cancel flag — reading
+    // the shared `runtime.cancel_flag` as an override would misclassify a child
+    // that ran to completion as Cancelled the moment a sibling (or the parent,
+    // after this child finished) tripped the shared flag, discarding a good
+    // result (#43). For a child that produced *no* terminal result, the per-run
+    // `cancel` (this child's timeout, or a parent cancel the drain task copied
+    // in) and the runtime-wide `cancel_flag` (a parent cancel the 100ms drain
+    // poll had not yet propagated) are both consulted, so a parent-cancelled
+    // child is not silently reported Succeeded (review: codex finding).
+    let per_run_cancelled = cancel.load(Ordering::Acquire);
+    let parent_cancelled = runtime.cancel_flag.load(Ordering::Acquire);
+    let status = classify_status(
+        join_outcome,
+        per_run_cancelled,
+        parent_cancelled,
+        final_subtype_value,
+    );
 
     // 8. Trim the result preview. `String::truncate` panics if the byte index
     // is not on a UTF-8 char boundary. LLM output regularly contains
@@ -1048,6 +1048,52 @@ async fn run_subagent(
         is_error,
         metadata,
     })
+}
+
+/// Classify a child subagent's final [`SubagentStatus`] from the three
+/// signals available at the end of `run_subagent`. Pure so it can be unit
+/// tested across the full matrix.
+///
+/// Precedence:
+///   1. `join_outcome` — `JoinHandle` timeout/panic/abort. An unconditional
+///      override produced by the timeout/join machinery (a timed-out child is
+///      aborted, so it never also presents a terminal `Success`).
+///   2. `final_subtype` — the child run's OWN terminal Result subtype, and it
+///      is authoritative: a child that produced a `Success`/error result did
+///      its work, and a cancel flag must NEVER discard it. Checking the cancel
+///      flags before the subtype is exactly the bug #43 fixes — a child that
+///      ran to completion is reported by its result even when the runtime-wide
+///      `cancel_flag` (or its own per-run signal, drain-copied from the parent)
+///      was tripped by a sibling, or by the parent after this child finished.
+///   3. Fallback for a child that produced *no* terminal Result: if it was
+///      cancelled — by its own `per_run_cancelled` signal (this child's timeout
+///      or a parent cancel the drain task already copied in) OR by a
+///      `parent_cancelled` (runtime-wide) cancel the 100ms drain poll had not
+///      yet propagated — classify `Cancelled` rather than defaulting to
+///      success. Both flags are consulted only here, so a parent-cancelled
+///      child that never produced a result (e.g. queued on the concurrency
+///      semaphore) is not silently reported `Succeeded` (review finding).
+fn classify_status(
+    join_outcome: Option<SubagentStatus>,
+    per_run_cancelled: bool,
+    parent_cancelled: bool,
+    final_subtype: Option<crate::events::ResultSubtype>,
+) -> SubagentStatus {
+    match join_outcome {
+        Some(s) => s,
+        None => match final_subtype {
+            // A terminal result is authoritative and is never overridden by a
+            // cancel flag (#43).
+            Some(crate::events::ResultSubtype::Success) => SubagentStatus::Succeeded,
+            Some(crate::events::ResultSubtype::ErrorMaxTurns)
+            | Some(crate::events::ResultSubtype::ErrorDuringExecution) => SubagentStatus::Failed,
+            Some(crate::events::ResultSubtype::Cancelled) => SubagentStatus::Cancelled,
+            // No terminal result: a child cancelled by itself or the parent is
+            // Cancelled; otherwise it defensively succeeded.
+            None if per_run_cancelled || parent_cancelled => SubagentStatus::Cancelled,
+            None => SubagentStatus::Succeeded,
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1483,5 +1529,123 @@ mod active_guard_tests {
         let active = rt.active.lock().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].subagent_session_id, sid2);
+    }
+}
+
+#[cfg(test)]
+mod classify_status_tests {
+    //! Coverage of `classify_status`, the pure status-classification helper
+    //! extracted from `run_subagent`. The full `run_subagent` flow needs a
+    //! real provider/registry/hook tree (out of scope here), so we exercise
+    //! the classification matrix directly. The key regression (#43) is that a
+    //! child that ran to completion with `Success` is classified `Succeeded`
+    //! and its result preserved even when the runtime-wide shared cancel flag
+    //! has been tripped by a sibling or the parent. A child that produced *no*
+    //! terminal result, however, still honors a parent/runtime-wide cancel that
+    //! the per-run drain had not yet propagated, so it is not reported
+    //! `Succeeded` by default (review follow-up).
+
+    use super::classify_status;
+    use crate::agents::runtime::SubagentStatus;
+    use crate::events::ResultSubtype;
+
+    /// Regression for #43. A sibling (or the parent) trips the runtime-wide
+    /// shared `cancel_flag` — modeled here as `parent_cancelled = true` — but
+    /// THIS child already ran to completion with `ResultSubtype::Success`. The
+    /// terminal result is authoritative, so it must classify as `Succeeded`
+    /// (result preserved), NOT `Cancelled`.
+    #[test]
+    fn shared_cancel_does_not_discard_completed_success() {
+        let status = classify_status(None, false, true, Some(ResultSubtype::Success));
+        assert_eq!(status, SubagentStatus::Succeeded);
+    }
+
+    /// Also #43, the per-run variant the review surfaced: even if this child's
+    /// OWN per-run signal was tripped (a parent cancel the drain task copied in)
+    /// while it was racing to finish, a `Success` terminal result it managed to
+    /// produce is still authoritative and preserved — a cancel flag must never
+    /// discard a completed result.
+    #[test]
+    fn per_run_cancel_does_not_discard_completed_success() {
+        let status = classify_status(None, true, false, Some(ResultSubtype::Success));
+        assert_eq!(status, SubagentStatus::Succeeded);
+    }
+
+    /// Self-cancelled with no terminal subtype is `Cancelled`.
+    #[test]
+    fn self_cancelled_no_subtype_is_cancelled() {
+        let status = classify_status(None, true, false, None);
+        assert_eq!(status, SubagentStatus::Cancelled);
+    }
+
+    /// A child's own `ErrorDuringExecution` / `ErrorMaxTurns` terminal subtype
+    /// maps to `Failed` when not cancelled.
+    #[test]
+    fn error_subtypes_map_to_failed() {
+        assert_eq!(
+            classify_status(
+                None,
+                false,
+                false,
+                Some(ResultSubtype::ErrorDuringExecution)
+            ),
+            SubagentStatus::Failed
+        );
+        assert_eq!(
+            classify_status(None, false, false, Some(ResultSubtype::ErrorMaxTurns)),
+            SubagentStatus::Failed
+        );
+    }
+
+    /// The child loop's own terminal `Cancelled` subtype maps to `Cancelled`
+    /// even if the per-run signal was not separately tripped.
+    #[test]
+    fn child_cancelled_subtype_is_cancelled() {
+        let status = classify_status(None, false, false, Some(ResultSubtype::Cancelled));
+        assert_eq!(status, SubagentStatus::Cancelled);
+    }
+
+    /// A completed loop that emitted no Result event, with no cancellation of
+    /// any kind, defaults to `Succeeded`.
+    #[test]
+    fn no_subtype_defaults_to_succeeded() {
+        let status = classify_status(None, false, false, None);
+        assert_eq!(status, SubagentStatus::Succeeded);
+    }
+
+    /// Regression for the review finding. A child cancelled by the PARENT
+    /// (runtime-wide `cancel_flag` set) that produced no terminal Result —
+    /// because the 100ms drain poll had not yet copied the parent cancel into
+    /// this child's per-run flag (e.g. the child was queued on the concurrency
+    /// semaphore, or finished within a drain interval) — must classify as
+    /// `Cancelled`, not default to `Succeeded`.
+    #[test]
+    fn parent_cancelled_no_subtype_is_cancelled() {
+        let status = classify_status(None, false, true, None);
+        assert_eq!(status, SubagentStatus::Cancelled);
+    }
+
+    /// `join_outcome` is an unconditional override: a JoinHandle-level
+    /// timeout/panic/abort wins over both the per-run signal and the subtype.
+    #[test]
+    fn join_outcome_overrides_everything() {
+        assert_eq!(
+            classify_status(
+                Some(SubagentStatus::TimedOut),
+                true,
+                true,
+                Some(ResultSubtype::Success)
+            ),
+            SubagentStatus::TimedOut
+        );
+        assert_eq!(
+            classify_status(
+                Some(SubagentStatus::Failed),
+                false,
+                false,
+                Some(ResultSubtype::Success)
+            ),
+            SubagentStatus::Failed
+        );
     }
 }
