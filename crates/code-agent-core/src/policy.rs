@@ -348,7 +348,7 @@ impl PolicyEngine {
                 PermissionMode::DontAsk => {
                     // Allow when the structured rules match,
                     // or when the simple-name list contains the tool.
-                    if let Some(d) = self.match_allow(ctx.tool_name, &tool_input, &tool_input) {
+                    if let Some(d) = self.match_allow(ctx.tool_name, &tool_input) {
                         return d;
                     }
                     if self
@@ -406,7 +406,7 @@ impl PolicyEngine {
         // structured allow-rule auto-allow when force_callback is set.
         let mut matched_allow_rule = false;
         if !force_callback {
-            if let Some(d) = self.match_allow(ctx.tool_name, &tool_input, &tool_input) {
+            if let Some(d) = self.match_allow(ctx.tool_name, &tool_input) {
                 return d;
             }
             matched_allow_rule = self
@@ -503,19 +503,14 @@ impl PolicyEngine {
         )
     }
 
-    fn match_allow(
-        &self,
-        tool_name: &str,
-        input: &Value,
-        new_input: &Value,
-    ) -> Option<PolicyDecision> {
+    fn match_allow(&self, tool_name: &str, input: &Value) -> Option<PolicyDecision> {
         for r in &self.config.allowed_tools {
             if r.matches(tool_name, input) {
                 let mut d = PolicyDecision::allow(
                     PolicyDecisionSource::AllowRule,
                     Some("allow rule".into()),
                 );
-                d.updated_tool_input = Some(new_input.clone());
+                d.updated_tool_input = Some(input.clone());
                 return Some(d);
             }
         }

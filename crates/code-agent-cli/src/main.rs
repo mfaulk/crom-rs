@@ -897,7 +897,8 @@ struct ForkArgs {
 
 #[derive(Parser, Debug)]
 struct ChatArgs {
-    /// Initial prompt; if omitted, read from stdin.
+    /// Initial prompt; if omitted, no initial prompt is sent and chat waits
+    /// for interactive input.
     prompt: Option<String>,
     #[command(flatten)]
     common: CommonArgs,
@@ -3675,7 +3676,6 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
     });
 
     let mut current_text = String::new();
-    let mut had_success = false;
     loop {
         tokio::select! {
             ev = client.next_event() => {
@@ -3685,7 +3685,6 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
                     Err(_) => break,
                 };
                 if let AgentEvent::Result(r) = &ev {
-                    had_success = matches!(r.subtype, ResultSubtype::Success);
                     if cfg.show_usage {
                         if let Some(u) = &r.usage {
                             let cost = r.total_cost_usd
@@ -3745,12 +3744,9 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
     }
 
     let _ = client.shutdown().await;
-    if had_success {
-        Ok(())
-    } else {
-        // Treat normal chat exit (no Result) as success.
-        Ok(())
-    }
+    // A normal chat exit is always treated as success, including when the
+    // stream ended without a Success `Result` (e.g. the user quit the loop).
+    Ok(())
 }
 
 async fn cmd_mcp(args: McpCommand) -> Result<()> {

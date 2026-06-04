@@ -76,6 +76,9 @@ impl Tool for TodoWriteTool {
     }
 
     fn permission_kind(&self) -> PermissionKind {
+        // TodoWrite mutates only internal todo state, never the workspace or
+        // filesystem, so it is intentionally classified ReadOnly to avoid
+        // approval prompts.
         PermissionKind::ReadOnly
     }
 

@@ -27,7 +27,7 @@ pub use read::ReadTool;
 pub use todo::TodoWriteTool;
 pub use write::WriteTool;
 
-/// Build a `ToolRegistry` populated with all six built-in tools using default
+/// Build a `ToolRegistry` populated with all seven built-in tools using default
 /// `ToolLimits`. Callers can customize by constructing `ToolLimits` and using
 /// `register_builtin_with_limits`.
 pub fn register_builtin(registry: &mut ToolRegistry) {
