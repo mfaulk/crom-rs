@@ -234,7 +234,7 @@ impl AgentRuntime {
 
     /// Act on an existing plan.
     pub async fn act(&self, request: ActRequest) -> Result<AgentRunResult, AgentSdkError> {
-        run::execute_act(self.inner.clone(), request).await
+        run::execute_act(self.inner.clone(), request, None).await
     }
 
     /// Register a custom tool at the runtime level. The tool participates in

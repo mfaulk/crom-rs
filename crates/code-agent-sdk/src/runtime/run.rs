@@ -264,6 +264,14 @@ pub(crate) async fn execute_request(
                 deadline_fired.load(Ordering::SeqCst),
             )),
         };
+        // Emit PlanCreated once the plan is produced so consumers (e.g. the
+        // eval harness) can observe planning natively from the event stream
+        // rather than reconstructing it from the result (#34).
+        let plan_created = SdkEvent::PlanCreated(crate::event::PlanCreated {
+            run_id: run_id.clone(),
+            plan: plan_result.plan.clone(),
+        });
+        emit_event(&runtime, &event_tx, storage_session.as_ref(), plan_created).await;
         let act_req = ActRequest {
             plan: plan_result.plan.clone(),
             workspace: Some(WorkspaceSource::custom(workspace_for_run.clone())),
@@ -277,8 +285,14 @@ pub(crate) async fn execute_request(
             test_force_approval: true,
             deadline,
         };
+        let act_emit = ActEmitContext {
+            run_id: run_id.clone(),
+            event_tx: &event_tx,
+            storage_session: storage_session.clone(),
+            mapper: &mapper,
+        };
         return tokio::select! {
-            r = execute_act(runtime.clone(), act_req) => r,
+            r = execute_act(runtime.clone(), act_req, Some(act_emit)) => r,
             _ = cancellation.cancelled() => Ok(cancelled_result(
                 run_id,
                 None,
@@ -809,12 +823,39 @@ pub(crate) async fn execute_plan(
     })
 }
 
+/// Context that lets `execute_act` route the act phase's core
+/// `AgentEvent` stream through the same `SdkEventMapper` + `emit_event`
+/// path the regular run uses (#34). Plan-then-act consumers therefore see
+/// the same SdkEvents the mapper produces for a regular run — tool-call
+/// started/completed, assistant messages/deltas, tool-call denied, plus the
+/// `PatchProposed`/diagnostic events emitted around the run.
+/// `ApprovalPromptShown`/`ApprovalPromptResolved` AgentEvents are counted in
+/// `EventSummary.approvals_requested` but are not mapped to dedicated
+/// SdkEvents (a mapper-level gap shared with the regular run path).
+/// When `None`, `execute_act` runs silently (the standalone `act()` entry
+/// point on the runtime collects events into the result but does not own an
+/// event channel).
+pub(crate) struct ActEmitContext<'a> {
+    /// Reuse the parent run's id so emitted act events share the same
+    /// `run_id` as `PlanCreated` / `RunStarted` / `RunCompleted`.
+    pub run_id: RunId,
+    pub event_tx: &'a mpsc::Sender<Result<SdkEvent, AgentSdkError>>,
+    pub storage_session: Option<SessionId>,
+    pub mapper: &'a SdkEventMapper,
+}
+
 pub(crate) async fn execute_act(
     runtime: Arc<RuntimeInner>,
     request: ActRequest,
+    emit: Option<ActEmitContext<'_>>,
 ) -> Result<AgentRunResult, AgentSdkError> {
     let workspace = resolve_workspace(&runtime, request.workspace).await?;
-    let run_id = RunId::new();
+    // When driven from the plan-then-act path, reuse the parent run id so
+    // every emitted act event is tagged with the same run as the plan.
+    let run_id = match &emit {
+        Some(ctx) => ctx.run_id.clone(),
+        None => RunId::new(),
+    };
     let metadata = request.metadata.clone();
     let model = request
         .model
@@ -882,6 +923,40 @@ pub(crate) async fn execute_act(
         .await
         .map_err(|e| AgentSdkError::planning("plan.act_failed", e.to_string()))?;
 
+    // Account for the act phase's core AgentEvent stream and (when driven
+    // from the plan-then-act path) route it through the same mapper +
+    // emit_event path the regular run uses, so plan-then-act consumers
+    // observe tool-call/validation events (#34). The core `act_plan`
+    // driver collects events rather than streaming them, so we replay the
+    // collected vector here in order; ordering is preserved.
+    //
+    // Per-event accounting (tool calls, approvals) is unconditional so the
+    // returned EventSummary is correct for both the plan-then-act path and
+    // the standalone `act()` entry (which passes `emit: None`). Only
+    // `emit_event` is gated on `emit.is_some()`.
+    //
+    // Mapping covers exactly the regular-run set: assistant messages, tool
+    // calls started/completed, and denials. `SdkEventMapper::map` does not
+    // map `ApprovalPromptShown`/`ApprovalPromptResolved` to a dedicated
+    // SdkEvent, so approval *events* are not surfaced here — but neither are
+    // they on the regular run path, which also emits solely via
+    // `mapper.map`. That approval-event mapping gap is shared by both paths
+    // and is out of scope for this change.
+    let mut tool_calls = 0usize;
+    let mut approvals_requested = 0usize;
+    for ev in &outcome.events {
+        match ev {
+            AgentEvent::ToolCallStarted(_) => tool_calls += 1,
+            AgentEvent::ApprovalPromptShown(_) => approvals_requested += 1,
+            _ => {}
+        }
+        if let Some(ctx) = &emit {
+            if let Some(sdk_ev) = ctx.mapper.map(ev) {
+                emit_event(&runtime, ctx.event_tx, ctx.storage_session.as_ref(), sdk_ev).await;
+            }
+        }
+    }
+
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     for d in &outcome.deviations {
@@ -913,6 +988,30 @@ pub(crate) async fn execute_act(
             }
         }
     }
+
+    // When driven from the plan-then-act path, emit a PatchProposed event
+    // (mirroring the regular run) plus any deviation diagnostics, so the
+    // act phase's outcome is observable on the event stream as well.
+    if let Some(ctx) = &emit {
+        if let Some(p) = &patch {
+            if !p.files.is_empty() {
+                let sdk_ev = SdkEvent::PatchProposed(PatchProposedEvent {
+                    run_id: run_id.clone(),
+                    patch: p.clone(),
+                });
+                emit_event(&runtime, ctx.event_tx, ctx.storage_session.as_ref(), sdk_ev).await;
+            }
+        }
+        for diag in &diagnostics {
+            let sdk_ev = SdkEvent::Diagnostic(DiagnosticEvent {
+                run_id: run_id.clone(),
+                diagnostic: diag.clone(),
+            });
+            emit_event(&runtime, ctx.event_tx, ctx.storage_session.as_ref(), sdk_ev).await;
+        }
+    }
+
+    let diagnostics_count = diagnostics.len();
     Ok(AgentRunResult {
         run_id,
         session_id: None,
@@ -928,14 +1027,10 @@ pub(crate) async fn execute_act(
         model,
         events_summary: EventSummary {
             total_events: outcome.events.len(),
-            tool_calls: outcome
-                .events
-                .iter()
-                .filter(|e| matches!(e, AgentEvent::ToolCallStarted(_)))
-                .count(),
-            approvals_requested: 0,
+            tool_calls,
+            approvals_requested,
             files_changed: changed_files.len(),
-            diagnostics_count: 0,
+            diagnostics_count,
             duration_ms,
         },
         metadata,

@@ -372,6 +372,162 @@ async fn validation_denied_when_command_execution_disabled() {
         .any(|d| d.code == "tool.side_effect_denied"));
 }
 
+/// PlanThenAct with a scripted fake provider emits `PlanCreated` AND the
+/// act phase's tool-call events into the event stream, and the scripted
+/// tool actually executes (the file is written to the workspace). This
+/// pins both #34 (events emitted) and the #45 wiring (the act phase runs
+/// tool calls in headless mode).
+///
+/// Note: the act phase emits exactly the SdkEvents the regular run path
+/// does (tool-call started/completed, assistant messages, denials,
+/// patch-proposed, deviation diagnostics). Approval *events*
+/// (`ApprovalPromptShown`/`ApprovalPromptResolved`) are not surfaced as
+/// dedicated SdkEvents — `SdkEventMapper::map` does not map them — and the
+/// regular run path doesn't surface them either, so this test does not
+/// assert approval SdkEvents. It does assert the act-phase EventSummary
+/// `tool_calls` count is correct.
+#[tokio::test]
+async fn plan_then_act_emits_plan_and_act_tool_calls() {
+    use code_agent_core::{ModelEvent, TokenUsage, ToolCall};
+
+    // The ScriptedFakeProvider shares one turn queue across BOTH the
+    // planning agent and the act agent (the same provider Arc is used by
+    // each). Script them in order:
+    //   1. plan agent: call SubmitPlan (requesting the Write tool), stop.
+    //   2. plan agent: after the tool result, emit text + end_turn.
+    //   3. act agent:  call Write, stop.
+    //   4. act agent:  after the tool result, emit text + end_turn.
+    // The plan must list the file it writes (with write access) AND the
+    // Write tool, or the act phase's Write call is classified as an
+    // out-of-scope deviation and denied. This mirrors what a well-formed
+    // model plan produces (the planning prompt instructs the model to list
+    // "the concrete files, tools, commands").
+    let submit_plan_input = serde_json::json!({
+        "title": "Write greeting",
+        "summary": "Create out.txt with a greeting",
+        "goal": "create out.txt",
+        "files": [{ "path": "out.txt", "access": "write" }],
+        "requested_tools": [{ "tool_name": "Write" }],
+        "steps": [{
+            "id": "s1",
+            "title": "write the file",
+            "kind": "edit",
+            "expected_tools": [{ "tool_name": "Write" }],
+            "expected_files": [{ "path": "out.txt", "access": "write" }],
+        }],
+    });
+    let provider = ScriptedFakeProvider::new(vec![
+        // (1) planning: submit the plan
+        vec![
+            ModelEvent::ToolCall(ToolCall {
+                id: "plan-1".into(),
+                name: "SubmitPlan".into(),
+                input: submit_plan_input,
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: Some(TokenUsage::default()),
+            },
+        ],
+        // (2) planning: wrap up
+        vec![
+            ModelEvent::TextDelta {
+                text: "plan ready".into(),
+            },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: Some(TokenUsage::default()),
+            },
+        ],
+        // (3) act: write the file
+        vec![
+            ModelEvent::ToolCall(ToolCall {
+                id: "act-1".into(),
+                name: "Write".into(),
+                input: serde_json::json!({
+                    "file_path": "out.txt",
+                    "content": "hello\n",
+                }),
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: Some(TokenUsage::default()),
+            },
+        ],
+        // (4) act: wrap up
+        vec![
+            ModelEvent::TextDelta {
+                text: "done".into(),
+            },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: Some(TokenUsage::default()),
+            },
+        ],
+    ]);
+
+    let dir = TempDir::new().unwrap();
+    let runtime = AgentRuntime::builder()
+        .provider(ProviderConfig::fake(Arc::new(provider)))
+        .workspace(WorkspaceSource::filesystem(dir.path()))
+        .tool_policy(ToolPolicy {
+            enable_builtin_tools: BuiltinToolSet::cli_defaults(),
+            side_effect_policy: SideEffectPolicy::full(),
+            ..Default::default()
+        })
+        .interactivity(InteractivityMode::Headless)
+        .approval_callback(Arc::new(AllowAllApprovals))
+        .build()
+        .await
+        .unwrap();
+
+    let mut handle = runtime
+        .run(
+            AgentRequest::new("create out.txt with a greeting")
+                .mode(AgentMode::PlanThenAct)
+                .patch_policy(PatchPolicy::ApplyToWorkspace)
+                .approval_policy(ApprovalPolicy::CallbackRequired)
+                .interactivity(InteractivityMode::Headless)
+                .max_turns(6),
+        )
+        .await
+        .unwrap();
+
+    let mut saw_plan_created = false;
+    let mut saw_write_started = false;
+    while let Some(ev) = handle.events.next().await {
+        match ev.unwrap() {
+            SdkEvent::PlanCreated(_) => saw_plan_created = true,
+            SdkEvent::ToolCallStarted(t) if t.tool_name == "Write" => saw_write_started = true,
+            _ => {}
+        }
+    }
+    let result = handle.final_result().await.unwrap();
+
+    assert!(
+        saw_plan_created,
+        "PlanThenAct must emit SdkEvent::PlanCreated (#34)"
+    );
+    assert!(
+        saw_write_started,
+        "act phase must emit the Write tool-call event (#34/#45)"
+    );
+    assert!(
+        matches!(result.status, AgentRunStatus::Completed),
+        "expected Completed, got {:?}",
+        result.status
+    );
+    // The act phase actually executed the tool: the file is on disk.
+    let on_disk = std::fs::read_to_string(dir.path().join("out.txt"))
+        .expect("act phase must have written out.txt");
+    assert_eq!(on_disk, "hello\n");
+    // The act-phase EventSummary stats reflect the single Write call.
+    assert_eq!(
+        result.events_summary.tool_calls, 1,
+        "act-phase EventSummary must count the Write tool call"
+    );
+}
+
 /// Plan-only mode produces a PlanDocument and does not mutate.
 #[tokio::test]
 async fn plan_only_returns_plan_document() {

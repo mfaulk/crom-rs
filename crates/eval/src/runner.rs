@@ -266,22 +266,14 @@ async fn drive_agent(
             use code_agent_sdk::AgentRunStatus;
             let errored = !matches!(run_result.status, AgentRunStatus::Completed);
             let timed_out = matches!(run_result.status, AgentRunStatus::TimedOut);
-            let mut events = collected;
-            // The SDK plan/act path returns the plan on the result rather than
-            // always emitting a `PlanCreated` into the event sink. Synthesize one
-            // so behavior oracles (`must_emit_plan`) and process scoring can
-            // observe that a plan was produced.
-            if let Some(plan) = run_result.plan.clone() {
-                let already = events.iter().any(|e| matches!(e, SdkEvent::PlanCreated(_)));
-                if !already {
-                    events.push(SdkEvent::PlanCreated(code_agent_sdk::event::PlanCreated {
-                        run_id: run_result.run_id.clone(),
-                        plan,
-                    }));
-                }
-            }
+            // The SDK plan/act path now natively emits `PlanCreated` and the
+            // act phase's mapper-produced SdkEvents (tool calls, messages,
+            // denials) into the event sink, so the harness no longer
+            // synthesizes a PlanCreated from `run_result.plan` (#34). Approval
+            // events remain counted-only (not emitted as SdkEvents) on both
+            // the plan/act and regular run paths.
             Ok(RunOutcome {
-                events,
+                events: collected,
                 summary: run_result.summary,
                 timed_out,
                 errored,
