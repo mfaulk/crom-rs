@@ -314,4 +314,64 @@ mod tests {
         let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
         assert!(parse_sse_response(body).is_err());
     }
+
+    #[test]
+    // An empty (no-event) SSE body is reported as "contained no data" rather
+    // than a generic parse failure.
+    fn parse_sse_response_errors_on_empty_body() {
+        let err = parse_sse_response("").unwrap_err();
+        match err {
+            McpError::InvalidJsonRpc(msg) => assert!(msg.contains("no data"), "got: {msg}"),
+            other => panic!("expected InvalidJsonRpc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // A body whose only event has malformed JSON propagates the parse error
+    // (not the "no response event" message), since an event was seen.
+    fn parse_sse_response_propagates_event_parse_error() {
+        let body = "data: {not json}\n\n";
+        let err = parse_sse_response(body).unwrap_err();
+        // serde_json error becomes McpError::Json via From.
+        assert!(matches!(err, McpError::Json(_)));
+    }
+
+    // ---- sse_event_data ----
+
+    #[test]
+    // Blank lines delimit events; each event's `data:` field is one entry.
+    fn sse_event_data_splits_on_blank_lines() {
+        let body = "data: a\n\ndata: b\n\n";
+        assert_eq!(sse_event_data(body), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    // Multi-line `data:` fields within one event are newline-joined per spec.
+    fn sse_event_data_joins_multiline_within_event() {
+        let body = "data: line1\ndata: line2\n\n";
+        assert_eq!(sse_event_data(body), vec!["line1\nline2".to_string()]);
+    }
+
+    #[test]
+    // A trailing event without a closing blank line is still flushed.
+    fn sse_event_data_flushes_unterminated_trailing_event() {
+        let body = "data: only";
+        assert_eq!(sse_event_data(body), vec!["only".to_string()]);
+    }
+
+    #[test]
+    // Non-`data:` SSE fields (event:, id:, comments) are ignored, and an event
+    // with no data field produces no entry.
+    fn sse_event_data_ignores_non_data_fields() {
+        let body = "event: message\nid: 1\n: keep-alive comment\n\n";
+        assert!(sse_event_data(body).is_empty());
+    }
+
+    #[test]
+    // Leading whitespace after `data:` is stripped (trim_start); trailing
+    // whitespace is preserved.
+    fn sse_event_data_strips_leading_whitespace() {
+        let body = "data:  spaced \n\n";
+        assert_eq!(sse_event_data(body), vec!["spaced ".to_string()]);
+    }
 }

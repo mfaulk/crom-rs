@@ -286,3 +286,345 @@ struct ListPromptsResponse {
     #[serde(default, rename = "nextCursor")]
     next_cursor: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{JsonRpcId, JsonRpcResponse};
+    use crate::transport::{McpServerLogEntry, McpTransport, McpTransportKind};
+    use async_trait::async_trait;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// Recorded `(method, params)` pairs for each outgoing request or
+    /// notification, shared with the test for inspection after the calls.
+    type RecordedCalls = Arc<Mutex<Vec<(String, Option<Value>)>>>;
+
+    /// In-process transport driven by a script of canned responses keyed by
+    /// JSON-RPC method. Records every request/notification for assertions so
+    /// these tests exercise the real `McpClient` state machine without
+    /// spawning a child process or opening a socket.
+    #[derive(Default)]
+    struct MockTransport {
+        /// Per-method FIFO queues of responses to hand back.
+        responses: Mutex<std::collections::HashMap<String, VecDeque<JsonRpcResponse>>>,
+        /// Method **and params** of every `send_request` call, in order, so
+        /// tests can assert on the exact payload the client sent (e.g. the
+        /// pagination cursor or a tool's name/arguments) rather than just the
+        /// method name.
+        requests: RecordedCalls,
+        /// Method **and params** of every `send_notification` call, in order.
+        notifications: RecordedCalls,
+        /// The last protocol version the client pushed via
+        /// `set_protocol_version`, exposed through a shared handle so a test
+        /// can assert the negotiated version was propagated into the transport.
+        protocol_version: Arc<Mutex<Option<String>>>,
+        /// When set, every request first sleeps this long (to drive timeouts).
+        request_delay: Option<Duration>,
+    }
+
+    impl MockTransport {
+        fn push(&self, method: &str, response: JsonRpcResponse) {
+            self.responses
+                .lock()
+                .unwrap()
+                .entry(method.to_string())
+                .or_default()
+                .push_back(response);
+        }
+
+        fn ok(id: u64, result: Value) -> JsonRpcResponse {
+            JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: Some(JsonRpcId::Number(id)),
+                result: Some(result),
+                error: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpTransport for MockTransport {
+        fn kind(&self) -> McpTransportKind {
+            McpTransportKind::Stdio
+        }
+
+        async fn send_request(&mut self, request: JsonRpcRequest) -> McpResult<JsonRpcResponse> {
+            if let Some(delay) = self.request_delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.requests
+                .lock()
+                .unwrap()
+                .push((request.method.clone(), request.params.clone()));
+            let mut map = self.responses.lock().unwrap();
+            let resp = map
+                .get_mut(&request.method)
+                .and_then(|q| q.pop_front())
+                .unwrap_or_else(|| panic!("no canned response for {}", request.method));
+            // Echo back the request id so response_id_matches-style checks in
+            // real transports would pass; the mock returns directly anyway.
+            Ok(JsonRpcResponse {
+                id: request.id.clone().into(),
+                ..resp
+            })
+        }
+
+        async fn send_notification(&mut self, notification: JsonRpcNotification) -> McpResult<()> {
+            self.notifications
+                .lock()
+                .unwrap()
+                .push((notification.method.clone(), notification.params.clone()));
+            Ok(())
+        }
+
+        fn set_protocol_version(&mut self, version: Option<String>) {
+            *self.protocol_version.lock().unwrap() = version;
+        }
+
+        fn drain_logs(&mut self) -> Vec<McpServerLogEntry> {
+            Vec::new()
+        }
+    }
+
+    fn client_with(transport: MockTransport) -> McpClient {
+        McpClient {
+            server_name: "mock".into(),
+            transport_kind: McpTransportKind::Stdio,
+            capabilities: ServerCapabilities::default(),
+            server_info: None,
+            protocol_version: None,
+            transport: Box::new(transport),
+            ids: JsonRpcIdAllocator::new(),
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn init_result(version: &str) -> Value {
+        json!({
+            "protocolVersion": version,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "mock", "version": "0.1.0"}
+        })
+    }
+
+    #[tokio::test]
+    // A successful initialize records the negotiated protocol version, captures
+    // capabilities/server-info, pushes the version into the transport, and
+    // sends exactly one `notifications/initialized`.
+    async fn initialize_negotiates_and_sends_initialized() {
+        let transport = MockTransport::default();
+        let notes = transport.notifications.clone();
+        let reqs = transport.requests.clone();
+        let pushed_version = transport.protocol_version.clone();
+        transport.push(
+            "initialize",
+            MockTransport::ok(1, init_result("2025-06-18")),
+        );
+        let mut client = client_with(transport);
+
+        let init = client.initialize().await.unwrap();
+        assert_eq!(init.protocol_version, "2025-06-18");
+        assert_eq!(client.protocol_version.as_deref(), Some("2025-06-18"));
+        assert_eq!(init.server_info.name, "mock");
+        assert!(client.capabilities.tools.is_some());
+
+        // The client must have advertised the protocol version it supports in
+        // the `initialize` request params.
+        let reqs = reqs.lock().unwrap();
+        let (method, params) = &reqs[0];
+        assert_eq!(method, "initialize");
+        let params = params.as_ref().expect("initialize params present");
+        assert_eq!(params["protocolVersion"], json!(MCP_PROTOCOL_VERSION));
+
+        // The negotiated version from the *response* must be propagated into
+        // the transport via `set_protocol_version`. If production dropped the
+        // `set_protocol_version(Some(...))` call, this handle stays `None` and
+        // the assertion fails.
+        assert_eq!(
+            pushed_version.lock().unwrap().as_deref(),
+            Some("2025-06-18"),
+        );
+
+        // Exactly one initialized notification, sent after the response.
+        let sent = notes.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "notifications/initialized");
+    }
+
+    #[tokio::test]
+    // An initialize response with a blank protocolVersion is rejected (the
+    // server failed to negotiate) and no initialized notification is sent.
+    async fn initialize_rejects_blank_protocol_version() {
+        let transport = MockTransport::default();
+        let notes = transport.notifications.clone();
+        transport.push("initialize", MockTransport::ok(1, init_result("   ")));
+        let mut client = client_with(transport);
+
+        let err = client.initialize().await.unwrap_err();
+        assert!(matches!(err, McpError::InvalidJsonRpc(_)));
+        // No initialized handshake on a failed negotiation.
+        assert!(notes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    // A JSON-RPC error response to initialize surfaces as McpError::JsonRpc.
+    async fn initialize_propagates_server_error() {
+        let transport = MockTransport::default();
+        transport.push(
+            "initialize",
+            JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: Some(JsonRpcId::Number(1)),
+                result: None,
+                error: Some(crate::protocol::JsonRpcError {
+                    code: -32603,
+                    message: "internal".into(),
+                    data: None,
+                }),
+            },
+        );
+        let mut client = client_with(transport);
+        let err = client.initialize().await.unwrap_err();
+        assert!(matches!(err, McpError::JsonRpc { .. }));
+    }
+
+    #[tokio::test]
+    // list_tools follows `nextCursor` across pages and concatenates the tools
+    // from every page in order.
+    async fn list_tools_paginates_across_pages() {
+        let transport = MockTransport::default();
+        let reqs = transport.requests.clone();
+        transport.push(
+            "tools/list",
+            MockTransport::ok(
+                0,
+                json!({
+                    "tools": [{"name": "a", "inputSchema": {"type": "object"}}],
+                    "nextCursor": "p2"
+                }),
+            ),
+        );
+        transport.push(
+            "tools/list",
+            MockTransport::ok(
+                0,
+                json!({
+                    "tools": [{"name": "b", "inputSchema": {"type": "object"}}],
+                    "nextCursor": ""
+                }),
+            ),
+        );
+        let mut client = client_with(transport);
+
+        let tools = client.list_tools().await.unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+
+        let reqs = reqs.lock().unwrap();
+        // Two pages => two requests.
+        assert_eq!(reqs.len(), 2);
+        // The first page is fetched without a cursor.
+        assert_eq!(reqs[0].0, "tools/list");
+        assert_eq!(reqs[0].1, Some(json!({})));
+        // The second request must carry the cursor the first page returned
+        // (`"p2"`). If `list_tools` stopped forwarding `nextCursor`, the second
+        // request would omit it (`{}`) and this assertion would fail.
+        assert_eq!(reqs[1].0, "tools/list");
+        assert_eq!(reqs[1].1, Some(json!({ "cursor": "p2" })));
+    }
+
+    #[tokio::test]
+    // A server that returns the same `nextCursor` twice is treated as
+    // misbehaving and rejected instead of spinning forever.
+    async fn list_tools_rejects_non_advancing_cursor() {
+        let transport = MockTransport::default();
+        transport.push(
+            "tools/list",
+            MockTransport::ok(0, json!({"tools": [], "nextCursor": "same"})),
+        );
+        transport.push(
+            "tools/list",
+            MockTransport::ok(0, json!({"tools": [], "nextCursor": "same"})),
+        );
+        let mut client = client_with(transport);
+
+        let err = client.list_tools().await.unwrap_err();
+        match err {
+            McpError::InvalidJsonRpc(msg) => {
+                assert!(msg.contains("did not advance"), "got: {msg}");
+            }
+            other => panic!("expected InvalidJsonRpc, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // A single page with no cursor terminates after one request.
+    async fn list_tools_single_page() {
+        let transport = MockTransport::default();
+        let reqs = transport.requests.clone();
+        transport.push(
+            "tools/list",
+            MockTransport::ok(
+                0,
+                json!({"tools": [{"name": "only", "inputSchema": {"type": "object"}}]}),
+            ),
+        );
+        let mut client = client_with(transport);
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(reqs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    // call_tool forwards name+arguments and shapes the response into an
+    // McpToolResult (content + isError flag).
+    async fn call_tool_shapes_result() {
+        let transport = MockTransport::default();
+        let reqs = transport.requests.clone();
+        transport.push(
+            "tools/call",
+            MockTransport::ok(
+                0,
+                json!({
+                    "content": [{"type": "text", "text": "hi"}],
+                    "isError": false
+                }),
+            ),
+        );
+        let mut client = client_with(transport);
+        let result = client.call_tool("echo", json!({"x": 1})).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
+
+        // The outgoing `tools/call` request must carry the exact tool name and
+        // arguments passed in. A regression that sent the wrong name or dropped
+        // the arguments would fail here.
+        let reqs = reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        let (method, params) = &reqs[0];
+        assert_eq!(method, "tools/call");
+        assert_eq!(
+            params.as_ref().expect("tools/call params present"),
+            &json!({ "name": "echo", "arguments": { "x": 1 } }),
+        );
+    }
+
+    #[tokio::test]
+    // A request that outlives the request timeout fails with a Timeout error
+    // rather than hanging the caller. The transport sleeps far longer than the
+    // configured 50ms budget, so `request_with_timeout` must trip first.
+    async fn request_times_out() {
+        let transport = MockTransport {
+            request_delay: Some(Duration::from_secs(60)),
+            ..MockTransport::default()
+        };
+        transport.push("tools/list", MockTransport::ok(0, json!({"tools": []})));
+        let mut client = client_with(transport);
+        client.request_timeout = Duration::from_millis(50);
+
+        let err = client.list_tools().await.unwrap_err();
+        assert!(matches!(err, McpError::Timeout { .. }));
+    }
+}

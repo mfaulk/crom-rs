@@ -213,22 +213,8 @@ fn spawn_stderr_task(
         let mut lines = BufReader::new(stderr).lines();
         let mut total = 0usize;
         while let Ok(Some(line)) = lines.next_line().await {
-            let mut message = redact_text_with_secrets(&line, &secrets);
-            let mut truncated = false;
-            if total.saturating_add(message.len()) > max_bytes {
-                let remaining = max_bytes.saturating_sub(total);
-                if remaining == 0 {
-                    truncated = true;
-                    message.clear();
-                } else {
-                    let mut end = remaining.min(message.len());
-                    while !message.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    message.truncate(end);
-                    truncated = true;
-                }
-            }
+            let message = redact_text_with_secrets(&line, &secrets);
+            let (message, truncated) = truncate_log_line(message, total, max_bytes);
             total = total.saturating_add(message.len());
             if !message.is_empty() || truncated {
                 push_log(
@@ -246,6 +232,33 @@ fn spawn_stderr_task(
             }
         }
     })
+}
+
+/// Clamp a single stderr log line so the running `total` plus this line never
+/// exceeds `max_bytes`. Returns the (possibly truncated) message and whether
+/// truncation occurred. Truncation backs off to a UTF-8 char boundary so a
+/// multi-byte codepoint is never split; once the budget is fully spent the
+/// line is emptied but still flagged truncated (signalling the caller to stop
+/// draining further stderr).
+pub(crate) fn truncate_log_line(
+    mut message: String,
+    total: usize,
+    max_bytes: usize,
+) -> (String, bool) {
+    if total.saturating_add(message.len()) <= max_bytes {
+        return (message, false);
+    }
+    let remaining = max_bytes.saturating_sub(total);
+    if remaining == 0 {
+        message.clear();
+    } else {
+        let mut end = remaining.min(message.len());
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    (message, true)
 }
 
 fn push_log(
@@ -423,6 +436,134 @@ mod read_line_bounded_tests {
             err,
             crate::errors::McpError::ResultTooLarge { .. }
         ));
+    }
+
+    // EOF with nothing buffered returns 0 (the caller's signal that the child
+    // closed stdout), rather than an empty-but-nonzero line.
+    #[tokio::test]
+    async fn empty_reader_returns_zero() {
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut out = String::new();
+        let n = read_line_bounded(&mut reader, &mut out, 1024)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(out.is_empty());
+    }
+
+    // A final line lacking a trailing newline (EOF-terminated) is still
+    // returned in full, with its byte count, not dropped as incomplete.
+    #[tokio::test]
+    async fn returns_unterminated_final_line() {
+        let mut reader = Cursor::new(b"partial".to_vec());
+        let mut out = String::new();
+        let n = read_line_bounded(&mut reader, &mut out, 1024)
+            .await
+            .unwrap();
+        assert_eq!(n, "partial".len());
+        assert_eq!(out, "partial");
+    }
+
+    // Line buffering across many tiny chunks: a complete line spanning several
+    // `fill_buf` returns is reassembled, and reading stops at the first
+    // newline (the remainder stays buffered for the next call).
+    #[tokio::test]
+    async fn stops_at_first_newline_and_buffers_remainder() {
+        // Two lines; chunk size 1 forces byte-at-a-time reads.
+        let mut reader = ChunkedReader::new(b"first\nsecond\n".to_vec(), 1);
+        let mut out = String::new();
+        let n = read_line_bounded(&mut reader, &mut out, 1024)
+            .await
+            .unwrap();
+        assert_eq!(out, "first\n");
+        assert_eq!(n, 6);
+        // The next read picks up exactly where the first stopped.
+        let mut out2 = String::new();
+        let n2 = read_line_bounded(&mut reader, &mut out2, 1024)
+            .await
+            .unwrap();
+        assert_eq!(out2, "second\n");
+        assert_eq!(n2, 7);
+    }
+}
+
+#[cfg(test)]
+mod stderr_log_tests {
+    //! Coverage for the stderr log-buffer bookkeeping: per-line truncation at
+    //! the byte cap (with char-boundary safety) and the aggregate `push_log`
+    //! cap that drops entries once the buffer is full.
+
+    use super::{push_log, truncate_log_line, McpServerLogEntry};
+    use crate::transport::McpLogStream;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    // A line that fits within the remaining budget is passed through untouched.
+    fn line_under_budget_is_unchanged() {
+        let (msg, truncated) = truncate_log_line("hello".into(), 0, 100);
+        assert_eq!(msg, "hello");
+        assert!(!truncated);
+    }
+
+    #[test]
+    // A line that would overflow the cap is clamped to the remaining budget
+    // and flagged truncated.
+    fn line_over_budget_is_clamped() {
+        // 90 bytes already used, cap 100, so only 10 bytes remain.
+        let (msg, truncated) = truncate_log_line("0123456789ABCDEF".into(), 90, 100);
+        assert!(truncated);
+        assert_eq!(msg.len(), 10);
+        assert_eq!(msg, "0123456789");
+    }
+
+    #[test]
+    // Once the budget is fully spent the line is emptied but still flagged so
+    // the stderr reader knows to stop draining.
+    fn line_at_full_budget_is_emptied() {
+        let (msg, truncated) = truncate_log_line("anything".into(), 100, 100);
+        assert!(truncated);
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    // Truncation never splits a multi-byte codepoint: the kept prefix backs
+    // off to a char boundary even if that means keeping fewer bytes than the
+    // raw remaining budget.
+    fn truncation_respects_char_boundary() {
+        // `é` is 2 bytes. Remaining budget 3 would land mid-codepoint, so we
+        // keep 2 bytes (one `é`).
+        let line = "é".repeat(4); // 8 bytes
+        let (msg, truncated) = truncate_log_line(line, 0, 3);
+        assert!(truncated);
+        assert_eq!(msg, "é");
+        assert!(std::str::from_utf8(msg.as_bytes()).is_ok());
+    }
+
+    fn entry(msg: &str) -> McpServerLogEntry {
+        McpServerLogEntry {
+            stream: McpLogStream::Stderr,
+            message: msg.to_string(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    // push_log appends while the aggregate buffered byte count is under the
+    // cap, then silently drops further entries once it is reached.
+    fn push_log_drops_entries_past_aggregate_cap() {
+        let logs: Arc<Mutex<VecDeque<McpServerLogEntry>>> = Arc::new(Mutex::new(VecDeque::new()));
+        // Cap 10: first two 4-byte messages fit (current 0, then 4 < 10).
+        push_log(&logs, 10, entry("aaaa"));
+        push_log(&logs, 10, entry("bbbb"));
+        // Now 8 bytes buffered (< 10) so a third is still accepted...
+        push_log(&logs, 10, entry("cccc"));
+        // ...but at 12 buffered bytes (>= 10) the next entry is dropped.
+        push_log(&logs, 10, entry("dddd"));
+        let guard = logs.lock().unwrap();
+        assert_eq!(guard.len(), 3);
+        assert_eq!(guard[0].message, "aaaa");
+        assert_eq!(guard[2].message, "cccc");
     }
 }
 
