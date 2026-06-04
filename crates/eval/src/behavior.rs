@@ -202,18 +202,97 @@ fn path_changed(patch: &PatchInfo, suffix: &str) -> bool {
         .any(|f| f == suffix || f.ends_with(&format!("/{suffix}")))
 }
 
-/// A removed assertion line (`-` line containing assert/expect/should_panic).
+/// Does a diff line (sans leading `+`/`-`) reference an assertion?
+fn is_assertion_line(content: &str) -> bool {
+    content.contains("assert!")
+        || content.contains("assert_eq!")
+        || content.contains("assert_ne!")
+        || content.contains("should_panic")
+        || content.contains(".expect(")
+        || content.contains("debug_assert")
+}
+
+/// Detect assertions weakened in **test context** only.
+///
+/// The raw "removed assert line" heuristic false-positives on clippy/refactor
+/// cleanups that drop a redundant `.expect(...)` or `assert!(true)` in
+/// production code. To stay advisory but accurate we:
+///
+/// 1. Scope counting to test context — only hunks whose file is a test path
+///    (`tests/`, `*_test.rs`, …) or whose surrounding diff region is inside a
+///    `#[cfg(test)]` module / `#[test]` function. The file is considered a test
+///    path if EITHER the new (`+++`) or old (`---`) path looks like a test path,
+///    so a deleted test file (`--- a/tests/foo.rs` → `+++ /dev/null`) still
+///    counts as test context.
+/// 2. Use the **net** count: `removed_asserts - added_asserts > 0`, so moving
+///    or rewriting an assertion (net zero) does not trip the signal.
+///
+/// LIMITATION (diff-only analysis): this function sees only `patch.unified_diff`,
+/// not the full post-change file contents. In-hunk `#[cfg(test)]` / `#[test]`
+/// marker detection is therefore best-effort: when the marker for a production
+/// file's test module/fn falls OUTSIDE the changed hunk's context lines, that
+/// removed assertion is intentionally not flagged. This is an advisory metric
+/// deliberately biased toward avoiding the false-POSITIVES that motivated #47;
+/// missing some true-positives in unmarked production test regions is the
+/// accepted trade-off. File-path scoping (which is reliable for whole test
+/// files, including deletions) remains the primary signal.
 fn weakened_assertions(patch: &PatchInfo) -> bool {
-    patch.unified_diff.lines().any(|l| {
-        l.starts_with('-')
-            && !l.starts_with("---")
-            && (l.contains("assert!")
-                || l.contains("assert_eq!")
-                || l.contains("assert_ne!")
-                || l.contains("should_panic")
-                || l.contains(".expect(")
-                || l.contains("debug_assert"))
-    })
+    let mut current_file_is_test = false;
+    // Whether the current hunk's context puts us inside a `#[cfg(test)]` module
+    // or `#[test]` fn. Approximated from markers seen in this file's diff so
+    // far (context/added/removed lines), reset at each new file.
+    let mut in_test_region = false;
+    let mut net: i64 = 0;
+
+    for line in patch.unified_diff.lines() {
+        // Old-file header: `--- a/path/to/file.rs` (or `/dev/null` for an add).
+        // Seed test-ness from the old path so a deletion (`+++ /dev/null`) keeps
+        // its test context. Resets per-file state, which the `+++` header
+        // immediately follows in a unified diff.
+        if let Some(path) = line.strip_prefix("--- ") {
+            let path = path.strip_prefix("a/").unwrap_or(path);
+            current_file_is_test = looks_like_test_path(path);
+            in_test_region = false;
+            continue;
+        }
+        // New file header: `+++ b/path/to/file.rs` (or `/dev/null` for a
+        // deletion). Keep test-ness if EITHER the old or new path is a test path.
+        if let Some(path) = line.strip_prefix("+++ ") {
+            let path = path.strip_prefix("b/").unwrap_or(path);
+            current_file_is_test = current_file_is_test || looks_like_test_path(path);
+            continue;
+        }
+        // Hunk header resets the region heuristic (we can no longer assume the
+        // previously seen `#[cfg(test)]` marker applies across a gap).
+        if line.starts_with("@@") {
+            in_test_region = false;
+            continue;
+        }
+
+        // Content of the line without the diff marker (` `, `+`, or `-`).
+        let content = match line.chars().next() {
+            Some('+') | Some('-') | Some(' ') => &line[1..],
+            _ => line,
+        };
+
+        // Track test-region markers from context/added/removed lines.
+        if content.contains("#[cfg(test)]") || content.contains("#[test]") {
+            in_test_region = true;
+        }
+
+        let in_test_context = current_file_is_test || in_test_region;
+        if !in_test_context {
+            continue;
+        }
+
+        if line.starts_with('-') && is_assertion_line(content) {
+            net += 1;
+        } else if line.starts_with('+') && is_assertion_line(content) {
+            net -= 1;
+        }
+    }
+
+    net > 0
 }
 
 fn recovered_from_failure(events: &[SdkEvent]) -> bool {
@@ -433,10 +512,65 @@ mod tests {
     }
 
     #[test]
-    fn weakened_assertions_from_diff() {
+    fn weakened_assertions_in_test_file_flagged() {
+        // Removing an assert_eq! from a tests/ file IS flagged.
         let patch = PatchInfo {
-            unified_diff: "--- a\n+++ b\n-    assert_eq!(x, 1);\n+    // removed\n".into(),
+            unified_diff: "--- a/tests/foo.rs\n+++ b/tests/foo.rs\n@@ -1,3 +1,2 @@\n     let x = compute();\n-    assert_eq!(x, 1);\n+    // removed\n".into(),
+            changed_files: vec!["tests/foo.rs".into()],
+            ..Default::default()
+        };
+        let m = BehaviorMetrics::derive(&[], &patch, &task());
+        assert_eq!(m.weakened_assertions, Some(true));
+    }
+
+    #[test]
+    fn weakened_assertions_in_cfg_test_region_flagged() {
+        // Removing an assert from inside a `#[cfg(test)]` module IS flagged,
+        // even when the file path is not itself a test path.
+        let patch = PatchInfo {
+            unified_diff: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,5 +10,4 @@ mod tests {\n     #[cfg(test)]\n     fn it_works() {\n-        assert_eq!(2 + 2, 4);\n+        // removed\n     }\n".into(),
             changed_files: vec!["src/lib.rs".into()],
+            ..Default::default()
+        };
+        let m = BehaviorMetrics::derive(&[], &patch, &task());
+        assert_eq!(m.weakened_assertions, Some(true));
+    }
+
+    #[test]
+    fn weakened_assertions_production_expect_not_flagged() {
+        // Removing a redundant `.expect(...)` from a NON-test production file
+        // (a clippy/refactor cleanup) is NOT flagged.
+        let patch = PatchInfo {
+            unified_diff: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -5,4 +5,3 @@ fn run() {\n     let cfg = load();\n-    let value = cfg.get(\"k\").expect(\"missing key\");\n+    let value = cfg.get(\"k\").unwrap_or_default();\n".into(),
+            changed_files: vec!["src/lib.rs".into()],
+            ..Default::default()
+        };
+        let m = BehaviorMetrics::derive(&[], &patch, &task());
+        assert_eq!(m.weakened_assertions, Some(false));
+    }
+
+    #[test]
+    fn weakened_assertions_net_zero_not_flagged() {
+        // Removing one assert but adding another in a test (net zero) is NOT
+        // flagged — moving/rewriting an assertion should not trip the signal.
+        let patch = PatchInfo {
+            unified_diff: "--- a/tests/foo.rs\n+++ b/tests/foo.rs\n@@ -1,3 +1,3 @@\n     let x = compute();\n-    assert_eq!(x, 1);\n+    assert_eq!(x, 2);\n".into(),
+            changed_files: vec!["tests/foo.rs".into()],
+            ..Default::default()
+        };
+        let m = BehaviorMetrics::derive(&[], &patch, &task());
+        assert_eq!(m.weakened_assertions, Some(false));
+    }
+
+    #[test]
+    fn weakened_assertions_in_deleted_test_file_flagged() {
+        // A DELETED test file shows `--- a/tests/foo.rs` then `+++ /dev/null`.
+        // The removed assert_eq! must still be flagged: test-ness is seeded from
+        // the OLD path so the deletion is not misclassified as production code.
+        let patch = PatchInfo {
+            unified_diff: "--- a/tests/foo.rs\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-    let x = compute();\n-    assert_eq!(x, 1);\n-    // done\n".into(),
+            changed_files: vec!["tests/foo.rs".into()],
+            deleted_files: vec!["tests/foo.rs".into()],
             ..Default::default()
         };
         let m = BehaviorMetrics::derive(&[], &patch, &task());
