@@ -39,6 +39,11 @@ code-agent-sdk = { workspace = true, features = [
 # runtime by the CODE_AGENT_EVAL_LIVE env var, not at compile time.
 code-agent-anthropic = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Used to SIGKILL the whole process group of an oracle command on timeout /
+# output-cap so children (e.g. cargo) are not orphaned.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

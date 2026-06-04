@@ -328,6 +328,7 @@ mod tests {
                 stderr: String::new(),
                 duration_ms: 1,
                 timed_out: false,
+                output_truncated: false,
             }],
             assertions: vec![],
             behavior: vec![],

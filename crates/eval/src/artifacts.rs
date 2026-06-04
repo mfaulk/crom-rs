@@ -198,6 +198,7 @@ mod tests {
             stderr: String::new(),
             duration_ms: 5,
             timed_out: false,
+            output_truncated: false,
         }];
         task.write_command_outputs(&cmds).unwrap();
 

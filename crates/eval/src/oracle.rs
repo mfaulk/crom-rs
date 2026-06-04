@@ -12,6 +12,8 @@
 //!   and their negations).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +33,11 @@ pub struct CommandResult {
     pub stderr: String,
     pub duration_ms: u64,
     pub timed_out: bool,
+    /// Set when stdout/stderr exceeded `MAX_CAPTURE` and the child was killed
+    /// to bound memory; the captured streams are truncated and `success` is
+    /// false. Defaults to `false` for backward-compatible deserialization.
+    #[serde(default)]
+    pub output_truncated: bool,
 }
 
 /// Result of a single file assertion.
@@ -134,6 +141,7 @@ pub async fn evaluate_oracle(
                 stderr: format!("isolation error: {e}"),
                 duration_ms: 0,
                 timed_out: false,
+                output_truncated: false,
             }),
         }
     }
@@ -158,50 +166,360 @@ pub async fn evaluate_oracle(
 }
 
 /// Run a single shell command in `dir` with a timeout, capturing output.
+///
+/// The child is spawned in its own process group (on Unix) so the entire group
+/// can be signalled, not just the wrapping `sh` — otherwise long children (e.g.
+/// `cargo test`) would be orphaned and outlive `run_command`.
+///
+/// stdout/stderr are streamed with a hard byte cap of `MAX_CAPTURE` per
+/// stream rather than buffered unbounded; once a stream exceeds the cap the
+/// child (group) is killed and that stream is flagged truncated. This bounds
+/// live memory even for commands that print unboundedly fast.
+///
+/// The main flow selects ONLY between the child exiting and the wall-clock
+/// timeout: there is no read-completion branch that could drop the timeout
+/// future. A process that closes its stdout/stderr but keeps running (so the
+/// pipes reach EOF while the process lives) is still bounded by the timeout.
+///
+/// After the select resolves — whether the child exited or the timeout fired —
+/// the whole process group is ALWAYS killed before the read tasks are joined.
+/// Reaping the direct `sh` does not close stdout/stderr fds that a backgrounded
+/// descendant inherited and still holds, and on Unix a pipe reaches EOF only
+/// when every write end is closed; so without this a command that backgrounds a
+/// stdio-inheriting descendant and exits (e.g. `sh -c 'sleep 60 & exit 0'`)
+/// would block the readers forever. The post-exit joins are additionally bounded
+/// by a short grace (`REAP_GRACE`) as a backstop, so no `.await` in this
+/// function is unbounded.
+///
+/// Every `child.wait()` that runs AFTER a group kill (the timeout branch's
+/// post-kill reap and the unconditional post-select reap) is itself wrapped in a
+/// `REAP_GRACE` timeout: if the best-effort group kill is ineffective (rare, or
+/// non-Unix where we can only signal the direct child), we give up reaping rather
+/// than block until the command exits naturally. Combined with the bounded read
+/// joins, no `.await` in this function can exceed roughly `timeout + REAP_GRACE`.
 pub async fn run_command(command: &str, dir: &Path, timeout: Duration) -> CommandResult {
     let start = std::time::Instant::now();
     let mut cmd = tokio::process::Command::new("sh");
-    // `kill_on_drop` terminates the `sh` wrapper when the timeout future is
-    // dropped. Note: `sh` does not forward the signal to its own children, so a
-    // long-running child (e.g. cargo) may briefly outlive the timeout — see the
-    // "known limitations" section of docs/eval.md.
     cmd.arg("-c")
         .arg(command)
         .current_dir(dir)
         .kill_on_drop(true)
-        .stdin(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Put the child in its own process group so we can signal the whole group
+    // (the wrapping `sh` plus any children it spawns) on timeout / cap-exceeded.
+    #[cfg(unix)]
+    {
+        // `tokio::process::Command` re-exposes the Unix `process_group`
+        // extension; making the child a group leader lets us signal the whole
+        // group (the child plus anything it spawns) on timeout / cap-exceeded.
+        cmd.process_group(0);
+    }
 
-    // `output()` returns a future; drive it under a timeout below.
-    match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(Ok(output)) => CommandResult {
-            command: command.to_string(),
-            success: output.status.success(),
-            exit_code: output.status.code(),
-            stdout: truncate(&String::from_utf8_lossy(&output.stdout)),
-            stderr: truncate(&String::from_utf8_lossy(&output.stderr)),
-            duration_ms: start.elapsed().as_millis() as u64,
-            timed_out: false,
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return CommandResult {
+                command: command.to_string(),
+                success: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: format!("failed to run command: {e}"),
+                duration_ms: start.elapsed().as_millis() as u64,
+                timed_out: false,
+                output_truncated: false,
+            };
+        }
+    };
+
+    // The child's pid is also its process-group id (we made it a group leader).
+    // Share it with the read tasks so a task that blows past the cap can kill the
+    // whole group itself, without round-tripping through the main flow.
+    let child_pid = child.id();
+
+    // Drain both streams concurrently with a per-stream byte cap. Each stream is
+    // read in its own background task that, on exceeding the cap, (a) records a
+    // PER-STREAM truncated flag and (b) kills the child's process group, then
+    // drains-and-discards to EOF so the pipe never blocks the child. Capped reads
+    // bound live memory regardless of how fast the command prints.
+    //
+    // The accumulated bytes and the truncated flag live in SHARED handles, not in
+    // the task's return value: if a descendant escapes the group kill and keeps a
+    // pipe open past the read-join grace, the join below aborts the task — and we
+    // still recover whatever was captured so far by reading the shared handle,
+    // instead of dropping it with the aborted task.
+    let out_buf = SharedCapture::default();
+    let err_buf = SharedCapture::default();
+    let out_task = tokio::spawn(capped_read_owned(
+        child.stdout.take(),
+        MAX_CAPTURE,
+        child_pid,
+        out_buf.clone(),
+    ));
+    let err_task = tokio::spawn(capped_read_owned(
+        child.stderr.take(),
+        MAX_CAPTURE,
+        child_pid,
+        err_buf.clone(),
+    ));
+
+    // Select ONLY between child exit and the wall-clock timeout. A cap-exceeded
+    // reader kills the group on its own, which causes `child.wait()` to resolve
+    // through this same exit branch — so there is no separate cap branch that
+    // could drop the `sleep(timeout)` future and leave an unbounded wait.
+    let (timed_out, status) = tokio::select! {
+        res = child.wait() => (false, res.ok()),
+        _ = tokio::time::sleep(timeout) => {
+            kill_group(&mut child);
+            // Bound the post-kill reap: if the best-effort group kill was
+            // ineffective (rare, or non-Unix) we must NOT wait until the command
+            // exits naturally, which would defeat the wall-clock timeout.
+            (true, reap_bounded(&mut child).await)
+        }
+    };
+
+    // ALWAYS kill the whole process group, even on a normal `child.wait()` exit.
+    // Reaping the direct `sh` child does NOT close stdout/stderr fds that a
+    // backgrounded descendant inherited and still holds: on Unix a pipe reaches
+    // EOF only when ALL write ends are closed. So a command like
+    // `sh -c 'sleep 60 & exit 0'` exits the `sh` immediately (the exit branch
+    // wins with timed_out=false) while the descendant keeps the pipe open — the
+    // read tasks below would then block forever waiting for an EOF that never
+    // comes. Signalling the group here kills any lingering descendant so the
+    // write ends close and the readers hit EOF. Killing an already-dead group is
+    // a harmless ESRCH no-op. This also satisfies the orphan-prevention goal
+    // (#33): a command's backgrounded descendants must not outlive it.
+    kill_pgid(child_pid);
+
+    // Bounded post-kill re-reap. On the normal-exit path `child.wait()` in the
+    // select already reaped the direct child; on the timeout path `reap_bounded`
+    // may have already done so or given up. This final reap is a backstop that is
+    // ALSO bounded by REAP_GRACE, so even if a prior reap gave up (ineffective
+    // group kill) we never block until the command exits naturally.
+    reap_bounded(&mut child).await;
+
+    // Collect whatever the readers captured, BOUNDED by a short grace timeout so
+    // nothing here can hang even in a pathological case. After the group kill the
+    // pipes drain to EOF almost immediately; the grace is a backstop. If it
+    // elapses we abort the read tasks and recover the partial bytes the task had
+    // already accumulated into the shared buffer.
+    let (stdout_bytes, out_truncated) = join_capped(out_task, &out_buf).await;
+    let (stderr_bytes, err_truncated) = join_capped(err_task, &err_buf).await;
+    // Either-stream-truncated, preserved on CommandResult for serialization.
+    let output_truncated = out_truncated || err_truncated;
+
+    // Mark `[truncated]` only on the stream that actually exceeded its cap.
+    let stdout = cap_to_string(stdout_bytes, out_truncated);
+    let stderr = if timed_out {
+        let mut s = cap_to_string(stderr_bytes, err_truncated);
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&format!("command timed out after {}s", timeout.as_secs()));
+        s
+    } else {
+        cap_to_string(stderr_bytes, err_truncated)
+    };
+
+    let success = !timed_out && !output_truncated && status.map(|s| s.success()).unwrap_or(false);
+
+    CommandResult {
+        command: command.to_string(),
+        success,
+        exit_code: if timed_out {
+            None
+        } else {
+            status.and_then(|s| s.code())
         },
-        Ok(Err(e)) => CommandResult {
-            command: command.to_string(),
-            success: false,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: format!("failed to run command: {e}"),
-            duration_ms: start.elapsed().as_millis() as u64,
-            timed_out: false,
-        },
-        Err(_) => CommandResult {
-            command: command.to_string(),
-            success: false,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: format!("command timed out after {}s", timeout.as_secs()),
-            duration_ms: start.elapsed().as_millis() as u64,
-            timed_out: true,
-        },
+        stdout,
+        stderr,
+        duration_ms: start.elapsed().as_millis() as u64,
+        timed_out,
+        output_truncated,
     }
 }
+
+/// Grace window for (a) reaping the child after a best-effort group kill and (b)
+/// collecting the read tasks after the child has exited and the process group has
+/// been killed. The pipes drain to EOF almost immediately once every write end is
+/// closed, and a killed child is reaped near-instantly; this bounds both waits so
+/// a pathological descendant — or an ineffective group kill — can never make
+/// `run_command` hang. If it elapses on a reap we give up reaping; if it elapses
+/// on a join we abort the task and recover whatever was captured so far.
+const REAP_GRACE: Duration = Duration::from_millis(500);
+
+/// Shared, abort-safe capture for one stream: the accumulated bytes plus a
+/// per-stream truncated flag. The read task and `run_command` both hold a clone;
+/// because the bytes live here (not in the task's return value) they survive an
+/// abort of the read task, so the grace-timeout path can return partial output
+/// rather than dropping it.
+#[derive(Clone, Default)]
+struct SharedCapture {
+    buf: Arc<Mutex<Vec<u8>>>,
+    truncated: Arc<AtomicBool>,
+}
+
+impl SharedCapture {
+    /// Snapshot the accumulated bytes and truncated flag. Used both on the
+    /// abort/grace path (to recover partial output) and as the post-join read.
+    fn snapshot(&self) -> (Vec<u8>, bool) {
+        let bytes = self.buf.lock().expect("capture mutex not poisoned").clone();
+        (bytes, self.truncated.load(Ordering::Acquire))
+    }
+}
+
+/// Reap a child whose process group was already best-effort SIGKILL'd, BOUNDED by
+/// `REAP_GRACE`. A killed child is reaped almost instantly; the timeout exists
+/// only for the rare case where the group kill was ineffective (e.g. non-Unix, or
+/// the leader changed) so we never wait until the command would exit naturally.
+/// On timeout we give up reaping and return `None` (the child has already been
+/// SIGKILL'd best-effort, and `kill_on_drop` will make a final attempt).
+async fn reap_bounded(child: &mut tokio::process::Child) -> Option<std::process::ExitStatus> {
+    match tokio::time::timeout(REAP_GRACE, child.wait()).await {
+        Ok(res) => res.ok(),
+        Err(_) => None,
+    }
+}
+
+/// Await a spawned capped-read task with a bounded grace window. On grace
+/// timeout the task is aborted and the PARTIAL bytes it had already accumulated
+/// into `shared` are recovered, so the post-exit collection in `run_command` can
+/// never block indefinitely and never drops already-captured output.
+async fn join_capped(
+    mut task: tokio::task::JoinHandle<()>,
+    shared: &SharedCapture,
+) -> (Vec<u8>, bool) {
+    match tokio::time::timeout(REAP_GRACE, &mut task).await {
+        // The task finished (cleanly or panicked); the bytes it accumulated are in
+        // `shared`. Read from `shared` either way so a panic still yields partials.
+        Ok(_) => shared.snapshot(),
+        Err(_) => {
+            // Grace elapsed (a descendant is still holding the pipe open despite
+            // the group kill): abort the reader and recover the partial capture
+            // it had accumulated so far, instead of returning an empty buffer.
+            task.abort();
+            shared.snapshot()
+        }
+    }
+}
+
+/// Read from an optional owned async stream into a shared buffer, stopping
+/// accumulation once `cap` bytes have been captured. The accumulated bytes and
+/// the per-stream truncated flag are written into `shared` (not returned) so they
+/// survive an abort of this task; see [`SharedCapture`].
+///
+/// When the cap is exceeded the task kills the child's process group (via
+/// `child_pid`, which is also the pgid) so the command terminates promptly, then
+/// drains-and-discards the remaining data to EOF so the pipe never blocks the
+/// child before it dies. The accumulation never exceeds `cap` bytes, so live
+/// memory stays bounded regardless of how much the command prints.
+///
+/// The shared mutex is only ever held briefly to push a just-read chunk and is
+/// released before the next `.await`, so no lock is held across a read.
+async fn capped_read_owned<R>(
+    reader: Option<R>,
+    cap: usize,
+    child_pid: Option<u32>,
+    shared: SharedCapture,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut reader) = reader else {
+        return;
+    };
+    let mut chunk = [0u8; 8 * 1024];
+    let mut captured = 0usize;
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => return,
+            Ok(n) => {
+                let room = cap.saturating_sub(captured);
+                if n > room {
+                    // More data is available than the cap allows: keep up to the
+                    // cap, kill the group so the command stops, then drain the
+                    // rest to EOF and discard it so the pipe doesn't block the
+                    // child while it is being torn down.
+                    {
+                        // Hold the lock only to append the kept prefix; release it
+                        // before the drain reads below (no lock across `.await`).
+                        let mut buf = shared.buf.lock().expect("capture mutex not poisoned");
+                        buf.extend_from_slice(&chunk[..room]);
+                    }
+                    shared.truncated.store(true, Ordering::Release);
+                    kill_pgid(child_pid);
+                    while let Ok(m) = reader.read(&mut chunk).await {
+                        if m == 0 {
+                            break;
+                        }
+                    }
+                    return;
+                }
+                {
+                    // Hold the lock only to append the just-read chunk; release it
+                    // before looping back to the next `.await`.
+                    let mut buf = shared.buf.lock().expect("capture mutex not poisoned");
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                captured += n;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Convert captured bytes to a (possibly already cap-truncated) UTF-8 string,
+/// appending a truncation marker when bytes were dropped.
+fn cap_to_string(bytes: Vec<u8>, truncated: bool) -> String {
+    let mut s = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        s.push_str("\n... [truncated]");
+    }
+    s
+}
+
+/// Kill the child. On Unix the child is a process-group leader, so signal the
+/// whole group (negative pid) with SIGKILL to take down any descendants (e.g.
+/// `cargo` spawned by `sh`). On other platforms fall back to killing just the
+/// child process.
+#[cfg(unix)]
+fn kill_group(child: &mut tokio::process::Child) {
+    // The child was made a group leader via `process_group(0)`, so its pid is
+    // also its process-group id.
+    if let Some(pid) = child.id() {
+        kill_pgid(Some(pid));
+    } else {
+        let _ = child.start_kill();
+    }
+}
+
+/// Non-Unix fallback: kill just the child process.
+#[cfg(not(unix))]
+fn kill_group(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+}
+
+/// Kill the process group led by `pid` (the child is a group leader, so its pid
+/// is also its pgid). Best-effort: a `None` pid or already-gone group is a no-op.
+/// This is callable from the read tasks, which do not hold a `&mut Child`.
+#[cfg(unix)]
+fn kill_pgid(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // SAFETY: `kill(2)` with a negative pid targets the process group; this
+        // is a best-effort cleanup and ignores errors (e.g. group already gone).
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+/// Non-Unix fallback: without a `Child` handle we cannot target the group, so
+/// the read-task cap-kill is a no-op here. The wall-clock timeout in
+/// `run_command` still bounds the wait, and on drop `kill_on_drop` reaps the
+/// child.
+#[cfg(not(unix))]
+fn kill_pgid(_pid: Option<u32>) {}
 
 /// Run a program with an explicit argv (no intermediate shell) in `dir` with a
 /// timeout, capturing output. Used by container backends so multi-word
@@ -229,6 +547,7 @@ pub async fn run_argv(
             stderr: truncate(&String::from_utf8_lossy(&output.stderr)),
             duration_ms: start.elapsed().as_millis() as u64,
             timed_out: false,
+            output_truncated: false,
         },
         Ok(Err(e)) => CommandResult {
             command: display,
@@ -238,6 +557,7 @@ pub async fn run_argv(
             stderr: format!("failed to run command: {e}"),
             duration_ms: start.elapsed().as_millis() as u64,
             timed_out: false,
+            output_truncated: false,
         },
         Err(_) => CommandResult {
             command: display,
@@ -247,6 +567,7 @@ pub async fn run_argv(
             stderr: format!("command timed out after {}s", timeout.as_secs()),
             duration_ms: start.elapsed().as_millis() as u64,
             timed_out: true,
+            output_truncated: false,
         },
     }
 }
@@ -445,6 +766,221 @@ mod tests {
         assert!(!res.success);
     }
 
+    /// A command that prints far more than the cap has its captured output
+    /// bounded to ~MAX_CAPTURE and the child is killed, so the call returns
+    /// promptly instead of hanging on an unbounded stream.
+    #[tokio::test]
+    async fn output_is_capped_and_child_killed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        // `yes` prints forever; without a cap+kill this would never return.
+        let res = run_command("yes AAAAAAAA", tmp.path(), Duration::from_secs(30)).await;
+        let elapsed = start.elapsed();
+
+        assert!(res.output_truncated, "expected output_truncated to be set");
+        assert!(!res.success, "a killed/truncated command is not a success");
+        assert!(!res.timed_out, "should be cap-killed, not timed out");
+        // Bounded to roughly the cap (plus the small truncation marker).
+        assert!(
+            res.stdout.len() <= MAX_CAPTURE + "\n... [truncated]".len(),
+            "stdout not bounded: {} bytes",
+            res.stdout.len()
+        );
+        assert!(res.stdout.ends_with("[truncated]"));
+        // Returned promptly rather than hanging for the full 30s timeout.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cap-killed command took too long: {elapsed:?}"
+        );
+    }
+
+    /// REGRESSION (Finding 1): a command that closes its stdout/stderr but keeps
+    /// running makes the pipes reach EOF while the process is still alive. The
+    /// timeout must still fire — the call must NOT hang waiting on `child.wait()`
+    /// after the readers finish. We use a short timeout and assert it returns
+    /// promptly with `timed_out` set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_fires_when_stdio_closed_but_process_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        // Close both stdio fds, then sleep well past the timeout. The read tasks
+        // see EOF immediately; only the wall-clock timeout can stop the sleeper.
+        let res = run_command(
+            "exec >&- 2>&-; sleep 30",
+            tmp.path(),
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(res.timed_out, "expected the wall-clock timeout to fire");
+        assert!(!res.success, "a timed-out command is not a success");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "run_command hung despite the timeout: {elapsed:?}"
+        );
+    }
+
+    /// REGRESSION (Finding 1): a command that backgrounds a stdio-INHERITING
+    /// descendant and then exits. The direct `sh` child exits immediately, so the
+    /// `child.wait()` branch wins with `timed_out=false` and the `sleep(timeout)`
+    /// future is dropped. The backgrounded `sleep` still holds the write end of
+    /// both pipes, so without the unconditional group-kill the post-exit
+    /// `out_task`/`err_task` joins would block FOREVER waiting for an EOF that
+    /// never arrives. With the fix the group is killed after the select, the
+    /// pipes hit EOF, and the call returns promptly — well under the 30s sleep.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn returns_promptly_when_descendant_inherits_stdio_and_parent_exits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        // `sleep 30 &` inherits the shell's stdout/stderr (the pipe write ends),
+        // then `exit 0` reaps the `sh` immediately. The descendant keeps the pipe
+        // open for 30s; the call must NOT wait for it.
+        let res = run_command("sleep 30 & exit 0", tmp.path(), Duration::from_secs(30)).await;
+        let elapsed = start.elapsed();
+
+        // The `sh` exited 0 normally (not a timeout): success is fine here, the
+        // point is that we returned without hanging on the live descendant.
+        assert!(
+            !res.timed_out,
+            "sh exited normally; should not be a timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "run_command hung on a backgrounded stdio-inheriting descendant: {elapsed:?}"
+        );
+    }
+
+    /// Per-stream truncation (Finding 2): when only stdout floods past the cap,
+    /// stdout is marked truncated but stderr (small) is NOT.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_flooding_stream_is_marked_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        // stdout floods forever; stderr emits one small line.
+        let res = run_command(
+            "echo small 1>&2; yes AAAAAAAA",
+            tmp.path(),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(res.output_truncated, "either-stream flag should be set");
+        assert!(
+            res.stdout.ends_with("[truncated]"),
+            "stdout should be marked truncated"
+        );
+        assert!(
+            !res.stderr.contains("[truncated]"),
+            "stderr did not exceed the cap and must not be marked truncated: {:?}",
+            res.stderr
+        );
+        assert!(
+            res.stderr.contains("small"),
+            "stderr should retain its small payload: {:?}",
+            res.stderr
+        );
+    }
+
+    /// On timeout the whole process group is signalled, so a child the shell
+    /// spawned does not outlive `run_command`. We run a `sleep` in a backgrounded
+    /// subshell, capture its pid, then assert (Unix) that the pid is gone shortly
+    /// after the short timeout fires.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_child_process_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("child.pid");
+        let pidfile_str = pidfile.to_str().unwrap();
+        // Spawn a long sleeper, record its pid, then block so run_command times
+        // out while the sleeper is still "running" under the same group.
+        let command = format!("sleep 30 & echo $! > {pidfile_str}; wait");
+
+        let start = std::time::Instant::now();
+        let res = run_command(&command, tmp.path(), Duration::from_millis(300)).await;
+        assert!(res.timed_out, "expected timeout");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "run_command did not return promptly on timeout"
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pidfile written")
+            .trim()
+            .parse()
+            .expect("pid parses");
+
+        // Give the SIGKILL a brief moment to propagate, then assert the child is
+        // gone: kill(pid, 0) returns -1/ESRCH when no such process exists.
+        let mut alive = true;
+        for _ in 0..50 {
+            // SAFETY: signal 0 only checks for process existence.
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!alive, "child sleeper (pid {pid}) outlived the timeout");
+    }
+
+    /// Partial-capture recovery (Finding 2): when `join_capped` aborts a reader
+    /// that escaped the group kill and is still holding the pipe, the bytes the
+    /// task already pushed into the SHARED buffer must be returned — not an empty
+    /// Vec. We drive the abort path deterministically: a task writes some bytes
+    /// (and sets truncated) into the shared capture, then parks forever so it can
+    /// never join within the grace, forcing the abort branch.
+    #[tokio::test]
+    async fn join_capped_recovers_partial_bytes_on_abort() {
+        let shared = SharedCapture::default();
+        {
+            let mut buf = shared.buf.lock().unwrap();
+            buf.extend_from_slice(b"partial-output");
+        }
+        shared.truncated.store(true, Ordering::Release);
+
+        // A task that never returns: it can only leave `join_capped` via the
+        // grace timeout + abort branch.
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        let start = std::time::Instant::now();
+        let (bytes, truncated) = join_capped(task, &shared).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            bytes, b"partial-output",
+            "partial bytes accumulated before abort must be recovered"
+        );
+        assert!(truncated, "truncated flag must be preserved across abort");
+        // Bounded by the grace, not hung.
+        assert!(
+            elapsed < REAP_GRACE + Duration::from_secs(1),
+            "join_capped did not abort within the grace: {elapsed:?}"
+        );
+    }
+
+    /// Normal-path parity (Finding 2): when the reader task joins cleanly within
+    /// the grace, `join_capped` returns exactly what it accumulated into the
+    /// shared buffer — same result as before the abort-safe refactor.
+    #[tokio::test]
+    async fn join_capped_returns_full_bytes_on_clean_join() {
+        let shared = SharedCapture::default();
+        let writer = shared.clone();
+        let task = tokio::spawn(async move {
+            let mut buf = writer.buf.lock().unwrap();
+            buf.extend_from_slice(b"hello world");
+        });
+
+        let (bytes, truncated) = join_capped(task, &shared).await;
+        assert_eq!(bytes, b"hello world");
+        assert!(!truncated);
+    }
+
     #[test]
     fn file_assertions() {
         let tmp = tempfile::tempdir().unwrap();
@@ -569,6 +1105,7 @@ mod tests {
                 stderr: String::new(),
                 duration_ms: 1,
                 timed_out: false,
+                output_truncated: false,
             }],
             assertions: vec![AssertionResult {
                 description: "a".into(),
