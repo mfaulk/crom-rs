@@ -463,19 +463,15 @@ pub(crate) async fn execute_request(
         // identical diagnostic and re-fire `cancel()`, producing a
         // diagnostics list that grew with every additional event (#149).
         //
-        // Trip only once the count *exceeds* the cap (`> max`), so a run
-        // that uses exactly `max` tool calls still finishes and returns a
-        // result rather than being marked Failed at its allowance. This is a
-        // reactive cancellation: `tool_calls` is incremented on
-        // `ToolCallStarted`, so the (max+1)-th call has already started by the
-        // time this fires (cooperative cancellation cannot un-start it).
-        // Strictly preventing the (max+1)-th call from dispatching at all
-        // would require a pre-dispatch budget gate in the core agent loop
-        // (code-agent-core), which is out of scope for the SDK runtime — see
-        // #213. (An earlier `>=` attempt failed runs at their exact allowance,
-        // e.g. max_tool_calls=1 on the first call, which is worse.)
+        // `tool_calls` is incremented on `ToolCallStarted`, so the moment it
+        // reaches the cap the max-th call has just started. Trip exactly there
+        // (`>= max`) and fire cancellation: the core agent loop checks the
+        // cancel flag before dispatching each subsequent tool call, so the
+        // (max+1)-th call never starts. This enforces a hard ceiling of
+        // exactly `max` started tool calls (#29). An earlier `> max` boundary
+        // let the (max+1)-th call start before tripping — an off-by-one.
         if let Some(max) = request.budgets.max_tool_calls {
-            if !max_tool_calls_reported && tool_calls > max as usize {
+            if !max_tool_calls_reported && tool_calls >= max as usize {
                 cancellation.cancel();
                 diagnostics.push(Diagnostic::error(
                     "budget.max_tool_calls_exceeded",
@@ -1428,12 +1424,13 @@ mod status_tests {
 #[cfg(all(test, feature = "fake-provider"))]
 mod budget_tests {
     //! End-to-end coverage of the `max_tool_calls` budget gate boundary in
-    //! `execute_request`. The gate trips only once the running tool-call
-    //! count *exceeds* the cap (`tool_calls > max`), so a run that uses
-    //! exactly `max` calls still completes while `max + 1` fails with the
-    //! `budget.max_tool_calls_exceeded` diagnostic, and that diagnostic is
-    //! pushed at most once (#149). Driven with the scripted fake provider so
-    //! the tool-call count is deterministic.
+    //! `execute_request`. The gate is a hard ceiling: it trips as soon as the
+    //! running tool-call count reaches the cap (`tool_calls >= max`) and fires
+    //! cancellation, so the core loop blocks the (max+1)-th call and exactly
+    //! `max` tool calls ever start (#29). Runs under the cap complete cleanly;
+    //! the `budget.max_tool_calls_exceeded` diagnostic is pushed at most once
+    //! (#149). Driven with the scripted fake provider so the tool-call count
+    //! is deterministic.
 
     use super::*;
     use crate::fake_provider::ScriptedFakeProvider;
@@ -1503,22 +1500,33 @@ mod budget_tests {
             .expect("run completes")
     }
 
-    // Exactly `max` tool calls: the gate uses `> max`, so a run that uses its
-    // full allowance is NOT failed and emits no budget diagnostic.
+    // Strictly under the cap: a run that uses fewer than `max` tool calls
+    // never trips the gate, so it is not Failed and emits no budget diagnostic.
     #[tokio::test]
-    async fn exactly_max_tool_calls_is_not_failed() {
-        let result = run_with_budget(2, 2).await;
+    async fn under_max_tool_calls_is_not_failed() {
+        let result = run_with_budget(1, 2).await;
         assert_ne!(
             result.status,
             AgentRunStatus::Failed,
-            "a run at exactly max_tool_calls must not be Failed"
+            "a run under max_tool_calls must not be Failed"
         );
         assert!(
             !result
                 .diagnostics
                 .iter()
                 .any(|d| d.code == "budget.max_tool_calls_exceeded"),
-            "no budget diagnostic expected at the allowance boundary"
+            "no budget diagnostic expected below the allowance boundary"
+        );
+    }
+
+    // Hard ceiling: with max_tool_calls=2 and a provider that wants 5 calls,
+    // exactly 2 tool calls start; the 3rd is blocked by the budget (#29).
+    #[tokio::test]
+    async fn budget_caps_started_tool_calls_at_max() {
+        let result = run_with_budget(5, 2).await;
+        assert_eq!(
+            result.events_summary.tool_calls, 2,
+            "exactly max_tool_calls tool calls must start; the (max+1)-th is blocked"
         );
     }
 
