@@ -177,7 +177,7 @@ const FILE_PATH_FAST_PATH_TOOLS: &[&str] = &["Read", "Write", "Edit"];
 ///
 /// The key embeds tool-name and the most-identifying portion of the input:
 /// the `command` for Bash, the `file_path` for the built-in filesystem tools
-/// in [`FILE_PATH_FAST_PATH_TOOLS`], and a canonical (key-sorted) JSON
+/// (`Read`, `Write`, `Edit`), and a canonical (key-sorted) JSON
 /// serialization of the *entire* input for every other tool — notably MCP
 /// tools, even those whose inputs happen to carry a `file_path` field. This
 /// means "allow for the rest of the session" allows that exact invocation
