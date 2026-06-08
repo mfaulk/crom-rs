@@ -167,11 +167,14 @@ pub struct ApprovalMemorySnapshot {
 
 /// Build a stable approval-memory key for a tool invocation.
 ///
-/// The key embeds tool-name and the most-identifying portion of the input
-/// (the `command` for Bash, the `file_path` for filesystem tools). This means
-/// "allow Bash for the rest of the session" allows that exact command again,
-/// not arbitrary other Bash invocations — which is the intent of allow-once-
-/// for-session for execution tools.
+/// The key embeds tool-name and the most-identifying portion of the input:
+/// the `command` for Bash, the `file_path` for filesystem tools, and a
+/// canonical (key-sorted) JSON serialization of the *entire* input for every
+/// other tool — notably MCP tools, whose inputs carry neither field. This
+/// means "allow for the rest of the session" allows that exact invocation
+/// again, not arbitrary other invocations of the same tool with different
+/// arguments, which would be a privilege-escalation footgun for side-effecting
+/// MCP tools.
 pub fn approval_key(tool_name: &str, input: &Value) -> String {
     if tool_name == "Bash" {
         let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -179,8 +182,32 @@ pub fn approval_key(tool_name: &str, input: &Value) -> String {
     } else if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
         format!("{}::{}", tool_name, fp)
     } else {
-        tool_name.to_string()
+        format!("{}::{}", tool_name, canonical_json(input))
     }
+}
+
+/// Serialize `value` to JSON with all object keys recursively sorted, so that
+/// inputs that are semantically equal always produce byte-identical output
+/// regardless of original key order or the `serde_json` `preserve_order`
+/// feature. Used to make [`approval_key`] deterministic for arbitrary inputs.
+fn canonical_json(value: &Value) -> String {
+    fn canonicalize(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut sorted = serde_json::Map::new();
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                for k in keys {
+                    sorted.insert(k.clone(), canonicalize(&map[k]));
+                }
+                Value::Object(sorted)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
+            other => other.clone(),
+        }
+    }
+    // Serialization of a canonicalized Value cannot fail.
+    serde_json::to_string(&canonicalize(value)).unwrap_or_default()
 }
 
 /// Configuration for the policy engine.
@@ -550,6 +577,56 @@ mod tests {
     }
     fn rid() -> RunId {
         RunId::from("rid".to_string())
+    }
+
+    // Two different MCP inputs for the same tool produce different approval keys.
+    #[test]
+    fn approval_key_mcp_distinct_inputs_differ() {
+        let a = approval_key(
+            "mcp__github__create_issue",
+            &serde_json::json!({"title": "a", "repo": "x"}),
+        );
+        let b = approval_key(
+            "mcp__github__create_issue",
+            &serde_json::json!({"title": "b", "repo": "x"}),
+        );
+        assert_ne!(a, b);
+        // The key must not collapse to the bare tool name.
+        assert_ne!(a, "mcp__github__create_issue");
+    }
+
+    // Identical MCP inputs produce identical keys, regardless of key order.
+    #[test]
+    fn approval_key_mcp_identical_inputs_match() {
+        let k1 = approval_key(
+            "mcp__github__create_issue",
+            &serde_json::json!({"title": "a", "repo": "x"}),
+        );
+        let k2 = approval_key(
+            "mcp__github__create_issue",
+            &serde_json::json!({"title": "a", "repo": "x"}),
+        );
+        // Same logical input with reordered keys must hash to the same canonical key.
+        let k3 = approval_key(
+            "mcp__github__create_issue",
+            &serde_json::json!({"repo": "x", "title": "a"}),
+        );
+        assert_eq!(k1, k2);
+        assert_eq!(k1, k3);
+    }
+
+    // Bash keying still uses only the command string (unchanged behavior).
+    #[test]
+    fn approval_key_bash_unchanged() {
+        let k = approval_key("Bash", &serde_json::json!({"command": "cargo test"}));
+        assert_eq!(k, "Bash::cargo test");
+    }
+
+    // file_path keying still uses tool name and path only (unchanged behavior).
+    #[test]
+    fn approval_key_file_path_unchanged() {
+        let k = approval_key("Edit", &serde_json::json!({"file_path": "x.rs"}));
+        assert_eq!(k, "Edit::x.rs");
     }
 
     #[tokio::test]
