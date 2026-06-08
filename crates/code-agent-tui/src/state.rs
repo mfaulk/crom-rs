@@ -1502,10 +1502,16 @@ impl TuiAppState {
                 // #80: restore the detail panel to whatever it showed
                 // before the approval overrode it (e.g. a diff), instead
                 // of leaving it pinned to `Approval` with empty content.
-                // If the panel is no longer in Approval mode the user
-                // navigated away, so leave their choice intact.
+                // Only restore when the panel is still EXACTLY in the
+                // approval-open state `open_approval_modal` set (Approval
+                // mode AND visible). If the user changed the mode or hid
+                // the panel (e.g. /toggle-detail) while the approval was
+                // pending, their action wins — drop the stale snapshot
+                // without clobbering their current state.
                 if let Some(prior) = self.prior_detail_panel.take() {
-                    if self.layout.detail_panel.mode == DetailPanelMode::Approval {
+                    if self.layout.detail_panel.mode == DetailPanelMode::Approval
+                        && self.layout.detail_panel.visible
+                    {
                         self.layout.detail_panel = prior;
                     }
                 }
@@ -2571,6 +2577,31 @@ mod tests {
         // Prior diff view is restored, not left on empty Approval mode.
         assert_eq!(s.layout.detail_panel.mode, DetailPanelMode::Diff);
         assert!(s.layout.detail_panel.visible);
+        assert!(s.prior_detail_panel.is_none());
+    }
+
+    #[test]
+    // #80: if the user hides the detail panel while the approval is still
+    // pending, resolving the approval must not force the prior snapshot
+    // back open — the panel stays hidden.
+    fn approval_resolved_keeps_panel_hidden_when_user_hid_it() {
+        use code_agent_sdk::event::{ApprovalDecisionWire, ApprovalResolvedEvent};
+        let mut s = fresh_state();
+        s.set_detail_panel(DetailPanelMode::Diff, true);
+        s.open_approval_modal("Bash".to_string(), "cargo test".to_string());
+        // User dismisses the modal and hides the detail panel (e.g.
+        // /toggle-detail) while the approval is still pending; the mode is
+        // still Approval but visibility has been turned off.
+        s.layout.detail_panel.visible = false;
+        s.apply(TuiInbound::sdk(SdkEvent::ApprovalResolved(
+            ApprovalResolvedEvent {
+                run_id: rid(),
+                tool_name: "Bash".to_string(),
+                decision: ApprovalDecisionWire::Allow,
+            },
+        )));
+        // The user's hide wins: the panel stays hidden, not reopened.
+        assert!(!s.layout.detail_panel.visible);
         assert!(s.prior_detail_panel.is_none());
     }
 
