@@ -12,13 +12,17 @@
 //!     index.jsonl                    # one line per write (never rewritten)
 //! ```
 //!
-//! Writes that read-modify-write a plan (`create`, `save_revision`,
-//! `approve`, `reject`, `archive`) take an exclusive advisory lock
-//! (`flock`, via `fs4`) on the sibling `<plan-id>.lock` file for the full
-//! read-decide-write block, so two separate processes cannot interleave
-//! and clobber each other's writes. Within a single process a per-plan
-//! async mutex provides the same serialization without blocking the
-//! runtime on the `flock` syscall for sibling tasks.
+//! Writes that touch a plan (`create`, `save_revision`, `approve`,
+//! `reject`, `archive`) take an exclusive advisory lock (`flock`, via
+//! `fs4`) on the sibling `<plan-id>.lock` file for the write section, so
+//! two separate processes cannot produce torn or interleaved writes for
+//! the same plan id. Within a single process a per-plan async mutex
+//! provides the same serialization without blocking the runtime on the
+//! `flock` syscall for sibling tasks. `mutate_revision` (and
+//! `save_revision_atomic`) additionally load under the lock and are the
+//! cross-process-atomic read-modify-write paths; `save_revision` takes an
+//! already-built document, so a load-then-save outside `mutate_revision`
+//! can still lose updates across processes (tracked in issue #94).
 //!
 //! All writes go through `tempfile::NamedTempFile::persist` so a partial
 //! write never replaces a valid file. A corrupted index never makes other
@@ -116,18 +120,31 @@ pub trait PlanStore: Send + Sync {
 
 /// On-disk implementation rooted at `<cwd>/.agent/plans/`.
 ///
-/// Concurrency is serialized at two levels for the read-decide-write
-/// block in `save_revision` / `save_revision_atomic`:
+/// Concurrency is serialized at two levels around each plan write:
 ///
 /// * In-process: a per-plan async mutex (`plan_locks`) so two concurrent
-///   revisions of the same plan id within one process cannot both observe
-///   the same prior state and race the approval-invalidation check.
+///   writers of the same plan id within one process cannot interleave
+///   their write sections.
 /// * Cross-process: an exclusive advisory lock (`fs4` / `flock`) on a
-///   sibling `<plan-id>.lock` file, held across the same block, so two
-///   separate processes (e.g. the CLI and the TUI) cannot interleave
-///   their read-modify-write cycles and clobber each other. The lock is
-///   acquired after the in-process mutex and released on drop. Distinct
-///   plan ids do not contend with each other at either level.
+///   sibling `<plan-id>.lock` file, held across the write section, so two
+///   separate processes (e.g. the CLI and the TUI) cannot produce torn or
+///   interleaved writes for the same plan id. The lock is acquired after
+///   the in-process mutex and released on drop. Distinct plan ids do not
+///   contend with each other at either level.
+///
+/// Scope of the cross-process guarantee differs by entry point:
+///
+/// * [`Self::mutate_revision`] and [`Self::save_revision_atomic`] perform
+///   the full read-modify-write *under* the lock — they load the live
+///   on-disk plan after acquiring the lock — so they are cross-process
+///   atomic and cannot lose a concurrent update.
+/// * `save_revision` receives an already-built [`PlanDocument`]; its
+///   caller typically `load`s *outside* the lock and saves the mutated
+///   result. The flock still prevents torn or interleaved writes, but a
+///   load-then-save sequence performed outside `mutate_revision` can
+///   still lose updates across processes (last writer wins). Closing that
+///   gap requires an optimistic-concurrency contract change and is
+///   tracked in issue #94.
 #[derive(Debug, Clone)]
 pub struct FsPlanStore {
     root: PathBuf,
@@ -662,12 +679,18 @@ impl PlanStore for FsPlanStore {
     async fn save_revision(&self, plan: PlanDocument) -> Result<(), PlanError> {
         Self::validate_id(&plan.id)?;
 
-        // Serialize the read-decide-write block for this plan id so two
-        // concurrent revisions cannot both observe the same prior state
-        // and race the approval-invalidation check. Different plan ids
-        // do not block each other. The in-process mutex covers callers
-        // sharing this process; the `<id>.lock` advisory lock extends the
-        // same guarantee across separate processes.
+        // Serialize the write section for this plan id. The in-process
+        // mutex prevents two concurrent revisions in this process from
+        // racing the approval-invalidation check; the `<id>.lock` advisory
+        // lock prevents torn or interleaved writes across processes.
+        // Different plan ids do not block each other.
+        //
+        // Note: this method receives an already-built `plan`. The caller
+        // typically `load`s *outside* this lock, so two processes that
+        // each load-then-save can still lose an update (last writer wins);
+        // the lock only guards the write section. Use `mutate_revision`
+        // for a cross-process-atomic read-modify-write. Full lost-update
+        // prevention for this API is tracked in issue #94.
         let lock = self.plan_lock(&plan.id).await;
         let _guard = lock.lock().await;
         let _file_lock = self.lock_plan_file(&plan.id)?;
