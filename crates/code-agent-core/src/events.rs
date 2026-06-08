@@ -603,6 +603,11 @@ pub struct AgentResult {
 pub enum ResultSubtype {
     Success,
     ErrorMaxTurns,
+    /// The run hit the `max_tool_calls` budget: a turn's tool calls would
+    /// have pushed the running total past the cap, so the loop refused to
+    /// dispatch them and ended the run. Distinct from `ErrorMaxTurns` so a
+    /// tool-call budget breach is not conflated with a turn budget breach.
+    ErrorMaxToolCalls,
     ErrorDuringExecution,
     Cancelled,
 }

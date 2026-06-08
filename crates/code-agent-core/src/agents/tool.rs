@@ -1086,6 +1086,7 @@ fn classify_status(
             // cancel flag (#43).
             Some(crate::events::ResultSubtype::Success) => SubagentStatus::Succeeded,
             Some(crate::events::ResultSubtype::ErrorMaxTurns)
+            | Some(crate::events::ResultSubtype::ErrorMaxToolCalls)
             | Some(crate::events::ResultSubtype::ErrorDuringExecution) => SubagentStatus::Failed,
             Some(crate::events::ResultSubtype::Cancelled) => SubagentStatus::Cancelled,
             // No terminal result: a child cancelled by itself or the parent is
@@ -1128,6 +1129,9 @@ fn build_child_options(
                 None => cap,
             }
         }),
+        // A subagent inherits the parent's tool-call ceiling so it cannot be
+        // used to bypass the run's `max_tool_calls` budget.
+        max_tool_calls: parent.max_tool_calls,
         session_id: Some(child_session),
         permission_callback: parent.permission_callback.clone(),
         system_prompt: None,

@@ -95,6 +95,13 @@ pub struct AgentOptions {
     pub disallowed_tool_rules: Vec<ToolRule>,
     pub permission_mode: PermissionMode,
     pub max_turns: Option<u32>,
+    /// Hard ceiling on the number of tool calls the run may start. When
+    /// set, the loop refuses to dispatch a turn whose tool calls would push
+    /// the running total past this cap and ends with
+    /// [`ResultSubtype::ErrorMaxToolCalls`]. `None` means unlimited. A run
+    /// that uses exactly `max_tool_calls` calls and then finishes naturally
+    /// is not affected — the cap only blocks the call that would exceed it.
+    pub max_tool_calls: Option<u32>,
     pub session_id: Option<SessionId>,
     pub permission_callback: Option<Arc<dyn PermissionCallback>>,
     pub system_prompt: Option<String>,
@@ -144,6 +151,7 @@ impl Default for AgentOptions {
             disallowed_tool_rules: Vec::new(),
             permission_mode: PermissionMode::Default,
             max_turns: Some(8),
+            max_tool_calls: None,
             session_id: None,
             permission_callback: None,
             system_prompt: None,
@@ -172,6 +180,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("disallowed_tool_rules", &self.disallowed_tool_rules)
             .field("permission_mode", &self.permission_mode)
             .field("max_turns", &self.max_turns)
+            .field("max_tool_calls", &self.max_tool_calls)
             .field("session_id", &self.session_id)
             .field("max_tokens", &self.max_tokens)
             .field("approval_memory", &self.approval_memory)

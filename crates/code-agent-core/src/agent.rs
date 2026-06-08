@@ -844,8 +844,14 @@ pub(crate) async fn run_loop(
     conversation.push(Message::user_text(prompt.clone()));
 
     let max_turns = options.max_turns.unwrap_or(8);
+    let max_tool_calls = options.max_tool_calls;
 
     let mut turns: u32 = 0;
+    // Running count of tool calls that have been dispatched (a `ToolCallStarted`
+    // was emitted for each). Used to enforce the `max_tool_calls` budget: a turn
+    // whose calls would push this past `max_tool_calls` is refused before any of
+    // its `ToolCallStarted` events fire, so exactly `max_tool_calls` ever start.
+    let mut tool_calls_started: u32 = 0;
     let mut total_usage = TokenUsage::default();
     let mut last_result_text: Option<String> = None;
 
@@ -1282,6 +1288,43 @@ pub(crate) async fn run_loop(
             return Ok(());
         }
 
+        // Enforce the `max_tool_calls` budget at the dispatch boundary. If
+        // running this turn's tool calls would push the running total past
+        // the cap, refuse the whole turn *before* emitting any of its
+        // `ToolCallStarted` events and end the run with `ErrorMaxToolCalls`.
+        // This is the correct enforcement point: a run that uses exactly
+        // `max_tool_calls` calls and then finishes naturally still emits its
+        // `Result(Success)` on a later turn, while the call that would exceed
+        // the cap never starts (#29).
+        if let Some(max) = max_tool_calls {
+            if tool_calls_started + (tool_calls.len() as u32) > max {
+                let cost = pricing.as_ref().map(|p| p.estimate(&total_usage));
+                let result = AgentResult {
+                    subtype: ResultSubtype::ErrorMaxToolCalls,
+                    result: last_result_text.clone(),
+                    session_id: session_id.clone(),
+                    run_id: Some(cfg.run_id.clone()),
+                    num_turns: turns,
+                    usage: Some(total_usage.clone()),
+                    total_cost_usd: cost,
+                };
+                emit(&tx, &session_sink, &session_id, AgentEvent::Result(result)).await;
+                run_stop_hook(
+                    &hooks,
+                    &telemetry_sink,
+                    &tx,
+                    &session_sink,
+                    &session_id,
+                    &cfg.run_id,
+                    &options.cwd,
+                    turns,
+                    StopReason::Error,
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
         // Execute tool calls in (input) order. The model is allowed to
         // emit multiple tool_use blocks in one turn. Read-only tools
         // (`PermissionKind::ReadOnly`) can safely overlap their IO and
@@ -1347,6 +1390,10 @@ pub(crate) async fn run_loop(
                 AgentEvent::ToolCallStarted(ToolCallStarted { call: call.clone() }),
             )
             .await;
+            // Count every started call (including ones later denied) so the
+            // `max_tool_calls` gate above mirrors the SDK's `ToolCallStarted`
+            // tracking exactly.
+            tool_calls_started += 1;
 
             if search_runtime.is_some() && !turn_loaded_names.contains(&call.name) {
                 let reason = format!("tool not loaded: {}", call.name);

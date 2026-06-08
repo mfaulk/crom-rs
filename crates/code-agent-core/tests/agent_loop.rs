@@ -314,6 +314,84 @@ async fn loop_stops_at_max_turns() {
     assert_eq!(r.subtype, ResultSubtype::ErrorMaxTurns);
 }
 
+fn count_tool_starts(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolCallStarted(_)))
+        .count()
+}
+
+fn tool_then_final_provider(tool_turns: usize) -> Arc<ScriptedProvider> {
+    use code_agent_core::ToolCall;
+    let mut turns: Vec<Vec<ModelEvent>> = Vec::new();
+    for i in 0..tool_turns {
+        turns.push(vec![
+            ModelEvent::MessageStart,
+            ModelEvent::ToolCall(ToolCall {
+                id: format!("t{i}"),
+                name: "Echo".into(),
+                input: json!({"v": i}),
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ]);
+    }
+    turns.push(vec![
+        ModelEvent::MessageStart,
+        ModelEvent::TextDelta {
+            text: "done".into(),
+        },
+        ModelEvent::MessageStop {
+            stop_reason: Some("end_turn".into()),
+            usage: None,
+        },
+    ]);
+    Arc::new(ScriptedProvider::new(turns))
+}
+
+#[tokio::test]
+// A run that uses exactly max_tool_calls and then finishes naturally ends in
+// Success with all max calls executed — the cap only blocks the (max+1)-th.
+async fn loop_allows_exactly_max_tool_calls() {
+    let provider = tool_then_final_provider(2);
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+    let opts = AgentOptions {
+        max_turns: Some(8),
+        max_tool_calls: Some(2),
+        allowed_tools: vec!["Echo".into()],
+        permission_callback: Some(Arc::new(AlwaysAllow)),
+        ..AgentOptions::default()
+    };
+    let events = run(provider, opts, tools, "hi").await;
+    assert_eq!(count_tool_starts(&events), 2);
+    assert_eq!(final_result(&events).subtype, ResultSubtype::Success);
+}
+
+#[tokio::test]
+// A run whose model wants more than max_tool_calls has the (max+1)-th call
+// blocked: exactly max calls start and the result is ErrorMaxToolCalls.
+async fn loop_blocks_call_exceeding_max_tool_calls() {
+    let provider = tool_then_final_provider(5);
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+    let opts = AgentOptions {
+        max_turns: Some(8),
+        max_tool_calls: Some(2),
+        allowed_tools: vec!["Echo".into()],
+        permission_callback: Some(Arc::new(AlwaysAllow)),
+        ..AgentOptions::default()
+    };
+    let events = run(provider, opts, tools, "hi").await;
+    assert_eq!(count_tool_starts(&events), 2);
+    assert_eq!(
+        final_result(&events).subtype,
+        ResultSubtype::ErrorMaxToolCalls
+    );
+}
+
 // Regression for #160: dropping the `Agent::run` stream early must stop the
 // spawned loop. Before the fix, send sites used `let _ = tx.send(..).await`
 // and ignored `SendError`, so the loop kept calling the provider and

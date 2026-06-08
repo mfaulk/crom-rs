@@ -338,6 +338,10 @@ pub(crate) async fn execute_request(
         model: model.clone(),
         session_id: session_id.clone(),
         max_turns: request.max_turns.or(request.budgets.max_turns),
+        // Enforce the tool-call ceiling in the core loop, which is the only
+        // layer that can block the (max+1)-th call *before* it starts while
+        // still letting an exactly-`max` run finish naturally (#29).
+        max_tool_calls: request.budgets.max_tool_calls,
         permission_mode: PermissionMode::Default,
         allowed_tools: tools.names(),
         ..Default::default()
@@ -387,13 +391,6 @@ pub(crate) async fn execute_request(
     let mut usage: Option<code_agent_core::TokenUsage> = None;
     let mut final_summary = String::new();
     let mut status = AgentRunStatus::Completed;
-    // One-shot guard for the `max_tool_calls` budget. Without this,
-    // every event after the cap was crossed re-pushed an identical
-    // `budget.max_tool_calls_exceeded` diagnostic and re-fired
-    // `cancellation.cancel()`. Since cancellation does not stop the
-    // already-streaming agent loop instantly, dozens of duplicate
-    // diagnostics could accumulate before the run wound down (#149).
-    let mut max_tool_calls_reported = false;
 
     loop {
         // Race the next agent event against cancellation so the SDK
@@ -442,6 +439,16 @@ pub(crate) async fn execute_request(
                             r.result.clone().unwrap_or_default(),
                         ));
                     }
+                    ResultSubtype::ErrorMaxToolCalls => {
+                        // The core loop blocked the call that would have
+                        // exceeded `max_tool_calls`; surface it as a Failed run
+                        // with the budget diagnostic (#29).
+                        status = AgentRunStatus::Failed;
+                        diagnostics.push(Diagnostic::error(
+                            "budget.max_tool_calls_exceeded",
+                            "max_tool_calls budget exceeded",
+                        ));
+                    }
                     ResultSubtype::ErrorDuringExecution => {
                         status = AgentRunStatus::Failed;
                         if let Some(msg) = &r.result {
@@ -456,30 +463,6 @@ pub(crate) async fn execute_request(
         // Map to SDK event for downstream consumers.
         if let Some(sdk_ev) = mapper.map(&ev) {
             emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
-        }
-
-        // Budget enforcement. Guard against re-reporting: every event
-        // that arrives after the cap is crossed used to re-push an
-        // identical diagnostic and re-fire `cancel()`, producing a
-        // diagnostics list that grew with every additional event (#149).
-        //
-        // `tool_calls` is incremented on `ToolCallStarted`, so the moment it
-        // reaches the cap the max-th call has just started. Trip exactly there
-        // (`>= max`) and fire cancellation: the core agent loop checks the
-        // cancel flag before dispatching each subsequent tool call, so the
-        // (max+1)-th call never starts. This enforces a hard ceiling of
-        // exactly `max` started tool calls (#29). An earlier `> max` boundary
-        // let the (max+1)-th call start before tripping — an off-by-one.
-        if let Some(max) = request.budgets.max_tool_calls {
-            if !max_tool_calls_reported && tool_calls >= max as usize {
-                cancellation.cancel();
-                diagnostics.push(Diagnostic::error(
-                    "budget.max_tool_calls_exceeded",
-                    "max_tool_calls budget exceeded",
-                ));
-                status = AgentRunStatus::Failed;
-                max_tool_calls_reported = true;
-            }
         }
     }
     drop(event_stream);
@@ -1423,14 +1406,15 @@ mod status_tests {
 
 #[cfg(all(test, feature = "fake-provider"))]
 mod budget_tests {
-    //! End-to-end coverage of the `max_tool_calls` budget gate boundary in
-    //! `execute_request`. The gate is a hard ceiling: it trips as soon as the
-    //! running tool-call count reaches the cap (`tool_calls >= max`) and fires
-    //! cancellation, so the core loop blocks the (max+1)-th call and exactly
-    //! `max` tool calls ever start (#29). Runs under the cap complete cleanly;
-    //! the `budget.max_tool_calls_exceeded` diagnostic is pushed at most once
-    //! (#149). Driven with the scripted fake provider so the tool-call count
-    //! is deterministic.
+    //! End-to-end coverage of the `max_tool_calls` budget boundary in
+    //! `execute_request`. Enforcement lives in the core agent loop, which
+    //! refuses to dispatch a turn whose tool calls would exceed the cap. Two
+    //! contracts must both hold (#29): a run that uses exactly `max` tool
+    //! calls and then finishes naturally completes successfully (it is *not*
+    //! Failed), while a run whose model wants more than `max` has the
+    //! (max+1)-th call blocked and ends Failed with a single
+    //! `budget.max_tool_calls_exceeded` diagnostic. Driven with the scripted
+    //! fake provider so the tool-call count is deterministic.
 
     use super::*;
     use crate::fake_provider::ScriptedFakeProvider;
@@ -1519,6 +1503,30 @@ mod budget_tests {
         );
     }
 
+    // Boundary contract: a run that uses *exactly* `max` tool calls and then
+    // produces a final answer must complete normally — not Failed — and must
+    // execute all `max` calls (the gate only blocks the (max+1)-th) (#29).
+    #[tokio::test]
+    async fn exactly_max_tool_calls_is_not_failed() {
+        let result = run_with_budget(2, 2).await;
+        assert_ne!(
+            result.status,
+            AgentRunStatus::Failed,
+            "a run using exactly max_tool_calls must not be Failed"
+        );
+        assert_eq!(
+            result.events_summary.tool_calls, 2,
+            "all max_tool_calls tool calls must execute"
+        );
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "budget.max_tool_calls_exceeded"),
+            "no budget diagnostic when the run stays at the cap"
+        );
+    }
+
     // Hard ceiling: with max_tool_calls=2 and a provider that wants 5 calls,
     // exactly 2 tool calls start; the 3rd is blocked by the budget (#29).
     #[tokio::test]
@@ -1530,24 +1538,20 @@ mod budget_tests {
         );
     }
 
-    // `max + 1` tool calls: the gate trips. The run ends in a terminal
-    // non-success state and records exactly one
-    // `budget.max_tool_calls_exceeded` diagnostic — the #149 one-shot guard
-    // prevents the duplicate diagnostics that earlier re-fired on every event
-    // after the cap was crossed. (The exact terminal status is Failed or
-    // Cancelled depending on whether the post-gate `cancel()` is observed by
-    // the loop's select before it breaks; both are non-success, so we pin the
-    // diagnostic-once invariant rather than the racy status.)
+    // Exceeding the cap: a provider that wants more than `max` calls has the
+    // (max+1)-th blocked; exactly `max` execute and the run is Failed with a
+    // single `budget.max_tool_calls_exceeded` diagnostic (#29).
     #[tokio::test]
     async fn exceeding_max_tool_calls_fails_once() {
         let result = run_with_budget(2, 1).await;
-        assert!(
-            matches!(
-                result.status,
-                AgentRunStatus::Failed | AgentRunStatus::Cancelled
-            ),
-            "expected a terminal non-success status, got {:?}",
-            result.status
+        assert_eq!(
+            result.events_summary.tool_calls, 1,
+            "exactly max_tool_calls tool calls execute before the gate blocks the next"
+        );
+        assert_eq!(
+            result.status,
+            AgentRunStatus::Failed,
+            "a run that wants more than max_tool_calls must be Failed"
         );
         let count = result
             .diagnostics
