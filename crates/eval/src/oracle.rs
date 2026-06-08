@@ -33,9 +33,10 @@ pub struct CommandResult {
     pub stderr: String,
     pub duration_ms: u64,
     pub timed_out: bool,
-    /// Set when stdout/stderr exceeded `MAX_CAPTURE` and the child was killed
-    /// to bound memory; the captured streams are truncated and `success` is
-    /// false. Defaults to `false` for backward-compatible deserialization.
+    /// Set when stdout/stderr exceeded `MAX_CAPTURE` and the captured stream was
+    /// truncated to bound memory. This does NOT affect `success`: a command that
+    /// prints over the cap and exits zero is still a success (#70). Defaults to
+    /// `false` for backward-compatible deserialization.
     #[serde(default)]
     pub output_truncated: bool,
 }
@@ -173,8 +174,11 @@ pub async fn evaluate_oracle(
 ///
 /// stdout/stderr are streamed with a hard byte cap of `MAX_CAPTURE` per
 /// stream rather than buffered unbounded; once a stream exceeds the cap the
-/// child (group) is killed and that stream is flagged truncated. This bounds
-/// live memory even for commands that print unboundedly fast.
+/// reader stops accumulating and that stream is flagged truncated, but the
+/// command keeps running so its real exit status is observed (#70). This bounds
+/// live memory even for commands that print unboundedly fast, without failing or
+/// killing a command merely for being verbose. Only the wall-clock timeout kills
+/// a (never-exiting) command.
 ///
 /// The main flow selects ONLY between the child exiting and the wall-clock
 /// timeout: there is no read-completion branch that could drop the timeout
@@ -234,15 +238,17 @@ pub async fn run_command(command: &str, dir: &Path, timeout: Duration) -> Comman
     };
 
     // The child's pid is also its process-group id (we made it a group leader).
-    // Share it with the read tasks so a task that blows past the cap can kill the
-    // whole group itself, without round-tripping through the main flow.
+    // It is used after the select to unconditionally kill the whole group so no
+    // backgrounded descendant outlives the command and holds a pipe open.
     let child_pid = child.id();
 
     // Drain both streams concurrently with a per-stream byte cap. Each stream is
     // read in its own background task that, on exceeding the cap, (a) records a
-    // PER-STREAM truncated flag and (b) kills the child's process group, then
-    // drains-and-discards to EOF so the pipe never blocks the child. Capped reads
-    // bound live memory regardless of how fast the command prints.
+    // PER-STREAM truncated flag and (b) stops accumulating but drains-and-discards
+    // to EOF so the pipe never blocks the child. Exceeding the cap does NOT kill or
+    // fail the command (#70): the command runs to completion so its real exit
+    // status is observed. Capped reads bound live memory regardless of how fast the
+    // command prints.
     //
     // The accumulated bytes and the truncated flag live in SHARED handles, not in
     // the task's return value: if a descendant escapes the group kill and keeps a
@@ -254,20 +260,19 @@ pub async fn run_command(command: &str, dir: &Path, timeout: Duration) -> Comman
     let out_task = tokio::spawn(capped_read_owned(
         child.stdout.take(),
         MAX_CAPTURE,
-        child_pid,
         out_buf.clone(),
     ));
     let err_task = tokio::spawn(capped_read_owned(
         child.stderr.take(),
         MAX_CAPTURE,
-        child_pid,
         err_buf.clone(),
     ));
 
     // Select ONLY between child exit and the wall-clock timeout. A cap-exceeded
-    // reader kills the group on its own, which causes `child.wait()` to resolve
-    // through this same exit branch — so there is no separate cap branch that
-    // could drop the `sleep(timeout)` future and leave an unbounded wait.
+    // reader no longer kills the command; it just stops accumulating and drains to
+    // EOF, so the command runs to completion and `child.wait()` resolves through
+    // this exit branch. The timeout is the only thing that can kill a runaway
+    // (never-exiting) command.
     let (timed_out, status) = tokio::select! {
         res = child.wait() => (false, res.ok()),
         _ = tokio::time::sleep(timeout) => {
@@ -322,7 +327,10 @@ pub async fn run_command(command: &str, dir: &Path, timeout: Duration) -> Comman
         cap_to_string(stderr_bytes, err_truncated)
     };
 
-    let success = !timed_out && !output_truncated && status.map(|s| s.success()).unwrap_or(false);
+    // Size-truncation does NOT fail a command: a legitimately passing verification
+    // command (e.g. `cargo test --all-targets`) routinely prints over the cap. Only
+    // a timeout or a non-zero/absent exit status fails the command. See #70.
+    let success = !timed_out && status.map(|s| s.success()).unwrap_or(false);
 
     CommandResult {
         command: command.to_string(),
@@ -409,20 +417,19 @@ async fn join_capped(
 /// the per-stream truncated flag are written into `shared` (not returned) so they
 /// survive an abort of this task; see [`SharedCapture`].
 ///
-/// When the cap is exceeded the task kills the child's process group (via
-/// `child_pid`, which is also the pgid) so the command terminates promptly, then
-/// drains-and-discards the remaining data to EOF so the pipe never blocks the
-/// child before it dies. The accumulation never exceeds `cap` bytes, so live
-/// memory stays bounded regardless of how much the command prints.
+/// When the cap is exceeded the task stops accumulating and drains-and-discards
+/// the remaining data to EOF so the pipe never blocks the child, but it does NOT
+/// kill the command: exceeding the size cap is purely a display/memory concern
+/// and must not fail or terminate an otherwise-passing command (#70). The
+/// accumulation never exceeds `cap` bytes, so live memory stays bounded
+/// regardless of how much the command prints, while the command runs to
+/// completion so its real exit status is observed. Only the wall-clock timeout in
+/// [`run_command`] can kill the command.
 ///
 /// The shared mutex is only ever held briefly to push a just-read chunk and is
 /// released before the next `.await`, so no lock is held across a read.
-async fn capped_read_owned<R>(
-    reader: Option<R>,
-    cap: usize,
-    child_pid: Option<u32>,
-    shared: SharedCapture,
-) where
+async fn capped_read_owned<R>(reader: Option<R>, cap: usize, shared: SharedCapture)
+where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
@@ -438,9 +445,13 @@ async fn capped_read_owned<R>(
                 let room = cap.saturating_sub(captured);
                 if n > room {
                     // More data is available than the cap allows: keep up to the
-                    // cap, kill the group so the command stops, then drain the
-                    // rest to EOF and discard it so the pipe doesn't block the
-                    // child while it is being torn down.
+                    // cap, then drain-and-discard the rest to EOF so the pipe never
+                    // blocks the child. We do NOT kill the group here — exceeding
+                    // the size cap is purely a display/memory concern and must not
+                    // terminate or fail an otherwise-passing command (#70). The
+                    // command runs to completion so its real exit status is
+                    // observed; only the wall-clock timeout (in `run_command`) can
+                    // kill it.
                     {
                         // Hold the lock only to append the kept prefix; release it
                         // before the drain reads below (no lock across `.await`).
@@ -448,7 +459,6 @@ async fn capped_read_owned<R>(
                         buf.extend_from_slice(&chunk[..room]);
                     }
                     shared.truncated.store(true, Ordering::Release);
-                    kill_pgid(child_pid);
                     while let Ok(m) = reader.read(&mut chunk).await {
                         if m == 0 {
                             break;
@@ -766,20 +776,18 @@ mod tests {
         assert!(!res.success);
     }
 
-    /// A command that prints far more than the cap has its captured output
-    /// bounded to ~MAX_CAPTURE and the child is killed, so the call returns
-    /// promptly instead of hanging on an unbounded stream.
+    /// A never-exiting command that floods output stays memory-bounded to
+    /// ~MAX_CAPTURE; since the cap no longer kills, only the wall-clock timeout
+    /// stops it, so it returns as `timed_out` (not a success).
     #[tokio::test]
-    async fn output_is_capped_and_child_killed() {
+    async fn unbounded_output_is_capped_and_timeout_kills() {
         let tmp = tempfile::tempdir().unwrap();
-        let start = std::time::Instant::now();
-        // `yes` prints forever; without a cap+kill this would never return.
-        let res = run_command("yes AAAAAAAA", tmp.path(), Duration::from_secs(30)).await;
-        let elapsed = start.elapsed();
+        // `yes` prints forever and never exits; only the timeout can stop it.
+        let res = run_command("yes AAAAAAAA", tmp.path(), Duration::from_millis(500)).await;
 
         assert!(res.output_truncated, "expected output_truncated to be set");
-        assert!(!res.success, "a killed/truncated command is not a success");
-        assert!(!res.timed_out, "should be cap-killed, not timed out");
+        assert!(res.timed_out, "a never-exiting command must time out");
+        assert!(!res.success, "a timed-out command is not a success");
         // Bounded to roughly the cap (plus the small truncation marker).
         assert!(
             res.stdout.len() <= MAX_CAPTURE + "\n... [truncated]".len(),
@@ -787,11 +795,32 @@ mod tests {
             res.stdout.len()
         );
         assert!(res.stdout.ends_with("[truncated]"));
-        // Returned promptly rather than hanging for the full 30s timeout.
+    }
+
+    /// REGRESSION (#70): a command that prints well over MAX_CAPTURE and exits 0
+    /// is a SUCCESS — size-truncation alone must not fail or kill it. Output is
+    /// still capped and flagged truncated, but the real exit status is observed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn over_cap_output_with_zero_exit_is_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Print ~256 KiB (4x the 64 KiB cap) then exit 0. Pre-fix this was killed
+        // mid-run and reported as failed; post-fix it runs to completion.
+        let bytes = MAX_CAPTURE * 4;
+        let command = format!("head -c {bytes} /dev/zero | tr '\\0' 'A'; exit 0");
+        let res = run_command(&command, tmp.path(), Duration::from_secs(30)).await;
+
+        assert!(res.success, "an over-cap command that exits 0 must succeed");
+        assert_eq!(res.exit_code, Some(0));
+        assert!(res.output_truncated, "expected output_truncated to be set");
+        assert!(!res.timed_out, "ran to completion, not timed out");
+        // Captured output stays bounded to the cap plus the truncation marker.
         assert!(
-            elapsed < Duration::from_secs(5),
-            "cap-killed command took too long: {elapsed:?}"
+            res.stdout.len() <= MAX_CAPTURE + "\n... [truncated]".len(),
+            "stdout not bounded: {} bytes",
+            res.stdout.len()
         );
+        assert!(res.stdout.ends_with("[truncated]"));
     }
 
     /// REGRESSION (Finding 1): a command that closes its stdout/stderr but keeps
