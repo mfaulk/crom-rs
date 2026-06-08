@@ -25,7 +25,9 @@ use crate::completion::{
 use crate::composer::{ComposerState, KeyAction, KeyEvent};
 use crate::event_adapter::map_sdk_event;
 use crate::inspectors::Inspectors;
-use crate::layout::{DetailPanelMode, FocusPane, LayoutState, SidePanelMode, TuiModal};
+use crate::layout::{
+    DetailPanelMode, DetailPanelState, FocusPane, LayoutState, SidePanelMode, TuiModal,
+};
 use crate::transcript::EventCard;
 
 /// Modal-id prefix used by Phase E to mark the approval modal that
@@ -203,6 +205,11 @@ pub struct TuiAppState {
     /// `Approval` mode and the approval modal render this. Cleared
     /// when the corresponding `ApprovalResolved` event fires.
     pub pending_approval: Option<PendingApproval>,
+    /// #80: snapshot of the detail-panel mode/visibility taken when
+    /// `open_approval_modal` overrides the panel to show the approval.
+    /// Restored when the approval resolves so the prior content (e.g. a
+    /// diff) is not lost. `None` when no approval is overriding the panel.
+    pub prior_detail_panel: Option<DetailPanelState>,
     /// Phase E: most recent proposed patch (the diff workbench's
     /// payload). Populated from `SdkEvent::PatchProposed`.
     pub last_patch: Option<PatchSet>,
@@ -344,6 +351,7 @@ impl TuiAppState {
             composer_popup: None,
             current_plan: None,
             pending_approval: None,
+            prior_detail_panel: None,
             last_patch: None,
             inspectors: Inspectors::empty(),
             inspector_selection: InspectorSelection::default(),
@@ -460,6 +468,13 @@ impl TuiAppState {
             tool_name: tool_name.clone(),
             summary: summary.clone(),
         });
+        // #80: snapshot the prior detail-panel state before overriding it
+        // so `ApprovalResolved` can restore it. Only snapshot the first
+        // time so a second `open_approval_modal` (e.g. duplicate path)
+        // doesn't overwrite the snapshot with the Approval override.
+        if self.prior_detail_panel.is_none() {
+            self.prior_detail_panel = Some(self.layout.detail_panel.clone());
+        }
         self.layout.detail_panel.mode = DetailPanelMode::Approval;
         self.layout.detail_panel.visible = true;
         self.layout.push_modal(TuiModal::Custom {
@@ -1484,6 +1499,16 @@ impl TuiAppState {
             SdkEvent::ApprovalResolved(_) => {
                 self.pending_approval = None;
                 let _ = self.layout.remove_custom_modals_by_id(APPROVAL_MODAL_ID);
+                // #80: restore the detail panel to whatever it showed
+                // before the approval overrode it (e.g. a diff), instead
+                // of leaving it pinned to `Approval` with empty content.
+                // If the panel is no longer in Approval mode the user
+                // navigated away, so leave their choice intact.
+                if let Some(prior) = self.prior_detail_panel.take() {
+                    if self.layout.detail_panel.mode == DetailPanelMode::Approval {
+                        self.layout.detail_panel = prior;
+                    }
+                }
             }
             SdkEvent::PatchProposed(p) => {
                 self.last_patch = Some(p.patch.clone());
@@ -2522,6 +2547,31 @@ mod tests {
         // Approval modal removed; Help modal still on top.
         assert!(matches!(s.layout.current_modal(), Some(TuiModal::Help)));
         assert_eq!(s.layout.modal_stack.len(), 1);
+    }
+
+    #[test]
+    // #80: resolving an approval restores the detail panel to its prior
+    // mode/visibility (a Diff here) instead of leaving it pinned to
+    // Approval with empty content.
+    fn approval_resolved_restores_prior_detail_panel() {
+        use code_agent_sdk::event::{ApprovalDecisionWire, ApprovalResolvedEvent};
+        let mut s = fresh_state();
+        // The detail panel is showing a diff before the approval arrives.
+        s.set_detail_panel(DetailPanelMode::Diff, true);
+        s.open_approval_modal("Bash".to_string(), "cargo test".to_string());
+        // Sanity: the approval override took effect.
+        assert_eq!(s.layout.detail_panel.mode, DetailPanelMode::Approval);
+        s.apply(TuiInbound::sdk(SdkEvent::ApprovalResolved(
+            ApprovalResolvedEvent {
+                run_id: rid(),
+                tool_name: "Bash".to_string(),
+                decision: ApprovalDecisionWire::Allow,
+            },
+        )));
+        // Prior diff view is restored, not left on empty Approval mode.
+        assert_eq!(s.layout.detail_panel.mode, DetailPanelMode::Diff);
+        assert!(s.layout.detail_panel.visible);
+        assert!(s.prior_detail_panel.is_none());
     }
 
     // #177: the approval modal can be opened from two uncoordinated
