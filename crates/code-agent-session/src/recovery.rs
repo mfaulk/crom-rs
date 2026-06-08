@@ -177,7 +177,17 @@ pub fn classify_state(
         };
     }
     match lock {
-        None => SessionRuntimeState::Idle,
+        None => {
+            // No `Result` event and no lock: either nothing ever happened
+            // (Idle) or the prior process exited without recording a terminal
+            // state (Interrupted). Mirrors `classify_state_lite` so the two
+            // public classifiers agree — see the "classifier hole" note there.
+            if records.is_empty() {
+                SessionRuntimeState::Idle
+            } else {
+                SessionRuntimeState::Interrupted
+            }
+        }
         Some(l) => {
             let started = parse_iso(&l.started_at).unwrap_or(now_unix);
             let elapsed = now_unix.saturating_sub(started);
@@ -593,6 +603,24 @@ mod tests {
             has_result: false,
         };
         let state = classify_state_lite(probe, None, 1_000_000, 60);
+        assert_eq!(state, S::Interrupted);
+    }
+
+    #[tokio::test]
+    // The public classify_state must agree with classify_state_lite: records,
+    // no Result, no lock is Interrupted, not Idle. Regression for the divergent
+    // classifier hole in the exported classify_state.
+    async fn public_classify_interrupted_when_records_no_result_no_lock() {
+        let id = SessionId::new();
+        let rec = SessionRecord::new(
+            now_iso(),
+            PathBuf::from("/tmp"),
+            id.to_string(),
+            SessionPayload::UserPrompt {
+                text: "do thing".into(),
+            },
+        );
+        let state = classify_state(&[rec], None, 1_000_000, 60);
         assert_eq!(state, S::Interrupted);
     }
 
