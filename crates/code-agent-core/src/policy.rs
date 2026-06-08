@@ -165,12 +165,21 @@ pub struct ApprovalMemorySnapshot {
     pub project_allow: Vec<String>,
 }
 
+/// Built-in filesystem tools whose primary side effect is fully identified by
+/// their `file_path` argument. The `file_path` fast-path in [`approval_key`] is
+/// restricted to these names so that arbitrary tools (notably MCP tools, whose
+/// schemas may happen to include a `file_path` string field) cannot collapse
+/// their key down to `tool::path` and thereby reuse a prior approval for a call
+/// with the same path but different side-effecting arguments.
+const FILE_PATH_FAST_PATH_TOOLS: &[&str] = &["Read", "Write", "Edit"];
+
 /// Build a stable approval-memory key for a tool invocation.
 ///
 /// The key embeds tool-name and the most-identifying portion of the input:
-/// the `command` for Bash, the `file_path` for filesystem tools, and a
-/// canonical (key-sorted) JSON serialization of the *entire* input for every
-/// other tool — notably MCP tools, whose inputs carry neither field. This
+/// the `command` for Bash, the `file_path` for the built-in filesystem tools
+/// in [`FILE_PATH_FAST_PATH_TOOLS`], and a canonical (key-sorted) JSON
+/// serialization of the *entire* input for every other tool — notably MCP
+/// tools, even those whose inputs happen to carry a `file_path` field. This
 /// means "allow for the rest of the session" allows that exact invocation
 /// again, not arbitrary other invocations of the same tool with different
 /// arguments, which would be a privilege-escalation footgun for side-effecting
@@ -178,12 +187,14 @@ pub struct ApprovalMemorySnapshot {
 pub fn approval_key(tool_name: &str, input: &Value) -> String {
     if tool_name == "Bash" {
         let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-        format!("Bash::{}", cmd)
-    } else if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
-        format!("{}::{}", tool_name, fp)
-    } else {
-        format!("{}::{}", tool_name, canonical_json(input))
+        return format!("Bash::{}", cmd);
     }
+    if FILE_PATH_FAST_PATH_TOOLS.contains(&tool_name) {
+        if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
+            return format!("{}::{}", tool_name, fp);
+        }
+    }
+    format!("{}::{}", tool_name, canonical_json(input))
 }
 
 /// Serialize `value` to JSON with all object keys recursively sorted, so that
@@ -627,6 +638,39 @@ mod tests {
     fn approval_key_file_path_unchanged() {
         let k = approval_key("Edit", &serde_json::json!({"file_path": "x.rs"}));
         assert_eq!(k, "Edit::x.rs");
+    }
+
+    // An MCP tool carrying a file_path arg must NOT use the fast-path: differing
+    // side-effecting args yield different keys so a prior approval is not reused.
+    #[test]
+    fn approval_key_mcp_with_file_path_distinguishes_other_args() {
+        let a = approval_key(
+            "mcp__fs__write",
+            &serde_json::json!({"file_path": "x", "content": "a"}),
+        );
+        let b = approval_key(
+            "mcp__fs__write",
+            &serde_json::json!({"file_path": "x", "content": "b"}),
+        );
+        assert_ne!(a, b);
+        // And the key must not collapse to the bare tool::path fast-path form.
+        assert_ne!(a, "mcp__fs__write::x");
+    }
+
+    // A built-in FS tool with the same file_path keeps the same key regardless
+    // of other args (the file_path fast-path applies only to Read/Write/Edit).
+    #[test]
+    fn approval_key_fs_tool_same_path_same_key() {
+        let a = approval_key(
+            "Write",
+            &serde_json::json!({"file_path": "x", "content": "a"}),
+        );
+        let b = approval_key(
+            "Write",
+            &serde_json::json!({"file_path": "x", "content": "b"}),
+        );
+        assert_eq!(a, b);
+        assert_eq!(a, "Write::x");
     }
 
     #[tokio::test]
