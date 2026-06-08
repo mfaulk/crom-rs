@@ -186,7 +186,11 @@ impl FsPlanStore {
                 path: path.clone(),
                 source: e,
             })?;
-        file.lock().map_err(|e| PlanError::Io {
+        // UFCS through `fs4::FileExt` to disambiguate from the inherent
+        // `std::fs::File::lock` stabilized in Rust 1.89: `unstable_name_collisions`
+        // is denied under `-D warnings`, and the inherent method would otherwise
+        // silently shadow fs4's on newer toolchains.
+        FileExt::lock(&file).map_err(|e| PlanError::Io {
             path: path.clone(),
             source: e,
         })?;

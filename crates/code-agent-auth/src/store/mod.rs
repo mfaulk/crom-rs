@@ -263,7 +263,11 @@ impl CredentialStore {
                     format!("open index lock {}: {}", lock_path.display(), e),
                 )
             })?;
-        file.lock().map_err(|e| {
+        // UFCS through `fs4::FileExt` to disambiguate from the inherent
+        // `std::fs::File::lock` stabilized in Rust 1.89: `unstable_name_collisions`
+        // is denied under `-D warnings`, and the inherent method would otherwise
+        // silently shadow fs4's on newer toolchains.
+        FileExt::lock(&file).map_err(|e| {
             AuthError::new(
                 AuthErrorKind::CredentialStoreUnavailable,
                 format!("lock index {}: {}", lock_path.display(), e),
