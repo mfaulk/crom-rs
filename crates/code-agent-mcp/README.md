@@ -20,6 +20,23 @@ tools.
   started/completed/failed events.
 - `protocol` — typed JSON-RPC and MCP initialize/capability messages.
 
+## Concurrency
+
+Request concurrency is an explicit per-transport capability. A transport
+reports it via `McpTransport::supports_concurrent_requests`:
+
+- **stdio** is single-flight: its request/response cycle needs exclusive
+  access to the shared stdout framing reader, so callers serialize requests
+  (the `&mut self` `send_request` path).
+- **streamable HTTP** advertises concurrency (`true`): each request is an
+  independent HTTP round-trip over a cloneable `reqwest::Client`, so multiple
+  tool calls to the same server can be in flight at once via the `&self`
+  `McpClient::call_tool_concurrent` / `McpTransport::send_request_concurrent`
+  path. Unique JSON-RPC ids come from an atomic allocator, and each request
+  keeps its own per-request timeout. `code-agent-core` picks the concurrent
+  path automatically when the transport supports it, so a slow tool call no
+  longer blocks a fast one on the same HTTP server.
+
 ## Usage
 
 Used by `code-agent-core`'s tool catalog and the `code-agent` CLI to surface

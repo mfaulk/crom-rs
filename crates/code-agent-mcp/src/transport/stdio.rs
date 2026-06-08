@@ -178,7 +178,7 @@ impl McpTransport for StdioMcpTransport {
 
     fn set_protocol_version(&mut self, _version: Option<String>) {}
 
-    fn drain_logs(&mut self) -> Vec<McpServerLogEntry> {
+    fn drain_logs(&self) -> Vec<McpServerLogEntry> {
         let mut guard = self.logs.lock().unwrap_or_else(|e| e.into_inner());
         guard.drain(..).collect()
     }

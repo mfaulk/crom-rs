@@ -152,6 +152,47 @@ impl McpClient {
         serde_json::from_value(value).map_err(McpError::from)
     }
 
+    /// Whether this client's transport can dispatch multiple requests
+    /// concurrently via [`McpClient::call_tool_concurrent`]. When `false`,
+    /// callers must serialize requests (e.g. behind a `Mutex`) and use the
+    /// `&mut self` request path.
+    pub fn supports_concurrent_requests(&self) -> bool {
+        self.transport.supports_concurrent_requests()
+    }
+
+    /// Like [`McpClient::call_tool`] but takes `&self`, allowing the caller to
+    /// hold only a shared reference so multiple tool calls to the same server
+    /// can be in flight at once. Only valid when
+    /// [`McpClient::supports_concurrent_requests`] is `true`. The JSON-RPC id
+    /// allocator is atomic, so concurrent callers still get unique ids, and the
+    /// per-request timeout/cancel behavior matches the serial path.
+    pub async fn call_tool_concurrent(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> McpResult<McpToolResult> {
+        let request = JsonRpcRequest::new(
+            self.ids.next_id(),
+            "tools/call",
+            Some(json!({ "name": name, "arguments": arguments })),
+        );
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            self.request_timeout,
+            self.transport.send_request_concurrent(request),
+        )
+        .await
+        .map_err(|_| McpError::timeout(self.request_timeout))??;
+        tracing::debug!(
+            server = %self.server_name,
+            method = "tools/call",
+            duration_ms = started.elapsed().as_millis() as u64,
+            "MCP concurrent request completed"
+        );
+        let value = response_value(response)?;
+        serde_json::from_value(value).map_err(McpError::from)
+    }
+
     pub async fn list_resources(&mut self) -> McpResult<Vec<McpResource>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
@@ -210,7 +251,7 @@ impl McpClient {
         )))
     }
 
-    pub fn drain_logs(&mut self) -> Vec<McpServerLogEntry> {
+    pub fn drain_logs(&self) -> Vec<McpServerLogEntry> {
         self.transport.drain_logs()
     }
 
@@ -382,7 +423,7 @@ mod tests {
             *self.protocol_version.lock().unwrap() = version;
         }
 
-        fn drain_logs(&mut self) -> Vec<McpServerLogEntry> {
+        fn drain_logs(&self) -> Vec<McpServerLogEntry> {
             Vec::new()
         }
     }
@@ -626,5 +667,163 @@ mod tests {
 
         let err = client.list_tools().await.unwrap_err();
         assert!(matches!(err, McpError::Timeout { .. }));
+    }
+
+    /// Concurrency-capable transport whose `send_request_concurrent` takes
+    /// `&self`, so multiple requests can overlap. A request named in
+    /// `slow_methods` waits on a notify channel before responding, letting a
+    /// test interleave a slow and a fast call against a single client.
+    #[derive(Default)]
+    struct ConcurrentMockTransport {
+        /// When set, a `tools/call` whose tool name equals `gated_tool` blocks
+        /// on this notify until released; ungated calls return immediately.
+        gate: Option<Arc<tokio::sync::Notify>>,
+        /// Tool name (from the request params) whose response is gated.
+        gated_tool: Option<String>,
+        /// When set, `send_request_concurrent` returns this transport error
+        /// (after an optional gate wait) to model a mid-flight failure.
+        fail_with: Option<String>,
+        /// Number of requests currently in flight, to prove overlap.
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        /// Peak observed concurrency.
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl McpTransport for ConcurrentMockTransport {
+        fn kind(&self) -> McpTransportKind {
+            McpTransportKind::StreamableHttp
+        }
+
+        async fn send_request(&mut self, request: JsonRpcRequest) -> McpResult<JsonRpcResponse> {
+            self.send_request_concurrent(request).await
+        }
+
+        fn supports_concurrent_requests(&self) -> bool {
+            true
+        }
+
+        async fn send_request_concurrent(
+            &self,
+            request: JsonRpcRequest,
+        ) -> McpResult<JsonRpcResponse> {
+            use std::sync::atomic::Ordering;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let tool_name = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string);
+            if self.gated_tool.is_some() && self.gated_tool == tool_name {
+                if let Some(gate) = &self.gate {
+                    gate.notified().await;
+                }
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if let Some(msg) = &self.fail_with {
+                return Err(McpError::Transport(msg.clone()));
+            }
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id.clone().into(),
+                result: Some(json!({"content": [], "isError": false})),
+                error: None,
+            })
+        }
+
+        async fn send_notification(&mut self, _notification: JsonRpcNotification) -> McpResult<()> {
+            Ok(())
+        }
+
+        fn set_protocol_version(&mut self, _version: Option<String>) {}
+
+        fn drain_logs(&self) -> Vec<McpServerLogEntry> {
+            Vec::new()
+        }
+    }
+
+    fn concurrent_client_with(transport: ConcurrentMockTransport) -> McpClient {
+        McpClient {
+            server_name: "mock".into(),
+            transport_kind: McpTransportKind::StreamableHttp,
+            capabilities: ServerCapabilities::default(),
+            server_info: None,
+            protocol_version: None,
+            transport: Box::new(transport),
+            ids: JsonRpcIdAllocator::new(),
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test]
+    // Two `call_tool_concurrent` calls to one client overlap: a gated slow call
+    // does not block a fast call, the fast one completes first, and peak
+    // observed concurrency is 2 (proving the requests were in flight together).
+    async fn concurrent_calls_overlap_and_fast_beats_slow() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = ConcurrentMockTransport {
+            gate: Some(gate.clone()),
+            gated_tool: Some("slow".into()),
+            peak: peak.clone(),
+            ..ConcurrentMockTransport::default()
+        };
+        let client = Arc::new(concurrent_client_with(transport));
+
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let c_slow = client.clone();
+        let order_slow = order.clone();
+        let slow = tokio::spawn(async move {
+            // The "slow" tool is gated and blocks until notified.
+            let r = c_slow.call_tool_concurrent("slow", json!({})).await;
+            order_slow.lock().unwrap().push("slow");
+            r
+        });
+
+        // Give the slow task a chance to register as in-flight and block.
+        tokio::task::yield_now().await;
+
+        let c_fast = client.clone();
+        let order_fast = order.clone();
+        let fast = tokio::spawn(async move {
+            let r = c_fast.call_tool_concurrent("fast", json!({})).await;
+            order_fast.lock().unwrap().push("fast");
+            r
+        });
+
+        // The fast call must finish while the slow one is still gated.
+        fast.await.unwrap().unwrap();
+        assert_eq!(order.lock().unwrap().clone(), vec!["fast"]);
+
+        // Release the slow call and let it finish.
+        gate.notify_one();
+        slow.await.unwrap().unwrap();
+        assert_eq!(order.lock().unwrap().clone(), vec!["fast", "slow"]);
+
+        // Both requests were in flight at the same time.
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    // A transport error on the concurrent path surfaces to the caller as an
+    // McpError rather than hanging, so a failed in-flight request fails fast.
+    async fn concurrent_call_propagates_transport_error() {
+        let transport = ConcurrentMockTransport {
+            fail_with: Some("connection reset".into()),
+            ..ConcurrentMockTransport::default()
+        };
+        let client = concurrent_client_with(transport);
+        let err = client
+            .call_tool_concurrent("anything", json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            McpError::Transport(msg) => assert!(msg.contains("connection reset"), "got: {msg}"),
+            other => panic!("expected Transport error, got {other:?}"),
+        }
     }
 }

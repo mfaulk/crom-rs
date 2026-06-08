@@ -199,6 +199,18 @@ impl McpTransport for StreamableHttpMcpTransport {
     }
 
     async fn send_request(&mut self, request: JsonRpcRequest) -> McpResult<JsonRpcResponse> {
+        self.send_request_concurrent(request).await
+    }
+
+    // Each Streamable-HTTP request is an independent HTTP round-trip over a
+    // cloneable `reqwest::Client`, and `post_json` already takes `&self`
+    // (session-id capture uses interior mutability), so concurrent in-flight
+    // requests are correlated by the HTTP layer rather than a shared reader.
+    fn supports_concurrent_requests(&self) -> bool {
+        true
+    }
+
+    async fn send_request_concurrent(&self, request: JsonRpcRequest) -> McpResult<JsonRpcResponse> {
         let value = serde_json::to_value(request)?;
         self.post_json(value, true)
             .await?

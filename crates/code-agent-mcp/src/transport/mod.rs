@@ -39,16 +39,42 @@ pub struct McpServerLogEntry {
 }
 
 #[async_trait]
-pub trait McpTransport: Send {
+pub trait McpTransport: Send + Sync {
     fn kind(&self) -> McpTransportKind;
 
     async fn send_request(&mut self, request: JsonRpcRequest) -> McpResult<JsonRpcResponse>;
+
+    /// Whether multiple requests may be dispatched concurrently against this
+    /// transport via [`McpTransport::send_request_concurrent`]. Defaults to
+    /// `false`: a transport whose request/response cycle needs exclusive
+    /// access to shared reader state (e.g. the stdio framing reader) stays
+    /// single-flight. Transports that can correlate concurrent in-flight
+    /// requests independently (e.g. Streamable HTTP, where each request is an
+    /// independent HTTP round-trip) override this to `true`.
+    fn supports_concurrent_requests(&self) -> bool {
+        false
+    }
+
+    /// Dispatch a request using only a shared reference so multiple requests
+    /// can be in flight at once. Only valid when
+    /// [`McpTransport::supports_concurrent_requests`] returns `true`; the
+    /// default implementation rejects the call so a mis-wired caller fails
+    /// loudly instead of silently serializing.
+    async fn send_request_concurrent(&self, request: JsonRpcRequest) -> McpResult<JsonRpcResponse> {
+        let _ = request;
+        Err(crate::errors::McpError::Transport(
+            "transport does not support concurrent requests".into(),
+        ))
+    }
 
     async fn send_notification(&mut self, notification: JsonRpcNotification) -> McpResult<()>;
 
     fn set_protocol_version(&mut self, version: Option<String>);
 
-    fn drain_logs(&mut self) -> Vec<McpServerLogEntry> {
+    /// Drain any buffered server log entries (e.g. captured stderr). Takes
+    /// `&self` so a concurrency-capable client shared by `Arc` (no `Mutex`)
+    /// can still drain logs; the buffer itself uses interior mutability.
+    fn drain_logs(&self) -> Vec<McpServerLogEntry> {
         Vec::new()
     }
 
@@ -82,6 +108,49 @@ mod tests {
             result,
             error,
         }
+    }
+
+    /// Minimal transport relying entirely on the trait defaults, to pin the
+    /// single-flight default that keeps stdio serialized.
+    struct DefaultTransport;
+
+    #[async_trait]
+    impl McpTransport for DefaultTransport {
+        fn kind(&self) -> McpTransportKind {
+            McpTransportKind::Stdio
+        }
+        async fn send_request(
+            &mut self,
+            _request: crate::protocol::JsonRpcRequest,
+        ) -> McpResult<JsonRpcResponse> {
+            unreachable!()
+        }
+        async fn send_notification(
+            &mut self,
+            _notification: crate::protocol::JsonRpcNotification,
+        ) -> McpResult<()> {
+            Ok(())
+        }
+        fn set_protocol_version(&mut self, _version: Option<String>) {}
+    }
+
+    #[test]
+    // By default a transport is single-flight: concurrency is opt-in, so stdio
+    // (which does not override) stays serialized.
+    fn default_transport_is_single_flight() {
+        assert!(!DefaultTransport.supports_concurrent_requests());
+    }
+
+    #[tokio::test]
+    // The default `send_request_concurrent` rejects rather than silently
+    // serializing, so a caller can never accidentally route through it.
+    async fn default_concurrent_request_is_rejected() {
+        let req = crate::protocol::JsonRpcRequest::new(JsonRpcId::Number(1), "x", None);
+        let err = DefaultTransport
+            .send_request_concurrent(req)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McpError::Transport(_)));
     }
 
     #[test]

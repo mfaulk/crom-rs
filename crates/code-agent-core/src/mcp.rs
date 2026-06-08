@@ -129,9 +129,8 @@ pub async fn register_mcp_tools(
         });
         report.logs.extend(
             client
-                .lock()
-                .await
                 .drain_logs()
+                .await
                 .into_iter()
                 .map(|entry| (server_name.clone(), entry)),
         );
@@ -148,7 +147,7 @@ pub async fn register_mcp_tools(
 struct ServerDiscovery {
     status: McpServerStatus,
     tools: Vec<McpToolDefinition>,
-    client: Option<Arc<Mutex<McpClient>>>,
+    client: Option<McpClientHandle>,
     logs: Vec<code_agent_mcp::McpServerLogEntry>,
 }
 
@@ -241,11 +240,10 @@ async fn discover_one_server(
     if load_prompts {
         status.prompt_count = client.list_prompts().await.ok().map(|p| p.len());
     }
-    let client = Arc::new(Mutex::new(client));
     ServerDiscovery {
         status,
         tools,
-        client: Some(client),
+        client: Some(McpClientHandle::new(client)),
         logs: Vec::new(),
     }
 }
@@ -311,8 +309,38 @@ pub struct McpTool {
     output_schema: Option<Value>,
     annotations: Option<Value>,
     transport: code_agent_mcp::McpTransportKind,
-    client: Arc<Mutex<McpClient>>,
+    client: McpClientHandle,
     limits: McpLimits,
+}
+
+/// Shared handle to a connected MCP client, dispatched according to the
+/// transport's concurrency capability. `Serial` keeps the single-flight
+/// `Mutex` for transports (stdio) whose request path needs exclusive access
+/// to a shared reader; `Concurrent` shares the client by `Arc` alone so
+/// multiple `&self` tool calls can overlap (Streamable HTTP).
+#[derive(Clone)]
+enum McpClientHandle {
+    Serial(Arc<Mutex<McpClient>>),
+    Concurrent(Arc<McpClient>),
+}
+
+impl McpClientHandle {
+    /// Wrap a freshly-connected client, choosing the dispatch strategy from
+    /// the transport's advertised concurrency capability.
+    fn new(client: McpClient) -> Self {
+        if client.supports_concurrent_requests() {
+            Self::Concurrent(Arc::new(client))
+        } else {
+            Self::Serial(Arc::new(Mutex::new(client)))
+        }
+    }
+
+    async fn drain_logs(&self) -> Vec<code_agent_mcp::McpServerLogEntry> {
+        match self {
+            Self::Serial(client) => client.lock().await.drain_logs(),
+            Self::Concurrent(client) => client.drain_logs(),
+        }
+    }
 }
 
 impl McpTool {
@@ -321,7 +349,7 @@ impl McpTool {
         transport: code_agent_mcp::McpTransportKind,
         agent_tool_name: String,
         definition: McpToolDefinition,
-        client: Arc<Mutex<McpClient>>,
+        client: McpClientHandle,
         limits: McpLimits,
     ) -> Self {
         let description = definition.description.clone().unwrap_or_else(|| {
@@ -393,11 +421,23 @@ impl Tool for McpTool {
 
     async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolResult, ToolError> {
         let started = Instant::now();
-        let mut client = self.client.lock().await;
-        let result = client
-            .call_tool(&self.remote_tool_name, input)
-            .await
-            .map_err(tool_error_from_mcp)?;
+        // Concurrency-capable transports (Streamable HTTP) dispatch through a
+        // shared reference so multiple tool calls to the same server can be in
+        // flight at once: a slow call no longer blocks a fast one. Single-flight
+        // transports (stdio) still serialize behind the client `Mutex`.
+        let result = match &self.client {
+            McpClientHandle::Concurrent(client) => client
+                .call_tool_concurrent(&self.remote_tool_name, input)
+                .await
+                .map_err(tool_error_from_mcp)?,
+            McpClientHandle::Serial(client) => {
+                let mut client = client.lock().await;
+                client
+                    .call_tool(&self.remote_tool_name, input)
+                    .await
+                    .map_err(tool_error_from_mcp)?
+            }
+        };
         let (text, metadata, result_bytes, truncated) =
             mcp_result_to_text_and_metadata(&result, self.limits.max_tool_result_bytes)
                 .map_err(tool_error_from_mcp)?;
