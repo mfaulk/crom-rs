@@ -24,6 +24,14 @@ Dependency-light: no HTTP client is bundled. OAuth flows and providers accept
 an `oauth::HttpTransport` the host crate supplies (e.g. backed by `reqwest`),
 keeping this crate easy to test and embed.
 
+The file-backed credential store serializes its index read-modify-write
+(`put` / `delete` / `set_active`) both in-process (a `Mutex`) and across
+processes (an exclusive `flock`, via `fs4`, on a sibling `<index>.lock`
+file). While holding the cross-process lock it re-reads the on-disk index
+so concurrent `code-agent` processes (e.g. the CLI and the TUI) cannot
+clobber each other's updates. The secret write keeps its atomic temp-file
++ rename and `0o600` permissions.
+
 ## Usage
 
 Used by the `code-agent` CLI and the OpenAI/Gemini provider crates.

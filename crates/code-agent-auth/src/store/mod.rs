@@ -19,6 +19,7 @@ pub mod system;
 
 use std::sync::Arc;
 
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AuthError, AuthErrorKind};
@@ -115,15 +116,24 @@ pub trait SecretBackend: Send + Sync {
 
 /// Combined account + secret store.
 ///
-/// The in-process `Mutex` serializes read-modify-write cycles against
-/// `index_path` for callers that share this `CredentialStore` (or any
-/// clone of it). It does NOT guard against a second process — e.g. the
-/// CLI and the TUI running side by side — racing on the same index
-/// file: each process loads a snapshot at `build` time, mutates its
-/// copy, and writes via `tempfile::persist`. The last writer wins and
-/// earlier in-flight updates from the other process can be lost.
-/// Tightening this with an advisory file lock requires adding a
-/// dependency such as `fs2` / `fs4` and is intentionally deferred.
+/// Read-modify-write cycles against `index_path` (`put` / `delete` /
+/// `set_active`) are serialized at two levels:
+///
+/// * In-process: the `Mutex<AccountIndex>` serializes callers that share
+///   this `CredentialStore` (or any clone of it) and guards the in-memory
+///   index snapshot.
+/// * Cross-process: an exclusive advisory lock (`fs4` / `flock`) on a
+///   sibling `<index_path>.lock` file is held across the whole cycle.
+///   While holding it the store re-reads the on-disk index so it mutates
+///   the *current* persisted state rather than a snapshot captured at
+///   `build` time — without this a second process (e.g. the CLI and the
+///   TUI side by side) could clobber an update committed in between. The
+///   lock is released on drop.
+///
+/// The write itself still uses the atomic temp-file + rename in
+/// `file::write_secret_file` with `0o600` perms, so the lock only
+/// serializes the read-modify-write; it does not change the on-disk
+/// format or durability guarantees.
 #[derive(Clone)]
 pub struct CredentialStore {
     pub mode: CredentialStoreMode,
@@ -225,6 +235,71 @@ impl CredentialStore {
         })
     }
 
+    /// Acquire an exclusive cross-process advisory lock on
+    /// `<index_path>.lock`, held until the returned guard is dropped.
+    /// Returns `Ok(None)` for the in-memory (`index_path == None`) store,
+    /// where there is no on-disk file to race over.
+    fn lock_index_file(&self) -> Result<Option<IndexFileLock>, AuthError> {
+        let Some(path) = self.index_path.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AuthError::new(
+                    AuthErrorKind::CredentialStoreUnavailable,
+                    format!("create index dir {}: {}", parent.display(), e),
+                )
+            })?;
+        }
+        let lock_path = lock_path_for(path);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                AuthError::new(
+                    AuthErrorKind::CredentialStoreUnavailable,
+                    format!("open index lock {}: {}", lock_path.display(), e),
+                )
+            })?;
+        file.lock().map_err(|e| {
+            AuthError::new(
+                AuthErrorKind::CredentialStoreUnavailable,
+                format!("lock index {}: {}", lock_path.display(), e),
+            )
+        })?;
+        Ok(Some(IndexFileLock { file: Some(file) }))
+    }
+
+    /// Re-read the on-disk index into the in-memory copy. Must be called
+    /// while holding both the in-process mutex (`idx`) and the
+    /// cross-process flock, so the subsequent read-modify-write applies to
+    /// the freshest persisted state rather than the snapshot captured at
+    /// `build` time. A missing or unparsable index is treated as empty —
+    /// matching `build`'s best-effort load — but only when no on-disk
+    /// index file exists; if the file is present we must not silently drop
+    /// another process's committed accounts.
+    fn reload_index_into(&self, idx: &mut AccountIndex) -> Result<(), AuthError> {
+        let Some(path) = self.index_path.as_ref() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        let bytes = std::fs::read(path).map_err(|e| {
+            AuthError::new(
+                AuthErrorKind::CredentialStoreUnavailable,
+                format!("read account index at {}: {}", path.display(), e),
+            )
+        })?;
+        // Preserve the existing build-time tolerance for a corrupt index
+        // (treat as default) so a partially written file from an older
+        // version does not hard-fail an otherwise valid write.
+        *idx = serde_json::from_slice::<AccountIndex>(&bytes).unwrap_or_default();
+        Ok(())
+    }
+
     pub fn put(
         &self,
         account: StoredAccount,
@@ -234,33 +309,39 @@ impl CredentialStore {
         let account_id = account.account_id.clone();
         self.backend.put(&provider, &account_id, secret)?;
         let mut idx = self.index.lock().unwrap();
-        // Remember the prior state so a failed index write can be undone
-        // without destroying a credential.
-        let prior = idx.get(&provider, &account_id).cloned();
-        idx.upsert(account);
-        if let Err(e) = self.persist_index(&idx) {
-            // The secret is already committed to the backend but the index
-            // that references it could not be persisted. Roll back so we
-            // neither orphan a new secret nor destroy an existing one, and
-            // keep the in-memory index consistent with what's on disk.
-            // Surface the original persistence error regardless.
-            match prior {
-                // This was a *new* account: the on-disk index never
-                // referenced this secret, so it would linger unreferenced
-                // (#222). Delete it and drop the in-memory insert.
-                None => {
-                    let _ = self.backend.delete(&provider, &account_id);
-                    idx.remove(&provider, &account_id);
-                }
-                // This was an *update* (e.g. an OAuth token refresh). The
-                // on-disk index still references this key, so the freshly
-                // written secret is reachable and must NOT be deleted —
-                // doing so would wipe a valid credential. Restore the prior
-                // metadata so the in-memory index matches the persisted one.
-                Some(prev) => {
-                    idx.upsert(prev);
-                }
+
+        // Capture whether this key was already known *before* we touch the
+        // index, so a rollback can tell a new account (orphaned secret →
+        // delete, #222) from an update (secret still reachable → keep).
+        // This is read from the in-memory index, which reflects the prior
+        // committed state shared by every clone of this store, and is
+        // captured here so it is available even if the lock cannot be
+        // acquired below.
+        let was_update = idx.get(&provider, &account_id).is_some();
+
+        // Run the locked read-modify-write. The lock guard is bound inside
+        // the block so it is held across the reload + persist and released
+        // when the block returns.
+        let result = (|| -> Result<(), AuthError> {
+            let _file_lock = self.lock_index_file()?;
+            // Re-sync the in-memory index with the current persisted state
+            // under the lock so we don't clobber another process's
+            // committed accounts when we persist below.
+            self.reload_index_into(&mut idx)?;
+            idx.upsert(account);
+            self.persist_index(&idx)
+        })();
+
+        if let Err(e) = result {
+            // The secret is committed to the backend but the locked index
+            // update failed (lock, reload, or persist). Roll back so we
+            // neither orphan a new secret nor destroy an existing one, then
+            // surface the original error.
+            if !was_update {
+                let _ = self.backend.delete(&provider, &account_id);
             }
+            // Restore the in-memory index to match what is on disk.
+            self.reload_index_into(&mut idx).ok();
             return Err(e);
         }
         Ok(())
@@ -287,7 +368,11 @@ impl CredentialStore {
             }
             Err(e) => return Err(e),
         }
+        let _file_lock = self.lock_index_file()?;
         let mut idx = self.index.lock().unwrap();
+        // Re-sync with on-disk state under the lock so removing one
+        // account does not drop another process's concurrently added one.
+        self.reload_index_into(&mut idx)?;
         let removed = idx.remove(provider, account_id).is_some();
         self.persist_index(&idx)?;
         Ok(removed)
@@ -298,7 +383,11 @@ impl CredentialStore {
         provider: &ProviderId,
         account_id: AccountId,
     ) -> Result<(), AuthError> {
+        let _file_lock = self.lock_index_file()?;
         let mut idx = self.index.lock().unwrap();
+        // Re-sync with on-disk state under the lock so changing the active
+        // selection preserves accounts another process committed.
+        self.reload_index_into(&mut idx)?;
         idx.set_active(provider, account_id);
         self.persist_index(&idx)
     }
@@ -324,6 +413,35 @@ impl CredentialStore {
         })?;
         file::write_secret_file(path, &bytes)?;
         Ok(())
+    }
+}
+
+/// Path of the sibling advisory-lock file for an index at `path`.
+/// Kept separate from the index file itself so the `flock` never sits on
+/// a file that the atomic temp-file + rename writes replace out from
+/// under it.
+fn lock_path_for(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+/// RAII guard for the exclusive cross-process advisory lock on the
+/// credential index's `.lock` file. Released when dropped: `unlock` is
+/// best-effort and, even if it fails, closing the descriptor releases the
+/// underlying `flock`.
+struct IndexFileLock {
+    file: Option<std::fs::File>,
+}
+
+impl Drop for IndexFileLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = FileExt::unlock(&file);
+        }
     }
 }
 
@@ -709,5 +827,80 @@ mod tests {
             snap.get(&b.provider, &b.account_id).is_some(),
             "account B missing from reloaded index"
         );
+    }
+
+    // Env-var protocol for the cross-process index-lock test.
+    const XPROC_INDEX: &str = "AUTH_STORE_XPROC_INDEX";
+    const XPROC_ID: &str = "AUTH_STORE_XPROC_ID";
+    const XPROC_CHILD: &str = "AUTH_STORE_XPROC_CHILD";
+
+    #[test]
+    // Cross-process serialization: several OS processes each `put` a
+    // distinct account into the SAME on-disk index concurrently. The
+    // `<index>.lock` advisory flock plus the under-lock reload must make
+    // every put a read-modify-write against the current persisted index,
+    // so all accounts survive with no lost updates. (Without the lock the
+    // last writer would clobber the others — each loaded its snapshot at
+    // `build` time.)
+    fn concurrent_puts_across_processes_do_not_lose_updates() {
+        // Worker branch: re-exec'd by the parent with env vars set, it
+        // performs a single `put` of its assigned account and exits.
+        if std::env::var(XPROC_CHILD).is_ok() {
+            let index_path = std::path::PathBuf::from(std::env::var(XPROC_INDEX).unwrap());
+            let id = std::env::var(XPROC_ID).unwrap();
+            let store =
+                CredentialStore::build(CredentialStoreMode::File, true, Some(index_path)).unwrap();
+            let acct = sample_account(ProviderId::Anthropic, &id);
+            let secret = StoredCredentialSecret {
+                api_key: Some(SecretString::new("k".into())),
+                ..Default::default()
+            };
+            store.put(acct, &secret).unwrap();
+            std::process::exit(0);
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let index_path = dir.path().join("index.json");
+        // Materialize the store/index/secrets dir once up front so the
+        // children share an already-initialized layout.
+        let _seed =
+            CredentialStore::build(CredentialStoreMode::File, true, Some(index_path.clone()))
+                .unwrap();
+
+        let procs: u32 = 6;
+        let exe = std::env::current_exe().unwrap();
+        let ids: Vec<String> = (0..procs).map(|i| format!("acc-{i}")).collect();
+        let mut children = Vec::new();
+        for id in &ids {
+            let child = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "store::tests::concurrent_puts_across_processes_do_not_lose_updates",
+                    "--nocapture",
+                ])
+                .env(XPROC_CHILD, "1")
+                .env(XPROC_INDEX, &index_path)
+                .env(XPROC_ID, id)
+                .spawn()
+                .expect("spawn worker process");
+            children.push(child);
+        }
+        for mut child in children {
+            let status = child.wait().expect("wait for worker");
+            assert!(status.success(), "worker process failed: {status:?}");
+        }
+
+        // Every account each process wrote must be present in the
+        // persisted index.
+        let reloaded =
+            CredentialStore::build(CredentialStoreMode::File, true, Some(index_path)).unwrap();
+        let snap = reloaded.snapshot_index();
+        for id in &ids {
+            assert!(
+                snap.get(&ProviderId::Anthropic, &AccountId::new(id))
+                    .is_some(),
+                "account {id} missing from reloaded index — lost update across processes"
+            );
+        }
     }
 }

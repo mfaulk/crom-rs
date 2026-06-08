@@ -8,8 +8,17 @@
 //!     <plan-id>.json                 # latest version, atomically written
 //!     <plan-id>.v<n>.json            # per-version snapshot for diffs/history
 //!     <plan-id>.v<n>.approved.json   # write-once snapshot captured at approval time
+//!     <plan-id>.lock                 # advisory cross-process write lock
 //!     index.jsonl                    # one line per write (never rewritten)
 //! ```
+//!
+//! Writes that read-modify-write a plan (`create`, `save_revision`,
+//! `approve`, `reject`, `archive`) take an exclusive advisory lock
+//! (`flock`, via `fs4`) on the sibling `<plan-id>.lock` file for the full
+//! read-decide-write block, so two separate processes cannot interleave
+//! and clobber each other's writes. Within a single process a per-plan
+//! async mutex provides the same serialization without blocking the
+//! runtime on the `flock` syscall for sibling tasks.
 //!
 //! All writes go through `tempfile::NamedTempFile::persist` so a partial
 //! write never replaces a valid file. A corrupted index never makes other
@@ -37,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::sync::Mutex as AsyncMutex;
@@ -49,6 +59,22 @@ use super::artifact::{
 use super::deviation::redact_secrets_in_plan;
 use super::errors::PlanError;
 use super::options::PlanningOptions;
+
+/// RAII guard for an exclusive cross-process advisory lock on a plan's
+/// `<id>.lock` file. The lock is released when the guard is dropped:
+/// `unlock` is best-effort and, even if it fails, closing the file
+/// descriptor on drop releases the underlying `flock`.
+struct PlanFileLock {
+    file: Option<std::fs::File>,
+}
+
+impl Drop for PlanFileLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = FileExt::unlock(&file);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct PlanListFilter {
@@ -90,12 +116,18 @@ pub trait PlanStore: Send + Sync {
 
 /// On-disk implementation rooted at `<cwd>/.agent/plans/`.
 ///
-/// Holds a per-plan async mutex (`plan_locks`) that serializes the
-/// read-decide-write block in `save_revision` so two concurrent revisions
-/// of the same plan id cannot both observe the same prior state and
-/// race the approval-invalidation check. Cross-process safety is NOT
-/// provided — for that, add an advisory file lock (e.g. `fs2`) once it
-/// lands in the workspace.
+/// Concurrency is serialized at two levels for the read-decide-write
+/// block in `save_revision` / `save_revision_atomic`:
+///
+/// * In-process: a per-plan async mutex (`plan_locks`) so two concurrent
+///   revisions of the same plan id within one process cannot both observe
+///   the same prior state and race the approval-invalidation check.
+/// * Cross-process: an exclusive advisory lock (`fs4` / `flock`) on a
+///   sibling `<plan-id>.lock` file, held across the same block, so two
+///   separate processes (e.g. the CLI and the TUI) cannot interleave
+///   their read-modify-write cycles and clobber each other. The lock is
+///   acquired after the in-process mutex and released on drop. Distinct
+///   plan ids do not contend with each other at either level.
 #[derive(Debug, Clone)]
 pub struct FsPlanStore {
     root: PathBuf,
@@ -119,15 +151,46 @@ impl FsPlanStore {
     /// proceed in parallel. The map mutex is held only long enough to
     /// look up / insert the entry.
     ///
-    /// TODO(cross-process): the workspace does not yet depend on `fs2`
-    /// or another advisory-lock crate, so concurrent writers across
-    /// processes can still race. Adding an `<id>.lock` flock here would
-    /// close that gap.
+    /// This only guards callers that share this process. Cross-process
+    /// serialization is handled separately by [`Self::lock_plan_file`].
     async fn plan_lock(&self, id: &PlanId) -> Arc<AsyncMutex<()>> {
         let mut map = self.plan_locks.lock().await;
         map.entry(id.0.clone())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
+    }
+
+    /// Path of the sibling advisory-lock file for `id`. Separate from the
+    /// plan's data files so the `flock` never sits on a file that gets
+    /// renamed out from under it by the atomic temp-file writes.
+    fn lock_path(&self, id: &PlanId) -> Result<PathBuf, PlanError> {
+        Self::validate_id(id)?;
+        Ok(self.root.join(format!("{}.lock", id.0)))
+    }
+
+    /// Acquire an exclusive cross-process advisory lock on `<id>.lock`,
+    /// held until the returned guard is dropped. Serializes the
+    /// read-decide-write block in `save_revision` against other processes
+    /// (e.g. the CLI and the TUI) operating on the same plan id. The lock
+    /// is advisory: it only serializes callers that also take it, which is
+    /// every write path in this store.
+    fn lock_plan_file(&self, id: &PlanId) -> Result<PlanFileLock, PlanError> {
+        self.ensure_root()?;
+        let path = self.lock_path(id)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| PlanError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
+        file.lock().map_err(|e| PlanError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        Ok(PlanFileLock { file: Some(file) })
     }
 
     pub fn root(&self) -> &Path {
@@ -260,6 +323,10 @@ impl FsPlanStore {
         Self::validate_id(&edited.id)?;
         let lock = self.plan_lock(&edited.id).await;
         let _guard = lock.lock().await;
+        // Cross-process advisory lock, held for the whole load + validate
+        // + save so a second process cannot interleave its own
+        // read-modify-write for this plan id. Released on drop.
+        let _file_lock = self.lock_plan_file(&edited.id)?;
         // Load the live on-disk plan inside the lock so a concurrent
         // `save_revision` for this id cannot slip between the load and
         // the validator. `load` itself does not take the per-plan lock,
@@ -279,6 +346,40 @@ impl FsPlanStore {
             })?;
         validator(&current, &edited)?;
         self.save_revision_locked(edited)
+    }
+
+    /// Atomic read-modify-write for a single plan id. Loads the live
+    /// on-disk plan, applies `transform` to it, and saves the result —
+    /// all while holding both the in-process per-plan mutex and the
+    /// cross-process `<id>.lock` advisory lock. Because the load happens
+    /// under the lock, two concurrent callers (including separate
+    /// processes) cannot both observe the same prior state, so no update
+    /// is lost. `transform` returning an error aborts the save.
+    pub async fn mutate_revision<F>(&self, id: &PlanId, transform: F) -> Result<(), PlanError>
+    where
+        F: FnOnce(&mut PlanDocument) -> Result<(), PlanError>,
+    {
+        Self::validate_id(id)?;
+        let lock = self.plan_lock(id).await;
+        let _guard = lock.lock().await;
+        let _file_lock = self.lock_plan_file(id)?;
+        // Load inside the lock so the modify happens against the freshest
+        // committed state, not a snapshot read before the lock was held.
+        let path = self.current_path(id)?;
+        if !path.exists() {
+            return Err(PlanError::NotFound(id.0.clone()));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| PlanError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        let mut plan: PlanDocument =
+            serde_json::from_slice(&bytes).map_err(|e| PlanError::Parse {
+                path: path.clone(),
+                source: e,
+            })?;
+        transform(&mut plan)?;
+        self.save_revision_locked(plan)
     }
 
     /// Locked body of `save_revision`: caller must hold the per-plan
@@ -508,6 +609,9 @@ impl FsPlanStore {
 impl PlanStore for FsPlanStore {
     async fn create(&self, mut plan: PlanDocument) -> Result<PlanId, PlanError> {
         Self::validate_id(&plan.id)?;
+        // Hold the cross-process lock across the exists-check + write so a
+        // second process cannot create the same plan id concurrently.
+        let _file_lock = self.lock_plan_file(&plan.id)?;
         if self.current_path(&plan.id)?.exists() {
             return Err(PlanError::Other(format!("plan {} already exists", plan.id)));
         }
@@ -557,9 +661,12 @@ impl PlanStore for FsPlanStore {
         // Serialize the read-decide-write block for this plan id so two
         // concurrent revisions cannot both observe the same prior state
         // and race the approval-invalidation check. Different plan ids
-        // do not block each other.
+        // do not block each other. The in-process mutex covers callers
+        // sharing this process; the `<id>.lock` advisory lock extends the
+        // same guarantee across separate processes.
         let lock = self.plan_lock(&plan.id).await;
         let _guard = lock.lock().await;
+        let _file_lock = self.lock_plan_file(&plan.id)?;
         self.save_revision_locked(plan)
     }
 
@@ -611,6 +718,10 @@ impl PlanStore for FsPlanStore {
     }
 
     async fn approve(&self, req: PlanApprovalRequest) -> Result<PlanDocument, PlanError> {
+        Self::validate_id(&req.plan_id)?;
+        // Serialize the load + status transition + write against other
+        // processes touching this plan id.
+        let _file_lock = self.lock_plan_file(&req.plan_id)?;
         let mut plan = self.load(&req.plan_id).await?;
         if plan.version != req.approved_version {
             return Err(PlanError::VersionMismatch {
@@ -655,6 +766,8 @@ impl PlanStore for FsPlanStore {
     }
 
     async fn reject(&self, req: PlanRejectRequest) -> Result<PlanDocument, PlanError> {
+        Self::validate_id(&req.plan_id)?;
+        let _file_lock = self.lock_plan_file(&req.plan_id)?;
         let mut plan = self.load(&req.plan_id).await?;
         if matches!(plan.status, PlanStatus::Archived) {
             return Err(PlanError::BadStatus("cannot reject archived plan".into()));
@@ -693,6 +806,8 @@ impl PlanStore for FsPlanStore {
     }
 
     async fn archive(&self, plan_id: &PlanId) -> Result<(), PlanError> {
+        Self::validate_id(plan_id)?;
+        let _file_lock = self.lock_plan_file(plan_id)?;
         let mut plan = self.load(plan_id).await?;
         plan.status = PlanStatus::Archived;
         plan.updated_at = OffsetDateTime::now_utc();
@@ -1558,5 +1673,121 @@ mod tests {
         // On-disk state unchanged.
         let after = s.load(&id).await.unwrap();
         assert_eq!(after.title, pre.title);
+    }
+
+    // Env-var protocol for the cross-process flock test. When
+    // `PLAN_STORE_XPROC_CHILD` is set, the test below re-execs itself as a
+    // worker that performs N read-modify-write increments on a shared
+    // plan's `metadata.counter` and exits.
+    const XPROC_ROOT: &str = "PLAN_STORE_XPROC_ROOT";
+    const XPROC_PLAN: &str = "PLAN_STORE_XPROC_PLAN";
+    const XPROC_ITERS: &str = "PLAN_STORE_XPROC_ITERS";
+    const XPROC_CHILD: &str = "PLAN_STORE_XPROC_CHILD";
+
+    // Each child loads the plan, bumps `metadata.counter` by one, bumps
+    // the version, and saves — `iters` times. The exclusive `<id>.lock`
+    // flock must make the whole load-modify-save atomic across processes,
+    // so no increment is lost.
+    fn xproc_worker(root: PathBuf, plan_id: PlanId, iters: u32) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let store = FsPlanStore::new(
+                root,
+                PlanningOptions {
+                    max_plan_revisions: 100_000,
+                    ..PlanningOptions::default()
+                },
+            );
+            for _ in 0..iters {
+                store
+                    .mutate_revision(&plan_id, |plan| {
+                        let counter = plan
+                            .metadata
+                            .get("counter")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        plan.metadata = serde_json::json!({ "counter": counter + 1 });
+                        plan.version += 1;
+                        plan.created_by = PlanCreatedBy::RevisedByUser;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    // Cross-process serialization: spawn several OS processes that each
+    // do N read-modify-write increments to the same plan's counter
+    // concurrently. The `<id>.lock` advisory flock must serialize the
+    // load-modify-save across processes so the final counter equals
+    // procs * iters with no lost updates. (In-process mutexes cannot help
+    // here — these are genuinely separate processes.)
+    fn save_revision_serializes_across_processes() {
+        // Worker branch: this same test binary is re-exec'd with the env
+        // vars set, runs the increments, and exits before reaching the
+        // parent logic below.
+        if std::env::var(XPROC_CHILD).is_ok() {
+            let root = PathBuf::from(std::env::var(XPROC_ROOT).unwrap());
+            let plan_id = PlanId(std::env::var(XPROC_PLAN).unwrap());
+            let iters: u32 = std::env::var(XPROC_ITERS).unwrap().parse().unwrap();
+            xproc_worker(root, plan_id, iters);
+            std::process::exit(0);
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let store = FsPlanStore::new(root.clone(), PlanningOptions::default());
+        let mut plan = small_plan();
+        plan.metadata = serde_json::json!({ "counter": 0 });
+        let id = plan.id.clone();
+        rt.block_on(store.create(plan)).unwrap();
+
+        let procs: u32 = 4;
+        let iters: u32 = 25;
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for _ in 0..procs {
+            let child = std::process::Command::new(&exe)
+                // Re-run only this test, single-threaded, with output
+                // captured so the worker's process exit is the signal.
+                .args([
+                    "--exact",
+                    "plan::store::tests::save_revision_serializes_across_processes",
+                    "--nocapture",
+                ])
+                .env(XPROC_CHILD, "1")
+                .env(XPROC_ROOT, &root)
+                .env(XPROC_PLAN, &id.0)
+                .env(XPROC_ITERS, iters.to_string())
+                .spawn()
+                .expect("spawn worker process");
+            children.push(child);
+        }
+        for mut child in children {
+            let status = child.wait().expect("wait for worker");
+            assert!(status.success(), "worker process failed: {status:?}");
+        }
+
+        // Final counter must reflect every increment from every process.
+        let final_plan = rt.block_on(store.load(&id)).unwrap();
+        let counter = final_plan
+            .metadata
+            .get("counter")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        assert_eq!(
+            counter,
+            (procs * iters) as u64,
+            "lost updates: counter {counter} != {procs} procs * {iters} iters"
+        );
     }
 }
