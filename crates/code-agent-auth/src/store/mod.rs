@@ -116,23 +116,31 @@ pub trait SecretBackend: Send + Sync {
 
 /// Combined account + secret store.
 ///
-/// Read-modify-write cycles against `index_path` (`put` / `delete` /
-/// `set_active`) are serialized at two levels:
+/// Write paths against `index_path` (`put` / `delete` / `set_active`)
+/// mutate both the backend secret and the metadata index, so they are
+/// serialized at two levels with a single, consistent acquisition order:
 ///
-/// * In-process: the `Mutex<AccountIndex>` serializes callers that share
-///   this `CredentialStore` (or any clone of it) and guards the in-memory
-///   index snapshot.
-/// * Cross-process: an exclusive advisory lock (`fs4` / `flock`) on a
-///   sibling `<index_path>.lock` file is held across the whole cycle.
-///   While holding it the store re-reads the on-disk index so it mutates
-///   the *current* persisted state rather than a snapshot captured at
-///   `build` time — without this a second process (e.g. the CLI and the
-///   TUI side by side) could clobber an update committed in between. The
-///   lock is released on drop.
+/// 1. Cross-process (outer): an exclusive advisory lock (`fs4` / `flock`)
+///    on a sibling `<index_path>.lock` file is taken FIRST and held across
+///    the entire critical section — both the backend secret mutation
+///    (`backend.put` / `backend.delete`) and the index read-modify-write.
+///    This makes the secret change and its matching index entry atomic
+///    with respect to other processes/threads, and re-reading the on-disk
+///    index under the lock means each write applies to the *current*
+///    persisted state rather than a snapshot captured at `build` time —
+///    without this a second process (e.g. the CLI and the TUI side by
+///    side) could clobber an update committed in between, or leave the
+///    index referencing a secret another writer just removed.
+/// 2. In-process (inner): the `Mutex<AccountIndex>` is taken only *after*
+///    the flock, and only briefly, to update the in-memory snapshot shared
+///    by clones of this store. The mutex is never held across the blocking
+///    flock acquisition, so the two locks always nest in the same order
+///    (flock → mutex) on every write path and cannot deadlock. Read paths
+///    take only the mutex and so never block a writer.
 ///
 /// The write itself still uses the atomic temp-file + rename in
-/// `file::write_secret_file` with `0o600` perms, so the lock only
-/// serializes the read-modify-write; it does not change the on-disk
+/// `file::write_secret_file` with `0o600` perms, so the locks only
+/// serialize the read-modify-write; they do not change the on-disk
 /// format or durability guarantees.
 #[derive(Clone)]
 pub struct CredentialStore {
@@ -311,36 +319,40 @@ impl CredentialStore {
     ) -> Result<(), AuthError> {
         let provider = account.provider.clone();
         let account_id = account.account_id.clone();
-        self.backend.put(&provider, &account_id, secret)?;
-        let mut idx = self.index.lock().unwrap();
 
-        // Capture whether this key was already known *before* we touch the
-        // index, so a rollback can tell a new account (orphaned secret →
-        // delete, #222) from an update (secret still reachable → keep).
-        // This is read from the in-memory index, which reflects the prior
-        // committed state shared by every clone of this store, and is
-        // captured here so it is available even if the lock cannot be
-        // acquired below.
+        // Acquire the cross-process flock FIRST (outer lock), before any
+        // backend mutation, so the secret write and the matching index
+        // update are atomic with respect to other processes/threads sharing
+        // this index. This blocking acquisition happens *without* holding
+        // the in-process mutex, keeping the lock order flock → mutex
+        // identical to `delete` / `set_active` (no inverted-order deadlock).
+        let _file_lock = self.lock_index_file()?;
+
+        // Take the in-process mutex only after the flock, and re-sync the
+        // in-memory index with the current persisted state under both locks
+        // so the read-modify-write applies to the freshest committed state.
+        let mut idx = self.index.lock().unwrap();
+        self.reload_index_into(&mut idx)?;
+
+        // Whether this key was already known *before* we touch the backend,
+        // read under the lock from the just-reloaded index, so a rollback
+        // can tell a new account (orphaned secret → delete, #222) from an
+        // update (secret still reachable → keep).
         let was_update = idx.get(&provider, &account_id).is_some();
 
-        // Run the locked read-modify-write. The lock guard is bound inside
-        // the block so it is held across the reload + persist and released
-        // when the block returns.
+        // Write the secret under the flock, then persist the matching index
+        // entry. Both happen inside the same critical section so a
+        // concurrent same-account delete cannot interleave between them.
         let result = (|| -> Result<(), AuthError> {
-            let _file_lock = self.lock_index_file()?;
-            // Re-sync the in-memory index with the current persisted state
-            // under the lock so we don't clobber another process's
-            // committed accounts when we persist below.
-            self.reload_index_into(&mut idx)?;
+            self.backend.put(&provider, &account_id, secret)?;
             idx.upsert(account);
             self.persist_index(&idx)
         })();
 
         if let Err(e) = result {
-            // The secret is committed to the backend but the locked index
-            // update failed (lock, reload, or persist). Roll back so we
-            // neither orphan a new secret nor destroy an existing one, then
-            // surface the original error.
+            // The locked write failed (backend put or index persist). Roll
+            // back so we neither orphan a new secret nor destroy an existing
+            // one, then surface the original error.
             if !was_update {
                 let _ = self.backend.delete(&provider, &account_id);
             }
@@ -360,6 +372,17 @@ impl CredentialStore {
     }
 
     pub fn delete(&self, provider: &ProviderId, account_id: &AccountId) -> Result<bool, AuthError> {
+        // Acquire the cross-process flock FIRST (outer lock), before the
+        // backend secret removal, so the secret delete and the matching
+        // index update are atomic with respect to a concurrent same-account
+        // `put`. Then take the in-process mutex (inner lock) — flock → mutex
+        // matches `put` / `set_active`, so the two locks never deadlock.
+        let _file_lock = self.lock_index_file()?;
+        let mut idx = self.index.lock().unwrap();
+        // Re-sync with on-disk state under the lock so removing one
+        // account does not drop another process's concurrently added one.
+        self.reload_index_into(&mut idx)?;
+
         // Logout must be idempotent (deleting a non-existent secret is
         // fine), but a *failed* backend delete is not. If the keychain
         // refuses the operation we keep the metadata entry so the next
@@ -372,11 +395,6 @@ impl CredentialStore {
             }
             Err(e) => return Err(e),
         }
-        let _file_lock = self.lock_index_file()?;
-        let mut idx = self.index.lock().unwrap();
-        // Re-sync with on-disk state under the lock so removing one
-        // account does not drop another process's concurrently added one.
-        self.reload_index_into(&mut idx)?;
         let removed = idx.remove(provider, account_id).is_some();
         self.persist_index(&idx)?;
         Ok(removed)
@@ -675,23 +693,53 @@ mod tests {
         store_ok.put(acct.clone(), &old_secret).unwrap();
 
         // Phase 2: an *update* to the same account whose index persist fails
-        // (the parent of `index_path` is a regular file, so create_dir_all
-        // errors). Shares the same backend + in-memory index as phase 1.
-        let blocker = dir.path().join("blocker");
-        std::fs::write(&blocker, b"x").unwrap();
+        // *after* the secret is written. Because the flock is now taken
+        // before any backend mutation, the failure must occur at the index
+        // write step (not at lock acquisition) for the secret to have been
+        // written. We point the bad store at a pre-seeded index in its own
+        // subdirectory (so the lock file already exists and reload reads a
+        // valid index), then make that subdirectory read-only so the atomic
+        // temp-file create inside `write_secret_file` fails. Shares the same
+        // backend + in-memory index as phase 1.
+        let bad_dir = dir.path().join("bad");
+        std::fs::create_dir(&bad_dir).unwrap();
+        let bad_index = bad_dir.join("index.json");
         let store_bad = CredentialStore {
             mode: CredentialStoreMode::Auto,
             allow_file_store: true,
             backend: backend.clone(),
             index: index.clone(),
-            index_path: Some(blocker.join("index.json")),
+            index_path: Some(bad_index.clone()),
         };
+        // Seed a valid index + lock file via a clean put, then lock the
+        // directory down so subsequent persists fail at the temp-file step.
+        store_bad.put(acct.clone(), &old_secret).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-unix, fall back to making the index path a directory so
+            // the rename in `persist_index` fails; reload tolerates the read
+            // error path is not exercised because the lock file pre-exists.
+            std::fs::remove_file(&bad_index).ok();
+            std::fs::create_dir(&bad_index).unwrap();
+        }
         let new_secret = StoredCredentialSecret {
             api_key: Some(SecretString::new("sk-new".into())),
             ..Default::default()
         };
         let err = store_bad.put(acct.clone(), &new_secret).unwrap_err();
         assert_eq!(err.kind, AuthErrorKind::CredentialStoreUnavailable);
+
+        // Restore permissions so the TempDir cleanup can remove the files.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o700)).ok();
+        }
 
         // The credential must NOT be destroyed by the failed update — and it
         // reflects the freshly written value (still referenced by the
@@ -830,6 +878,127 @@ mod tests {
         assert!(
             snap.get(&b.provider, &b.account_id).is_some(),
             "account B missing from reloaded index"
+        );
+    }
+
+    #[test]
+    // Deadlock regression: cloned stores sharing one on-disk index, with
+    // one thread running `put` and another running `delete`/`set_active` in
+    // a tight loop, must all COMPLETE. The buggy code took the in-process
+    // mutex then blocked on the flock in `put`, but the flock then the mutex
+    // in `delete`/`set_active` — inverted ordering that could deadlock.
+    fn concurrent_put_and_delete_do_not_deadlock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = CredentialStore::build(
+            CredentialStoreMode::File,
+            true,
+            Some(dir.path().join("index.json")),
+        )
+        .unwrap();
+        let acct = sample_account(ProviderId::Anthropic, "deadlock-acct");
+        let secret = StoredCredentialSecret {
+            api_key: Some(SecretString::new("k".into())),
+            ..Default::default()
+        };
+
+        let iters = 200;
+        let s_put = store.clone();
+        let s_del = store.clone();
+        let s_active = store.clone();
+        let put_acct = acct.clone();
+        let put_secret = secret.clone();
+        let del_acct = acct.clone();
+        let active_acct = acct.clone();
+
+        let t_put = std::thread::spawn(move || {
+            for _ in 0..iters {
+                s_put.put(put_acct.clone(), &put_secret).unwrap();
+            }
+        });
+        let t_del = std::thread::spawn(move || {
+            for _ in 0..iters {
+                let _ = s_del.delete(&del_acct.provider, &del_acct.account_id);
+            }
+        });
+        let t_active = std::thread::spawn(move || {
+            for _ in 0..iters {
+                let _ = s_active.set_active(&active_acct.provider, active_acct.account_id.clone());
+            }
+        });
+
+        // Join on a watchdog thread so a deadlock surfaces as a test
+        // failure (timeout) rather than hanging the whole suite forever.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            t_put.join().unwrap();
+            t_del.join().unwrap();
+            t_active.join().unwrap();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("put/delete/set_active deadlocked (no completion within timeout)");
+    }
+
+    #[test]
+    // Corruption regression: concurrent put/delete of the SAME account must
+    // never leave the index referencing a missing secret, nor a secret with
+    // no index entry. Holding the flock across BOTH the backend secret
+    // mutation and the index update makes the pair atomic across threads.
+    fn concurrent_same_account_put_delete_stays_consistent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = CredentialStore::build(
+            CredentialStoreMode::File,
+            true,
+            Some(dir.path().join("index.json")),
+        )
+        .unwrap();
+        let acct = sample_account(ProviderId::Anthropic, "race-acct");
+        let secret = StoredCredentialSecret {
+            api_key: Some(SecretString::new("k".into())),
+            ..Default::default()
+        };
+
+        let iters = 300;
+        let s_put = store.clone();
+        let s_del = store.clone();
+        let put_acct = acct.clone();
+        let put_secret = secret.clone();
+        let del_acct = acct.clone();
+        let t_put = std::thread::spawn(move || {
+            for _ in 0..iters {
+                s_put.put(put_acct.clone(), &put_secret).unwrap();
+            }
+        });
+        let t_del = std::thread::spawn(move || {
+            for _ in 0..iters {
+                let _ = s_del.delete(&del_acct.provider, &del_acct.account_id);
+            }
+        });
+        t_put.join().unwrap();
+        t_del.join().unwrap();
+
+        // After the race, the persisted index and the backend secret must
+        // agree: an index entry implies a present secret, and a present
+        // secret implies an index entry. Check under the lock-free reload.
+        let reloaded = CredentialStore::build(
+            CredentialStoreMode::File,
+            true,
+            Some(dir.path().join("index.json")),
+        )
+        .unwrap();
+        let has_index = reloaded
+            .snapshot_index()
+            .get(&acct.provider, &acct.account_id)
+            .is_some();
+        let has_secret = reloaded
+            .get_secret(&acct.provider, &acct.account_id)
+            .unwrap()
+            .is_some();
+        assert_eq!(
+            has_index, has_secret,
+            "index/secret inconsistency after concurrent put/delete: \
+             index={has_index} secret={has_secret}"
         );
     }
 

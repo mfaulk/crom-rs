@@ -24,13 +24,20 @@ Dependency-light: no HTTP client is bundled. OAuth flows and providers accept
 an `oauth::HttpTransport` the host crate supplies (e.g. backed by `reqwest`),
 keeping this crate easy to test and embed.
 
-The file-backed credential store serializes its index read-modify-write
-(`put` / `delete` / `set_active`) both in-process (a `Mutex`) and across
-processes (an exclusive `flock`, via `fs4`, on a sibling `<index>.lock`
-file). While holding the cross-process lock it re-reads the on-disk index
-so concurrent `code-agent` processes (e.g. the CLI and the TUI) cannot
-clobber each other's updates. The secret write keeps its atomic temp-file
-+ rename and `0o600` permissions.
+The file-backed credential store serializes its write paths
+(`put` / `delete` / `set_active`) with a single, consistent lock order:
+the cross-process advisory `flock` (via `fs4`, on a sibling
+`<index>.lock` file) is acquired FIRST and held across the whole critical
+section, and the in-process `Mutex` guarding the in-memory index snapshot
+is taken only afterwards, briefly. Using the same `flock` → `Mutex` order
+on every write path avoids the inverted-ordering deadlock that an
+in-process `Mutex` → `flock` order on one path would cause. While holding
+the `flock` the store re-reads the on-disk index and performs both the
+backend secret mutation and the matching index update under that lock, so
+concurrent `code-agent` processes (e.g. the CLI and the TUI) can neither
+clobber each other's updates nor leave the index pointing at a secret a
+concurrent writer just removed. The secret write keeps its atomic
+temp-file + rename and `0o600` permissions.
 
 ## Usage
 
