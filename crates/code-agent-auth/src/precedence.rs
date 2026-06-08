@@ -152,11 +152,13 @@ pub fn resolve_credential(inputs: AuthResolverInputs<'_>) -> Result<ResolvedAuth
     };
 
     // Informational conflict warning when an env var would override a stored
-    // credential. A backend error while probing is swallowed here (the
-    // warning is best-effort and must not suppress resolution); a real error
-    // still surfaces from the precedence chain below if a store source is
-    // actually selected.
-    if env.is_some() {
+    // credential. Only emitted under `EnvFirst`, where the env var actually
+    // outranks stored sources; under `ExplicitFirst`/`StoredFirst` an active
+    // stored account wins, so the warning would be misleading. A backend error
+    // while probing is swallowed here (the warning is best-effort and must not
+    // suppress resolution); a real error still surfaces from the precedence
+    // chain below if a store source is actually selected.
+    if inputs.mode == AuthPrecedenceMode::EnvFirst && env.is_some() {
         let stored_present =
             matches!(stored_active(), Ok(Some(_))) || matches!(stored_first(), Ok(Some(_)));
         if stored_present {
@@ -602,9 +604,30 @@ mod tests {
     }
 
     #[test]
-    // Resolver surfaces a precedence-conflict warning when env var and
-    // stored credential both exist.
-    fn warns_on_env_vs_stored_conflict() {
+    // EnvFirst with both an env var and a stored account present surfaces the
+    // override warning, since env actually wins under that mode.
+    fn warns_on_env_vs_stored_conflict_in_env_first() {
+        let (store, aid) = store_with_account(ProviderId::Anthropic, "k1", "stored-key");
+        let mut env = BTreeMap::new();
+        env.insert("ANTHROPIC_API_KEY".into(), "env-key".into());
+        let res = resolve_credential(AuthResolverInputs {
+            provider: Some(ProviderId::Anthropic),
+            mode: AuthPrecedenceMode::EnvFirst,
+            explicit_api_key: None,
+            explicit_account: None,
+            active_account: Some(&aid),
+            env,
+            store: Some(&store),
+        })
+        .unwrap();
+        assert!(!res.warnings.is_empty());
+        assert!(res.warnings[0].contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    // ExplicitFirst with an active stored account outranking env emits no
+    // override warning, since env does not actually win under that mode.
+    fn no_env_override_warning_in_explicit_first() {
         let (store, aid) = store_with_account(ProviderId::Anthropic, "k1", "stored-key");
         let mut env = BTreeMap::new();
         env.insert("ANTHROPIC_API_KEY".into(), "env-key".into());
@@ -618,7 +641,26 @@ mod tests {
             store: Some(&store),
         })
         .unwrap();
-        assert!(!res.warnings.is_empty());
-        assert!(res.warnings[0].contains("ANTHROPIC_API_KEY"));
+        assert!(res.warnings.is_empty());
+    }
+
+    #[test]
+    // StoredFirst with env var present emits no override warning, since the
+    // stored credential wins and env never overrides.
+    fn no_env_override_warning_in_stored_first() {
+        let (store, aid) = store_with_account(ProviderId::OpenAi, "k1", "stored-key");
+        let mut env = BTreeMap::new();
+        env.insert("OPENAI_API_KEY".into(), "env-key".into());
+        let res = resolve_credential(AuthResolverInputs {
+            provider: Some(ProviderId::OpenAi),
+            mode: AuthPrecedenceMode::StoredFirst,
+            explicit_api_key: None,
+            explicit_account: None,
+            active_account: Some(&aid),
+            env,
+            store: Some(&store),
+        })
+        .unwrap();
+        assert!(res.warnings.is_empty());
     }
 }
