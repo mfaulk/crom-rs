@@ -135,6 +135,7 @@ pub fn redact_path_for_diff(path: &WorkspaceRelativePath) -> bool {
 }
 
 /// Outcome of attempting to read the current on-disk file for a diff.
+#[cfg_attr(test, derive(Debug))]
 enum CurrentRead {
     /// File contents, read in full (within the size cap).
     Bytes(Vec<u8>),
@@ -145,16 +146,32 @@ enum CurrentRead {
     Skip,
 }
 
-/// Stats `absolute` and reads it only when its size is within `read_cap`.
-/// Files larger than the cap are reported as [`CurrentRead::TooLarge`]
-/// without ever being loaded, mirroring how binary files are surfaced.
+/// Reads at most `read_cap` bytes from `absolute`, bounding the read itself
+/// rather than trusting a separate `metadata()` stat. Opening the handle and
+/// limiting the reader to `read_cap + 1` bytes closes the TOCTOU window where
+/// the file could grow or be replaced between a stat and a full read: if the
+/// `read_cap + 1`-th byte is present the file is over the cap and reported as
+/// [`CurrentRead::TooLarge`] without its contents ever being fully buffered,
+/// mirroring how binary files are surfaced.
 async fn read_current_capped(absolute: &std::path::Path, read_cap: u64) -> CurrentRead {
-    match tokio::fs::metadata(absolute).await {
-        Ok(meta) if meta.len() > read_cap => CurrentRead::TooLarge,
-        Ok(_) => match tokio::fs::read(absolute).await {
-            Ok(b) => CurrentRead::Bytes(b),
-            Err(_) => CurrentRead::Skip,
-        },
+    use tokio::io::AsyncReadExt;
+
+    let file = match tokio::fs::File::open(absolute).await {
+        Ok(f) => f,
+        Err(_) => return CurrentRead::Skip,
+    };
+    // Read one byte past the cap so a file exactly at the cap is kept while a
+    // larger one is detected by the presence of that extra byte.
+    let limit = read_cap.saturating_add(1);
+    let mut buf = Vec::new();
+    match file.take(limit).read_to_end(&mut buf).await {
+        Ok(_) => {
+            if buf.len() as u64 > read_cap {
+                CurrentRead::TooLarge
+            } else {
+                CurrentRead::Bytes(buf)
+            }
+        }
         Err(_) => CurrentRead::Skip,
     }
 }
@@ -440,5 +457,32 @@ mod tests {
     fn is_text_classifies_binary() {
         assert!(is_text(b"hello\nworld"));
         assert!(!is_text(b"\x00binary"));
+    }
+
+    #[tokio::test]
+    // A file exactly at the cap is read in full as bytes, not flagged too-large.
+    async fn read_current_capped_keeps_file_at_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("at_cap.txt");
+        tokio::fs::write(&path, vec![b'a'; 64]).await.unwrap();
+        match read_current_capped(&path, 64).await {
+            CurrentRead::Bytes(b) => assert_eq!(b.len(), 64),
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // An oversized file is flagged TooLarge without buffering more than cap+1 bytes.
+    async fn read_current_capped_bounds_oversized_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        // On-disk file is far larger than the cap.
+        tokio::fs::write(&path, vec![b'a'; 1024 * 1024])
+            .await
+            .unwrap();
+        match read_current_capped(&path, 64).await {
+            CurrentRead::TooLarge => {}
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
     }
 }
