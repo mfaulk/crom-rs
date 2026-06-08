@@ -118,6 +118,7 @@ impl Tool for EditTool {
                 summary.push_str(change.value());
             }
         }
+        let summary = crate::truncate_with_marker(&summary, self.limits.max_output_bytes);
         let metadata = json!({
             "path": parsed.file_path,
             "replacements": 1,

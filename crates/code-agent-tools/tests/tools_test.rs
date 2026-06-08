@@ -165,6 +165,45 @@ async fn edit_succeeds_single_occurrence() {
 }
 
 #[tokio::test]
+// Edit caps a large diff summary in both content and metadata at max_output_bytes (plus marker).
+async fn edit_caps_large_diff_summary() {
+    let dir = TempDir::new().unwrap();
+    let limits = ToolLimits {
+        max_output_bytes: 1024,
+        ..ToolLimits::default()
+    };
+    // Replace a large block with a different large block so every line changes,
+    // producing a diff summary far larger than the cap (many +/- lines).
+    let old_block: String = (0..20_000).map(|i| format!("old line {i}\n")).collect();
+    let new_block: String = (0..20_000).map(|i| format!("new line {i}\n")).collect();
+    let original = format!("header\n{old_block}footer\n");
+    std::fs::write(dir.path().join("big.txt"), &original).unwrap();
+    let tool = EditTool::new(Arc::new(limits));
+    let res = tool
+        .execute(
+            json!({"file_path": "big.txt", "old_string": old_block, "new_string": new_block}),
+            ctx_for(&dir),
+        )
+        .await
+        .unwrap();
+    assert!(!res.is_error);
+    let cap = 1024;
+    let marker_slack = 128;
+    let diff = res.metadata.get("diff").unwrap().as_str().unwrap();
+    assert!(
+        diff.len() <= cap + marker_slack,
+        "metadata diff len {} exceeds cap",
+        diff.len()
+    );
+    let code_agent_core::ToolContent::Text(text) = &res.content[0];
+    assert!(
+        text.len() <= cap + marker_slack + 64,
+        "content text len {} exceeds cap",
+        text.len()
+    );
+}
+
+#[tokio::test]
 // Bash kills a long-running command after the configured timeout.
 async fn bash_timeout_kills_command() {
     let dir = TempDir::new().unwrap();
