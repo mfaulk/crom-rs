@@ -151,25 +151,6 @@ pub fn resolve_credential(inputs: AuthResolverInputs<'_>) -> Result<ResolvedAuth
         Ok(None)
     };
 
-    // Informational conflict warning when an env var would override a stored
-    // credential. Only emitted under `EnvFirst`, where the env var actually
-    // outranks stored sources; under `ExplicitFirst`/`StoredFirst` an active
-    // stored account wins, so the warning would be misleading. A backend error
-    // while probing is swallowed here (the warning is best-effort and must not
-    // suppress resolution); a real error still surfaces from the precedence
-    // chain below if a store source is actually selected.
-    if inputs.mode == AuthPrecedenceMode::EnvFirst && env.is_some() {
-        let stored_present =
-            matches!(stored_active(), Ok(Some(_))) || matches!(stored_first(), Ok(Some(_)));
-        if stored_present {
-            if let Some(name) = provider_env_var(&provider) {
-                warnings.push(format!(
-                    "{name} environment variable will override stored {provider} account under env-first precedence"
-                ));
-            }
-        }
-    }
-
     // Resolve in precedence order, short-circuiting at the first available
     // credential so lower-precedence store lookups (and their errors) are
     // only reached when nothing higher-precedence applies.
@@ -212,6 +193,31 @@ pub fn resolve_credential(inputs: AuthResolverInputs<'_>) -> Result<ResolvedAuth
             }
         }
     };
+
+    // Informational conflict warning, driven by the *actual* resolution
+    // outcome rather than the mode alone: emit it precisely when the chosen
+    // credential is the provider env var while a stored credential was also
+    // available, so env genuinely overrode an available stored credential.
+    // This covers `EnvFirst` (env always outranks stored) and the
+    // `ExplicitFirst` sub-case where there is no explicit key/account and no
+    // active stored account, so env is selected ahead of `stored_first()`. A
+    // backend error while probing for a stored credential is swallowed here
+    // (the warning is best-effort and must not suppress resolution); a real
+    // error still surfaces from the precedence chain above when a store source
+    // is actually selected.
+    if let Some(ResolvedCredential::ApiKey {
+        source: CredentialSource::EnvVar(name),
+        ..
+    }) = chosen.as_ref()
+    {
+        let stored_present =
+            matches!(stored_active(), Ok(Some(_))) || matches!(stored_first(), Ok(Some(_)));
+        if stored_present {
+            warnings.push(format!(
+                "{name} environment variable will override stored {provider} account"
+            ));
+        }
+    }
 
     match chosen {
         Some(c) => Ok(ResolvedAuth {
@@ -642,6 +648,62 @@ mod tests {
         })
         .unwrap();
         assert!(res.warnings.is_empty());
+    }
+
+    /// Build a store holding an inactive stored account (not set active), so
+    /// it is reachable only via the `stored_first` fallback, not `active`.
+    fn store_with_inactive_account(provider: ProviderId, id: &str, key: &str) -> CredentialStore {
+        let store = CredentialStore::new_in_memory_for_tests();
+        let aid = AccountId::new(id);
+        let acct = StoredAccount {
+            account_id: aid.clone(),
+            provider: provider.clone(),
+            login_method: LoginMethodKind::ApiKey,
+            display_email: None,
+            workspace_id: None,
+            plan_type: None,
+            created_at: OffsetDateTime::now_utc(),
+            last_refresh_at: None,
+            expires_at: None,
+            scopes: vec![],
+            active: false,
+            metadata: serde_json::json!({}),
+            needs_reauth: false,
+        };
+        let secret = StoredCredentialSecret {
+            api_key: Some(SecretString::new(key.into())),
+            ..Default::default()
+        };
+        store.put(acct, &secret).unwrap();
+        store
+    }
+
+    #[test]
+    // ExplicitFirst with no explicit key/account and no active account, but a
+    // stored_first credential available: env actually wins over the reachable
+    // stored credential, so the override warning fires.
+    fn warns_on_env_vs_stored_first_in_explicit_first() {
+        let store = store_with_inactive_account(ProviderId::Anthropic, "k1", "stored-key");
+        let mut env = BTreeMap::new();
+        env.insert("ANTHROPIC_API_KEY".into(), "env-key".into());
+        let res = resolve_credential(AuthResolverInputs {
+            provider: Some(ProviderId::Anthropic),
+            mode: AuthPrecedenceMode::ExplicitFirst,
+            explicit_api_key: None,
+            explicit_account: None,
+            active_account: None,
+            env,
+            store: Some(&store),
+        })
+        .unwrap();
+        match &res.credential {
+            ResolvedCredential::ApiKey { source, .. } => {
+                assert!(matches!(source, CredentialSource::EnvVar(_)));
+            }
+            other => panic!("expected env ApiKey, got {other:?}"),
+        }
+        assert!(!res.warnings.is_empty());
+        assert!(res.warnings[0].contains("ANTHROPIC_API_KEY"));
     }
 
     #[test]
