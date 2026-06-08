@@ -402,7 +402,10 @@ fn canary_checks(task: &EvalTask, checks: &mut Vec<Check>) {
                 .path
                 .clone()
                 .unwrap_or_else(|| "repo".to_string());
-            if rel.starts_with(&fixture_root) && fixture_root != "." {
+            // Match on path components, not a raw string prefix, so a sibling
+            // like `repo-hidden/...` is NOT treated as inside `fixture_root=repo`
+            // (#81).
+            if Path::new(rel).starts_with(&fixture_root) && fixture_root != "." {
                 checks.push(Check::error(
                     "canary_hidden_visible",
                     format!("hidden fixture '{rel}' lives inside the public fixture"),
@@ -429,7 +432,9 @@ fn canary_checks(task: &EvalTask, checks: &mut Vec<Check>) {
             .path
             .clone()
             .unwrap_or_else(|| "repo".to_string());
-        if rel.starts_with(&fixture_root) && fixture_root != "." {
+        // Path-component match, not raw string prefix, so `repo-hidden/...` is
+        // not flagged as inside `fixture_root=repo` (#81).
+        if Path::new(rel).starts_with(&fixture_root) && fixture_root != "." {
             checks.push(Check::error(
                 "canary_oracle_visible",
                 format!("oracle patch '{rel}' lives inside the public fixture"),
@@ -568,6 +573,36 @@ mod tests {
             .checks
             .iter()
             .any(|c| c.name == "canary_metadata" && !c.passed));
+    }
+
+    /// REGRESSION (#81): a sibling path that merely shares a string prefix with
+    /// `fixture_root` ("repo-hidden" vs "repo") is NOT flagged as inside the
+    /// public fixture, while a true child path ("repo/...") IS flagged.
+    #[test]
+    fn canary_oracle_visible_uses_path_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `fixture_root` defaults to "repo" via task_in.
+        let mut sibling = task_in(tmp.path(), command_oracle(vec!["true".into()]));
+        sibling.oracle_patch = Some("repo-hidden/oracle.patch".to_string());
+        let mut sibling_checks = Vec::new();
+        canary_checks(&sibling, &mut sibling_checks);
+        assert!(
+            !sibling_checks
+                .iter()
+                .any(|c| c.name == "canary_oracle_visible"),
+            "sibling 'repo-hidden/...' must not be flagged as inside 'repo'"
+        );
+
+        let mut inside = task_in(tmp.path(), command_oracle(vec!["true".into()]));
+        inside.oracle_patch = Some("repo/oracle.patch".to_string());
+        let mut inside_checks = Vec::new();
+        canary_checks(&inside, &mut inside_checks);
+        assert!(
+            inside_checks
+                .iter()
+                .any(|c| c.name == "canary_oracle_visible" && !c.passed),
+            "child 'repo/...' must be flagged as inside the public fixture"
+        );
     }
 
     #[tokio::test]
