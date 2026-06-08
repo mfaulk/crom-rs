@@ -712,6 +712,15 @@ pub async fn summarize_session(
         std::collections::HashMap::new();
     let mut uncounted_sum: f64 = 0.0;
     let mut saw_any_cost = false;
+    // Token usage is cumulative per run just like cost, so it must be
+    // bucketed the same way: keep the last `TokenUsage` per run id and add
+    // up the run-less ones, then sum the buckets at the end. Summing on
+    // every Result double-counts whenever a run emits more than one Result.
+    let mut last_usage_per_run: std::collections::HashMap<
+        code_agent_core::RunId,
+        code_agent_core::TokenUsage,
+    > = std::collections::HashMap::new();
+    let mut uncounted_usage = code_agent_core::TokenUsage::default();
     for r in &records {
         if s.cwd.is_none() {
             s.cwd = Some(r.cwd.clone());
@@ -736,8 +745,16 @@ pub async fn summarize_session(
                     s.final_result = res.result.clone();
                     s.final_subtype = Some(format!("{:?}", res.subtype));
                     if let Some(u) = &res.usage {
-                        s.total_input_tokens += u.input_tokens;
-                        s.total_output_tokens += u.output_tokens;
+                        match &res.run_id {
+                            // Overwrite, not add: cumulative usage per run,
+                            // mirroring `last_cost_per_run`.
+                            Some(run_id) => {
+                                last_usage_per_run.insert(run_id.clone(), u.clone());
+                            }
+                            // No run id to bucket by — accumulate directly,
+                            // mirroring `uncounted_sum`.
+                            None => uncounted_usage.add(u),
+                        }
                     }
                     if let Some(c) = res.total_cost_usd {
                         saw_any_cost = true;
@@ -766,6 +783,14 @@ pub async fn summarize_session(
         let bucketed: f64 = last_cost_per_run.values().sum();
         s.total_cost_usd = Some(bucketed + uncounted_sum);
     }
+    // Sum the per-run usage buckets plus the run-less accumulator. The summary
+    // only tracks input/output totals (no cache fields), so collapse to those.
+    let mut total_usage = uncounted_usage;
+    for u in last_usage_per_run.values() {
+        total_usage.add(u);
+    }
+    s.total_input_tokens = total_usage.input_tokens;
+    s.total_output_tokens = total_usage.output_tokens;
     Ok(s)
 }
 
@@ -1266,6 +1291,124 @@ mod tests {
             (total - 0.25).abs() < 1e-9,
             "expected 0.25 (last of run-a + sum of None), got {total}"
         );
+    }
+
+    // Build a SessionRecord wrapping an AgentResult event carrying cumulative
+    // token usage for the given run id. Used by the token-accounting tests.
+    fn result_record_with_usage(
+        dir: &TempDir,
+        session_id: &SessionId,
+        run_id: Option<&str>,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> SessionRecord {
+        let res = AgentResult {
+            subtype: ResultSubtype::Success,
+            result: None,
+            session_id: session_id.clone(),
+            run_id: run_id.map(|s| RunId(s.to_string())),
+            num_turns: 1,
+            usage: Some(code_agent_core::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            total_cost_usd: None,
+        };
+        SessionRecord::new(
+            now_iso(),
+            dir.path().to_path_buf(),
+            session_id.to_string(),
+            SessionPayload::Event(AgentEvent::Result(res)),
+        )
+    }
+
+    #[tokio::test]
+    // Token usage is cumulative per run, so two Results sharing one run_id must
+    // collapse to the last reported value, not the sum. Run A reports 100/10
+    // then a later cumulative 250/30; the session total must equal the last
+    // (250/30), not 350/40.
+    async fn summary_tokens_take_last_per_run() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        store
+            .append(
+                &id,
+                result_record_with_usage(&dir, &id, Some("run-a"), 100, 10),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                &id,
+                result_record_with_usage(&dir, &id, Some("run-a"), 250, 30),
+            )
+            .await
+            .unwrap();
+
+        let summary = summarize_session(&store, &id).await.unwrap();
+        assert_eq!(summary.total_input_tokens, 250);
+        assert_eq!(summary.total_output_tokens, 30);
+    }
+
+    #[tokio::test]
+    // Distinct run_ids contribute independently; their last-per-run usages sum.
+    // Run A's last is 250/30, run B's last is 40/5, so the total is 290/35.
+    async fn summary_tokens_sum_across_runs() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        store
+            .append(
+                &id,
+                result_record_with_usage(&dir, &id, Some("run-a"), 100, 10),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                &id,
+                result_record_with_usage(&dir, &id, Some("run-a"), 250, 30),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                &id,
+                result_record_with_usage(&dir, &id, Some("run-b"), 40, 5),
+            )
+            .await
+            .unwrap();
+
+        let summary = summarize_session(&store, &id).await.unwrap();
+        assert_eq!(summary.total_input_tokens, 290);
+        assert_eq!(summary.total_output_tokens, 35);
+    }
+
+    #[tokio::test]
+    // Results without a run_id cannot be bucketed, so each contributes its
+    // full usage: 100/10 + 40/5 = 140/15.
+    async fn summary_tokens_sum_results_without_run_id() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+
+        store
+            .append(&id, result_record_with_usage(&dir, &id, None, 100, 10))
+            .await
+            .unwrap();
+        store
+            .append(&id, result_record_with_usage(&dir, &id, None, 40, 5))
+            .await
+            .unwrap();
+
+        let summary = summarize_session(&store, &id).await.unwrap();
+        assert_eq!(summary.total_input_tokens, 140);
+        assert_eq!(summary.total_output_tokens, 15);
     }
 
     #[tokio::test]
