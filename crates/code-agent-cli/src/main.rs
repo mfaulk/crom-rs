@@ -1688,6 +1688,7 @@ async fn resolve_common(
         disallowed_tool_rules: settings.disallowed_tools.clone(),
         permission_mode: mode,
         max_turns: Some(max_turns),
+        max_tool_calls: None,
         session_id: None,
         permission_callback,
         system_prompt: None,

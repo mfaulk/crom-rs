@@ -98,9 +98,10 @@ pub struct AgentOptions {
     /// Hard ceiling on the number of tool calls the run may start. When
     /// set, the loop refuses to dispatch a turn whose tool calls would push
     /// the running total past this cap and ends with
-    /// [`ResultSubtype::ErrorMaxToolCalls`]. `None` means unlimited. A run
-    /// that uses exactly `max_tool_calls` calls and then finishes naturally
-    /// is not affected — the cap only blocks the call that would exceed it.
+    /// [`crate::events::ResultSubtype::ErrorMaxToolCalls`]. `None` means
+    /// unlimited. A run that uses exactly `max_tool_calls` calls and then
+    /// finishes naturally is not affected — the cap only blocks the call
+    /// that would exceed it.
     pub max_tool_calls: Option<u32>,
     pub session_id: Option<SessionId>,
     pub permission_callback: Option<Arc<dyn PermissionCallback>>,
