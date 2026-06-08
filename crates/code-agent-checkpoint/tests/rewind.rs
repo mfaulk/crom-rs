@@ -450,6 +450,83 @@ async fn binary_diff_marker() {
 }
 
 #[tokio::test]
+// A current file that grew beyond the per-file cap is reported as a
+// too-large Binary marker and never read fully into memory.
+async fn diff_oversized_current_file_not_read_fully() {
+    use code_agent_checkpoint::CheckpointLimits;
+
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().to_path_buf();
+    // Tiny per-file cap so a grown current file blows past it.
+    let limits = CheckpointLimits {
+        max_checkpoint_bytes_per_file: 64,
+        ..CheckpointLimits::default()
+    };
+    let store = LocalCheckpointStore::with_limits(cwd.clone(), limits);
+    let sid = SessionId::new();
+
+    tokio::fs::write(cwd.join("log.txt"), b"small\n")
+        .await
+        .unwrap();
+    let id = store
+        .create_checkpoint(CreateCheckpointRequest {
+            session_id: sid.clone(),
+            run_id: RunId::new(),
+            cwd: cwd.clone(),
+            description: None,
+            user_message_id: None,
+            git_state: None,
+        })
+        .await
+        .unwrap();
+    store
+        .capture_before_tool(CaptureBeforeToolRequest {
+            checkpoint_id: id.clone(),
+            session_id: sid.clone(),
+            run_id: RunId::new(),
+            cwd: cwd.clone(),
+            tool_name: "Edit".into(),
+            tool_input: serde_json::json!({"file_path": "log.txt"}),
+            paths: vec![ws_path("log.txt")],
+        })
+        .await
+        .unwrap();
+
+    // The current file grows far past the per-file cap (text, no NUL bytes).
+    let huge = vec![b'a'; 1024 * 1024];
+    tokio::fs::write(cwd.join("log.txt"), &huge).await.unwrap();
+
+    let diff = store
+        .diff_checkpoint(DiffCheckpointRequest {
+            checkpoint_id: id,
+            session_id: sid,
+            cwd,
+            max_bytes: Some(4096),
+        })
+        .await
+        .unwrap();
+
+    // It must be flagged as a too-large Binary change, not a rendered diff
+    // that embedded the megabyte of content.
+    assert!(
+        diff.file_diffs
+            .iter()
+            .any(|f| matches!(f, FileDiff::Binary { .. })),
+        "oversized current file should be a Binary marker: {:?}",
+        diff.file_diffs
+    );
+    for fd in &diff.file_diffs {
+        if let FileDiff::Modified { unified_diff, .. } = fd {
+            assert!(
+                unified_diff.len() < 64 * 1024,
+                "rendered diff must stay bounded, got {} bytes",
+                unified_diff.len()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 // .env files are redacted in diff output, never embedded in content.
 async fn env_files_redacted_in_diff() {
     let (_dir, store, sid, cwd) = fresh().await;

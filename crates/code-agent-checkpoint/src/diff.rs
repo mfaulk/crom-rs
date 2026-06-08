@@ -134,6 +134,31 @@ pub fn redact_path_for_diff(path: &WorkspaceRelativePath) -> bool {
     false
 }
 
+/// Outcome of attempting to read the current on-disk file for a diff.
+enum CurrentRead {
+    /// File contents, read in full (within the size cap).
+    Bytes(Vec<u8>),
+    /// File exceeds the read cap; treat like a binary change so its
+    /// contents are never loaded into memory or rendered.
+    TooLarge,
+    /// Stat or read failed (e.g. the file vanished mid-diff); skip it.
+    Skip,
+}
+
+/// Stats `absolute` and reads it only when its size is within `read_cap`.
+/// Files larger than the cap are reported as [`CurrentRead::TooLarge`]
+/// without ever being loaded, mirroring how binary files are surfaced.
+async fn read_current_capped(absolute: &std::path::Path, read_cap: u64) -> CurrentRead {
+    match tokio::fs::metadata(absolute).await {
+        Ok(meta) if meta.len() > read_cap => CurrentRead::TooLarge,
+        Ok(_) => match tokio::fs::read(absolute).await {
+            Ok(b) => CurrentRead::Bytes(b),
+            Err(_) => CurrentRead::Skip,
+        },
+        Err(_) => CurrentRead::Skip,
+    }
+}
+
 pub(crate) async fn diff_checkpoint(
     store: &LocalCheckpointStore,
     request: DiffCheckpointRequest,
@@ -157,6 +182,11 @@ pub(crate) async fn diff_checkpoint(
         .await?;
 
     let cap = request.max_bytes.unwrap_or(DEFAULT_MAX_DIFF_BYTES);
+    // Bound how much of the *current* on-disk file we will read. The blob
+    // side was capped at capture time, but the live file may have grown
+    // unbounded since then; reading it whole would defeat `max_bytes`,
+    // which only limits rendered output. Reuse the per-file capture cap.
+    let read_cap = store.limits().max_checkpoint_bytes_per_file;
     let mut total_bytes = 0usize;
     let mut truncated_overall = false;
     let mut file_diffs: Vec<FileDiff> = Vec::new();
@@ -199,9 +229,23 @@ pub(crate) async fn diff_checkpoint(
                         truncated: t,
                     });
                 } else {
-                    let current = match tokio::fs::read(&absolute).await {
-                        Ok(b) => b,
-                        Err(_) => continue,
+                    let current = match read_current_capped(&absolute, read_cap).await {
+                        CurrentRead::Bytes(b) => b,
+                        CurrentRead::Skip => continue,
+                        CurrentRead::TooLarge => {
+                            if redact {
+                                file_diffs.push(FileDiff::Redacted {
+                                    path: path.clone(),
+                                    change_kind: BinaryChangeKind::Modified,
+                                });
+                            } else {
+                                file_diffs.push(FileDiff::Binary {
+                                    path: path.clone(),
+                                    change_kind: BinaryChangeKind::Modified,
+                                });
+                            }
+                            continue;
+                        }
                     };
                     if redact {
                         if original == current {
@@ -245,9 +289,23 @@ pub(crate) async fn diff_checkpoint(
                 if !exists_now {
                     continue;
                 }
-                let current = match tokio::fs::read(&absolute).await {
-                    Ok(b) => b,
-                    Err(_) => continue,
+                let current = match read_current_capped(&absolute, read_cap).await {
+                    CurrentRead::Bytes(b) => b,
+                    CurrentRead::Skip => continue,
+                    CurrentRead::TooLarge => {
+                        if redact {
+                            file_diffs.push(FileDiff::Redacted {
+                                path: path.clone(),
+                                change_kind: BinaryChangeKind::Created,
+                            });
+                        } else {
+                            file_diffs.push(FileDiff::Binary {
+                                path: path.clone(),
+                                change_kind: BinaryChangeKind::Created,
+                            });
+                        }
+                        continue;
+                    }
                 };
                 if redact {
                     file_diffs.push(FileDiff::Redacted {
