@@ -169,10 +169,17 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> (String, bool) {
     if s.len() <= max_bytes {
         return (s.to_string(), false);
     }
-    if max_bytes == 0 {
-        return ("[MCP tool result truncated]".into(), true);
-    }
     let marker = "\n[MCP tool result truncated]";
+    // No room for any body once the marker is accounted for: return as much of
+    // the marker as fits within max_bytes (char-boundary safe) so the output
+    // length never exceeds max_bytes.
+    if max_bytes <= marker.len() {
+        let mut end = max_bytes;
+        while end > 0 && !marker.is_char_boundary(end) {
+            end -= 1;
+        }
+        return (marker[..end].to_string(), true);
+    }
     let keep = max_bytes.saturating_sub(marker.len());
     let mut end = keep.min(s.len());
     while !s.is_char_boundary(end) {
@@ -233,24 +240,46 @@ mod tests {
     }
 
     #[test]
-    // A zero byte budget yields only the truncation marker, flagged truncated.
-    fn truncate_utf8_zero_budget_returns_marker() {
+    // A zero byte budget yields an empty (but flagged) result so the output
+    // never exceeds the cap.
+    fn truncate_utf8_zero_budget_returns_empty() {
         let (out, truncated) = truncate_utf8("hello", 0);
-        assert_eq!(out, "[MCP tool result truncated]");
+        assert_eq!(out, "");
         assert!(truncated);
+    }
+
+    #[test]
+    // For every tiny byte budget (1..=27, below the marker length) and a few
+    // larger values, the returned output never exceeds max_bytes.
+    fn truncate_utf8_never_exceeds_max_bytes() {
+        let s = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(4);
+        for max_bytes in (1..=27).chain([28, 29, 40, 64]) {
+            let (out, truncated) = truncate_utf8(&s, max_bytes);
+            assert!(truncated, "expected truncation for max_bytes={max_bytes}");
+            assert!(
+                out.len() <= max_bytes,
+                "out.len()={} exceeds max_bytes={}",
+                out.len(),
+                max_bytes
+            );
+            // Output must remain valid UTF-8 (no split codepoint).
+            assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        }
     }
 
     #[test]
     // Truncation never splits a multi-byte codepoint: the kept prefix is
     // backed off to a char boundary and the marker is appended.
     fn truncate_utf8_respects_char_boundary() {
-        // Each `é` is 2 bytes; 10 of them = 20 bytes.
-        let s = "é".repeat(10);
-        let (out, truncated) = truncate_utf8(&s, 12);
+        // Each `é` is 2 bytes; 30 of them = 60 bytes. With max_bytes=35 the
+        // body budget (35 - 28 marker = 7) lands mid-codepoint and must back
+        // off to a char boundary (6 bytes) before the marker is appended.
+        let s = "é".repeat(30);
+        let (out, truncated) = truncate_utf8(&s, 35);
         assert!(truncated);
         assert!(out.ends_with("[MCP tool result truncated]"));
+        assert!(out.len() <= 35);
         // The kept body must still be valid UTF-8 (no split codepoint).
-        assert!(out.is_char_boundary(0));
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 
