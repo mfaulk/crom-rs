@@ -202,7 +202,9 @@ pub(crate) async fn diff_checkpoint(
     // Bound how much of the *current* on-disk file we will read. The blob
     // side was capped at capture time, but the live file may have grown
     // unbounded since then; reading it whole would defeat `max_bytes`,
-    // which only limits rendered output. Reuse the per-file capture cap.
+    // which only limits rendered output. Reuse the per-file capture cap as the
+    // baseline; the existing-file path may raise it to the captured blob's
+    // length so an unchanged-but-large file can still be compared in full.
     let read_cap = store.limits().max_checkpoint_bytes_per_file;
     let mut total_bytes = 0usize;
     let mut truncated_overall = false;
@@ -246,7 +248,16 @@ pub(crate) async fn diff_checkpoint(
                         truncated: t,
                     });
                 } else {
-                    let current = match read_current_capped(&absolute, read_cap).await {
+                    // The captured `original` blob may have been stored under a
+                    // larger per-file cap than the one in force now. Raise the
+                    // read cap to at least the blob's length so an *unchanged*
+                    // file can still be read in full and compared byte-for-byte
+                    // rather than being falsely flagged `TooLarge`/Modified. A
+                    // file genuinely larger than the blob is still bounded: it
+                    // exceeds `original.len()` (hence `read_cap`) and surfaces as
+                    // TooLarge as before.
+                    let existing_read_cap = read_cap.max(original.len() as u64);
+                    let current = match read_current_capped(&absolute, existing_read_cap).await {
                         CurrentRead::Bytes(b) => b,
                         CurrentRead::Skip => continue,
                         CurrentRead::TooLarge => {

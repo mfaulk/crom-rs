@@ -527,6 +527,85 @@ async fn diff_oversized_current_file_not_read_fully() {
 }
 
 #[tokio::test]
+// An unchanged file whose captured blob exceeds the current diff-time cap is
+// read in full and compared, reporting no modification (not a TooLarge marker).
+async fn diff_unchanged_file_larger_than_current_cap_not_modified() {
+    use code_agent_checkpoint::CheckpointLimits;
+
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path().to_path_buf();
+
+    // A text file comfortably larger than the small diff-time cap below.
+    let content = vec![b'a'; 4096];
+    tokio::fs::write(cwd.join("big.txt"), &content)
+        .await
+        .unwrap();
+
+    let sid = SessionId::new();
+    let run_id = RunId::new();
+
+    // Capture under a large per-file cap so the full blob is stored.
+    let big_store = LocalCheckpointStore::with_limits(
+        cwd.clone(),
+        CheckpointLimits {
+            max_checkpoint_bytes_per_file: 1024 * 1024,
+            ..CheckpointLimits::default()
+        },
+    );
+    let id = big_store
+        .create_checkpoint(CreateCheckpointRequest {
+            session_id: sid.clone(),
+            run_id: run_id.clone(),
+            cwd: cwd.clone(),
+            description: None,
+            user_message_id: None,
+            git_state: None,
+        })
+        .await
+        .unwrap();
+    big_store
+        .capture_before_tool(CaptureBeforeToolRequest {
+            checkpoint_id: id.clone(),
+            session_id: sid.clone(),
+            run_id: run_id.clone(),
+            cwd: cwd.clone(),
+            tool_name: "Edit".into(),
+            tool_input: serde_json::json!({"file_path": "big.txt"}),
+            paths: vec![ws_path("big.txt")],
+        })
+        .await
+        .unwrap();
+
+    // The file is left UNCHANGED on disk.
+
+    // Diff under a tiny per-file cap (smaller than the captured blob) against
+    // the same on-disk store/blobs.
+    let small_store = LocalCheckpointStore::with_limits(
+        cwd.clone(),
+        CheckpointLimits {
+            max_checkpoint_bytes_per_file: 64,
+            ..CheckpointLimits::default()
+        },
+    );
+    let diff = small_store
+        .diff_checkpoint(DiffCheckpointRequest {
+            checkpoint_id: id,
+            session_id: sid,
+            cwd,
+            max_bytes: Some(4096),
+        })
+        .await
+        .unwrap();
+
+    // The unchanged file must produce no diff entry at all.
+    assert!(
+        diff.file_diffs.is_empty(),
+        "unchanged file larger than diff cap must not be reported: {:?}",
+        diff.file_diffs
+    );
+}
+
+#[tokio::test]
 // .env files are redacted in diff output, never embedded in content.
 async fn env_files_redacted_in_diff() {
     let (_dir, store, sid, cwd) = fresh().await;
