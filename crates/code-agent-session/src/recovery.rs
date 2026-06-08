@@ -135,8 +135,14 @@ pub async fn read_lock(
         return Ok(None);
     }
     let bytes = tokio::fs::read(&path).await?;
-    let lock: RunLock = serde_json::from_slice(&bytes)?;
-    Ok(Some(lock))
+    // A crash mid-write can leave a truncated `*.lock` (the lock is written
+    // with a plain write+flush, not an atomic rename). Treat a malformed lock
+    // as "no usable lock" rather than propagating a hard error that would abort
+    // the whole `detect_state` scan. Genuine I/O errors above still surface.
+    match serde_json::from_slice::<RunLock>(&bytes) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Result of [`detect_state`] for a single session.
@@ -714,5 +720,42 @@ mod tests {
         assert!(super::parse_iso("not a date").is_none());
         assert!(super::parse_iso("2026-05-17").is_none());
         assert!(super::parse_iso("").is_none());
+    }
+
+    #[tokio::test]
+    // A corrupt/partial lock file is treated as "no usable lock": read_lock
+    // returns Ok(None) on a JSON parse failure instead of erroring.
+    async fn read_lock_returns_none_on_corrupt_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+        // Truncated/partial lock JSON left by a crash mid-write.
+        let lock_path = lock_path_for(dir.path(), &id).unwrap();
+        std::fs::write(&lock_path, b"{\"run_id\":\"r\",\"started").unwrap();
+        let lock = read_lock(dir.path(), &id).await.unwrap();
+        assert!(lock.is_none());
+    }
+
+    #[tokio::test]
+    // A single corrupt lock does not abort the whole detect_state scan; the
+    // session is still reported and classified sensibly (Interrupted, since it
+    // has records, no Result, and no usable lock).
+    async fn detect_state_survives_corrupt_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = FsSessionStore::new(dir.path());
+        let id = store.create(dir.path()).await.unwrap();
+        append_user_prompt(&store, dir.path(), &id, "do thing")
+            .await
+            .unwrap();
+        let lock_path = lock_path_for(dir.path(), &id).unwrap();
+        std::fs::write(&lock_path, b"{\"run_id\":\"r\",\"started").unwrap();
+
+        let infos = detect_state(dir.path(), 3600).await.unwrap();
+        let info = infos
+            .iter()
+            .find(|i| i.session_id.as_str() == id.as_str())
+            .expect("session must still be reported despite corrupt lock");
+        assert!(info.lock.is_none());
+        assert_eq!(info.state, S::Interrupted);
     }
 }
