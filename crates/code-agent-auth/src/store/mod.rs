@@ -711,21 +711,30 @@ mod tests {
             index: index.clone(),
             index_path: Some(bad_index.clone()),
         };
-        // Seed a valid index + lock file via a clean put, then lock the
-        // directory down so subsequent persists fail at the temp-file step.
+        // Seed a valid index + lock file via a clean put, then break only the
+        // index-persist step (not the under-lock reload) so the secret is
+        // written but committing the new index fails.
         store_bad.put(acct.clone(), &old_secret).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // Read-only directory: reload still reads the seeded index, the
+            // lock file already exists, but `write_secret_file`'s temp-file
+            // create inside the directory fails at the persist step.
             std::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         }
         #[cfg(not(unix))]
         {
-            // On non-unix, fall back to making the index path a directory so
-            // the rename in `persist_index` fails; reload tolerates the read
-            // error path is not exercised because the lock file pre-exists.
-            std::fs::remove_file(&bad_index).ok();
-            std::fs::create_dir(&bad_index).unwrap();
+            // Non-unix equivalent: keep the seeded `index.json` as a valid,
+            // readable file (so the under-lock reload SUCCEEDS) and make only
+            // the atomic persist fail by marking the index file read-only.
+            // The temp file is created in the (writable) directory, but the
+            // final rename over the read-only `index.json` is rejected, so the
+            // failure is injected at the index-persist step, mirroring the
+            // unix branch.
+            let mut perms = std::fs::metadata(&bad_index).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&bad_index, perms).unwrap();
         }
         let new_secret = StoredCredentialSecret {
             api_key: Some(SecretString::new("sk-new".into())),
@@ -739,6 +748,14 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o700)).ok();
+        }
+        #[cfg(not(unix))]
+        {
+            if let Ok(meta) = std::fs::metadata(&bad_index) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                std::fs::set_permissions(&bad_index, perms).ok();
+            }
         }
 
         // The credential must NOT be destroyed by the failed update — and it
