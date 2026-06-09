@@ -2015,12 +2015,8 @@ fn cap_string(mut s: String, limit: usize) -> String {
     if s.chars().count() <= limit {
         return s;
     }
-    let mut end = 0;
-    for (idx, _) in s.char_indices().take(limit.saturating_sub(1)) {
-        end = idx;
-    }
-    if end > 0 {
-        s.truncate(end);
+    if let Some((idx, _)) = s.char_indices().nth(limit) {
+        s.truncate(idx);
     }
     s.push_str("...");
     s
@@ -2092,5 +2088,40 @@ pub fn tool_schema_from_tool(tool: &dyn Tool) -> crate::provider::ToolSchema {
         name: tool.name().to_string(),
         description: tool.description().to_string(),
         input_schema: tool.input_schema(),
+    }
+}
+
+#[cfg(test)]
+mod cap_string_tests {
+    use super::cap_string;
+
+    // Strings at or under the limit are returned unchanged, with no ellipsis.
+    #[test]
+    fn keeps_strings_within_limit_unchanged() {
+        assert_eq!(cap_string("hello".to_string(), 5), "hello");
+        assert_eq!(cap_string("hi".to_string(), 5), "hi");
+        assert_eq!(cap_string(String::new(), 0), "");
+    }
+
+    // Over-limit strings keep exactly `limit` characters followed by an ellipsis.
+    #[test]
+    fn truncates_to_limit_chars_plus_ellipsis() {
+        assert_eq!(cap_string("hello world".to_string(), 5), "hello...");
+        assert_eq!(cap_string("abcdef".to_string(), 4), "abcd...");
+    }
+
+    // Small limits still truncate rather than returning the whole string.
+    #[test]
+    fn handles_small_limits() {
+        assert_eq!(cap_string("abc".to_string(), 1), "a...");
+        assert_eq!(cap_string("abc".to_string(), 2), "ab...");
+        assert_eq!(cap_string("abc".to_string(), 0), "...");
+    }
+
+    // Truncation happens on a character boundary, never mid-codepoint.
+    #[test]
+    fn truncates_on_char_boundary_for_multibyte() {
+        assert_eq!(cap_string("héllo world".to_string(), 5), "héllo...");
+        assert_eq!(cap_string("日本語テスト".to_string(), 3), "日本語...");
     }
 }

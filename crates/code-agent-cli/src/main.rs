@@ -3277,12 +3277,14 @@ async fn run_one_shot(
 
     let mut options = cfg.options.clone();
     options.session_id = Some(session_id.clone());
+    let mut seen: std::collections::HashSet<String> = options
+        .tool_search
+        .preloaded_discovered_tools
+        .iter()
+        .cloned()
+        .collect();
     for tool_name in preloaded_discovered_tools {
-        if !options
-            .tool_search
-            .preloaded_discovered_tools
-            .contains(&tool_name)
-        {
+        if seen.insert(tool_name.clone()) {
             options
                 .tool_search
                 .preloaded_discovered_tools
