@@ -1,4 +1,5 @@
 mod auth_cmd;
+mod diagnostics_cmd;
 mod eval_cmd;
 mod m9;
 mod plan_cmd;
@@ -167,6 +168,10 @@ enum Command {
     /// M14: coding-agent capability evaluation harness.
     #[command(subcommand)]
     Eval(eval_cmd::EvalCommand),
+    /// M16: parse command output (compiler/test logs) into structured
+    /// diagnostics, without an agent session.
+    #[command(subcommand)]
+    Diagnostics(diagnostics_cmd::DiagnosticsCommand),
 }
 
 #[derive(Parser, Debug)]
@@ -1462,6 +1467,7 @@ async fn main() -> ExitCode {
         }
         Command::HeadlessRun(args) => sdk_cmd::cmd_headless_run(args).await,
         Command::Eval(cmd) => eval_cmd::run(cmd).await,
+        Command::Diagnostics(cmd) => diagnostics_cmd::run(cmd),
     };
 
     match result {

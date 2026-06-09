@@ -1,0 +1,39 @@
+schema_version = 2
+id = "repair-grep-recover"
+title = "Repair: recover from a failing check within the run"
+category = "repair"
+difficulty = "easy"
+tags = ["repair", "recovery", "golden", "small"]
+suites = ["repair-smoke", "repair-mini"]
+
+prompt = """
+The file data.txt must contain `value=42`. Inspect it, run the check
+`grep -q 'value=42' data.txt`, fix the file if the check fails, and verify the
+check passes before finishing.
+"""
+
+max_turns = 10
+timeout_secs = 60
+
+[capabilities]
+requires_test_feedback = true
+
+[behavior]
+require_validation_after_edit = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# Public verification: the workspace must satisfy the requirement after the run.
+[oracle]
+kind = "command"
+commands = ["grep -q 'value=42' data.txt"]
+
+[[oracle.behavior]]
+kind = "must_use_tool"
+tool = "Edit"
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "grep"

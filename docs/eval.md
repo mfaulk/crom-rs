@@ -351,3 +351,13 @@ without the secret, live tasks skip cleanly.
   uses tags (e.g. `small`) and simple churn/deletion heuristics.
 - The harness avoids exact-diff matching by design: any patch that satisfies the
   command/file/behavior oracles is accepted.
+
+## Repair loop (M16)
+
+`code-agent eval run <suite> --repair enabled` turns on the bounded repair loop:
+failed validations are parsed into structured diagnostics, a targeted repair
+brief drives bounded retries, repeated identical failures are detected and
+stopped, and repair metrics + artifacts (`repair.json`, `repair.md`,
+`diagnostics.jsonl`, `validation-attempts.jsonl`) are recorded. The
+`repair-smoke` / `repair-mini` suites exercise it offline with the golden
+provider. See [repair-loop.md](repair-loop.md) and [diagnostics.md](diagnostics.md).

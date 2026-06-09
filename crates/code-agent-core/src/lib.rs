@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod client;
 pub mod compaction;
 pub mod conversation;
+pub mod diagnostics;
 pub mod errors;
 pub mod events;
 pub mod hooks;
@@ -17,6 +18,7 @@ pub mod plan;
 pub mod plugins;
 pub mod policy;
 pub mod provider;
+pub mod repair;
 pub mod run_id;
 pub mod settings;
 pub mod skills;
@@ -143,11 +145,11 @@ pub use provider::{ModelEvent, ModelProvider, ModelRequest};
 pub use run_id::RunId;
 pub use settings::{
     merge_settings_file_into, AgentsSettingsConfig, AuthProviderEntry, AuthSettingsConfig,
-    CheckpointRetentionConfig, CheckpointingConfig, CompactionSettingsConfig, EnabledPluginEntry,
-    HooksConfig, ModelFallbackEntry, ModelSettingsConfig, PlanningSettingsConfig,
-    PluginsSettingsConfig, ProjectInstructionsMode, SettingSource, Settings, SettingsError,
-    SettingsFile, SkillsSettingsConfig, SlashCommandsSettingsConfig, ToolLimitsConfig,
-    ValidationConfig,
+    CheckpointRetentionConfig, CheckpointingConfig, CompactionSettingsConfig, CompletionConfig,
+    DiagnosticsConfig, EnabledPluginEntry, HooksConfig, ModelFallbackEntry, ModelSettingsConfig,
+    PlanningSettingsConfig, PluginsSettingsConfig, ProjectInstructionsMode, RepairConfig,
+    SettingSource, Settings, SettingsError, SettingsFile, SkillsSettingsConfig,
+    SlashCommandsSettingsConfig, ToolLimitsConfig, ValidationConfig,
 };
 pub use skills::{
     compat_claude_skills_dir, filesystem_skills_dir, is_identifier_safe_skill_name,

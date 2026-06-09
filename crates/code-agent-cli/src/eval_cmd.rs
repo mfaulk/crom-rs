@@ -26,6 +26,10 @@ use code_agent_eval::runner::{run_tasks_repeated, EvalResult, EvalStatus, RunCon
 use code_agent_eval::task::{discover_tasks, EvalTask};
 use code_agent_eval::{triage, validate, RUNS_ROOT};
 
+// `Run(EvalRunArgs)` is much larger than the unit variants, but clap's
+// `Subcommand` derive cannot flatten a boxed variant, and these args are
+// constructed exactly once at startup — the size disparity is irrelevant here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum EvalCommand {
     /// List available eval tasks (id, title, tags, suites).
@@ -114,6 +118,21 @@ pub struct EvalRunArgs {
     /// Max attempts (Aider-style retry with test feedback).
     #[arg(long, default_value_t = 1)]
     pub attempts: usize,
+    /// M16: repair loop — `enabled` or `disabled` (default `disabled`). When
+    /// enabled, failed validations are parsed into structured diagnostics and a
+    /// targeted repair brief drives bounded retries.
+    #[arg(long, default_value = "disabled")]
+    pub repair: String,
+    /// M16: override the repair loop's max attempts (implies `--repair enabled`).
+    #[arg(long)]
+    pub repair_max_attempts: Option<u32>,
+    /// M16: require a validation command after the last mutation (records the
+    /// `final_answer_without_validation` warning otherwise).
+    #[arg(long)]
+    pub require_validation_after_edit: bool,
+    /// M16: diagnostic excerpt format hint for artifacts (`text` or `json`).
+    #[arg(long, default_value = "text")]
+    pub diagnostic_format: String,
     /// Include private suites/tasks in suite selection.
     #[arg(long)]
     pub include_private: bool,
@@ -355,6 +374,35 @@ fn select_tasks(args: &EvalRunArgs) -> Result<Vec<EvalTask>> {
     adapter.discover_tasks(Path::new(target))
 }
 
+/// Build the repair policy from the eval run flags. `--repair enabled|disabled`,
+/// with `--repair-max-attempts` and `--require-validation-after-edit` implying
+/// `enabled`.
+fn build_repair_policy(args: &EvalRunArgs) -> Result<code_agent_core::repair::RepairPolicy> {
+    use code_agent_core::repair::RepairPolicy;
+    let explicit_enable = args.repair_max_attempts.is_some() || args.require_validation_after_edit;
+    let enabled = match args.repair.to_ascii_lowercase().as_str() {
+        "enabled" | "on" | "true" => true,
+        "disabled" | "off" | "false" => explicit_enable,
+        other => {
+            return Err(anyhow!(
+                "invalid --repair '{other}' (expected enabled|disabled)"
+            ))
+        }
+    };
+    let mut policy = if enabled {
+        RepairPolicy::default()
+    } else {
+        RepairPolicy::disabled()
+    };
+    if let Some(n) = args.repair_max_attempts {
+        policy.max_attempts = n.max(1);
+    }
+    if args.require_validation_after_edit {
+        policy.require_validation_after_mutation = true;
+    }
+    Ok(policy)
+}
+
 async fn cmd_run(args: EvalRunArgs) -> Result<()> {
     let provider = ProviderMode::parse(&args.provider);
     if let ProviderMode::Live(name) = &provider {
@@ -384,6 +432,8 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
         run.root.display()
     );
 
+    let repair = build_repair_policy(&args)?;
+
     let config = RunConfig {
         provider: provider.clone(),
         timeout_grace: Duration::from_secs(30),
@@ -397,6 +447,7 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
         repetition: 0,
         seed: 0,
         attempts: args.attempts.max(1),
+        repair,
     };
 
     let results = run_tasks_repeated(&selected, &run, &config, repetitions).await;

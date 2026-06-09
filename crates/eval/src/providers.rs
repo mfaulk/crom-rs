@@ -215,6 +215,60 @@ pub fn golden_script(name: &str) -> Option<Vec<Vec<ModelEvent>>> {
             final_text_turn("Fixed add() to use addition; tests pass."),
         ]),
 
+        // M16 repair-smoke: within-run recovery. Read, run the failing check,
+        // make the correct edit, re-run the check (passes), finish. The agent
+        // validates after editing, so `validation_after_last_edit` is true.
+        "repair-grep-recover" => Some(vec![
+            tool_call_turn(
+                "rr1",
+                "Read",
+                serde_json::json!({ "file_path": "data.txt" }),
+            ),
+            tool_call_turn(
+                "rr2",
+                "Bash",
+                serde_json::json!({ "command": "grep -q 'value=42' data.txt" }),
+            ),
+            tool_call_turn(
+                "rr3",
+                "Edit",
+                serde_json::json!({
+                    "file_path": "data.txt",
+                    "old_string": "value=0",
+                    "new_string": "value=42"
+                }),
+            ),
+            tool_call_turn(
+                "rr4",
+                "Bash",
+                serde_json::json!({ "command": "grep -q 'value=42' data.txt" }),
+            ),
+            final_text_turn("Set value=42; the check now passes."),
+        ]),
+
+        // M16 repair-smoke: repeated-failure trap. The script makes a
+        // non-fixing edit and stops. The oracle fails; on the next attempt the
+        // identical script replays (the edit no longer matches the workspace)
+        // and the oracle fails with the *same* fingerprint, which the repair
+        // loop detects and stops on.
+        "repair-grep-trap" => Some(vec![
+            tool_call_turn(
+                "rt1",
+                "Read",
+                serde_json::json!({ "file_path": "data.txt" }),
+            ),
+            tool_call_turn(
+                "rt2",
+                "Edit",
+                serde_json::json!({
+                    "file_path": "data.txt",
+                    "old_string": "value=0",
+                    "new_string": "value=1"
+                }),
+            ),
+            final_text_turn("Changed the value."),
+        ]),
+
         _ => None,
     }
 }

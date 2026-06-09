@@ -53,6 +53,19 @@ pub enum FailureClass {
     OracleValidationFailed,
     /// The task manifest/fixture is invalid.
     TaskInvalid,
+    // --- M16 repair-loop failure classes ---
+    /// A compile error survived all repair attempts.
+    UnrecoveredCompileError,
+    /// A test failure survived all repair attempts.
+    UnrecoveredTestFailure,
+    /// The same failure fingerprint repeated past the policy limit.
+    RepeatedSameFailure,
+    /// The agent finalized after a mutation without validating it.
+    UnvalidatedCompletion,
+    /// The bounded repair loop exhausted its attempt budget.
+    RepairAttemptLimitExceeded,
+    /// Command output could not be parsed into a structured diagnostic.
+    DiagnosticParseFailure,
 }
 
 impl FailureClass {
@@ -81,6 +94,12 @@ impl FailureClass {
             AdapterError => "adapter_error",
             OracleValidationFailed => "oracle_validation_failed",
             TaskInvalid => "task_invalid",
+            UnrecoveredCompileError => "unrecovered_compile_error",
+            UnrecoveredTestFailure => "unrecovered_test_failure",
+            RepeatedSameFailure => "repeated_same_failure",
+            UnvalidatedCompletion => "unvalidated_completion",
+            RepairAttemptLimitExceeded => "repair_attempt_limit_exceeded",
+            DiagnosticParseFailure => "diagnostic_parse_failure",
         }
     }
 }

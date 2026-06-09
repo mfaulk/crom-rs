@@ -34,6 +34,7 @@ pub mod isolation;
 pub mod multirun;
 pub mod oracle;
 pub mod providers;
+pub mod repair;
 pub mod report;
 pub mod runner;
 pub mod schema;
@@ -48,6 +49,9 @@ pub use failure::FailureClass;
 pub use isolation::{EnvMetadata, IsolationBackend, LocalBackend};
 pub use oracle::{AssertionResult, BehaviorResult, CommandResult, OracleReport};
 pub use providers::{ProviderMode, ProviderSetup, ProviderUnavailable};
+pub use repair::{
+    FinalValidationStatus, RepairMetrics, RepairSession, RepairTrace, ValidationAttempt,
+};
 pub use runner::{EvalResult, EvalStatus, RunConfig};
 pub use schema::{
     BehaviorRules, Capabilities, HiddenSpec, PromptVariants, Quarantine, Visibility,

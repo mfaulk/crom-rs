@@ -1268,6 +1268,9 @@ pub fn settings_to_file(s: &Settings) -> code_agent_core::SettingsFile {
         auth: Some(s.auth.clone()),
         model_config: Some(s.model_config.clone()),
         planning: s.planning.clone(),
+        repair: Some(s.repair.clone()),
+        diagnostics: Some(s.diagnostics.clone()),
+        completion: Some(s.completion.clone()),
     }
 }
 

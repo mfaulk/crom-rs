@@ -20,6 +20,8 @@ camino = { workspace = true }
 globset = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 fs4 = { workspace = true }
 code-agent-mcp = { workspace = true }
 

@@ -126,3 +126,53 @@ model — so a regression scoped to (say) `requires_multifile_edit` is visible.
 See `crates/eval/eval/tasks/rust-hidden-sum-bug/task.toml` for a full v2 task
 with hidden tests, an oracle patch, capability labels, behavior rules, and path
 policy.
+
+## Repair metrics (M16)
+
+When the repair loop is enabled (`code-agent eval run <suite> --repair enabled`),
+each task result carries a `repair` object and the run writes repair artifacts
+(`repair.json`, `repair.md`, `diagnostics.jsonl`, `validation-attempts.jsonl`).
+See [repair-loop.md](repair-loop.md) for the end-to-end flow.
+
+Per-task `repair` metrics:
+
+```text
+enabled                            # was the repair loop on for this run
+repair_attempt_count               # number of repair briefs generated
+repair_success_count               # 1 if a failed validation was later recovered
+compiler_error_recovered           # Option<bool> (None if no compile failure seen)
+test_failure_recovered             # Option<bool> (None if no test failure seen)
+same_error_repeated                # an identical failure fingerprint repeated
+same_error_repeat_count            # max repeat count of any fingerprint
+focused_validation_suggested       # the brief suggested a focused command
+focused_validation_used            # Option<bool>: the agent ran a focused validation
+validation_after_last_edit         # Option<bool>: a validation ran after the last edit
+final_answer_without_validation    # finalized after a mutation without validating
+diagnostic_parse_success           # the failing output parsed into a diagnostic
+diagnostic_primary_kind            # the parsed DiagnosticKind, if any
+diagnostic_primary_file/line       # the primary span, if any
+repair_attempt_limit_exceeded      # the bounded loop hit its attempt budget
+final_validation_status            # passed | failed | unknown
+```
+
+Unknown or unavailable values are `null`/`None` — never fabricated.
+
+New failure classes (in addition to the M15 taxonomy):
+
+```text
+unrecovered_compile_error
+unrecovered_test_failure
+repeated_same_failure
+unvalidated_completion
+repair_attempt_limit_exceeded
+diagnostic_parse_failure
+```
+
+When a task does not resolve and a repair signal applies, the primary failure
+class is refined to one of the above and the original class is kept as a
+secondary label, so the existing taxonomy is preserved.
+
+The run `summary.json`/`summary.md` include an aggregate `repair` object and a
+**Repair loop** report section (tasks with failed validation, recovered after
+repair, unrecovered compile/test errors, repeated failures, median attempts,
+focused-validation usage, validation-after-edit rate) plus a per-task table.

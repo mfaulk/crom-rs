@@ -214,6 +214,27 @@ pub fn show(run_dir: &Path, task_id: &str) -> Result<String> {
         }
     }
 
+    // M16: repair trace, when present.
+    if let Ok(md) = std::fs::read_to_string(dir.join("repair.md")) {
+        s.push_str("\n## Repair trace\n\n");
+        s.push_str(md.trim());
+        s.push('\n');
+    } else if let Some(r) = &result {
+        let m = &r.repair;
+        if m.repair_attempt_count > 0 || m.diagnostic_primary_kind.is_some() {
+            s.push_str("\n## Repair\n\n");
+            s.push_str(&format!("- attempts: {}\n", m.repair_attempt_count));
+            if let Some(k) = m.diagnostic_primary_kind {
+                s.push_str(&format!("- initial failure: {}\n", k.as_str()));
+            }
+            s.push_str(&format!("- repeated: {}\n", m.same_error_repeated));
+            s.push_str(&format!(
+                "- final validation: {:?}\n",
+                m.final_validation_status
+            ));
+        }
+    }
+
     // Prompt.
     if let Ok(p) = std::fs::read_to_string(dir.join("prompt.md")) {
         s.push_str("\n## Prompt\n\n");
@@ -285,6 +306,13 @@ pub fn triage(run_dir: &Path) -> Result<String> {
         "unsafe_command",
         "overfit_public_tests",
         "hidden_test_failure",
+        // M16 repair-loop classes: grouped near the relevant build/test failures.
+        "repeated_same_failure",
+        "repair_attempt_limit_exceeded",
+        "unrecovered_compile_error",
+        "unrecovered_test_failure",
+        "unvalidated_completion",
+        "diagnostic_parse_failure",
         "compile_error",
         "public_test_failure",
         "required_path_missing",

@@ -115,6 +115,10 @@ pub struct EvalResult {
     pub attempts_used: usize,
     /// Estimated cost in USD if the provider reports usage; `None` otherwise.
     pub cost_usd: Option<f64>,
+    /// M16: repair-loop metrics (always present; `enabled=false` when the
+    /// repair loop was off).
+    #[serde(default)]
+    pub repair: crate::repair::RepairMetrics,
 }
 
 /// Configuration for an eval run.
@@ -144,6 +148,11 @@ pub struct RunConfig {
     pub seed: u64,
     /// Max attempts (Aider-style retry with test feedback). Default 1.
     pub attempts: usize,
+    /// M16: bounded repair-loop policy. When enabled, failed validations are
+    /// parsed into structured diagnostics and a targeted repair brief drives
+    /// the next attempt (up to `repair.max_attempts`). Disabled by default to
+    /// preserve existing single-attempt behavior.
+    pub repair: code_agent_core::repair::RepairPolicy,
 }
 
 impl Default for RunConfig {
@@ -161,6 +170,7 @@ impl Default for RunConfig {
             repetition: 0,
             seed: 0,
             attempts: 1,
+            repair: code_agent_core::repair::RepairPolicy::disabled(),
         }
     }
 }
@@ -364,6 +374,7 @@ fn default_result(
         seed: config.seed,
         attempts_used: 0,
         cost_usd: None,
+        repair: crate::repair::RepairMetrics::default(),
     }
 }
 
@@ -533,15 +544,26 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         assertions: Vec::new(),
         behavior: Vec::new(),
     };
-    let attempts = config.attempts.max(1);
+    // The repair loop bounds attempts by the repair policy when enabled,
+    // otherwise by the Aider-style `attempts` budget. A `RepairSession` always
+    // observes each validation so diagnostics/metrics are recorded even when
+    // the repair loop itself is disabled.
+    let repair_enabled = config.repair.enabled;
+    let max_attempts = if repair_enabled {
+        config.repair.max_attempts.max(1) as usize
+    } else {
+        config.attempts.max(1)
+    };
+    let mut repair_session = crate::repair::RepairSession::new(config.repair.clone());
     let mut attempts_used = 0usize;
+    let mut feedback = String::new();
 
-    for attempt in 0..attempts {
+    for attempt in 0..max_attempts {
         attempts_used += 1;
         let attempt_prompt = if attempt == 0 {
             prompt.clone()
         } else {
-            feedback_prompt(&prompt, &public_report)
+            feedback.clone()
         };
         match drive_agent(task, &attempt_prompt, &workspace_dir, config).await {
             Ok(o) => {
@@ -563,9 +585,41 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
             &limits,
         )
         .await;
-        if public_report.all_passed() || attempt + 1 == attempts {
+        if public_report.all_passed() {
+            repair_session.record_pass(&public_report, &workspace_dir);
             break;
         }
+        let is_last = attempt + 1 == max_attempts;
+        let outcome = repair_session.record_failure(&public_report, &workspace_dir);
+        if is_last {
+            break;
+        }
+        feedback = if repair_enabled {
+            if outcome.stop {
+                break;
+            }
+            outcome
+                .feedback
+                .unwrap_or_else(|| feedback_prompt(&prompt, &public_report))
+        } else {
+            feedback_prompt(&prompt, &public_report)
+        };
+    }
+
+    // Finalize repair trace + metrics from the accumulated diagnostics. Capture
+    // the raw diagnostics + validation attempts for artifact emission first
+    // (finish consumes the session).
+    let repair_diagnostics = repair_session.diagnostics.clone();
+    let repair_validation_attempts = repair_session.validation_attempts.clone();
+    let (repair_trace, repair_metrics) = repair_session.finish(public_report.all_passed(), &events);
+    // Emit repair artifacts (M16L). Raw command logs remain in the existing
+    // command-output artifacts; these add structured summaries.
+    if !repair_trace.attempts.is_empty() || !repair_diagnostics.is_empty() {
+        let _ = artifacts.write_json("repair.json", &repair_trace);
+        let _ =
+            artifacts.write_string("repair.md", &crate::repair::render_repair_md(&repair_trace));
+        let _ = artifacts.write_jsonl("diagnostics.jsonl", &repair_diagnostics);
+        let _ = artifacts.write_jsonl("validation-attempts.jsonl", &repair_validation_attempts);
     }
 
     // Generate the public patch (before any hidden overlay).
@@ -644,7 +698,7 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         plan_emitted: behavior.plan_submitted == Some(true),
         excessive_patch: excessive_patch(task, &patch),
     };
-    let (failure_class, secondary_failures) = if resolved {
+    let (mut failure_class, mut secondary_failures) = if resolved {
         (None, Vec::new())
     } else {
         match failure::classify(&signals) {
@@ -653,6 +707,19 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
             None => (Some(FailureClass::PublicTestFailure), Vec::new()),
         }
     };
+    // M16: refine the primary class with repair-loop signals. The original
+    // class is demoted to a secondary label so existing taxonomy is preserved.
+    if !resolved {
+        let refined = repair_refined_class(&repair_metrics);
+        if let Some(refined) = refined {
+            if let Some(prev) = failure_class {
+                if prev != refined && !secondary_failures.contains(&prev) {
+                    secondary_failures.push(prev);
+                }
+            }
+            failure_class = Some(refined);
+        }
+    }
 
     let turns_used = count_turns(&events);
     let tool_calls = count_tool_calls(&events);
@@ -716,9 +783,33 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     result.patch_lines_added = patch.insertions;
     result.patch_lines_removed = patch.deletions;
     result.attempts_used = attempts_used;
+    result.repair = repair_metrics;
 
     let _ = artifacts.write_json("result.json", &result);
     result
+}
+
+/// Map repair-loop metrics to a refined failure class for an unresolved task.
+/// Returns `None` when no repair-specific signal applies (keep the original
+/// class). Priority: repeated-failure > limit-exceeded > unrecovered family >
+/// unvalidated completion.
+fn repair_refined_class(m: &crate::repair::RepairMetrics) -> Option<FailureClass> {
+    if m.same_error_repeated && m.repair_attempt_count > 0 {
+        return Some(FailureClass::RepeatedSameFailure);
+    }
+    if m.repair_attempt_limit_exceeded {
+        return Some(FailureClass::RepairAttemptLimitExceeded);
+    }
+    if m.compiler_error_recovered == Some(false) {
+        return Some(FailureClass::UnrecoveredCompileError);
+    }
+    if m.test_failure_recovered == Some(false) {
+        return Some(FailureClass::UnrecoveredTestFailure);
+    }
+    if m.final_answer_without_validation {
+        return Some(FailureClass::UnvalidatedCompletion);
+    }
+    None
 }
 
 /// Build the second-attempt prompt from the failing public verification.
@@ -1090,6 +1181,7 @@ pub mod test_support {
             seed: 0,
             attempts_used: 1,
             cost_usd: None,
+            repair: crate::repair::RepairMetrics::default(),
         }
     }
 }

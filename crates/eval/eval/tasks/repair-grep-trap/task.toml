@@ -1,0 +1,30 @@
+schema_version = 2
+id = "repair-grep-trap"
+title = "Repair: repeated identical failure is detected and stopped"
+category = "repair"
+difficulty = "easy"
+tags = ["repair", "repeated-failure", "golden", "small", "negative"]
+suites = ["repair-smoke", "repair-mini"]
+
+prompt = """
+The file data.txt must contain `value=42`. Inspect it and make it correct.
+"""
+
+# This task intentionally is NOT solved by the scripted provider: it makes a
+# non-fixing edit, so the validation fails identically on each attempt. With the
+# repair loop enabled, the harness detects the repeated fingerprint and stops
+# rather than thrashing. It is a negative task: `resolved` is expected to be
+# false; the value under test is the repair-loop behavior, not the outcome.
+max_turns = 6
+timeout_secs = 60
+
+[capabilities]
+requires_test_feedback = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["grep -q 'value=42' data.txt"]

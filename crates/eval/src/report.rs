@@ -136,6 +136,46 @@ pub struct TaskSummary {
     pub quarantined: bool,
     #[serde(default)]
     pub behavior_warnings: usize,
+    // M16 repair-loop columns.
+    #[serde(default)]
+    pub repair_enabled: bool,
+    #[serde(default)]
+    pub repair_initial_kind: Option<String>,
+    #[serde(default)]
+    pub repair_recovered: Option<bool>,
+    #[serde(default)]
+    pub repair_attempts: u32,
+    #[serde(default)]
+    pub repair_repeated: bool,
+    #[serde(default)]
+    pub repair_focused_used: Option<bool>,
+    #[serde(default)]
+    pub repair_final_validation: String,
+}
+
+/// Aggregate repair-loop statistics across a run (M16M).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepairSummaryAgg {
+    /// Tasks where at least one validation failed and a diagnostic was parsed.
+    pub tasks_with_failed_validation: usize,
+    /// Tasks that recovered after a failed validation (repair success).
+    pub recovered_after_repair: usize,
+    pub unrecovered_compile_errors: usize,
+    pub unrecovered_test_failures: usize,
+    pub repeated_same_failure: usize,
+    pub repair_attempt_limit_exceeded: usize,
+    /// Tasks where a focused validation command was actually used.
+    pub focused_validation_used: usize,
+    /// Tasks where focused validation was suggested by the repair brief.
+    pub focused_validation_suggested: usize,
+    /// Tasks (with any mutation) that validated after the last edit.
+    pub validation_after_last_edit: usize,
+    /// Tasks with any mutation (denominator for the metric above).
+    pub tasks_with_mutation: usize,
+    /// Tasks that finalized after a mutation without validating.
+    pub final_answer_without_validation: usize,
+    /// Median repair attempts across tasks that attempted repair.
+    pub median_repair_attempts: u32,
 }
 
 /// A resolved-rate aggregation bucket.
@@ -181,6 +221,9 @@ pub struct RunSummary {
     pub by_provider: Vec<AggBucket>,
     #[serde(default)]
     pub by_model: Vec<AggBucket>,
+    /// M16 repair-loop aggregate.
+    #[serde(default)]
+    pub repair: RepairSummaryAgg,
 }
 
 /// Aggregate resolved-rate by a key extractor (possibly multi-valued).
@@ -211,6 +254,66 @@ where
         .collect()
 }
 
+fn final_validation_label(status: crate::repair::FinalValidationStatus) -> String {
+    use crate::repair::FinalValidationStatus::*;
+    match status {
+        Passed => "passed",
+        Failed => "failed",
+        Unknown => "unknown",
+    }
+    .to_string()
+}
+
+/// Aggregate repair-loop metrics across all results (M16M).
+fn aggregate_repair(results: &[EvalResult]) -> RepairSummaryAgg {
+    let mut agg = RepairSummaryAgg::default();
+    let mut attempt_counts: Vec<u32> = Vec::new();
+    for r in results {
+        let m = &r.repair;
+        if m.repair_attempt_count > 0 || m.diagnostic_parse_success {
+            agg.tasks_with_failed_validation += 1;
+        }
+        if m.repair_success_count > 0 {
+            agg.recovered_after_repair += 1;
+        }
+        if m.compiler_error_recovered == Some(false) {
+            agg.unrecovered_compile_errors += 1;
+        }
+        if m.test_failure_recovered == Some(false) {
+            agg.unrecovered_test_failures += 1;
+        }
+        if m.same_error_repeated {
+            agg.repeated_same_failure += 1;
+        }
+        if m.repair_attempt_limit_exceeded {
+            agg.repair_attempt_limit_exceeded += 1;
+        }
+        if m.focused_validation_suggested {
+            agg.focused_validation_suggested += 1;
+        }
+        if m.focused_validation_used == Some(true) {
+            agg.focused_validation_used += 1;
+        }
+        if let Some(v) = m.validation_after_last_edit {
+            agg.tasks_with_mutation += 1;
+            if v {
+                agg.validation_after_last_edit += 1;
+            }
+        }
+        if m.final_answer_without_validation {
+            agg.final_answer_without_validation += 1;
+        }
+        if m.repair_attempt_count > 0 {
+            attempt_counts.push(m.repair_attempt_count);
+        }
+    }
+    if !attempt_counts.is_empty() {
+        attempt_counts.sort_unstable();
+        agg.median_repair_attempts = attempt_counts[attempt_counts.len() / 2];
+    }
+    agg
+}
+
 impl RunSummary {
     pub fn from_results(run_id: &str, provider: &str, results: &[EvalResult]) -> Self {
         let mut summary = RunSummary {
@@ -235,6 +338,7 @@ impl RunSummary {
             by_isolation: Vec::new(),
             by_provider: Vec::new(),
             by_model: Vec::new(),
+            repair: RepairSummaryAgg::default(),
         };
         let mut score_sum = 0.0;
         for r in results {
@@ -280,8 +384,23 @@ impl RunSummary {
                 model: r.model.clone(),
                 quarantined: r.quarantined,
                 behavior_warnings: r.behavior_warnings.len(),
+                repair_enabled: r.repair.enabled,
+                repair_initial_kind: r
+                    .repair
+                    .diagnostic_primary_kind
+                    .map(|k| k.as_str().to_string()),
+                repair_recovered: if r.repair.repair_attempt_count > 0 {
+                    Some(r.repair.repair_success_count > 0)
+                } else {
+                    None
+                },
+                repair_attempts: r.repair.repair_attempt_count,
+                repair_repeated: r.repair.same_error_repeated,
+                repair_focused_used: r.repair.focused_validation_used,
+                repair_final_validation: final_validation_label(r.repair.final_validation_status),
             });
         }
+        summary.repair = aggregate_repair(results);
         if !results.is_empty() {
             summary.mean_score = (score_sum / results.len() as f64 * 1000.0).round() / 1000.0;
         }
@@ -356,6 +475,8 @@ impl RunSummary {
         render_buckets(&mut s, "By provider", &self.by_provider);
         render_buckets(&mut s, "By model", &self.by_model);
 
+        self.render_repair_section(&mut s);
+
         // Behavior summary: passed-but-risky, failed-without-validation, etc.
         let risky: Vec<&TaskSummary> = self
             .tasks
@@ -373,6 +494,95 @@ impl RunSummary {
             s.push('\n');
         }
         s
+    }
+
+    /// Render the M16 "Repair loop" section + per-task repair table. No-op when
+    /// no task exercised the repair loop.
+    fn render_repair_section(&self, s: &mut String) {
+        let r = &self.repair;
+        let repair_tasks: Vec<&TaskSummary> = self
+            .tasks
+            .iter()
+            .filter(|t| t.repair_attempts > 0 || t.repair_initial_kind.is_some())
+            .collect();
+        if r.tasks_with_failed_validation == 0 && repair_tasks.is_empty() {
+            return;
+        }
+        s.push_str("## Repair loop\n\n");
+        s.push_str(&format!(
+            "- tasks with failed validation: {}\n",
+            r.tasks_with_failed_validation
+        ));
+        s.push_str(&format!(
+            "- recovered after repair: {}\n",
+            r.recovered_after_repair
+        ));
+        s.push_str(&format!(
+            "- unrecovered compile errors: {}\n",
+            r.unrecovered_compile_errors
+        ));
+        s.push_str(&format!(
+            "- unrecovered test failures: {}\n",
+            r.unrecovered_test_failures
+        ));
+        s.push_str(&format!(
+            "- repeated same failure: {}\n",
+            r.repeated_same_failure
+        ));
+        s.push_str(&format!(
+            "- repair attempt limit exceeded: {}\n",
+            r.repair_attempt_limit_exceeded
+        ));
+        s.push_str(&format!(
+            "- median repair attempts: {}\n",
+            r.median_repair_attempts
+        ));
+        s.push_str(&format!(
+            "- focused validation used: {}/{}\n",
+            r.focused_validation_used, r.tasks_with_failed_validation
+        ));
+        s.push_str(&format!(
+            "- validation after last edit: {}/{}\n",
+            r.validation_after_last_edit, r.tasks_with_mutation
+        ));
+        if r.final_answer_without_validation > 0 {
+            s.push_str(&format!(
+                "- final answer before validation: {}\n",
+                r.final_answer_without_validation
+            ));
+        }
+        s.push('\n');
+
+        if !repair_tasks.is_empty() {
+            s.push_str(
+                "| Task | Initial Failure | Recovered | Attempts | Repeated | Focused | Final |\n",
+            );
+            s.push_str(
+                "|------|-----------------|-----------|----------|----------|---------|-------|\n",
+            );
+            for t in repair_tasks {
+                let yn = |b: Option<bool>| match b {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "-",
+                };
+                s.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} |\n",
+                    t.task_id,
+                    t.repair_initial_kind.as_deref().unwrap_or("-"),
+                    yn(t.repair_recovered),
+                    t.repair_attempts,
+                    if t.repair_repeated { "yes" } else { "no" },
+                    yn(t.repair_focused_used),
+                    if t.repair_final_validation.is_empty() {
+                        "unknown"
+                    } else {
+                        &t.repair_final_validation
+                    },
+                ));
+            }
+            s.push('\n');
+        }
     }
 }
 

@@ -118,6 +118,15 @@ pub struct SettingsFile {
     /// M11: planning + act configuration.
     #[serde(default)]
     pub planning: Option<PlanningSettingsConfig>,
+    /// M16: bounded repair-loop configuration.
+    #[serde(default)]
+    pub repair: Option<RepairConfig>,
+    /// M16: diagnostic parsing + compaction configuration.
+    #[serde(default)]
+    pub diagnostics: Option<DiagnosticsConfig>,
+    /// M16: validation-before-final-answer policy.
+    #[serde(default)]
+    pub completion: Option<CompletionConfig>,
 }
 
 /// On-disk planning settings (M11). All fields optional; merge into
@@ -453,6 +462,103 @@ pub struct ValidationConfig {
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub rewind_on_failure: Option<bool>,
+    /// M16: classify shell commands by intent (validation/mutation/...).
+    #[serde(default)]
+    pub classify_commands: Option<bool>,
+    /// M16: suggest focused validation commands after a failure.
+    #[serde(default)]
+    pub focused_validation_suggestions: Option<bool>,
+}
+
+/// M16: bounded repair-loop configuration. Mirrors [`crate::repair::RepairPolicy`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepairConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub max_same_failure_repeats: Option<u32>,
+    #[serde(default)]
+    pub require_inspection_before_repair: Option<bool>,
+    #[serde(default)]
+    pub prefer_focused_validation: Option<bool>,
+    #[serde(default)]
+    pub require_validation_after_mutation: Option<bool>,
+    #[serde(default)]
+    pub stop_on_repeated_identical_failure: Option<bool>,
+}
+
+impl RepairConfig {
+    /// Build an effective [`crate::repair::RepairPolicy`], applying defaults
+    /// for any unset field.
+    pub fn to_policy(&self) -> crate::repair::RepairPolicy {
+        let d = crate::repair::RepairPolicy::default();
+        crate::repair::RepairPolicy {
+            enabled: self.enabled.unwrap_or(d.enabled),
+            max_attempts: self.max_attempts.unwrap_or(d.max_attempts),
+            max_same_failure_repeats: self
+                .max_same_failure_repeats
+                .unwrap_or(d.max_same_failure_repeats),
+            require_validation_after_mutation: self
+                .require_validation_after_mutation
+                .unwrap_or(d.require_validation_after_mutation),
+            prefer_focused_validation: self
+                .prefer_focused_validation
+                .unwrap_or(d.prefer_focused_validation),
+            stop_on_repeated_identical_failure: self
+                .stop_on_repeated_identical_failure
+                .unwrap_or(d.stop_on_repeated_identical_failure),
+        }
+    }
+}
+
+/// M16: diagnostic parsing + compaction configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsConfig {
+    #[serde(default)]
+    pub prefer_cargo_json: Option<bool>,
+    #[serde(default)]
+    pub max_excerpt_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_errors: Option<usize>,
+    #[serde(default)]
+    pub max_warnings: Option<usize>,
+    #[serde(default)]
+    pub max_failing_tests: Option<usize>,
+    /// "off" | "short" | "full"
+    #[serde(default)]
+    pub include_backtrace: Option<String>,
+}
+
+impl DiagnosticsConfig {
+    /// Build an effective compaction config, applying defaults for unset fields.
+    pub fn to_compaction(&self) -> crate::diagnostics::CompactionConfig {
+        let d = crate::diagnostics::CompactionConfig::default();
+        crate::diagnostics::CompactionConfig {
+            max_excerpt_bytes: self.max_excerpt_bytes.unwrap_or(d.max_excerpt_bytes),
+            max_errors: self.max_errors.unwrap_or(d.max_errors),
+            max_warnings: self.max_warnings.unwrap_or(d.max_warnings),
+            max_failing_tests: self.max_failing_tests.unwrap_or(d.max_failing_tests),
+            include_backtrace: self
+                .include_backtrace
+                .clone()
+                .unwrap_or(d.include_backtrace),
+            ..d
+        }
+    }
+}
+
+/// M16: validation-before-final-answer (completion) policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionConfig {
+    #[serde(default)]
+    pub require_validation_after_mutation: Option<bool>,
+    #[serde(default)]
+    pub allow_unvalidated_final_answer: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,6 +631,12 @@ pub struct Settings {
     pub model_config: ModelSettingsConfig,
     /// M11: planning settings.
     pub planning: Option<PlanningSettingsConfig>,
+    /// M16: effective repair-loop configuration.
+    pub repair: RepairConfig,
+    /// M16: effective diagnostics configuration.
+    pub diagnostics: DiagnosticsConfig,
+    /// M16: effective completion (validation-before-final) configuration.
+    pub completion: CompletionConfig,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -550,6 +662,8 @@ pub enum SettingsError {
     BadCheckpointFailureMode(String),
     #[error("invalid checkpointing.bash_policy: {0}")]
     BadBashCheckpointPolicy(String),
+    #[error("invalid diagnostics.include_backtrace: {0} (expected off|short|full)")]
+    BadIncludeBacktrace(String),
     #[error("{0}")]
     BadToolSearch(String),
     #[error("{0}")]
@@ -779,6 +893,66 @@ pub fn merge_settings_file_into(
         }
         if let Some(r) = v.rewind_on_failure {
             dst.validation.rewind_on_failure = Some(r);
+        }
+        if let Some(b) = v.classify_commands {
+            dst.validation.classify_commands = Some(b);
+        }
+        if let Some(b) = v.focused_validation_suggestions {
+            dst.validation.focused_validation_suggestions = Some(b);
+        }
+    }
+    if let Some(r) = src.repair {
+        if let Some(v) = r.enabled {
+            dst.repair.enabled = Some(v);
+        }
+        if let Some(v) = r.max_attempts {
+            dst.repair.max_attempts = Some(v);
+        }
+        if let Some(v) = r.max_same_failure_repeats {
+            dst.repair.max_same_failure_repeats = Some(v);
+        }
+        if let Some(v) = r.require_inspection_before_repair {
+            dst.repair.require_inspection_before_repair = Some(v);
+        }
+        if let Some(v) = r.prefer_focused_validation {
+            dst.repair.prefer_focused_validation = Some(v);
+        }
+        if let Some(v) = r.require_validation_after_mutation {
+            dst.repair.require_validation_after_mutation = Some(v);
+        }
+        if let Some(v) = r.stop_on_repeated_identical_failure {
+            dst.repair.stop_on_repeated_identical_failure = Some(v);
+        }
+    }
+    if let Some(d) = src.diagnostics {
+        if let Some(v) = d.prefer_cargo_json {
+            dst.diagnostics.prefer_cargo_json = Some(v);
+        }
+        if let Some(v) = d.max_excerpt_bytes {
+            dst.diagnostics.max_excerpt_bytes = Some(v);
+        }
+        if let Some(v) = d.max_errors {
+            dst.diagnostics.max_errors = Some(v);
+        }
+        if let Some(v) = d.max_warnings {
+            dst.diagnostics.max_warnings = Some(v);
+        }
+        if let Some(v) = d.max_failing_tests {
+            dst.diagnostics.max_failing_tests = Some(v);
+        }
+        if let Some(v) = d.include_backtrace {
+            if !matches!(v.as_str(), "off" | "short" | "full") {
+                return Err(SettingsError::BadIncludeBacktrace(v));
+            }
+            dst.diagnostics.include_backtrace = Some(v);
+        }
+    }
+    if let Some(c) = src.completion {
+        if let Some(v) = c.require_validation_after_mutation {
+            dst.completion.require_validation_after_mutation = Some(v);
+        }
+        if let Some(v) = c.allow_unvalidated_final_answer {
+            dst.completion.allow_unvalidated_final_answer = Some(v);
         }
     }
     if let Some(mcp) = src.mcp {
@@ -1422,5 +1596,47 @@ mod tests {
             vec!["X", "Y"],
             "disallowed_tools must extend in call order; got {disallowed:?}"
         );
+    }
+
+    #[test]
+    fn repair_and_diagnostics_config_round_trip_and_to_policy() {
+        let json = r#"{
+            "repair": { "enabled": true, "max_attempts": 5, "stop_on_repeated_identical_failure": false },
+            "diagnostics": { "max_errors": 9, "include_backtrace": "full" },
+            "completion": { "require_validation_after_mutation": true }
+        }"#;
+        let file: SettingsFile = serde_json::from_str(json).unwrap();
+        let mut effective = Settings::default();
+        merge_settings_file_into(&mut effective, file).unwrap();
+
+        let policy = effective.repair.to_policy();
+        assert!(policy.enabled);
+        assert_eq!(policy.max_attempts, 5);
+        assert!(!policy.stop_on_repeated_identical_failure);
+        // Unset fields fall back to defaults.
+        assert_eq!(policy.max_same_failure_repeats, 2);
+
+        let compaction = effective.diagnostics.to_compaction();
+        assert_eq!(compaction.max_errors, 9);
+        assert_eq!(compaction.include_backtrace, "full");
+
+        assert_eq!(
+            effective.completion.require_validation_after_mutation,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn invalid_include_backtrace_is_rejected() {
+        let file = SettingsFile {
+            diagnostics: Some(DiagnosticsConfig {
+                include_backtrace: Some("loud".to_string()),
+                ..DiagnosticsConfig::default()
+            }),
+            ..SettingsFile::default()
+        };
+        let mut effective = Settings::default();
+        let err = merge_settings_file_into(&mut effective, file).unwrap_err();
+        assert!(matches!(err, SettingsError::BadIncludeBacktrace(_)));
     }
 }
