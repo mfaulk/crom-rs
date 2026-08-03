@@ -63,7 +63,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.toolchain }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-nextest
       # fmt + clippy only need to run once; guard them to the primary lane.
@@ -173,7 +173,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: coverage
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-llvm-cov, cargo-nextest
       # Non-gating: measure + track coverage. cargo-llvm-cov drives nextest,
