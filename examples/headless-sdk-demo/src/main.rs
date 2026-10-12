@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use code_agent_sdk::{
+use crom_sdk::{
     fake_provider::{EchoFakeProvider, ScriptedFakeProvider},
     AgentMode, AgentRequest, AgentRuntime, AllowAllApprovals, ApprovalPolicy, BuiltinToolSet,
     InMemoryWorkspace, PatchPolicy, ProviderConfig, SideEffectPolicy, ToolPolicy, WorkspaceSource,
@@ -85,7 +85,7 @@ async fn in_memory() -> anyhow::Result<()> {
 }
 
 async fn plan_act() -> anyhow::Result<()> {
-    use code_agent_sdk::SdkPlanRequest;
+    use crom_sdk::SdkPlanRequest;
     let workspace = InMemoryWorkspace::from_pairs(vec![("README.md", b"hi\n".to_vec())])?;
     let runtime = AgentRuntime::builder()
         .provider(ProviderConfig::fake(Arc::new(EchoFakeProvider)))

@@ -16,9 +16,9 @@ mkdir -p "${WORKDIR}/.agent"
 
 cd "${WORKDIR}"
 
-CARGO_BIN="${REPO_ROOT}/target/debug/code-agent"
+CARGO_BIN="${REPO_ROOT}/target/debug/crom"
 if [ ! -x "${CARGO_BIN}" ]; then
-  (cd "${REPO_ROOT}" && cargo build --bin code-agent)
+  (cd "${REPO_ROOT}" && cargo build --bin crom)
 fi
 
 echo "[demo] validate"

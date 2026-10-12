@@ -1,6 +1,6 @@
 # Repair loop (M16)
 
-The repair loop makes `code-agent` better at the **edit → validate → diagnose →
+The repair loop makes `crom` better at the **edit → validate → diagnose →
 repair** cycle. When a validation command fails after an edit, the runtime
 parses the failure into a structured [diagnostic](diagnostics.md), classifies
 it, summarizes it compactly, and feeds a targeted **repair brief** back into the
@@ -107,10 +107,10 @@ The eval harness drives the repair loop on the real runner path. Enable it on a
 run:
 
 ```text
-code-agent eval run <suite> --repair enabled
-code-agent eval run <suite> --repair disabled
-code-agent eval run <suite> --repair-max-attempts 3
-code-agent eval run <suite> --require-validation-after-edit
+crom eval run <suite> --repair enabled
+crom eval run <suite> --repair disabled
+crom eval run <suite> --repair-max-attempts 3
+crom eval run <suite> --require-validation-after-edit
 ```
 
 Per task/run, the harness writes repair artifacts alongside the existing
@@ -129,7 +129,7 @@ summaries on top.
 
 Repair metrics are added to each task result and surfaced in `summary.json`,
 `summary.md` (a **Repair loop** section plus a per-task table), and
-`code-agent eval show <run-id> <task-id>`. `code-agent eval triage <run-id>`
+`crom eval show <run-id> <task-id>`. `crom eval triage <run-id>`
 groups repeated repair failures. See [eval-schema.md](eval-schema.md#repair-metrics-m16)
 for the metric and failure-class definitions.
 

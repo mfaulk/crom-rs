@@ -1,6 +1,6 @@
-# code-agent
+# crom-rs
 
-A headless coding agent for Rust. Ships as the `code-agent` CLI binary and a
+A headless coding agent for Rust. Ships as the `crom` CLI binary and a
 set of embeddable crates (provider adapters, tool registry, MCP client, SDK
 runtime). The library targets approximate architectural parity with the
 public surface of Anthropic's Agent SDK while staying small enough to read
@@ -10,17 +10,17 @@ in one sitting.
 
 ### Install
 
-`code-agent` is not published to crates.io yet. Install the CLI from this
+`crom` is not published to crates.io yet. Install the CLI from this
 repository:
 
 ```sh
-git clone https://github.com/mfaulk/code-agent.git
-cd code-agent
-cargo install --path crates/code-agent-cli
+git clone https://github.com/mfaulk/crom-rs.git
+cd crom-rs
+cargo install --path crates/crom-cli
 ```
 
-`cargo install` puts the `code-agent` binary on your `PATH` (usually
-`~/.cargo/bin/code-agent`).
+`cargo install` puts the `crom` binary on your `PATH` (usually
+`~/.cargo/bin/crom`).
 
 ### Authenticate
 
@@ -29,45 +29,45 @@ opt-in file backend if no keychain is available). Pick whichever provider
 you want to use:
 
 ```sh
-code-agent login anthropic --api-key=sk-ant-...
-code-agent login openai    --api-key-stdin < ./openai.key
-code-agent login gemini    --api-key=AI-...
+crom login anthropic --api-key=sk-ant-...
+crom login openai    --api-key-stdin < ./openai.key
+crom login gemini    --api-key=AI-...
 
-code-agent auth status
+crom auth status
 ```
 
 You can also export `ANTHROPIC_API_KEY` (or the provider equivalent) in your
-shell and skip `code-agent login` entirely.
+shell and skip `crom login` entirely.
 
 ### Run the agent
 
 ```sh
 # One-shot run.
-code-agent run "Find the bug in src/lib.rs, fix it, and re-run cargo test" \
+crom run "Find the bug in src/lib.rs, fix it, and re-run cargo test" \
     --allowed-tools Read,Glob,Grep,Edit,Bash \
     --permission-mode acceptEdits \
     --max-turns 8
 
 # Interactive chat (multiple prompts in one process).
-code-agent chat --show-usage
+crom chat --show-usage
 
 # Full-screen terminal cockpit driven by the SDK runtime (M13 Phase A).
 # `--fake-provider` is offline and deterministic; remove it once an
 # `ANTHROPIC_API_KEY` is in your environment.
-code-agent tui --fake-provider
-code-agent tui --renderer plain     # plain-text fallback
-code-agent tui --snapshot           # single preview frame (CI-friendly)
+crom tui --fake-provider
+crom tui --renderer plain     # plain-text fallback
+crom tui --snapshot           # single preview frame (CI-friendly)
 
 # Resume the latest session in this directory.
-code-agent continue "and now add a regression test"
+crom continue "and now add a regression test"
 ```
 
-`code-agent --help` lists every subcommand; `code-agent <subcommand> --help`
+`crom --help` lists every subcommand; `crom <subcommand> --help`
 shows flags for each one.
 
 ## Adding an MCP server
 
-`code-agent` is an MCP client. To expose an MCP server's tools to the agent,
+`crom` is an MCP client. To expose an MCP server's tools to the agent,
 drop an `mcp.json` file at `.agent/mcp.json` in your project root:
 
 ```json
@@ -90,17 +90,17 @@ HTTP transports are also supported (`"type": "http"` with a `"url"` field).
 Allow the MCP tools on the run:
 
 ```sh
-code-agent run "Triage the three oldest open issues" \
+crom run "Triage the three oldest open issues" \
     --allowed-tools "Read,Grep,mcp__github__list_issues,mcp__github__get_issue"
 ```
 
 Inspect what each server exposes before granting access:
 
 ```sh
-code-agent mcp list          # show configured servers
-code-agent mcp status        # connect and report each server's health
-code-agent mcp tools github  # list the tools the github server exposes
-code-agent mcp call github list_issues --args-json '{}' --yes
+crom mcp list          # show configured servers
+crom mcp status        # connect and report each server's health
+crom mcp tools github  # list the tools the github server exposes
+crom mcp call github list_issues --args-json '{}' --yes
 ```
 
 MCP tools use `PermissionKind::External`. `acceptEdits` does *not* approve
@@ -112,7 +112,7 @@ For larger catalogs, enable search-mode tool loading so MCP schemas are not
 all sent to the model on turn one:
 
 ```sh
-code-agent run "Find the parser bug issue and inspect the likely source" \
+crom run "Find the parser bug issue and inspect the likely source" \
     --tool-loading search \
     --allowed-tools "Read,Grep,Glob,SearchTools,mcp__github__*"
 ```
@@ -142,12 +142,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 
 # Run the CLI without installing.
-cargo run -p code-agent-cli -- run "What files are here?" \
+cargo run -p crom-cli -- run "What files are here?" \
     --allowed-tools Read,Glob \
     --permission-mode default
 ```
 
-The `cargo run -p code-agent-cli -- <args>` form is the easiest way to
+The `cargo run -p crom-cli -- <args>` form is the easiest way to
 iterate on the CLI while developing — every CLI subcommand documented above
 works after `--`.
 

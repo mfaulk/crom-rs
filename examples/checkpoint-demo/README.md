@@ -13,7 +13,7 @@ cargo test       # one test fails on purpose
 
 ```bash
 ANTHROPIC_API_KEY=... \
-code-agent run \
+crom run \
   "Refactor parse_tokens to trim whitespace and add a test. It is okay if you make a mistake." \
   --checkpointing on \
   --permission-mode accept-edits \
@@ -38,8 +38,8 @@ conversation history is **not** rewound.
 ## Inspect and rewind by hand
 
 ```bash
-code-agent checkpoints list
-code-agent checkpoints diff <CHECKPOINT_ID>
-code-agent rewind <CHECKPOINT_ID> --dry-run    # preview
-code-agent rewind <CHECKPOINT_ID> --yes         # do it
+crom checkpoints list
+crom checkpoints diff <CHECKPOINT_ID>
+crom rewind <CHECKPOINT_ID> --dry-run    # preview
+crom rewind <CHECKPOINT_ID> --yes         # do it
 ```

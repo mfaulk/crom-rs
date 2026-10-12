@@ -6,7 +6,7 @@ The SDK accepts pre-resolved credentials. Applications never need to call
 ## Provider configuration
 
 ```rust,no_run
-use code_agent_sdk::{ProviderConfig, SecretString};
+use crom_sdk::{ProviderConfig, SecretString};
 
 let cfg = ProviderConfig::anthropic_api_key(SecretString::new(
     std::env::var("ANTHROPIC_API_KEY").unwrap(),

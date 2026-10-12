@@ -35,38 +35,38 @@ Companion docs:
 - **Primary `resolved` score** plus a structured **failure taxonomy**.
 - **Multi-run statistics** (`--repetitions k`): pass@1 / pass@k, per-task
   variance, failure-class distribution.
-- **Regression index** (`target/code-agent-eval/index.jsonl`) feeding
+- **Regression index** (`target/crom-eval/index.jsonl`) feeding
   `eval history`, `eval trend`, `eval regressions`, `eval task-history`.
 - **Triage** (`eval triage`, `eval show`, `eval open`).
 
 ## M15 command reference
 
 ```console
-$ code-agent eval adapters
-$ code-agent eval run <suite|task> --adapter internal
-$ code-agent eval run <path> --adapter directory
-$ code-agent eval run <suite> --isolation local --network false
-$ code-agent eval run <suite> --repetitions 5
-$ code-agent eval run <suite> --prompt-variant concise
-$ code-agent eval run <path> --adapter aider --attempts 2
-$ code-agent eval validate-task <id-or-path>
-$ code-agent eval validate-suite <suite> --repeat 5
-$ code-agent eval history
-$ code-agent eval trend <suite>
-$ code-agent eval regressions --baseline <run-or-sha> --candidate <run-or-sha>
-$ code-agent eval task-history <task-id>
-$ code-agent eval triage <run-id>
-$ code-agent eval show <run-id> <task-id>
-$ code-agent eval open <run-id> <task-id>
+$ crom eval adapters
+$ crom eval run <suite|task> --adapter internal
+$ crom eval run <path> --adapter directory
+$ crom eval run <suite> --isolation local --network false
+$ crom eval run <suite> --repetitions 5
+$ crom eval run <suite> --prompt-variant concise
+$ crom eval run <path> --adapter aider --attempts 2
+$ crom eval validate-task <id-or-path>
+$ crom eval validate-suite <suite> --repeat 5
+$ crom eval history
+$ crom eval trend <suite>
+$ crom eval regressions --baseline <run-or-sha> --candidate <run-or-sha>
+$ crom eval task-history <task-id>
+$ crom eval triage <run-id>
+$ crom eval show <run-id> <task-id>
+$ crom eval open <run-id> <task-id>
 ```
 
 A run that uses repetitions writes per-repetition artifacts under
 `<run-id>/rep-<n>/tasks/<task-id>/` and aggregate stats to
 `<run-id>/repetitions.json`.
 
-The harness lives in the `code-agent-eval` crate (`crates/eval`) and is exposed
-through the `code-agent eval` CLI. It drives the agent exclusively through the
-headless [SDK runtime](../crates/code-agent-sdk) from M12 — it never shells out
+The harness lives in the `crom-eval` crate (`crates/crom-eval`) and is exposed
+through the `crom eval` CLI. It drives the agent exclusively through the
+headless [SDK runtime](../crates/crom-sdk) from M12 — it never shells out
 to the CLI and never builds a separate mini-agent. Behavior is judged from
 structured SDK events, not by scraping model prose.
 
@@ -86,35 +86,35 @@ than a sprawling benchmark.
 List tasks:
 
 ```console
-$ code-agent eval list
-$ code-agent eval list --suite smoke
-$ code-agent eval list --tag rust
+$ crom eval list
+$ crom eval list --suite smoke
+$ crom eval list --tag rust
 ```
 
 Run the deterministic smoke suite offline (no model, no network):
 
 ```console
-$ code-agent eval run --suite smoke --provider fake
+$ crom eval run --suite smoke --provider fake
 ```
 
 Run a single task with the scripted golden provider:
 
 ```console
-$ code-agent eval run golden-edit-recover --provider golden
+$ crom eval run golden-edit-recover --provider golden
 ```
 
 Run the realistic Rust suite against a live provider (opt-in):
 
 ```console
-$ CODE_AGENT_EVAL_LIVE=1 ANTHROPIC_API_KEY=sk-... \
-    code-agent eval run --suite rust-small --provider anthropic
+$ CROM_EVAL_LIVE=1 ANTHROPIC_API_KEY=sk-... \
+    crom eval run --suite rust-small --provider anthropic
 ```
 
 Report and compare prior runs:
 
 ```console
-$ code-agent eval report <run-id>
-$ code-agent eval compare <baseline-run-id> <candidate-run-id>
+$ crom eval report <run-id>
+$ crom eval compare <baseline-run-id> <candidate-run-id>
 ```
 
 ## Provider modes
@@ -125,9 +125,9 @@ The `--provider` flag selects how the agent is driven for the whole run:
 |-------------|-------------|
 | `fake`      | A trivial echo provider. Proves the harness plumbing (workspace setup, event capture, oracles, scoring, artifacts) without proving model intelligence. Offline and deterministic. |
 | `golden`    | A scripted provider that replays a canned sequence of tool calls for a specific task (read → edit → run check → observe failure → edit → pass). Catches regressions in tool schemas, event handling, sessions, and command execution. |
-| `anthropic` (or any other name) | A real model provider. **Opt-in only**: requires `CODE_AGENT_EVAL_LIVE=1` and provider credentials (`ANTHROPIC_API_KEY`). If the opt-in flag or credentials are missing, affected tasks are reported as **skipped**, never failed. Never runs in ordinary CI. |
+| `anthropic` (or any other name) | A real model provider. **Opt-in only**: requires `CROM_EVAL_LIVE=1` and provider credentials (`ANTHROPIC_API_KEY`). If the opt-in flag or credentials are missing, affected tasks are reported as **skipped**, never failed. Never runs in ordinary CI. |
 
-Set `CODE_AGENT_EVAL_MODEL` to override the live model (default
+Set `CROM_EVAL_MODEL` to override the live model (default
 `claude-sonnet-4-6`).
 
 ## Suites
@@ -144,18 +144,18 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
 
 ## Adding a new task
 
-1. Create a directory under `crates/eval/eval/tasks/<task-id>/`.
+1. Create a directory under `crates/crom-eval/eval/tasks/<task-id>/`.
 2. Add a `task.toml` manifest (see the reference below).
 3. Add a `repo/` fixture directory containing the starting project. Keep it
    tiny. If it is a Rust crate, put an empty `[workspace]` table at the top of
    its `Cargo.toml` so the parent workspace never absorbs the fixture.
 4. (Optional) Add the task to a suite and/or register a golden script in
-   `crates/eval/src/providers.rs` keyed by the task id.
+   `crates/crom-eval/src/providers.rs` keyed by the task id.
 
 Example layout:
 
 ```text
-crates/eval/eval/tasks/rust-failing-unit-test/
+crates/crom-eval/eval/tasks/rust-failing-unit-test/
   task.toml
   repo/
     Cargo.toml
@@ -295,7 +295,7 @@ Each task gets a structured score in `[0, 1]`, serialised to `score.json`:
 Every run writes a self-contained bundle:
 
 ```text
-target/code-agent-eval/runs/<run-id>/
+target/crom-eval/runs/<run-id>/
   summary.json
   summary.md
   tasks/<task-id>/
@@ -321,8 +321,8 @@ The `eval` job in `.github/workflows/ci.yml` runs a fast, deterministic,
 offline lane on every push/PR:
 
 ```console
-cargo test -p code-agent-eval
-code-agent eval run --suite smoke --provider fake
+cargo test -p crom-eval
+crom eval run --suite smoke --provider fake
 ```
 
 It uploads the artifact bundle when the smoke suite regresses. Live-provider
@@ -330,7 +330,7 @@ evals never run here.
 
 Live evals are available manually via the `Eval (live provider)` workflow
 (`.github/workflows/eval-live.yml`), triggered from the Actions tab. It sets
-`CODE_AGENT_EVAL_LIVE=1` and uses the `ANTHROPIC_API_KEY` repository secret;
+`CROM_EVAL_LIVE=1` and uses the `ANTHROPIC_API_KEY` repository secret;
 without the secret, live tasks skip cleanly.
 
 ## Known limitations
@@ -354,7 +354,7 @@ without the secret, live tasks skip cleanly.
 
 ## Repair loop (M16)
 
-`code-agent eval run <suite> --repair enabled` turns on the bounded repair loop:
+`crom eval run <suite> --repair enabled` turns on the bounded repair loop:
 failed validations are parsed into structured diagnostics, a targeted repair
 brief drives bounded retries, repeated identical failures are detected and
 stopped, and repair metrics + artifacts (`repair.json`, `repair.md`,

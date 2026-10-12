@@ -1,11 +1,11 @@
 # Command diagnostics (M16)
 
-`code-agent` turns raw command output (compiler errors, test failures, panics,
+`crom` turns raw command output (compiler errors, test failures, panics,
 shell errors) into a structured, serializable **diagnostic** instead of an
 opaque text blob. Diagnostics power the repair loop, repair artifacts, and eval
-metrics, and are exposed directly through the `code-agent diagnostics` CLI.
+metrics, and are exposed directly through the `crom diagnostics` CLI.
 
-The implementation lives in `crates/code-agent-core/src/diagnostics/` and is
+The implementation lives in `crates/crom-core/src/diagnostics/` and is
 pure logic with no I/O, so it is reused by the Bash tool path, the repair
 controller, the eval harness, and the CLI.
 
@@ -99,9 +99,9 @@ and which commands count as validation-after-mutation.
 ## CLI
 
 ```text
-code-agent diagnostics parse       <log-file>   # full structured diagnostic (JSON)
-code-agent diagnostics summarize   <log-file>   # compact model-facing summary
-code-agent diagnostics fingerprint <log-file>   # stable failure fingerprint
+crom diagnostics parse       <log-file>   # full structured diagnostic (JSON)
+crom diagnostics summarize   <log-file>   # compact model-facing summary
+crom diagnostics fingerprint <log-file>   # stable failure fingerprint
 ```
 
 These operate on a captured stdout/stderr log file (use `-` for stdin) without
@@ -110,7 +110,7 @@ Pass `--command`, `--exit-code`, `--timed-out`, and `--cwd` to refine
 classification and the fingerprint.
 
 ```console
-$ cargo test 2>&1 | code-agent diagnostics fingerprint - --command "cargo test"
+$ cargo test 2>&1 | crom diagnostics fingerprint - --command "cargo test"
 kind:        type_mismatch
 code:        E0308
 file:        src/config.rs

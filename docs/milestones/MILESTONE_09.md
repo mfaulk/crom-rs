@@ -6,7 +6,7 @@ diffs, atomic run-locks with session recovery, first-run setup, and a
 diagnostics surface (`doctor`) suitable for CI. M9 is local-only; remote
 sync, multi-session UI, and shared dashboards remain out of scope.
 
-## New crate: `code-agent-tui`
+## New crate: `crom-tui`
 
 Renderer abstraction with two backends:
 
@@ -34,7 +34,7 @@ Tests use ratatui's `TestBackend` for deterministic snapshot coverage.
 
 ## Run locks + session recovery
 
-`code-agent-session` gains `recovery.rs`:
+`crom-session` gains `recovery.rs`:
 
 - Locks acquired atomically via `OpenOptions::create_new` — no
   TOCTOU window between probe and write.
@@ -61,17 +61,17 @@ reviewer's note back into the loop as actionable context.
 ## CLI surface
 
 ```sh
-code-agent init                             # first-run scaffold
-code-agent doctor [--json] [--fix] [--yes]  # diagnostics; --fix only creates missing .agent/ dirs
-code-agent changes [summary|diff|...]       # workspace inspection over checkpoint history
-code-agent sessions-ext recent              # honors recovery.stale_lock_after_seconds
-code-agent sessions-ext recover <ID>        # appends SessionRecovered marker
-code-agent paths                            # resolved config / data / cache locations
-code-agent status                           # current session + lock state
-code-agent config [...]                     # inspect merged settings layers
-code-agent statusline [--max-width N]       # render status-line preview
-code-agent tui [--renderer fullscreen|plain] [--snapshot]
-code-agent completions <shell>              # shell completion script
+crom init                             # first-run scaffold
+crom doctor [--json] [--fix] [--yes]  # diagnostics; --fix only creates missing .agent/ dirs
+crom changes [summary|diff|...]       # workspace inspection over checkpoint history
+crom sessions-ext recent              # honors recovery.stale_lock_after_seconds
+crom sessions-ext recover <ID>        # appends SessionRecovered marker
+crom paths                            # resolved config / data / cache locations
+crom status                           # current session + lock state
+crom config [...]                     # inspect merged settings layers
+crom statusline [--max-width N]       # render status-line preview
+crom tui [--renderer fullscreen|plain] [--snapshot]
+crom completions <shell>              # shell completion script
 ```
 
 `doctor --fix` requires `--yes` (or interactive confirmation) before

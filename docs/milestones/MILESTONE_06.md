@@ -93,19 +93,19 @@ intermediate child events stay in the child JSONL unless
 ## CLI surface
 
 ```sh
-code-agent agents list --cwd .
-code-agent agents show security-reviewer --cwd .
-code-agent agents validate --cwd .
-code-agent agents run security-reviewer "Review src/auth.rs" --cwd .
+crom agents list --cwd .
+crom agents show security-reviewer --cwd .
+crom agents validate --cwd .
+crom agents run security-reviewer "Review src/auth.rs" --cwd .
 
-code-agent run "Review this crate for security, tests, and API design." \
+crom run "Review this crate for security, tests, and API design." \
     --allowed-tools "Read,Grep,Glob,Bash,Agent" \
     --agents .agent/agents \
     --show-subagent-events
 
-code-agent sessions children <PARENT_SESSION_ID> --cwd .
-code-agent sessions show-child <SUBAGENT_SESSION_ID> --cwd .
-code-agent sessions export-child <SUBAGENT_SESSION_ID> --format json --cwd .
+crom sessions children <PARENT_SESSION_ID> --cwd .
+crom sessions show-child <SUBAGENT_SESSION_ID> --cwd .
+crom sessions export-child <SUBAGENT_SESSION_ID> --format json --cwd .
 ```
 
 New flags on `run` / `chat`: `--agents`, `--no-agents`,

@@ -6,7 +6,7 @@ benchmark-style slices all flow through the same runner, oracle, scoring, and
 artifact pipeline. List them with:
 
 ```console
-$ code-agent eval adapters
+$ crom eval adapters
 ```
 
 | id          | source                                          | maturity |
@@ -24,8 +24,8 @@ execution. None of them clone arbitrary GitHub repos.
 ## internal
 
 ```console
-$ code-agent eval run --suite rust-mini --adapter internal
-$ code-agent eval run rust-hidden-sum-bug --adapter internal
+$ crom eval run --suite rust-mini --adapter internal
+$ crom eval run rust-hidden-sum-bug --adapter internal
 ```
 
 Discovers `<tasks-dir>/<id>/task.toml`. This is the default adapter.
@@ -33,7 +33,7 @@ Discovers `<tasks-dir>/<id>/task.toml`. This is the default adapter.
 ## directory
 
 ```console
-$ code-agent eval run ./path/to/task --adapter directory
+$ crom eval run ./path/to/task --adapter directory
 ```
 
 Accepts either a directory containing a `task.toml` (loaded directly) or a bare
@@ -56,7 +56,7 @@ fixture; the hidden verification applies `test_patch` (if present) and runs
 `test_command`. Only local fixtures are supported.
 
 ```console
-$ code-agent eval run ./instances/example__repo-1 --adapter swebench
+$ crom eval run ./instances/example__repo-1 --adapter swebench
 ```
 
 ## aider (MVP)
@@ -66,7 +66,7 @@ Public verification is `cargo test`. Supports `--attempts 2` for a single
 retry with the failing test output fed back to the agent.
 
 ```console
-$ code-agent eval run ./exercises/reverse-string --adapter aider --attempts 2
+$ crom eval run ./exercises/reverse-string --adapter aider --attempts 2
 ```
 
 ## terminal (MVP)
@@ -76,12 +76,12 @@ A directory with `instruction.txt` and `test.sh` (plus optional `Dockerfile`/
 Container execution is recorded but not required.
 
 ```console
-$ code-agent eval run ./tasks/grep-task --adapter terminal
+$ crom eval run ./tasks/grep-task --adapter terminal
 ```
 
 ## Adding a new adapter
 
-Implement `code_agent_eval::adapter::EvalAdapter` (`id`, `describe`,
+Implement `crom_eval::adapter::EvalAdapter` (`id`, `describe`,
 `discover_tasks`) and register it in `AdapterRegistry::default()`. The adapter's
 only job is to produce `EvalTask` values (including any hidden verification); the
-runner executes them uniformly. See `crates/eval/src/external.rs` for examples.
+runner executes them uniformly. See `crates/crom-eval/src/external.rs` for examples.
