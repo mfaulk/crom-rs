@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CODE_AGENT_PLUGIN_ROOT}/scripts/format-check.sh"
+            "command": "${CROM_PLUGIN_ROOT}/scripts/format-check.sh"
           }
         ]
       }

@@ -9,7 +9,7 @@
 //!   and demos in non-interactive environments.
 //!
 //! Usage (run from the example directory — this is a standalone
-//! workspace, not a member of the main code-agent workspace):
+//! workspace, not a member of the main crom workspace):
 //!     cd examples/tui-demo
 //!     cargo run -- live
 //!     cargo run -- snapshot
@@ -17,11 +17,11 @@
 
 use std::sync::Arc;
 
-use code_agent_core::{ComposerConfig, StatusLineContext};
-use code_agent_sdk::{
+use crom_core::{ComposerConfig, StatusLineContext};
+use crom_sdk::{
     fake_provider::EchoFakeProvider, AgentRuntime, ProviderConfig, WorkspaceSource,
 };
-use code_agent_tui::{
+use crom_tui::{
     build_ui_frame, drive_single_prompt, ComposerState, TuiApp, TuiAppState,
 };
 use ratatui::backend::TestBackend;
@@ -88,7 +88,7 @@ async fn snapshot(prompt: &str) -> anyhow::Result<()> {
     let frame = build_ui_frame(&state, "");
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend)?;
-    code_agent_tui::fullscreen::draw(&mut terminal, frame)?;
+    crom_tui::fullscreen::draw(&mut terminal, frame)?;
     let buf = terminal.backend().buffer();
     for y in 0..buf.area.height {
         let mut line = String::new();

@@ -10,8 +10,8 @@ The SDK ships three `AgentStorage` implementations:
 
 ```rust,no_run
 use std::sync::Arc;
-use code_agent_sdk::{AgentRuntime, FileStorage, ProviderConfig};
-use code_agent_sdk::fake_provider::EchoFakeProvider;
+use crom_sdk::{AgentRuntime, FileStorage, ProviderConfig};
+use crom_sdk::fake_provider::EchoFakeProvider;
 
 # async fn run() -> anyhow::Result<()> {
 let storage = Arc::new(FileStorage::new("/tmp/agent-storage")?);

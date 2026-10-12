@@ -1,4 +1,4 @@
-# cargo-deny configuration for the code-agent workspace.
+# cargo-deny configuration for the crom workspace.
 # Run locally with: cargo deny check
 #
 # The workspace publishes under `Apache-2.0 OR MIT`, so we allow the common

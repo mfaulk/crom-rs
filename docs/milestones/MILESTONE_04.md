@@ -8,7 +8,7 @@ permission policy, approvals, sessions, telemetry, and logs. Workspace
 checkpointing still only covers local files — MCP external effects are
 explicitly marked as not rewindable.
 
-## New crate: `code-agent-mcp`
+## New crate: `crom-mcp`
 
 - Config types and loading from `.agent/mcp.json` (or under
   `.agent/settings.json -> mcp`).
@@ -92,13 +92,13 @@ MCP is disabled by default in the library API. The CLI loads MCP when
 ## CLI surface
 
 ```sh
-code-agent mcp list --cwd .
-code-agent mcp status --cwd . --mcp-config .agent/mcp.json
-code-agent mcp tools <server>
-code-agent mcp call <server> <tool> --args-json '{}' --yes
-code-agent mcp resources <server>
-code-agent mcp resource read <server> <uri>
-code-agent mcp prompts <server>
+crom mcp list --cwd .
+crom mcp status --cwd . --mcp-config .agent/mcp.json
+crom mcp tools <server>
+crom mcp call <server> <tool> --args-json '{}' --yes
+crom mcp resources <server>
+crom mcp resource read <server> <uri>
+crom mcp prompts <server>
 ```
 
 Run flags: `--mcp-config PATH`, `--mcp-enabled true|false`, `--mcp-strict`,
@@ -107,7 +107,7 @@ Run flags: `--mcp-config PATH`, `--mcp-enabled true|false`, `--mcp-strict`,
 Agent runs expose MCP tools through the existing tool allowlist:
 
 ```sh
-code-agent run "Summarize open fake issues" \
+crom run "Summarize open fake issues" \
   --mcp-config .agent/mcp.json \
   --allowed-tools "Read,Grep,mcp__fake__list_issues,mcp__fake__get_issue"
 ```

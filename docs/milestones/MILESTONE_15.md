@@ -34,8 +34,8 @@ reference.
 ### Isolation backends (`isolation.rs`)
 
 - `IsolationBackend` trait, `LocalBackend` (default, everywhere), and a
-  `ContainerBackend` for `docker`/`podman` (opt-in via `CODE_AGENT_EVAL_DOCKER`
-  / `CODE_AGENT_EVAL_PODMAN`; missing engine ⇒ `isolation_error`).
+  `ContainerBackend` for `docker`/`podman` (opt-in via `CROM_EVAL_DOCKER`
+  / `CROM_EVAL_PODMAN`; missing engine ⇒ `isolation_error`).
 - `CommandLimits` (timeout/network/cpu/memory/image); network disabled by
   default for verification. `EnvMetadata` written to `environment.json`.
 
@@ -80,7 +80,7 @@ reference.
 
 ### Regression index + trends (`index.rs`)
 
-- Append-only JSONL index at `target/code-agent-eval/index.jsonl` (run id, git
+- Append-only JSONL index at `target/crom-eval/index.jsonl` (run id, git
   sha/branch/dirty, suite, task, adapter, isolation, provider, model, resolved,
   failure class, cost, wall, tool calls, patch lines, category, tags,
   capabilities).
@@ -101,7 +101,7 @@ reference.
   resolved-rate aggregation by category / tag / capability / adapter / isolation
   / provider / model, plus a behavior summary.
 
-## CLI surface added (`code-agent eval`)
+## CLI surface added (`crom eval`)
 
 `adapters`, `validate-task`, `validate-suite`, `history`, `trend`,
 `regressions`, `task-history`, `triage`, `show`, `open`, plus `run` flags:
@@ -127,7 +127,7 @@ labels and added to a `rust-mini` suite. New tasks: `noop-already-correct`
 
 ## Tests
 
-Deterministic, offline (`code-agent-eval` unit tests + `tests/harness.rs` +
+Deterministic, offline (`crom-eval` unit tests + `tests/harness.rs` +
 `tests/m15.rs`): schema v1/v2 parsing and rejection, capability/behavior/
 quarantine/prompt-variant parsing, adapter registry + discovery, validation +
 flake + canary, local isolation + timeout + env metadata, behavior metrics,
@@ -137,8 +137,8 @@ show, and end-to-end hidden verification + directory + swebench-local runs.
 ## Safety / CI
 
 Normal tests require no API keys, network, Docker, or Podman. Live providers
-remain opt-in (`CODE_AGENT_EVAL_LIVE=1`); container backends are opt-in
-(`CODE_AGENT_EVAL_DOCKER`/`CODE_AGENT_EVAL_PODMAN`) or report `isolation_error`.
+remain opt-in (`CROM_EVAL_LIVE=1`); container backends are opt-in
+(`CROM_EVAL_DOCKER`/`CROM_EVAL_PODMAN`) or report `isolation_error`.
 Hidden tests are never present in the workspace during the agent run.
 
 ## Out of scope

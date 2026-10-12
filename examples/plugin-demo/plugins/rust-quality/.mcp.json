@@ -3,9 +3,9 @@
     "rust-docs": {
       "type": "stdio",
       "command": "echo",
-      "args": ["${CODE_AGENT_PLUGIN_ROOT}/scripts/format-check.sh"],
+      "args": ["${CROM_PLUGIN_ROOT}/scripts/format-check.sh"],
       "env": {
-        "CACHE_DIR": "${CODE_AGENT_PLUGIN_DATA}/rust-docs-cache"
+        "CACHE_DIR": "${CROM_PLUGIN_DATA}/rust-docs-cache"
       }
     }
   }

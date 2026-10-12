@@ -8,11 +8,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-BIN="$ROOT/target/debug/code-agent"
+BIN="$ROOT/target/debug/crom"
 
 if [[ ! -x "$BIN" ]]; then
-  echo "[demo] building code-agent (debug)..."
-  (cd "$ROOT" && cargo build -p code-agent-cli >/dev/null)
+  echo "[demo] building crom (debug)..."
+  (cd "$ROOT" && cargo build -p crom-cli >/dev/null)
 fi
 
 cd "$HERE"

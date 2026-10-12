@@ -89,13 +89,13 @@ and MCP external-effect checks.
 ## Catalog inspection commands
 
 ```sh
-code-agent tools list --cwd . --mcp-config .agent/mcp.json --all
-code-agent tools list --cwd . --mcp-config .agent/mcp.json --loaded
-code-agent tools list --cwd . --mcp-config .agent/mcp.json --deferred
-code-agent tools search "github issues" --cwd . --mcp-config .agent/mcp.json --limit 5
-code-agent tools show mcp__fake__github_list_issues --cwd . --mcp-config .agent/mcp.json
-code-agent tools stats --cwd . --mcp-config .agent/mcp.json
-code-agent tools explain-loading --cwd . --mcp-config .agent/mcp.json
+crom tools list --cwd . --mcp-config .agent/mcp.json --all
+crom tools list --cwd . --mcp-config .agent/mcp.json --loaded
+crom tools list --cwd . --mcp-config .agent/mcp.json --deferred
+crom tools search "github issues" --cwd . --mcp-config .agent/mcp.json --limit 5
+crom tools show mcp__fake__github_list_issues --cwd . --mcp-config .agent/mcp.json
+crom tools stats --cwd . --mcp-config .agent/mcp.json
+crom tools explain-loading --cwd . --mcp-config .agent/mcp.json
 ```
 
 The `tools` subcommands mirror the agent's runtime semantics:
@@ -123,7 +123,7 @@ JSON log mode (`--log-format json`) serializes these as valid JSON lines.
 ## Example usage
 
 ```sh
-code-agent run "Find the parser bug issue and inspect the likely source" \
+crom run "Find the parser bug issue and inspect the likely source" \
   --mcp-config .agent/mcp.json \
   --tool-loading search \
   --allowed-tools "Read,Grep,Glob,SearchTools,mcp__fake__*"

@@ -1,0 +1,32 @@
+[package]
+name = "crom-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core types and agent loop for crom"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+camino = { workspace = true }
+globset = { workspace = true }
+regex = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+fs4 = { workspace = true }
+crom-mcp = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+temp-env = { workspace = true }
+crom-session = { workspace = true }

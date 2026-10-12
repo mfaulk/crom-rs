@@ -28,9 +28,9 @@ phase has merged and the acceptance checklist at the bottom is satisfied.
 
 ### What's new
 
-`crates/code-agent-tui` previously shipped only rendering primitives
+`crates/crom-tui` previously shipped only rendering primitives
 (status line, transcript cards, approvals, diffs, plan view) plus a
-`Fullscreen` / `Plain` renderer split. The CLI's `code-agent tui`
+`Fullscreen` / `Plain` renderer split. The CLI's `crom tui`
 command was a stub that printed one preview frame and exited.
 
 Phase A introduces the first interactive event loop:
@@ -38,13 +38,13 @@ Phase A introduces the first interactive event loop:
 | Module | Purpose |
 |--------|---------|
 | `state.rs` | `TuiAppState`, `TuiAction`, `TuiInbound`, `RunStatus`. Pure, synchronous reducer that takes inbound events (SDK events, keys, resize, stream errors / endings) and emits side-effect intents. No terminal or runtime I/O. |
-| `event_adapter.rs` | `map_sdk_event` — total mapper from `code_agent_sdk::SdkEvent` to `EventCard` + activity hint + run-terminal marker. Unknown variants render as generic cards. |
+| `event_adapter.rs` | `map_sdk_event` — total mapper from `crom_sdk::SdkEvent` to `EventCard` + activity hint + run-terminal marker. Unknown variants render as generic cards. |
 | `app.rs` | `TuiApp` and `drive_single_prompt`. `TuiApp::run` enters raw-mode + alternate-screen, spawns a blocking task that decodes crossterm events into the composer's abstract `KeyEvent`, and runs a `tokio::select!` loop over input, the active `AgentRun` event stream, and a redraw tick. `TerminalGuard` restores the terminal on drop / panic. |
 
 ### Public API additions
 
 ```rust
-use code_agent_tui::{TuiApp, TuiAppState, ComposerState, RunStatus};
+use crom_tui::{TuiApp, TuiAppState, ComposerState, RunStatus};
 
 let app = TuiApp::new(runtime, state);
 app.run().await?;
@@ -65,7 +65,7 @@ match actions.first() {
 
 ### CLI surface
 
-`code-agent tui` now launches the live shell when stdout is a TTY and
+`crom tui` now launches the live shell when stdout is a TTY and
 fullscreen rendering is selected. Flags:
 
 | Flag | Behavior |
@@ -81,7 +81,7 @@ When neither `--fake-provider` nor `ANTHROPIC_API_KEY` is set the CLI
 prints a one-line preview frame and exits with a clear hint instead of
 launching an empty cockpit. Real provider routing for OAuth / OpenAI /
 Gemini is intentionally deferred to a later phase; the existing
-`code-agent run` / `code-agent headless-run` paths already cover those
+`crom run` / `crom headless-run` paths already cover those
 cases.
 
 ### Event coverage
@@ -99,7 +99,7 @@ to compile rather than silently dropping the event.
 
 ### Tests
 
-`crates/code-agent-tui/src/state.rs` adds 9 unit tests covering submit,
+`crates/crom-tui/src/state.rs` adds 9 unit tests covering submit,
 run start, run completion, run failure, delta coalescing, activity
 capacity, Ctrl+C semantics, stream error recovery, resize, and
 transcript bounding. `event_adapter.rs` adds 5 unit tests covering the
@@ -295,7 +295,7 @@ All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --
 * Session browser, recovery, model / provider / auth selectors — Phase G.
 * Command palette, help overlay, accessibility hardening — Phase H.
 * `examples/tui-demo`, new CLI subcommands, UI telemetry — Phase I.
-* Real provider routing in `code-agent tui` beyond fake / Anthropic-API-key.
+* Real provider routing in `crom tui` beyond fake / Anthropic-API-key.
 * OpenTelemetry export, theme system, VS Code / JetBrains / web / desktop
   surfaces (excluded for the whole milestone).
 
@@ -351,10 +351,10 @@ All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --
 
 | Module | Purpose |
 |--------|---------|
-| `inspectors.rs` (new) | Pure read-only record types — `InspectorTool`, `InspectorMcp`, `InspectorSubagent`, `InspectorSkill`, `InspectorPlugin` — and the `Inspectors` snapshot that owns the five vectors. Plain `String` / `usize` / `Option<u32>` fields so the renderer doesn't depend on `code-agent-core` / `code-agent-mcp` enum types. |
+| `inspectors.rs` (new) | Pure read-only record types — `InspectorTool`, `InspectorMcp`, `InspectorSubagent`, `InspectorSkill`, `InspectorPlugin` — and the `Inspectors` snapshot that owns the five vectors. Plain `String` / `usize` / `Option<u32>` fields so the renderer doesn't depend on `crom-core` / `crom-mcp` enum types. |
 | `state.rs` | New `TuiAppState` field `inspectors: Inspectors` and `inspector_selection: InspectorSelection { tools, mcp, subagents, skills, plugins: Option<usize> }`. New builder method `with_inspectors(inspectors)`. New helpers `inspector_list_len(mode)` / `inspector_selected_index(mode)` and the private `move_inspector_selection` / `set_inspector_selection` mutators. The reducer's side-panel key path intercepts `j`/`k`/`Up`/`Down`/`g`/`G` only when the panel is focused **and** the mode is one of the five inspector modes — non-inspector modes (Plan, Changes, Files, Sessions, …) continue to fall through to the composer so typed slash commands still work. |
 | `view.rs` | New `inspector_body(state, mode)` builds the side-panel body from the snapshot rows. Rows render with a leading `›` for the active selection and `  ` otherwise. Empty categories render `<Mode> inspector` / `(none configured)` instead of the Phase B placeholder. Long descriptions are truncated with `…` so a single row fits a ~80-column side panel. |
-| `code-agent-cli/src/main.rs` | `cmd_tui` now calls a new `build_inspector_snapshot_for_tui(cwd, settings)` before constructing `TuiAppState`. The snapshot honors `settings.agents.{enabled,allow_filesystem_agents,builtins,path}` and `settings.skills.{enabled,allow_filesystem_skills,compat_claude_skills,max_*}` for parity with the run path. After loading raw skills + agents + MCP options, the builder calls `plugins::apply_to_registries` so plugin-supplied components are merged into the inspector view. The builder returns `(Inspectors, Vec<String>)` — each diagnostic is seeded into the TUI activity panel so the user sees *why* an inspector is empty. MCP endpoints are redacted: stdio shows only `command (+N args)`; HTTP strips userinfo / query / fragment to avoid leaking bearer tokens. |
+| `crom-cli/src/main.rs` | `cmd_tui` now calls a new `build_inspector_snapshot_for_tui(cwd, settings)` before constructing `TuiAppState`. The snapshot honors `settings.agents.{enabled,allow_filesystem_agents,builtins,path}` and `settings.skills.{enabled,allow_filesystem_skills,compat_claude_skills,max_*}` for parity with the run path. After loading raw skills + agents + MCP options, the builder calls `plugins::apply_to_registries` so plugin-supplied components are merged into the inspector view. The builder returns `(Inspectors, Vec<String>)` — each diagnostic is seeded into the TUI activity panel so the user sees *why* an inspector is empty. MCP endpoints are redacted: stdio shows only `command (+N args)`; HTTP strips userinfo / query / fragment to avoid leaking bearer tokens. |
 
 ### Inspector rows
 
@@ -410,7 +410,7 @@ swallowed while inspector mode is focused).
 `inspector_body_empty_state_is_informative`,
 `all_inspector_modes_render_real_rows_when_populated`.
 
-`code-agent-cli` adds 2 redaction tests in `tui_inspector_helpers_tests`:
+`crom-cli` adds 2 redaction tests in `tui_inspector_helpers_tests`:
 `stdio_endpoint_redacts_args`,
 `http_endpoint_strips_query_fragment_and_userinfo`.
 
@@ -419,7 +419,7 @@ All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --
 ### Out of scope for Phase F
 
 * Detail-panel "inspect this row" view — selecting a tool / skill / plugin and pressing `Enter` to show its full schema / manifest / instructions. The detail panel's `ToolDetails` / `FilePreview` modes were stubbed in Phase B; populating them lands when Phase G adds the diagnostics workbench since the two share the same detail-pane real estate.
-* Live MCP server status (connected / failed / tool count) — needs a connection attempt; deferred so `code-agent tui` startup stays fast. The Phase F MCP inspector only lists *configured* servers, not running ones.
+* Live MCP server status (connected / failed / tool count) — needs a connection attempt; deferred so `crom tui` startup stays fast. The Phase F MCP inspector only lists *configured* servers, not running ones.
 * Plugin marketplace browsing / install / enable-disable actions — Phase F is read-only.
 * File-system `@file` autocomplete candidates (the Phase D `CompletionKind::File` empty-list seam) — needs a workspace scanner; Phase F's host has the cwd and a workspace handle but the actual scanner and candidate sort are deferred to Phase H so the candidate model can share the command-palette infrastructure.
 * Hot-reload of the inspector snapshot when the user runs `/plugins reload` or edits a SKILL.md — Phase H+.
@@ -433,9 +433,9 @@ All M1–M12 tests still pass; `cargo fmt --check`, `cargo clippy --workspace --
 | `inspectors.rs` | Four new record types — `InspectorSession`, `InspectorAccount`, `InspectorModel`, `InspectorProvider` — and four new `Inspectors` fields. All keep the plain-string / number shape so the renderer doesn't import auth / session types. |
 | `state.rs` | New ring buffer `diagnostics: Vec<DiagnosticEntry>` (bounded by `DIAGNOSTIC_CAP = 64`) fed by `SdkEvent::Diagnostic` via `apply_phase_e_workbench_event`. `inspector_list_len` / `inspector_selected_index` / `set_inspector_selection` extended for the 5 new modes (Sessions, Auth, Model, Provider, Diagnostics). New `push_diagnostic` method mirrors a one-line summary to the activity log. |
 | `view.rs` | `inspector_body` switch extended with arms for the 5 new modes. Row formats listed below. Selection glyph `›` and empty-state placeholder semantics carry over. |
-| `approval_bridge.rs` (new) | `ApprovalBridge` implements `code_agent_sdk::callback::ApprovalCallback`. Pairs with an unbounded mpsc receiver via `new_bridge_pair()` so the SDK's `approve()` round-trips through the TUI: SDK → mpsc → app loop → user → oneshot → SDK. Dropped resolver → SDK sees `Deny { reason: "approval canceled" }`; dropped receiver → SDK sees an `Internal` error. |
+| `approval_bridge.rs` (new) | `ApprovalBridge` implements `crom_sdk::callback::ApprovalCallback`. Pairs with an unbounded mpsc receiver via `new_bridge_pair()` so the SDK's `approve()` round-trips through the TUI: SDK → mpsc → app loop → user → oneshot → SDK. Dropped resolver → SDK sees `Deny { reason: "approval canceled" }`; dropped receiver → SDK sees an `Internal` error. |
 | `app.rs` | `TuiApp` accepts `with_approval_bridge(rx)`. New select! branch routes `BridgeRequest` into a stashed `pending_resolver: Option<oneshot::Sender<ApprovalDecision>>`. The `ResolveApproval(decision)` action now translates the reducer's decision into an SDK `ApprovalDecision` (`RequestRevision` maps to `Deny { reason: "user requested revision" }`) and sends through the stashed resolver. |
-| `code-agent-cli/src/main.rs` | `cmd_tui` is now async-aware; `build_inspector_snapshot_for_tui` awaits `session::recovery::detect_state` and opens a `CredentialStore` to project accounts + providers + models from `code_agent_auth::starter_registry`. A new `--recover` flag opens a "Recovery — N session(s)" modal when interrupted / needs_recovery sessions are detected. The TUI runtime is constructed with `.approval_callback(approval_bridge)` so live approvals route through the TUI. |
+| `crom-cli/src/main.rs` | `cmd_tui` is now async-aware; `build_inspector_snapshot_for_tui` awaits `session::recovery::detect_state` and opens a `CredentialStore` to project accounts + providers + models from `crom_auth::starter_registry`. A new `--recover` flag opens a "Recovery — N session(s)" modal when interrupted / needs_recovery sessions are detected. The TUI runtime is constructed with `.approval_callback(approval_bridge)` so live approvals route through the TUI. |
 
 ### Inspector rows (Phase G)
 
@@ -463,7 +463,7 @@ If the TUI exits before the user resolves the modal, the dropped resolver is map
 
 ### Recovery flow
 
-`code-agent tui --recover` triggers a startup scan of `<cwd>/.agent/sessions/` via `code_agent_session::recovery::detect_state`. If any session has state `Interrupted` or `NeedsRecovery`, a `Custom { id: "phase-g-recovery", ... }` modal lists the affected ids with their state and lock marker. The actual resume — replaying records, fork-vs-overwrite, lock takeover — is deferred to Phase H+ because it requires SDK storage adapter integration; Phase G's modal informs the user a recovery is available and the Sessions inspector lists them at all times regardless of the flag.
+`crom tui --recover` triggers a startup scan of `<cwd>/.agent/sessions/` via `crom_session::recovery::detect_state`. If any session has state `Interrupted` or `NeedsRecovery`, a `Custom { id: "phase-g-recovery", ... }` modal lists the affected ids with their state and lock marker. The actual resume — replaying records, fork-vs-overwrite, lock takeover — is deferred to Phase H+ because it requires SDK storage adapter integration; Phase G's modal informs the user a recovery is available and the Sessions inspector lists them at all times regardless of the flag.
 
 ### Keyboard (Phase G additions)
 
@@ -557,9 +557,9 @@ After the initial Phase H commit, a Codex review surfaced four important issues 
 
 | Module | Purpose |
 |--------|---------|
-| `code-agent-cli/src/main.rs` | New `--list-sessions` flag on `cmd_tui`. When set, the CLI prints discovered sessions (one per line, tab-separated `<id>\t<state>\t<lock?>\t<last_modified_unix?>`) and exits without launching the TUI. Pairs with the Phase G `--recover` flag for scripted recovery workflows. |
+| `crom-cli/src/main.rs` | New `--list-sessions` flag on `cmd_tui`. When set, the CLI prints discovered sessions (one per line, tab-separated `<id>\t<state>\t<lock?>\t<last_modified_unix?>`) and exits without launching the TUI. Pairs with the Phase G `--recover` flag for scripted recovery workflows. |
 | `examples/tui-demo/` (new) | Standalone example crate with two subcommands — `live` boots the M13 shell against the SDK fake provider (TTY required); `snapshot [prompt]` drives one canned prompt through `drive_single_prompt` and prints the rendered frame to stdout via ratatui's `TestBackend`. Useful for CI smoke tests and offline demos. |
-| `crates/code-agent-tui/src/state.rs` | Structured `tracing::debug!` records on the `code_agent_tui` target at four user-facing seams: panel switch (`side_panel_switch`), palette open (`palette_open`), approval decision (`approval_decision`), prompt submit (`submit_prompt`). Stays at `debug` so default `RUST_LOG=info` keeps the TUI silent. |
+| `crates/crom-tui/src/state.rs` | Structured `tracing::debug!` records on the `crom_tui` target at four user-facing seams: panel switch (`side_panel_switch`), palette open (`palette_open`), approval decision (`approval_decision`), prompt submit (`submit_prompt`). Stays at `debug` so default `RUST_LOG=info` keeps the TUI silent. |
 
 ### CLI surface
 
@@ -571,7 +571,7 @@ After the initial Phase H commit, a Codex review surfaced four important issues 
 
 ### Telemetry events
 
-Each event is a `tracing::debug!` record with `target: "code_agent_tui"` and structured fields:
+Each event is a `tracing::debug!` record with `target: "crom_tui"` and structured fields:
 
 | Event | Fields |
 |-------|--------|
@@ -580,7 +580,7 @@ Each event is a `tracing::debug!` record with `target: "code_agent_tui"` and str
 | `approval_decision` | `decision` (`ApprovalDecisionAction` debug) |
 | `submit_prompt` | `prompt_bytes` (length of the submitted prompt) |
 
-These ride on the workspace's existing `tracing` infrastructure; subscribers configured by the host (e.g. `tracing_subscriber::fmt()` with `RUST_LOG=code_agent_tui=debug`) capture them without any TUI-side wiring.
+These ride on the workspace's existing `tracing` infrastructure; subscribers configured by the host (e.g. `tracing_subscriber::fmt()` with `RUST_LOG=crom_tui=debug`) capture them without any TUI-side wiring.
 
 ### Tests
 

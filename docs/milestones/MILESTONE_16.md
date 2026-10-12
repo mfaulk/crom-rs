@@ -1,6 +1,6 @@
 # Milestone 16 — Repair Loop v1: Test Feedback Mastery
 
-**Theme:** Make `code-agent` substantially better at the
+**Theme:** Make `crom` substantially better at the
 edit → validate → diagnose → repair cycle. Compiler errors, test failures,
 panics, and command output stop being unstructured text blobs: they are captured
 as structured diagnostics, classified, summarized compactly, fingerprinted for
@@ -16,7 +16,7 @@ and reference.
 
 ## Deliverables
 
-### Diagnostics substrate (`crates/code-agent-core/src/diagnostics/`)
+### Diagnostics substrate (`crates/crom-core/src/diagnostics/`)
 
 - `CommandDiagnostic` model: `status`, parsed records, distilled `summary`,
   stable `fingerprint`, capped stdout/stderr excerpts. Every enum carries an
@@ -40,7 +40,7 @@ and reference.
   focused-validation plan generation. Augments, does not replace, the
   permission policy.
 
-### Repair controller (`crates/code-agent-core/src/repair.rs`)
+### Repair controller (`crates/crom-core/src/repair.rs`)
 
 - `RepairPolicy` (bounded, disableable), `RepairState` (serializable),
   `RepairController` driving `observe_validation → Cleared | Repair | Stop |
@@ -54,7 +54,7 @@ and reference.
   `diagnostics.include_backtrace` is rejected at load. `RepairConfig::to_policy`
   / `DiagnosticsConfig::to_compaction` build effective values with defaults.
 
-### Eval integration (`crates/eval/src/repair.rs`, `runner.rs`)
+### Eval integration (`crates/crom-eval/src/repair.rs`, `runner.rs`)
 
 - `RepairSession` drives the runner's attempt loop: parses each failed
   validation, generates the brief used as the next attempt's input, bounds
@@ -70,9 +70,9 @@ and reference.
 
 ### CLI
 
-- `code-agent diagnostics parse | summarize | fingerprint <log-file>` — parse
+- `crom diagnostics parse | summarize | fingerprint <log-file>` — parse
   captured logs without an agent session (`-` for stdin).
-- `code-agent eval run … --repair enabled|disabled --repair-max-attempts N
+- `crom eval run … --repair enabled|disabled --repair-max-attempts N
   --require-validation-after-edit --diagnostic-format text|json`.
 
 ### Repair eval suite

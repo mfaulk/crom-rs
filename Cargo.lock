@@ -270,300 +270,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "code-agent-anthropic"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "code-agent-core",
- "eventsource-stream",
- "futures",
- "insta",
- "proptest",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tracing",
-]
-
-[[package]]
-name = "code-agent-auth"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "fs4",
- "hex",
- "libc",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "code-agent-checkpoint"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "code-agent-core",
- "code-agent-session",
- "futures",
- "hex",
- "libc",
- "serde",
- "serde_json",
- "sha2",
- "similar 3.1.1",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "code-agent-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "clap_complete",
- "code-agent-anthropic",
- "code-agent-auth",
- "code-agent-checkpoint",
- "code-agent-core",
- "code-agent-eval",
- "code-agent-mcp",
- "code-agent-provider-gemini",
- "code-agent-provider-openai",
- "code-agent-sdk",
- "code-agent-session",
- "code-agent-tools",
- "code-agent-tui",
- "futures",
- "reqwest",
- "rpassword",
- "serde",
- "serde_json",
- "similar 3.1.1",
- "temp-env",
- "tempfile",
- "time",
- "tokio",
- "tokio-stream",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "code-agent-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "camino",
- "code-agent-mcp",
- "code-agent-session",
- "fs4",
- "futures",
- "globset",
- "hex",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "temp-env",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "code-agent-eval"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "code-agent-anthropic",
- "code-agent-auth",
- "code-agent-core",
- "code-agent-sdk",
- "futures",
- "libc",
- "regex",
- "serde",
- "serde_json",
- "similar 3.1.1",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tokio-stream",
- "toml",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "code-agent-mcp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "temp-env",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "code-agent-provider-gemini"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "code-agent-auth",
- "code-agent-core",
- "futures",
- "insta",
- "proptest",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tracing",
-]
-
-[[package]]
-name = "code-agent-provider-openai"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "code-agent-auth",
- "code-agent-core",
- "futures",
- "insta",
- "proptest",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tracing",
-]
-
-[[package]]
-name = "code-agent-sdk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "code-agent-anthropic",
- "code-agent-auth",
- "code-agent-checkpoint",
- "code-agent-core",
- "code-agent-provider-gemini",
- "code-agent-provider-openai",
- "code-agent-tools",
- "futures",
- "globset",
- "hex",
- "ignore",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "similar 3.1.1",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "code-agent-session"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "code-agent-core",
- "futures",
- "insta",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "code-agent-tools"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "camino",
- "code-agent-core",
- "globset",
- "ignore",
- "libc",
- "regex",
- "serde",
- "serde_json",
- "similar 3.1.1",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "code-agent-tui"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "code-agent-core",
- "code-agent-sdk",
- "crossterm",
- "futures",
- "ratatui",
- "serde",
- "serde_json",
- "similar 3.1.1",
- "tempfile",
- "textwrap",
- "thiserror",
- "time",
- "tokio",
- "tokio-stream",
- "tracing",
- "tracing-subscriber",
- "unicode-width",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -616,6 +322,300 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crom-anthropic"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "crom-core",
+ "eventsource-stream",
+ "futures",
+ "insta",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "crom-auth"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fs4",
+ "hex",
+ "libc",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "crom-checkpoint"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "crom-core",
+ "crom-session",
+ "futures",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar 3.1.1",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "crom-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "clap_complete",
+ "crom-anthropic",
+ "crom-auth",
+ "crom-checkpoint",
+ "crom-core",
+ "crom-eval",
+ "crom-mcp",
+ "crom-provider-gemini",
+ "crom-provider-openai",
+ "crom-sdk",
+ "crom-session",
+ "crom-tools",
+ "crom-tui",
+ "futures",
+ "reqwest",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "similar 3.1.1",
+ "temp-env",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "crom-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "camino",
+ "crom-mcp",
+ "crom-session",
+ "fs4",
+ "futures",
+ "globset",
+ "hex",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "temp-env",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "crom-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "crom-anthropic",
+ "crom-auth",
+ "crom-core",
+ "crom-sdk",
+ "futures",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "similar 3.1.1",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "crom-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "temp-env",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "crom-provider-gemini"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "crom-auth",
+ "crom-core",
+ "futures",
+ "insta",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "crom-provider-openai"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "crom-auth",
+ "crom-core",
+ "futures",
+ "insta",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "crom-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "crom-anthropic",
+ "crom-auth",
+ "crom-checkpoint",
+ "crom-core",
+ "crom-provider-gemini",
+ "crom-provider-openai",
+ "crom-tools",
+ "futures",
+ "globset",
+ "hex",
+ "ignore",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar 3.1.1",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "crom-session"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "crom-core",
+ "futures",
+ "insta",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "crom-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "camino",
+ "crom-core",
+ "globset",
+ "ignore",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "similar 3.1.1",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "crom-tui"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "crom-core",
+ "crom-sdk",
+ "crossterm",
+ "futures",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "similar 3.1.1",
+ "tempfile",
+ "textwrap",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width",
 ]
 
 [[package]]

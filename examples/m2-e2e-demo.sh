@@ -12,9 +12,9 @@
 #     `hooks → disallow rules → permission mode → allow rules → default deny`.
 #   * `--log-format json` and `--verbose` for structured telemetry.
 #   * `TodoWrite` progress tool exposed to the agent.
-#   * `code-agent sessions list|show|export` for inspection.
-#   * `code-agent continue` for resuming the latest session by cwd.
-#   * `code-agent fork` for branching a session into a new id.
+#   * `crom sessions list|show|export` for inspection.
+#   * `crom continue` for resuming the latest session by cwd.
+#   * `crom fork` for branching a session into a new id.
 #   * A live policy/hook denial: the agent attempts to read `.env`, the
 #     `Read:**/.env*` disallow rule fires, the agent never sees the secret.
 #
@@ -62,14 +62,14 @@ TARGET_DIR="$(
         || true
 )"
 TARGET_DIR="${TARGET_DIR:-$REPO_ROOT/target}"
-BIN="$TARGET_DIR/debug/code-agent"
+BIN="$TARGET_DIR/debug/crom"
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 # ---------------------------------------------------------------------------
-section "Step 0 — Build the code-agent CLI"
-cargo build -p code-agent-cli --manifest-path "$REPO_ROOT/Cargo.toml"
+section "Step 0 — Build the crom CLI"
+cargo build -p crom-cli --manifest-path "$REPO_ROOT/Cargo.toml"
 gray "binary: $BIN"
 if [[ ! -x "$BIN" ]]; then
     echo "error: expected binary at $BIN was not produced" >&2
@@ -128,7 +128,7 @@ gray "(cargo test exited non-zero, as expected)"
 section "Step 4 — Fix the bug under policy + hooks (Read+Edit+Bash+TodoWrite)"
 
 cyan "Command:"
-gray "  code-agent run \"...\" --cwd . \\"
+gray "  crom run \"...\" --cwd . \\"
 gray "      --allowed-tools Read,Glob,Grep,Edit,Bash,TodoWrite \\"
 gray "      --permission-mode dontAsk --max-turns 20 \\"
 gray "      --show-usage --verbose"
@@ -187,10 +187,10 @@ LINES_AFTER_FIX="$(wc -l < "$SESSION_FILE")"
 gray "JSONL records on disk for fix session: $LINES_AFTER_FIX"
 
 # ---------------------------------------------------------------------------
-section "Step 7 — code-agent continue: append a new turn to the latest session"
+section "Step 7 — crom continue: append a new turn to the latest session"
 
 cyan "Command:"
-gray "  code-agent continue \"...\" --cwd . \\"
+gray "  crom continue \"...\" --cwd . \\"
 gray "      --allowed-tools Read,Glob,Grep,Write,TodoWrite \\"
 gray "      --permission-mode dontAsk --max-turns 6"
 
@@ -212,10 +212,10 @@ LINES_AFTER_CONT="$(wc -l < "$SESSION_FILE")"
 gray "Session JSONL grew from $LINES_AFTER_FIX to $LINES_AFTER_CONT records (continue appended in-place)."
 
 # ---------------------------------------------------------------------------
-section "Step 8 — code-agent fork: branch the fix session into a new id, JSON telemetry"
+section "Step 8 — crom fork: branch the fix session into a new id, JSON telemetry"
 
 cyan "Command:"
-gray "  code-agent fork $FIX_SESSION \"...\" --cwd . \\"
+gray "  crom fork $FIX_SESSION \"...\" --cwd . \\"
 gray "      --allowed-tools Read,Edit,Bash,TodoWrite \\"
 gray "      --permission-mode dontAsk --max-turns 6 --log-format json"
 
@@ -262,7 +262,7 @@ grep -oE '"type":"[a-z_]+"' "$FORK_LOG" \
     | sed 's/^ */  /'
 
 cyan "First 3 JSON events from the fork run:"
-# `code-agent fork` prints `[fork] <src> -> <new>` to stdout before the run
+# `crom fork` prints `[fork] <src> -> <new>` to stdout before the run
 # starts, so the JSONL file has one non-JSON banner line at the top. Filter
 # for lines that start with `{` to show only AgentEvent rows.
 grep -E '^\{' "$FORK_LOG" | head -n 3
@@ -274,7 +274,7 @@ green "Fork session re-derived a passing fix independently."
 section "Step 9 — Live policy denial: agent tries to read .env, blocked"
 
 cyan "Command:"
-gray "  code-agent run \"...read .env...\" --cwd . \\"
+gray "  crom run \"...read .env...\" --cwd . \\"
 gray "      --allowed-tools Read --permission-mode dontAsk --max-turns 3"
 
 DENY_LOG="$WORK_DIR/deny.log"
@@ -320,7 +320,7 @@ section "Done"
 cat <<EOF
 Demo complete. Summary of what just happened:
 
-  * Built the code-agent CLI (debug profile).
+  * Built the crom CLI (debug profile).
   * Loaded $DEMO_DIR/.agent/settings.json — typed allow/disallow ToolRules,
     enabled built-in hooks (block_env_file_writes, block_dangerous_bash,
     audit_log, secret_redaction, max_patch_size_bytes).
@@ -329,9 +329,9 @@ Demo complete. Summary of what just happened:
     fixed src/lib.rs and re-ran cargo test (session $FIX_SESSION).
   * Verified .env was not touched (sha256 matches pre-run snapshot).
   * Listed sessions and inspected JSON summary + JSON export of the run.
-  * Used code-agent continue to append a SUMMARY.md follow-up turn to the
+  * Used crom continue to append a SUMMARY.md follow-up turn to the
     same JSONL ($LINES_AFTER_FIX -> $LINES_AFTER_CONT records).
-  * Used code-agent fork to spawn a new session ($NEW_SESSION) from the
+  * Used crom fork to spawn a new session ($NEW_SESSION) from the
     fix session and steer it with a different prompt; captured the run
     in --log-format json telemetry.
   * Drove a live policy denial: with .env reads disallowed by both the
