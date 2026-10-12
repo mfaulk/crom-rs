@@ -9,17 +9,9 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn binary() -> PathBuf {
-    let mut p = std::env::current_exe().unwrap();
-    // target/debug/deps/<this-test>
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.push("crom");
-    if cfg!(windows) {
-        p.set_extension("exe");
-    }
-    p
+    // Cargo hands the test the real binary path, which survives both the
+    // rename and layouts where the test binary is not a sibling of it.
+    PathBuf::from(env!("CARGO_BIN_EXE_crom"))
 }
 
 fn run(args: &[&str], dir: &std::path::Path) -> std::process::Output {
