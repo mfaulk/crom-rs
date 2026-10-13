@@ -8,8 +8,8 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
-code-agent-core = { path = "../../crates/code-agent-core" }
-code-agent-tools = { path = "../../crates/code-agent-tools" }
+crom-core = { path = "../../crates/crom-core" }
+crom-tools = { path = "../../crates/crom-tools" }
 tempfile = "3"
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "process", "time", "sync"] }

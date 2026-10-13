@@ -1,18 +1,18 @@
 # Custom tools
 
 Hosts register their own tools through `ToolPolicy::custom_tools`. Every
-tool implements the same `code_agent_core::Tool` trait that ships with the
+tool implements the same `crom_core::Tool` trait that ships with the
 built-ins.
 
 ```rust,no_run
 use std::sync::Arc;
 use async_trait::async_trait;
-use code_agent_core::{ToolError, ToolResult};
-use code_agent_sdk::{
+use crom_core::{ToolError, ToolResult};
+use crom_sdk::{
     AgentRuntime, BuiltinToolSet, PermissionKind, ProviderConfig, SideEffectPolicy,
     Tool, ToolContext, ToolPolicy,
 };
-use code_agent_sdk::fake_provider::EchoFakeProvider;
+use crom_sdk::fake_provider::EchoFakeProvider;
 
 struct PingTool;
 

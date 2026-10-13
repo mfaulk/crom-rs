@@ -109,12 +109,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
-name = "code-agent-anthropic"
+name = "crom-anthropic"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
- "code-agent-core",
+ "crom-core",
  "eventsource-stream",
  "futures",
  "reqwest",
@@ -127,7 +127,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-auth"
+name = "crom-auth"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -145,12 +145,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-core"
+name = "crom-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "camino",
- "code-agent-mcp",
+ "crom-mcp",
  "futures",
  "globset",
  "regex",
@@ -166,7 +166,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-mcp"
+name = "crom-mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -180,15 +180,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-sdk"
+name = "crom-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "code-agent-anthropic",
- "code-agent-auth",
- "code-agent-core",
- "code-agent-tools",
+ "crom-anthropic",
+ "crom-auth",
+ "crom-core",
+ "crom-tools",
  "futures",
  "globset",
  "hex",
@@ -207,12 +207,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-tools"
+name = "crom-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "camino",
- "code-agent-core",
+ "crom-core",
  "globset",
  "ignore",
  "libc",
@@ -525,8 +525,8 @@ name = "headless-sdk-demo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "code-agent-core",
- "code-agent-sdk",
+ "crom-core",
+ "crom-sdk",
  "futures",
  "serde_json",
  "tokio",

@@ -4,7 +4,7 @@ Add the SDK to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-code-agent-sdk = { path = "path/to/crates/code-agent-sdk", features = ["fake-provider"] }
+crom-sdk = { path = "path/to/crates/crom-sdk", features = ["fake-provider"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -13,8 +13,8 @@ Run a single coding task with the deterministic fake provider:
 ```rust,no_run
 use std::sync::Arc;
 
-use code_agent_sdk::fake_provider::EchoFakeProvider;
-use code_agent_sdk::{
+use crom_sdk::fake_provider::EchoFakeProvider;
+use crom_sdk::{
     AgentRequest, AgentRuntime, InMemoryWorkspace, ProviderConfig, WorkspaceSource,
 };
 
@@ -55,4 +55,4 @@ For a streamed run with cancellation, use `runtime.run(...)` instead of
 `run_once`. See [`events.md`](events.md).
 
 CLI users can drive the SDK without touching their app code via the
-`code-agent headless-run` subcommand.
+`crom headless-run` subcommand.

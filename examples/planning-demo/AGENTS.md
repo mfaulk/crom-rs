@@ -13,7 +13,7 @@ The plan store lives at `.agent/plans/`. The session log is at
 
 ## Notes
 
-- Plans must be reviewed and approved before `code-agent act` runs them.
+- Plans must be reviewed and approved before `crom act` runs them.
 - Out-of-scope tool calls trigger the configured deviation policy
   (`ask` in this demo).
 - `cargo test` validates the fix.

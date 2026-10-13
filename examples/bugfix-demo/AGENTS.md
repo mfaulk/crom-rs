@@ -1,6 +1,6 @@
 # bugfix-demo
 
-This is a tiny Rust crate used to exercise the `code-agent` end-to-end flow.
+This is a tiny Rust crate used to exercise the `crom` end-to-end flow.
 
 ## Intent
 
@@ -19,7 +19,7 @@ example, `parse_token("v123")` should return `Some(123)`).
 
 Edit only `src/lib.rs`. Do not modify the tests.
 
-## Follow-up task (used by `examples/e2e-demo.sh` after `code-agent resume`)
+## Follow-up task (used by `examples/e2e-demo.sh` after `crom resume`)
 
 If the user's follow-up prompt asks for a SUMMARY:
 

@@ -1,22 +1,22 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/code-agent-core",
-    "crates/code-agent-anthropic",
-    "crates/code-agent-tools",
-    "crates/code-agent-session",
-    "crates/code-agent-checkpoint",
-    "crates/code-agent-mcp",
-    "crates/code-agent-tui",
-    "crates/code-agent-cli",
-    "crates/code-agent-auth",
-    "crates/code-agent-provider-openai",
-    "crates/code-agent-provider-gemini",
-    "crates/code-agent-sdk",
-    "crates/eval",
+    "crates/crom-core",
+    "crates/crom-anthropic",
+    "crates/crom-tools",
+    "crates/crom-session",
+    "crates/crom-checkpoint",
+    "crates/crom-mcp",
+    "crates/crom-tui",
+    "crates/crom-cli",
+    "crates/crom-auth",
+    "crates/crom-provider-openai",
+    "crates/crom-provider-gemini",
+    "crates/crom-sdk",
+    "crates/crom-eval",
 ]
 exclude = [
-    "crates/eval/eval",
+    "crates/crom-eval/eval",
     "examples/bugfix-demo",
     "examples/policy-demo",
     "examples/checkpoint-demo",
@@ -32,7 +32,7 @@ exclude = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/mfaulk/code-agent"
+repository = "https://github.com/mfaulk/crom-rs"
 rust-version = "1.88"
 
 [workspace.dependencies]
@@ -68,18 +68,18 @@ rand = { version = "0.10", features = ["sys_rng"] }
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 
-code-agent-core = { path = "crates/code-agent-core", version = "0.1.0" }
-code-agent-anthropic = { path = "crates/code-agent-anthropic", version = "0.1.0" }
-code-agent-tools = { path = "crates/code-agent-tools", version = "0.1.0" }
-code-agent-session = { path = "crates/code-agent-session", version = "0.1.0" }
-code-agent-checkpoint = { path = "crates/code-agent-checkpoint", version = "0.1.0" }
-code-agent-mcp = { path = "crates/code-agent-mcp", version = "0.1.0" }
-code-agent-auth = { path = "crates/code-agent-auth", version = "0.1.0" }
-code-agent-provider-openai = { path = "crates/code-agent-provider-openai", version = "0.1.0" }
-code-agent-provider-gemini = { path = "crates/code-agent-provider-gemini", version = "0.1.0" }
-code-agent-sdk = { path = "crates/code-agent-sdk", version = "0.1.0" }
-code-agent-tui = { path = "crates/code-agent-tui", version = "0.1.0" }
-code-agent-eval = { path = "crates/eval", version = "0.1.0" }
+crom-core = { path = "crates/crom-core", version = "0.1.0" }
+crom-anthropic = { path = "crates/crom-anthropic", version = "0.1.0" }
+crom-tools = { path = "crates/crom-tools", version = "0.1.0" }
+crom-session = { path = "crates/crom-session", version = "0.1.0" }
+crom-checkpoint = { path = "crates/crom-checkpoint", version = "0.1.0" }
+crom-mcp = { path = "crates/crom-mcp", version = "0.1.0" }
+crom-auth = { path = "crates/crom-auth", version = "0.1.0" }
+crom-provider-openai = { path = "crates/crom-provider-openai", version = "0.1.0" }
+crom-provider-gemini = { path = "crates/crom-provider-gemini", version = "0.1.0" }
+crom-sdk = { path = "crates/crom-sdk", version = "0.1.0" }
+crom-tui = { path = "crates/crom-tui", version = "0.1.0" }
+crom-eval = { path = "crates/crom-eval", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

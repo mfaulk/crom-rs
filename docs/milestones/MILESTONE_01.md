@@ -8,11 +8,11 @@ the public surface of the Anthropic Agent SDK.
 
 | Crate | Purpose |
 |-------|---------|
-| `code-agent-core` | Agent loop, `ModelProvider` / `Tool` / `PermissionCallback` traits, `AgentEvent` stream, options, errors. |
-| `code-agent-anthropic` | Streaming Messages API provider: SSE parsing, tool-use buffering, retries on 408/429/5xx, separate connect/read timeouts. |
-| `code-agent-tools` | Built-in tools: `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`. |
-| `code-agent-session` | JSONL session store under `<cwd>/.agent/sessions/<id>.jsonl`; create/append/load/list/latest, `SessionSinkAdapter`, `replay_conversation` for resume. |
-| `code-agent-cli` | `code-agent` binary with `run`, `resume`, `sessions list`. |
+| `crom-core` | Agent loop, `ModelProvider` / `Tool` / `PermissionCallback` traits, `AgentEvent` stream, options, errors. |
+| `crom-anthropic` | Streaming Messages API provider: SSE parsing, tool-use buffering, retries on 408/429/5xx, separate connect/read timeouts. |
+| `crom-tools` | Built-in tools: `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`. |
+| `crom-session` | JSONL session store under `<cwd>/.agent/sessions/<id>.jsonl`; create/append/load/list/latest, `SessionSinkAdapter`, `replay_conversation` for resume. |
+| `crom-cli` | `crom` binary with `run`, `resume`, `sessions list`. |
 
 ## Agent loop semantics
 

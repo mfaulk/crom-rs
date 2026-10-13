@@ -8,13 +8,13 @@ Offline demo crate for M9 beta UX testing.
 cd examples/beta-demo
 
 # 1. Diagnose
-code-agent doctor
+crom doctor
 
 # 2. Render a status-line preview without a TTY
-code-agent tui --renderer plain --snapshot
+crom tui --renderer plain --snapshot
 
 # 3. Open the TUI in a real terminal
-code-agent tui
+crom tui
 
 # 4. Inside the TUI, ask:
 #      fix the failing tests
@@ -37,4 +37,4 @@ to give the agent something to fix end-to-end.
 - approval flow (Edit/Bash) with checkpoint coverage notes
 - `/changes` and `/diff` with checkpoint history
 - session recovery if you Ctrl+C in the middle
-- `code-agent doctor` for diagnostics
+- `crom doctor` for diagnostics

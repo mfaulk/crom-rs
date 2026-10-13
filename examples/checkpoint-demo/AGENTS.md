@@ -9,7 +9,7 @@ Tiny crate demonstrating the M3 checkpoint + rewind workflow. The current
    tokens with internal spaces, or empty input).
 
 It's okay to make a mistake — checkpointing captures the workspace before
-each edit, so the demo can rewind with `code-agent rewind <id>`.
+each edit, so the demo can rewind with `crom rewind <id>`.
 
 Constraints:
 

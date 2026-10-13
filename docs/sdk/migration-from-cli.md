@@ -1,12 +1,12 @@
 # Migrating from the CLI
 
-The CLI (`code-agent`) still drives the existing M1–M11 flows directly
+The CLI (`crom`) still drives the existing M1–M11 flows directly
 against `AgentClient`. The SDK adds a path that bypasses the CLI layer
 entirely:
 
-- The new `code-agent headless-run "<prompt>"` subcommand delegates to
+- The new `crom headless-run "<prompt>"` subcommand delegates to
   `AgentRuntime` for a single coding task.
-- Library consumers should use `code-agent-sdk` directly; the CLI is a
+- Library consumers should use `crom-sdk` directly; the CLI is a
   thin wrapper, not a required layer.
 
 ## Mapping CLI flags to SDK builder
@@ -25,7 +25,7 @@ entirely:
 
 Hosts that need the following stay on the CLI/`AgentClient` for now:
 
-- Plugin marketplaces and `code-agent plugin` commands.
+- Plugin marketplaces and `crom plugin` commands.
 - Interactive TUI sessions and approval flows.
 - The `/login` browser flow.
 - Skills loading from a filesystem skills directory.
@@ -43,4 +43,4 @@ feature flag — they are simply out of scope for M12.
   memory, plugin registries) must be wired explicitly.
 - **No `.agent/` reads by default**: the SDK does not look at workspace
   settings files. Hosts that want those can load them via
-  `code_agent_core::settings::load` and feed the relevant pieces in.
+  `crom_core::settings::load` and feed the relevant pieces in.

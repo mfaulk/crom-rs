@@ -25,7 +25,7 @@ jobs:
       CARGO_TERM_COLOR: always
       # The runtime opt-in switch. Without this the harness reports live tasks
       # as skipped rather than failing.
-      CODE_AGENT_EVAL_LIVE: '1'
+      CROM_EVAL_LIVE: '1'
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v6
@@ -35,7 +35,7 @@ jobs:
           key: eval-live
       - name: Run live eval suite
         run: |
-          cargo run --locked -p code-agent-cli -- eval run \
+          cargo run --locked -p crom-cli -- eval run \
             --suite "${{ inputs.suite }}" \
             --provider "${{ inputs.provider }}" \
             --allow-failures
@@ -44,5 +44,5 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: eval-live-runs
-          path: target/code-agent-eval/runs
+          path: target/crom-eval/runs
           if-no-files-found: ignore

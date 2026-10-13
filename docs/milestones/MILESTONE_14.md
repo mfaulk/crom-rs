@@ -7,7 +7,7 @@ realistic repository task, can the agent inspect code, plan, edit files, run
 checks, recover from failures, and produce a correct patch?
 
 The harness drives the agent exclusively through the M12 headless SDK runtime
-(`code-agent-sdk`) and judges behavior from structured SDK events, not from
+(`crom-sdk`) and judges behavior from structured SDK events, not from
 model prose. It runs offline and deterministically in CI via fake/golden
 providers, with opt-in support for live model providers.
 
@@ -15,13 +15,13 @@ See [`docs/eval.md`](../eval.md) for the full user guide and reference.
 
 ## Deliverables
 
-### New crate: `code-agent-eval` (`crates/eval`)
+### New crate: `crom-eval` (`crates/crom-eval`)
 
 | Module | Purpose |
 |--------|---------|
 | `task.rs` | Serde TOML manifest types (`Manifest`, `EvalTask`, `FixtureSpec`, `OracleSpec`, `AssertionSpec`, `BehaviorSpec`) and task discovery from `eval/tasks/`. |
 | `fixture.rs` | Isolated workspace setup: recursive fixture copy, fresh git repo + baseline commit, unified-diff/`--stat`/numstat patch generation against the baseline. |
-| `providers.rs` | Provider execution modes — `fake` (echo), `golden` (scripted `ScriptedFakeProvider` keyed by task id), `live` (Anthropic, gated by `CODE_AGENT_EVAL_LIVE`). |
+| `providers.rs` | Provider execution modes — `fake` (echo), `golden` (scripted `ScriptedFakeProvider` keyed by task id), `live` (Anthropic, gated by `CROM_EVAL_LIVE`). |
 | `runner.rs` | Orchestration: builds the SDK runtime over a filesystem workspace, runs one task or a selection, captures events via an `EventSink`, enforces turn/timeout budgets, decides `EvalStatus`, writes the artifact bundle. |
 | `oracle.rs` | Command / Rust / file-assertion / behavior oracles with structured pass/fail outcomes. |
 | `score.rs` | Weighted structured score (correctness 60% / patch 15% / process 15% / efficiency 10%) serialised to `score.json`. |
@@ -49,10 +49,10 @@ report_path, workspace_path, ... }`.
 - **Fake** — deterministic echo provider; proves harness plumbing offline.
 - **Golden** — scripted tool-call sequences (read → edit → run check → observe
   failure → edit → pass) keyed by task id in `providers.rs`.
-- **Live** — opt-in only via `CODE_AGENT_EVAL_LIVE=1` plus `ANTHROPIC_API_KEY`;
+- **Live** — opt-in only via `CROM_EVAL_LIVE=1` plus `ANTHROPIC_API_KEY`;
   missing opt-in/credentials report tasks as **skipped**, never failed.
 
-### CLI surface (`code-agent eval`)
+### CLI surface (`crom eval`)
 
 | Command | Behavior |
 |---------|----------|
@@ -61,9 +61,9 @@ report_path, workspace_path, ... }`.
 | `eval report <run>` | Print the summary from a prior run. |
 | `eval compare <baseline> <candidate>` | Diff pass/fail/score/tool-count/runtime across two runs. |
 
-`CODE_AGENT_EVAL_MODEL` overrides the live model (default `claude-sonnet-4-6`).
+`CROM_EVAL_MODEL` overrides the live model (default `claude-sonnet-4-6`).
 
-### Tasks and fixtures (`crates/eval/eval/tasks/`)
+### Tasks and fixtures (`crates/crom-eval/eval/tasks/`)
 
 Thirteen tasks across suites `smoke`, `golden`, `rust-small`, `safety`,
 `planning`:
@@ -76,12 +76,12 @@ Thirteen tasks across suites `smoke`, `golden`, `rust-small`, `safety`,
 (`must_not_run_command` for destructive patterns).
 
 Rust fixtures declare an empty `[workspace]` table so the parent workspace
-never absorbs them; `crates/eval/eval` is also listed under workspace
+never absorbs them; `crates/crom-eval/eval` is also listed under workspace
 `exclude`.
 
 ### Artifact bundle
 
-Per run under `target/code-agent-eval/runs/<run-id>/`: `summary.json`,
+Per run under `target/crom-eval/runs/<run-id>/`: `summary.json`,
 `summary.md`, and per task `task.toml`, `prompt.md`, `transcript.jsonl`,
 `events.jsonl`, `final.patch`, `final.diff`, `final_summary.md`,
 `command-output/`, `score.json`, `report.md`, and the preserved `workspace/`.
@@ -89,7 +89,7 @@ Per run under `target/code-agent-eval/runs/<run-id>/`: `summary.json`,
 ## Safety notes
 
 - Workspaces are isolated copies; the harness never mutates the fixture sources.
-- Live provider runs require an explicit `CODE_AGENT_EVAL_LIVE=1` opt-in and
+- Live provider runs require an explicit `CROM_EVAL_LIVE=1` opt-in and
   credentials; absent either, the run skips cleanly rather than failing.
 - Safety tasks assert the agent avoids destructive commands and behaves
   correctly when a tool is disabled by policy.
@@ -98,7 +98,7 @@ Per run under `target/code-agent-eval/runs/<run-id>/`: `summary.json`,
 
 ## Tests
 
-- `code-agent-eval` unit tests cover manifest parsing, fixture copy, git
+- `crom-eval` unit tests cover manifest parsing, fixture copy, git
   baseline + patch generation, command/file/behavior oracles, score
   serialisation, report/summary/compare rendering, and provider selection.
 - `tests/harness.rs` drives the full pipeline end-to-end offline: task
@@ -108,11 +108,11 @@ Per run under `target/code-agent-eval/runs/<run-id>/`: `summary.json`,
 
 ## CI
 
-- `ci.yml` gains an `eval` job: `cargo test -p code-agent-eval` plus
-  `code-agent eval run --suite smoke --provider fake`, uploading the artifact
+- `ci.yml` gains an `eval` job: `cargo test -p crom-eval` plus
+  `crom eval run --suite smoke --provider fake`, uploading the artifact
   bundle on failure. Deterministic and offline.
 - `eval-live.yml` is a manual `workflow_dispatch` lane for live-provider evals
-  (`CODE_AGENT_EVAL_LIVE=1`, `ANTHROPIC_API_KEY` secret); never runs on push/PR.
+  (`CROM_EVAL_LIVE=1`, `ANTHROPIC_API_KEY` secret); never runs on push/PR.
 
 ## Out of scope
 

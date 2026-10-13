@@ -1,6 +1,6 @@
-# code-agent SDK overview
+# crom SDK overview
 
-`code-agent-sdk` exposes the coding agent as a stable, typed, async, headless
+`crom-sdk` exposes the coding agent as a stable, typed, async, headless
 Rust SDK. Applications import the crate, build an [`AgentRuntime`], and call
 [`run_once`] or [`run`] to produce code, patches, validations, and progress
 events without touching the CLI, TUI, terminal, or global credentials.
@@ -37,18 +37,18 @@ events without touching the CLI, TUI, terminal, or global credentials.
 default = ["filesystem-workspace", "in-memory-workspace", "anthropic", "planning"]
 filesystem-workspace = []
 in-memory-workspace = []
-anthropic            = []   # depends on code-agent-anthropic
+anthropic            = []   # depends on crom-anthropic
 fake-provider        = []
 planning             = []
 mcp                  = []
 plugins              = []
 skills               = []
 subagents            = []
-checkpointing        = []   # depends on code-agent-checkpoint
+checkpointing        = []   # depends on crom-checkpoint
 cli                  = []   # placeholder; SDK never depends on the CLI
 tui                  = []   # placeholder; SDK never depends on the TUI
 ```
 
-[`AgentRuntime`]: ../../crates/code-agent-sdk/src/runtime/mod.rs
-[`run_once`]: ../../crates/code-agent-sdk/src/runtime/mod.rs
-[`run`]: ../../crates/code-agent-sdk/src/runtime/mod.rs
+[`AgentRuntime`]: ../../crates/crom-sdk/src/runtime/mod.rs
+[`run_once`]: ../../crates/crom-sdk/src/runtime/mod.rs
+[`run`]: ../../crates/crom-sdk/src/runtime/mod.rs

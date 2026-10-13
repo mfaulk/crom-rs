@@ -1,0 +1,17 @@
+---
+source: crates/crom-session/src/lib.rs
+expression: subagent
+---
+{
+  "schema_version": 1,
+  "timestamp": "2026-06-04T00:00:00Z",
+  "cwd": "/work/project",
+  "session_id": "sess-fixed-0001",
+  "payload": {
+    "kind": "subagent_metadata",
+    "parent_session_id": "sess-parent-0000",
+    "parent_run_id": "run-0000",
+    "parent_tool_call_id": "toolu_parent",
+    "agent_name": "code-reviewer"
+  }
+}

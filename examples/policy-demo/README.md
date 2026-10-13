@@ -19,7 +19,7 @@ A tiny Rust crate used as the M2 demo. It includes:
 From this directory:
 
 ```sh
-ANTHROPIC_API_KEY=… code-agent chat \
+ANTHROPIC_API_KEY=… crom chat \
   --cwd . \
   --permission-mode default \
   --show-usage

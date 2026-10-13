@@ -11,9 +11,9 @@
 #     commands that are not file-tracked.
 #   * Post-run validation gate (`--validate "cargo test"`,
 #     `--validation-timeout`).
-#   * Manual `code-agent checkpoint` plus `code-agent checkpoints list|show|
+#   * Manual `crom checkpoint` plus `crom checkpoints list|show|
 #     diff` for inspection.
-#   * `code-agent rewind --dry-run` and `code-agent rewind --yes` to restore
+#   * `crom rewind --dry-run` and `crom rewind --yes` to restore
 #     workspace files (conversation history is intentionally NOT rewound).
 #   * `--rewind-on-validation-failure`: a deliberately-failing post-run gate
 #     drives an automatic rewind to the start-of-run checkpoint.
@@ -105,14 +105,14 @@ TARGET_DIR="$(
         || true
 )"
 TARGET_DIR="${TARGET_DIR:-$REPO_ROOT/target}"
-BIN="$TARGET_DIR/debug/code-agent"
+BIN="$TARGET_DIR/debug/crom"
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 # ---------------------------------------------------------------------------
-section "Step 0 — Build the code-agent CLI"
-cargo build -p code-agent-cli --manifest-path "$REPO_ROOT/Cargo.toml"
+section "Step 0 — Build the crom CLI"
+cargo build -p crom-cli --manifest-path "$REPO_ROOT/Cargo.toml"
 gray "binary: $BIN"
 if [[ ! -x "$BIN" ]]; then
     echo "error: expected binary at $BIN was not produced" >&2
@@ -172,7 +172,7 @@ gray "(cargo test exited non-zero, as expected)"
 section "Step 4 — Fix the bug under checkpointing + validation gate"
 
 cyan "Command:"
-gray "  code-agent run \"...\" --cwd . \\"
+gray "  crom run \"...\" --cwd . \\"
 gray "      --checkpointing on \\"
 gray "      --permission-mode acceptEdits \\"
 gray "      --validate \"cargo test\" --validation-timeout 90 \\"
@@ -326,7 +326,7 @@ green "cargo test fails again after rewind — workspace is back to the start."
 section "Step 9 — Auto-rewind on validation failure (--rewind-on-validation-failure)"
 
 cyan "Command:"
-gray "  code-agent run \"...add a top-of-file comment...\" --cwd . \\"
+gray "  crom run \"...add a top-of-file comment...\" --cwd . \\"
 gray "      --checkpointing on \\"
 gray "      --permission-mode acceptEdits \\"
 gray "      --validate \"false\" --rewind-on-validation-failure \\"
@@ -354,7 +354,7 @@ AUTO_EXIT=${PIPESTATUS[0]}
 set -e
 
 # The CLI exit code is non-zero on validation failure; that's expected.
-gray "code-agent exited with $AUTO_EXIT (non-zero is expected when validation fails)."
+gray "crom exited with $AUTO_EXIT (non-zero is expected when validation fails)."
 
 if ! grep -qE '^\[validation\] failed$' "$AUTO_LOG"; then
     echo "error: '--validate \"false\"' did not produce '[validation] failed'." >&2
@@ -418,7 +418,7 @@ section "Done"
 cat <<EOF
 M3 demo complete. Summary of what just happened:
 
-  * Built the code-agent CLI (debug profile).
+  * Built the crom CLI (debug profile).
   * Loaded $DEMO_DIR/.agent/settings.json — checkpointing.enabled=true,
     bash_policy=allow_with_warning, validation.commands=["cargo test"].
   * Confirmed cargo test failed in the buggy starting state.

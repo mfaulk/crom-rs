@@ -15,18 +15,18 @@ From the repository root, after `cargo build`:
 
 The script runs (in order):
 
-1. `code-agent provider list` — registered providers and their support matrix.
-2. `code-agent login` (no args) — provider selector, including the
+1. `crom provider list` — registered providers and their support matrix.
+2. `crom login` (no args) — provider selector, including the
    intentionally **unsupported** Claude / Gemini subscription paths.
-3. `code-agent login fake --api-key=demo --allow-file-store` — store a
+3. `crom login fake --api-key=demo --allow-file-store` — store a
    fake API key.
-4. `code-agent auth status --allow-file-store` — show the resulting
+4. `crom auth status --allow-file-store` — show the resulting
    active provider and account.
-5. `code-agent model list` — unified model registry.
-6. `code-agent model use fake/fake-coding-model` — pick the demo model.
-7. `code-agent auth logout fake --allow-file-store` — delete the stored
+5. `crom model list` — unified model registry.
+6. `crom model use fake/fake-coding-model` — pick the demo model.
+7. `crom auth logout fake --allow-file-store` — delete the stored
    credential.
-8. `code-agent auth status --allow-file-store` — show the empty status.
+8. `crom auth status --allow-file-store` — show the empty status.
 
 ## Notes
 
@@ -36,7 +36,7 @@ The script runs (in order):
   leak to disk implicitly.
 - The fake provider lives entirely in-process. There is no network call;
   in particular, the fake OAuth/device flows are exercised by the
-  `code-agent-auth` integration tests rather than this script (which
+  `crom-auth` integration tests rather than this script (which
   focuses on the user-facing CLI).
 - Subscription-auth modes (Claude, Gemini, Codex) are surfaced as
   visible-but-unsupported. The selector explains why and points at the

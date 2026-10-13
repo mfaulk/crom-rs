@@ -123,13 +123,13 @@ model — so a regression scoped to (say) `requires_multifile_edit` is visible.
 
 ## Complete example
 
-See `crates/eval/eval/tasks/rust-hidden-sum-bug/task.toml` for a full v2 task
+See `crates/crom-eval/eval/tasks/rust-hidden-sum-bug/task.toml` for a full v2 task
 with hidden tests, an oracle patch, capability labels, behavior rules, and path
 policy.
 
 ## Repair metrics (M16)
 
-When the repair loop is enabled (`code-agent eval run <suite> --repair enabled`),
+When the repair loop is enabled (`crom eval run <suite> --repair enabled`),
 each task result carries a `repair` object and the run writes repair artifacts
 (`repair.json`, `repair.md`, `diagnostics.jsonl`, `validation-attempts.jsonl`).
 See [repair-loop.md](repair-loop.md) for the end-to-end flow.
