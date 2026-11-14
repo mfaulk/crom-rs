@@ -1,0 +1,72 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+expected_outcome = "change"
+id = "l2-pipeline-shutdown"
+title = "Fix a hanging, serialized, out-of-order worker pool"
+category = "bugfix"
+difficulty = "hard"
+tags = ["rust", "multi-file", "hidden-tests", "concurrency", "bugfix"]
+suites = ["l2"]
+
+prompt = """
+`pipeline::run` in the `pipeline` crate never returns, so `cargo test` fails
+with "pipeline did not finish". Fix the worker pool so that it honors the
+contract documented on `run` in src/pipeline.rs:
+
+- it returns once every input has been processed, and all worker threads
+  exit;
+- outputs are returned in input order, regardless of which job finishes
+  first;
+- jobs really run concurrently: with N workers, up to N calls to the user
+  function must be able to execute at the same time.
+
+`run_with_stats` must keep reporting per-worker job counts. Keep the public
+API of `run`, `run_with_stats`, and `Stats` unchanged. Do not use sleeps or
+timeouts in the library to paper over the problem.
+"""
+
+max_turns = 30
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml", "tests/run.rs"]
+required_paths = ["src/pipeline.rs", "src/worker.rs"]
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_public_api_preservation = true
+requires_async_reasoning = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+command_timeout_secs = 120
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden_pipeline"]
+command_timeout_secs = 120
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

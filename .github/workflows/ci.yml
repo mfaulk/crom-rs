@@ -158,6 +158,11 @@ jobs:
       # verification and every unmodified fixture fails it (no_change: passes).
       - name: Validate L1 capability suite
         run: cargo run --locked -p crom-cli -- eval validate-suite l1
+      # L2 capability corpus (#288): each task's unmodified fixture must fail
+      # public + hidden verification and its oracle patch must pass both (the
+      # no_change task must pass as-is). Fixtures are dependency-free crates.
+      - name: Validate L2 capability suite
+        run: cargo run --locked -p crom-cli -- eval validate-suite l2
       - name: Eval smoke suite (fake provider)
         run: cargo run --locked -p crom-cli -- eval run --suite smoke --provider fake
       - name: Eval golden suite (golden provider)

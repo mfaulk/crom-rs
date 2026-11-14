@@ -1,0 +1,68 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+expected_outcome = "change"
+id = "l2-shape-trait-refactor"
+title = "Refactor the Shape trait and update every implementor and call site"
+category = "refactor"
+difficulty = "medium"
+tags = ["rust", "multi-file", "hidden-tests", "refactor", "trait"]
+suites = ["l2"]
+
+prompt = """
+Refactor the `Shape` trait in the `shapes` crate:
+
+1. `fn name(&self)` must return `&'static str` instead of an allocated
+   `String`.
+2. Add a required method `fn perimeter(&self) -> f64` and implement it for
+   every shape (`Circle`, `Rect`, `Square`, `Triangle`).
+3. Add a provided (default) method `fn describe(&self) -> String` returning
+   `<name>: area=<area> perimeter=<perimeter>`, both numbers with two decimals,
+   e.g. `rect: area=6.00 perimeter=10.00`.
+
+Then update `Scene`: add `total_perimeter(&self) -> f64`, make `largest()`
+return `Option<&'static str>`, and make `Scene::describe()` emit one
+`Shape::describe()` line per shape (each terminated by `\\n`). Update existing
+call sites so `cargo test` passes.
+"""
+
+max_turns = 30
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/shape.rs", "src/scene.rs"]
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden_shapes"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

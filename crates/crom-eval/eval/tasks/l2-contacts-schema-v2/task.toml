@@ -1,0 +1,73 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+expected_outcome = "change"
+id = "l2-contacts-schema-v2"
+title = "Migrate a persisted record format to a versioned v2 schema"
+category = "feature"
+difficulty = "hard"
+tags = ["rust", "multi-file", "hidden-tests", "serialization", "migration"]
+suites = ["l2"]
+
+prompt = """
+The `contacts` crate stores contacts in a v1 text format (see src/codec.rs).
+Introduce a v2 format that adds an optional email address:
+
+- `Contact` gains `pub email: Option<String>`. `Contact::new(name, age)` keeps
+  working (email `None`); add `Contact::with_email(self, &str) -> Self`.
+- v2 text starts with the header line `#contacts v2`, followed by one line per
+  contact: `name|email|age` (empty email field = `None`). Inside `name` and
+  `email`, a backslash is written as `\\\\` and a `|` as `\\|`. Every line,
+  including the header, ends with `\\n`.
+- `encode` always writes v2 (an empty list encodes to just the header).
+- `decode` accepts both formats: text whose first line is the v2 header is v2,
+  anything else is v1 (v1 contacts get `email: None`). Blank lines are ignored.
+  v2 errors use `CodecError` with the 1-based line number (the header is
+  line 1) and message `expected 3 fields` or `invalid age`.
+- Add `migrate(text: &str) -> Result<String, CodecError>`, exported from the
+  crate root, that rewrites v1 or v2 text as v2 preserving contact order.
+
+`AddressBook` must persist emails. Update any existing expectations that
+change because `encode` now writes v2; `cargo test` must pass.
+"""
+
+max_turns = 30
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/codec.rs", "src/record.rs"]
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden_schema"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

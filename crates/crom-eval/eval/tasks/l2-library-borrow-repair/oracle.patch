@@ -1,0 +1,68 @@
+diff --git a/src/loans.rs b/src/loans.rs
+--- a/src/loans.rs
++++ b/src/loans.rs
+@@ -10,7 +10,7 @@
+ /// Lend book `id` to `who`, record it in the book's history, and log
+ /// `<who> borrowed '<title>'`.
+ pub fn checkout(store: &mut Store, id: u32, who: &str) -> Result<(), LoanError> {
+-    let mut book = store.get(id).ok_or(LoanError::NotFound(id))?;
++    let book = store.get_mut(id).ok_or(LoanError::NotFound(id))?;
+     if let Some(current) = &book.borrower {
+         return Err(LoanError::AlreadyBorrowed {
+             id,
+@@ -19,16 +19,16 @@
+     }
+     book.borrower = Some(who.to_string());
+     book.history.push(who.to_string());
+-    store.put(book);
+-    store.log(format!("{who} borrowed '{}'", book.title));
++    let entry = format!("{who} borrowed '{}'", book.title);
++    store.log(entry);
+     Ok(())
+ }
+ 
+ /// Take book `id` back, log `<who> returned '<title>'`, and return who had it.
+ pub fn return_book(store: &mut Store, id: u32) -> Result<String, LoanError> {
+-    let mut book = store.get(id).ok_or(LoanError::NotFound(id))?;
++    let book = store.get_mut(id).ok_or(LoanError::NotFound(id))?;
+     let who = book.borrower.take().ok_or(LoanError::NotBorrowed(id))?;
+-    store.put(book);
+-    store.log(format!("{who} returned '{}'", book.title));
++    let entry = format!("{who} returned '{}'", book.title);
++    store.log(entry);
+     Ok(who)
+ }
+diff --git a/src/report.rs b/src/report.rs
+--- a/src/report.rs
++++ b/src/report.rs
+@@ -3,10 +3,10 @@
+ 
+ /// The book with the longest loan history (earliest-added wins ties), or
+ /// `None` for an empty store.
+-pub fn most_borrowed(store: &Store) -> Option<Book> {
+-    let mut best: Option<Book> = None;
++pub fn most_borrowed(store: &Store) -> Option<&Book> {
++    let mut best: Option<&Book> = None;
+     for id in store.ids() {
+-        let book = store.get(id)?;
++        let book = store.get(id).expect("id from ids()");
+         if best
+             .as_ref()
+             .is_none_or(|b| book.history.len() > b.history.len())
+@@ -22,12 +22,13 @@
+ pub fn rename_author(store: &mut Store, from: &str, to: &str) -> usize {
+     let mut changed = 0;
+     for id in store.ids() {
+-        let book = store.get(id).expect("id from ids()");
++        let book = store.get_mut(id).expect("id from ids()");
+         if book.author != from {
+             continue;
+         }
+-        store.get_mut(id).expect("id from ids()").author = to.to_string();
+-        store.log(format!("author of '{}' changed to {to}", book.title));
++        book.author = to.to_string();
++        let entry = format!("author of '{}' changed to {to}", book.title);
++        store.log(entry);
+         changed += 1;
+     }
+     changed

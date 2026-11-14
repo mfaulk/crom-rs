@@ -1,0 +1,60 @@
+diff --git a/src/job.rs b/src/job.rs
+--- a/src/job.rs
++++ b/src/job.rs
+@@ -8,6 +8,8 @@
+ /// A finished job, reported by the worker that ran it.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Done {
++    /// The [`Job::index`] this output belongs to.
++    pub index: usize,
+     pub worker: usize,
+     pub output: String,
+ }
+diff --git a/src/pipeline.rs b/src/pipeline.rs
+--- a/src/pipeline.rs
++++ b/src/pipeline.rs
+@@ -46,15 +46,19 @@
+         job_tx.send(Job { index, input }).expect("workers alive");
+     }
+     drop(job_tx);
++    // Only the workers may hold result senders, or the loop below never ends.
++    drop(res_tx);
+ 
+     let mut stats = Stats {
+         per_worker: vec![0; workers],
+     };
+-    let mut outputs = Vec::new();
++    let mut done_jobs = Vec::new();
+     for done in res_rx.iter() {
+         stats.per_worker[done.worker] += 1;
+-        outputs.push(done.output);
++        done_jobs.push(done);
+     }
++    done_jobs.sort_by_key(|d| d.index);
++    let outputs = done_jobs.into_iter().map(|d| d.output).collect();
+     for h in handles {
+         h.join().expect("worker panicked");
+     }
+diff --git a/src/worker.rs b/src/worker.rs
+--- a/src/worker.rs
++++ b/src/worker.rs
+@@ -18,9 +18,17 @@
+     thread::Builder::new()
+         .name(format!("worker-{id}"))
+         .spawn(move || {
+-            while let Ok(job) = jobs.lock().expect("queue lock").recv() {
++            loop {
++                // Release the queue lock before running the task so other
++                // workers can pick up jobs concurrently.
++                let next = jobs.lock().expect("queue lock").recv();
++                let Ok(job) = next else { break };
+                 let output = task(&job.input);
+-                let done = Done { worker: id, output };
++                let done = Done {
++                    index: job.index,
++                    worker: id,
++                    output,
++                };
+                 if results.send(done).is_err() {
+                     break;
+                 }

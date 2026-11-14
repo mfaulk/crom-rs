@@ -1,0 +1,157 @@
+diff --git a/src/codec.rs b/src/codec.rs
+--- a/src/codec.rs
++++ b/src/codec.rs
+@@ -1,5 +1,9 @@
+-//! Storage format (v1): one contact per line, `name=<name>;age=<age>`.
+-//! Blank lines are ignored. Names may not contain `;` or newlines.
++//! Storage formats. Blank lines are ignored in both.
++//!
++//! - v1 (read-only): one contact per line, `name=<name>;age=<age>`.
++//! - v2: a `#contacts v2` header line, then `name|email|age` per contact. An
++//!   empty email means none; `\` and `|` inside values are escaped as `\\`
++//!   and `\|`.
+ 
+ use std::fmt;
+ 
+@@ -41,22 +45,85 @@
+         }
+     }
+     match (name, age) {
+-        (Some(name), Some(age)) => Ok(Contact { name, age }),
++        (Some(name), Some(age)) => Ok(Contact {
++            name,
++            email: None,
++            age,
++        }),
+         _ => Err(err(line_no, "missing field")),
+     }
+ }
+ 
++pub const V2_HEADER: &str = "#contacts v2";
++
++fn escape(s: &str) -> String {
++    s.replace('\\', "\\\\").replace('|', "\\|")
++}
++
++/// Split a v2 line on unescaped `|`, unescaping each field.
++fn split_v2(line: &str) -> Vec<String> {
++    let mut fields = vec![String::new()];
++    let mut chars = line.chars();
++    while let Some(c) = chars.next() {
++        match c {
++            '\\' => {
++                if let Some(next) = chars.next() {
++                    fields.last_mut().unwrap().push(next);
++                }
++            }
++            '|' => fields.push(String::new()),
++            c => fields.last_mut().unwrap().push(c),
++        }
++    }
++    fields
++}
++
++fn decode_v2_line(line_no: usize, line: &str) -> Result<Contact, CodecError> {
++    let mut fields = split_v2(line);
++    if fields.len() != 3 {
++        return Err(err(line_no, "expected 3 fields"));
++    }
++    let age = fields[2].parse().map_err(|_| err(line_no, "invalid age"))?;
++    let email = std::mem::take(&mut fields[1]);
++    Ok(Contact {
++        name: std::mem::take(&mut fields[0]),
++        email: (!email.is_empty()).then_some(email),
++        age,
++    })
++}
++
++/// Decode either format; v2 is recognised by its header line.
+ pub fn decode(text: &str) -> Result<Vec<Contact>, CodecError> {
++    let v2 = text.lines().next() == Some(V2_HEADER);
+     text.lines()
+         .enumerate()
++        .skip(usize::from(v2))
+         .filter(|(_, l)| !l.trim().is_empty())
+-        .map(|(i, l)| decode_v1_line(i + 1, l))
++        .map(|(i, l)| {
++            if v2 {
++                decode_v2_line(i + 1, l)
++            } else {
++                decode_v1_line(i + 1, l)
++            }
++        })
+         .collect()
+ }
+ 
++/// Encode as v2.
+ pub fn encode(contacts: &[Contact]) -> String {
+-    contacts
+-        .iter()
+-        .map(|c| format!("name={};age={}\n", c.name, c.age))
+-        .collect()
++    let mut out = format!("{V2_HEADER}\n");
++    for c in contacts {
++        out.push_str(&format!(
++            "{}|{}|{}\n",
++            escape(&c.name),
++            escape(c.email.as_deref().unwrap_or("")),
++            c.age
++        ));
++    }
++    out
+ }
++
++/// Rewrite v1 (or v2) text as v2, preserving order.
++pub fn migrate(text: &str) -> Result<String, CodecError> {
++    Ok(encode(&decode(text)?))
++}
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,5 +5,5 @@
+ pub mod record;
+ 
+ pub use book::AddressBook;
+-pub use codec::{decode, encode, CodecError};
++pub use codec::{decode, encode, migrate, CodecError};
+ pub use record::Contact;
+diff --git a/src/record.rs b/src/record.rs
+--- a/src/record.rs
++++ b/src/record.rs
+@@ -1,6 +1,7 @@
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Contact {
+     pub name: String,
++    pub email: Option<String>,
+     pub age: u32,
+ }
+ 
+@@ -8,7 +9,13 @@
+     pub fn new(name: &str, age: u32) -> Self {
+         Self {
+             name: name.to_string(),
++            email: None,
+             age,
+         }
+     }
++
++    pub fn with_email(mut self, email: &str) -> Self {
++        self.email = Some(email.to_string());
++        self
++    }
+ }
+diff --git a/tests/roundtrip.rs b/tests/roundtrip.rs
+--- a/tests/roundtrip.rs
++++ b/tests/roundtrip.rs
+@@ -7,9 +7,9 @@
+ }
+ 
+ #[test]
+-fn encodes_v1() {
++fn encodes_v2() {
+     let text = encode(&[Contact::new("Ann", 31)]);
+-    assert_eq!(text, "name=Ann;age=31\n");
++    assert_eq!(text, "#contacts v2\nAnn||31\n");
+ }
+ 
+ #[test]

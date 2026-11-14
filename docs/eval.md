@@ -164,6 +164,9 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
   `kind = "capability"`, `level = "L1"`, `network = "none"`, each with hidden
   verification and a validated reference. Intended for a live provider; CI
   validates it model-free with `crom eval validate-suite l1`.
+- `l2` — the M17 L2 capability corpus (multi-step coding and repair). Every
+  task is `kind = "capability"`, `level = "L2"`, with hidden tests and a
+  reference. Intended for a live provider; see [L2 corpus](#l2-corpus-m172).
 
 ### L1 capability corpus
 
@@ -185,6 +188,34 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
 Hidden fixtures live in each task's `hidden/` directory (outside `repo/`) and
 are overlaid only after the agent finishes; oracle patches live beside
 `task.toml`. Script checks under `hidden/hidden_checks/` run via `sh`.
+
+### L2 corpus (M17.2)
+
+Ten dependency-free, multi-module Rust crates (115–305 lines of Rust each) under
+`crates/crom-eval/eval/tasks/l2-*`. Each change task's `oracle.patch` touches
+at least two files; hidden tests in `hidden/tests/` are overlaid only after the
+agent finishes. Public verification is `cargo test` unless noted.
+
+| Task | Exercises | Reference touches |
+|---|---|---|
+| `l2-order-discount-codes` | cross-module feature (order, pricing, receipt) | 4 files |
+| `l2-shape-trait-refactor` | trait signature change + new required/provided methods, call-site updates | 6 files |
+| `l2-expr-test-cascade` | lexer + parser root causes behind a cascade of failing tests | 2 files |
+| `l2-feature-flag-json` | repair code behind the `json` cargo feature; public verification also runs `cargo test --features json` | 2 files |
+| `l2-config-error-enum` | replace `Result<_, String>` with a typed `ConfigError` across modules | 5 files |
+| `l2-library-borrow-repair` | borrow-checker / type errors after a by-reference `Store` API change | 2 files |
+| `l2-todo-cli-done` | new CLI subcommand plus an integration test that runs the binary | 4 files |
+| `l2-contacts-schema-v2` | versioned text-format migration with escaping and a `migrate` helper | 4 files |
+| `l2-pipeline-shutdown` | worker pool: hang (leaked sender), lock held across work, out-of-order results; deterministic watchdog tests | 3 files |
+| `l2-noop-bankers-rounding` | `no_change`: bug report contradicts the documented rounding policy (`reference = "validated_oracle"`) | — |
+
+```console
+crom eval validate-suite l2                               # offline; CI runs this
+crom eval run --suite l2 --provider <profile> --repair enabled
+crom eval run --suite l2 --provider <profile> --repair disabled
+```
+
+Each run needs a cargo toolchain; no task needs the network.
 
 ## Adding a new task
 
@@ -399,6 +430,7 @@ offline lane on every push/PR:
 
 ```console
 cargo test -p crom-eval
+crom eval validate-suite <smoke|golden|safety|repair-smoke|l1|l2>
 crom eval run --suite smoke --provider fake
 crom eval run --suite golden --provider golden
 crom eval run --suite safety --provider fake

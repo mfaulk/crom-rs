@@ -1,0 +1,70 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+expected_outcome = "change"
+id = "l2-todo-cli-done"
+title = "Add a CLI subcommand with an integration test"
+category = "cli"
+difficulty = "medium"
+tags = ["rust", "multi-file", "hidden-tests", "cli", "feature"]
+suites = ["l2"]
+
+prompt = """
+Add a `done <id>` subcommand to the `todo` CLI (`todo [--file <path>] done <id>`).
+
+- On success it marks the item done, saves the file, prints
+  `completed <id>: <text>` and exits 0. If the item was already done it prints
+  `already completed <id>: <text>` and exits 0.
+- An id that does not exist prints `error: no item with id <id>` to stderr and
+  exits 1.
+- A missing, non-numeric, or extra argument prints
+  `error: usage: todo done <id>` to stderr and exits 2.
+- `list` must show completed items as `[x] <id> <text>`.
+
+Follow the existing structure (argument parsing in src/cli.rs, behavior in
+src/commands.rs), update the usage summary in src/lib.rs, and add an
+integration test file for the new subcommand that runs the compiled binary,
+like the existing CLI integration test. `cargo test` must pass.
+"""
+
+max_turns = 30
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/cli.rs", "src/commands.rs", "tests/"]
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_cli_execution = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden_done"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"
