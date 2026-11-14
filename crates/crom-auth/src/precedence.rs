@@ -36,12 +36,23 @@ pub fn provider_env_var(provider: &ProviderId) -> Option<&'static str> {
     })
 }
 
+/// API-key env var for `provider`: a provider profile's `api_key_env`
+/// (`override_name`) wins over the static [`provider_env_var`] mapping, so
+/// custom profiles such as `deepseek` get their own variable.
+pub fn provider_env_var_for(provider: &ProviderId, override_name: Option<&str>) -> Option<String> {
+    override_name
+        .map(str::to_string)
+        .or_else(|| provider_env_var(provider).map(str::to_string))
+}
+
 /// Inputs to [`resolve_credential`]. CLI is responsible for filling these
 /// from flags/settings/env. Tests can construct one directly.
 #[derive(Default)]
 pub struct AuthResolverInputs<'a> {
     pub provider: Option<ProviderId>,
     pub mode: AuthPrecedenceMode,
+    /// Env var name from the provider profile; overrides [`provider_env_var`].
+    pub api_key_env: Option<String>,
     pub explicit_api_key: Option<SecretString>,
     pub explicit_account: Option<AccountId>,
     pub active_account: Option<&'a AccountId>,
@@ -98,10 +109,10 @@ pub fn resolve_credential(inputs: AuthResolverInputs<'_>) -> Result<ResolvedAuth
     };
 
     // Source D: env var API key (no backend I/O).
-    let env = provider_env_var(&provider).and_then(|name| {
-        inputs.env.get(name).map(|val| ResolvedCredential::ApiKey {
+    let env = provider_env_var_for(&provider, inputs.api_key_env.as_deref()).and_then(|name| {
+        inputs.env.get(&name).map(|val| ResolvedCredential::ApiKey {
             provider: provider.clone(),
-            source: CredentialSource::EnvVar(name.to_string()),
+            source: CredentialSource::EnvVar(name.clone()),
             key: SecretString::new(val.clone()),
         })
     });
@@ -298,6 +309,7 @@ mod tests {
         let res = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::Anthropic),
             mode: AuthPrecedenceMode::ExplicitFirst,
+            api_key_env: None,
             explicit_api_key: Some(SecretString::new("cli-key".into())),
             explicit_account: None,
             active_account: Some(&aid),
@@ -323,6 +335,7 @@ mod tests {
         let res = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::Anthropic),
             mode: AuthPrecedenceMode::EnvFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: Some(&aid),
@@ -348,6 +361,7 @@ mod tests {
         let res = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::OpenAi),
             mode: AuthPrecedenceMode::StoredFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: Some(&aid),
@@ -365,12 +379,45 @@ mod tests {
     }
 
     #[test]
+    // A profile's `api_key_env` makes a custom provider resolve its key from that env var.
+    fn api_key_env_override_resolves_custom_provider() {
+        let provider = ProviderId::parse("deepseek");
+        let mut env = BTreeMap::new();
+        env.insert("DEEPSEEK_API_KEY".into(), "ds-key".into());
+        env.insert("OPENAI_API_KEY".into(), "oa-key".into());
+        let res = resolve_credential(AuthResolverInputs {
+            provider: Some(provider.clone()),
+            mode: AuthPrecedenceMode::ExplicitFirst,
+            api_key_env: Some("DEEPSEEK_API_KEY".into()),
+            env,
+            ..Default::default()
+        })
+        .unwrap();
+        match res.credential {
+            ResolvedCredential::ApiKey { key, source, .. } => {
+                assert_eq!(key.expose(), "ds-key");
+                assert_eq!(source, CredentialSource::EnvVar("DEEPSEEK_API_KEY".into()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            provider_env_var_for(&provider, Some("DEEPSEEK_API_KEY")).as_deref(),
+            Some("DEEPSEEK_API_KEY")
+        );
+        assert_eq!(
+            provider_env_var_for(&ProviderId::OpenAi, None).as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+    }
+
+    #[test]
     // No credentials at all returns NotLoggedIn.
     fn no_credentials_returns_not_logged_in() {
         let store = CredentialStore::new_in_memory_for_tests();
         let err = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::Gemini),
             mode: AuthPrecedenceMode::ExplicitFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: None,
@@ -414,6 +461,7 @@ mod tests {
         let res = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::Anthropic),
             mode: AuthPrecedenceMode::StoredFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: Some(&aid),
@@ -498,6 +546,7 @@ mod tests {
         let err = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::Anthropic),
             mode: AuthPrecedenceMode::StoredFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: Some(&aid),
@@ -546,6 +595,7 @@ mod tests {
         let res = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::Anthropic),
             mode: AuthPrecedenceMode::EnvFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: Some(&aid),
@@ -594,6 +644,7 @@ mod tests {
         let res = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::Anthropic),
             mode: AuthPrecedenceMode::ExplicitFirst,
+            api_key_env: None,
             explicit_api_key: Some(SecretString::new("cli-key".into())),
             explicit_account: None,
             active_account: Some(&aid),
@@ -619,6 +670,7 @@ mod tests {
         let res = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::Anthropic),
             mode: AuthPrecedenceMode::EnvFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: Some(&aid),
@@ -640,6 +692,7 @@ mod tests {
         let res = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::Anthropic),
             mode: AuthPrecedenceMode::ExplicitFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: Some(&aid),
@@ -689,6 +742,7 @@ mod tests {
         let res = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::Anthropic),
             mode: AuthPrecedenceMode::ExplicitFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: None,
@@ -716,6 +770,7 @@ mod tests {
         let res = resolve_credential(AuthResolverInputs {
             provider: Some(ProviderId::OpenAi),
             mode: AuthPrecedenceMode::StoredFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: Some(&aid),

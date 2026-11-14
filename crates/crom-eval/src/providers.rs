@@ -7,11 +7,16 @@
 //!   calls for a specific task (read → edit → run check → observe failure →
 //!   edit → pass). Catches regressions in tool schemas, event handling,
 //!   sessions, and command execution.
-//! - **Live** — a real model provider (e.g. Anthropic). Opt-in only, gated by
-//!   the `CROM_EVAL_LIVE` environment variable and provider credentials.
-//!   Never runs in ordinary CI.
+//! - **Live** — a real model provider resolved from a provider profile
+//!   (`anthropic`, `openai`, `deepseek`, `gemini`, `local`, or a
+//!   settings-defined id). Opt-in only, gated by the `CROM_EVAL_LIVE`
+//!   environment variable and the profile's API-key env var. Never runs in
+//!   ordinary CI.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use crom_core::provider_profile::{resolve_profile, ProviderProfile, ProviderProfileConfig};
 
 use crom_core::{ModelEvent, ModelProvider, TokenUsage, ToolCall};
 use crom_sdk::fake_provider::{EchoFakeProvider, ScriptedFakeProvider};
@@ -27,7 +32,7 @@ pub enum ProviderMode {
     Fake,
     /// Scripted golden provider keyed by task.
     Golden,
-    /// Live model provider by name (currently `anthropic`).
+    /// Live model provider by provider-profile id.
     Live(String),
 }
 
@@ -68,8 +73,29 @@ pub struct ProviderUnavailable {
     pub reason: String,
 }
 
-/// Build a provider for `mode` and `task`.
-pub fn build(mode: &ProviderMode, task: &EvalTask) -> Result<ProviderSetup, ProviderUnavailable> {
+/// Resolve the provider profile for a live eval run. Same resolver as the
+/// CLI and SDK, so a profile id means the same endpoint everywhere.
+pub fn resolve_live_profile(
+    name: &str,
+    profiles: &BTreeMap<String, ProviderProfileConfig>,
+) -> Result<ProviderProfile, ProviderUnavailable> {
+    resolve_profile(name, profiles).map_err(|e| ProviderUnavailable {
+        reason: e.to_string(),
+    })
+}
+
+/// Model for a live run: `CROM_EVAL_MODEL`, else the profile's default.
+pub fn live_model(profile: &ProviderProfile) -> Option<String> {
+    crom_core::legacy::env_var("CROM_EVAL_MODEL").or_else(|| profile.default_model.clone())
+}
+
+/// Build a provider for `mode` and `task`. `profiles` are settings-level
+/// provider-profile overrides (see `docs/providers.md`).
+pub fn build(
+    mode: &ProviderMode,
+    task: &EvalTask,
+    profiles: &BTreeMap<String, ProviderProfileConfig>,
+) -> Result<ProviderSetup, ProviderUnavailable> {
     match mode {
         ProviderMode::Fake => Ok(ProviderSetup {
             config: ProviderConfig::fake(Arc::new(EchoFakeProvider)),
@@ -87,37 +113,40 @@ pub fn build(mode: &ProviderMode, task: &EvalTask) -> Result<ProviderSetup, Prov
                 label: "golden".to_string(),
             })
         }
-        ProviderMode::Live(name) => build_live(name),
+        ProviderMode::Live(name) => build_live(name, profiles),
     }
 }
 
-fn build_live(name: &str) -> Result<ProviderSetup, ProviderUnavailable> {
+fn build_live(
+    name: &str,
+    profiles: &BTreeMap<String, ProviderProfileConfig>,
+) -> Result<ProviderSetup, ProviderUnavailable> {
     if crom_core::legacy::env_var(LIVE_ENV).as_deref() != Some("1") {
         return Err(ProviderUnavailable {
             reason: format!("live provider '{name}' requires {LIVE_ENV}=1 (opt-in); skipping"),
         });
     }
-    match name {
-        "anthropic" => {
-            let key = std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .filter(|k| !k.is_empty());
-            match key {
-                Some(key) => Ok(ProviderSetup {
-                    config: ProviderConfig::anthropic_api_key(crom_sdk::SecretString::new(key)),
-                    model: crom_core::legacy::env_var("CROM_EVAL_MODEL")
-                        .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
-                    label: "anthropic".to_string(),
-                }),
-                None => Err(ProviderUnavailable {
-                    reason: "ANTHROPIC_API_KEY is not set; skipping live anthropic run".to_string(),
-                }),
-            }
-        }
-        other => Err(ProviderUnavailable {
-            reason: format!("unknown live provider '{other}'"),
-        }),
-    }
+    let profile = resolve_live_profile(name, profiles)?;
+    let Some(env_name) = profile.api_key_env.clone() else {
+        return Err(ProviderUnavailable {
+            reason: format!("provider profile '{name}' has no api_key_env; skipping"),
+        });
+    };
+    let Some(key) = std::env::var(&env_name).ok().filter(|k| !k.is_empty()) else {
+        return Err(ProviderUnavailable {
+            reason: format!("{env_name} is not set; skipping live {name} run"),
+        });
+    };
+    let Some(model) = live_model(&profile) else {
+        return Err(ProviderUnavailable {
+            reason: format!("provider profile '{name}' has no default_model; set CROM_EVAL_MODEL"),
+        });
+    };
+    Ok(ProviderSetup {
+        config: ProviderConfig::profile(profile, crom_sdk::SecretString::new(key)),
+        model,
+        label: name.to_string(),
+    })
 }
 
 // --- Golden script construction helpers ---------------------------------
@@ -293,13 +322,29 @@ mod tests {
         assert!(golden_script("does-not-exist").is_none());
     }
 
+    /// Live eval profiles come from the shared core resolver, including settings overrides.
+    #[test]
+    fn live_profile_matches_core_resolver() {
+        let overrides: BTreeMap<String, ProviderProfileConfig> =
+            serde_json::from_value(serde_json::json!({ "deepseek": { "base_url": "http://x:1" } }))
+                .unwrap();
+        assert_eq!(
+            resolve_live_profile("deepseek", &overrides).unwrap(),
+            resolve_profile("deepseek", &overrides).unwrap()
+        );
+        assert!(resolve_live_profile("nope", &overrides)
+            .unwrap_err()
+            .reason
+            .contains("unknown provider profile"));
+    }
+
     #[test]
     fn live_requires_opt_in() {
         // Without the opt-in env var, live providers are unavailable. We avoid
         // mutating process env (racy across tests) by checking the real state:
         // ordinary test runs do not set CROM_EVAL_LIVE=1.
         if std::env::var(LIVE_ENV).ok().as_deref() != Some("1") {
-            match build_live("anthropic") {
+            match build_live("anthropic", &BTreeMap::new()) {
                 Err(err) => assert!(err.reason.contains(LIVE_ENV)),
                 Ok(_) => panic!("live provider should be unavailable without opt-in"),
             }

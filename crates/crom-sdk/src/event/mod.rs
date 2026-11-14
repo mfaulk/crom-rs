@@ -73,6 +73,10 @@ pub struct RunStarted {
     pub session_id: Option<SessionId>,
     pub provider: ProviderId,
     pub model: String,
+    /// Host (and port) of the provider endpoint when known — never the
+    /// full URL or credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_host: Option<String>,
     pub metadata: RequestMetadata,
 }
 

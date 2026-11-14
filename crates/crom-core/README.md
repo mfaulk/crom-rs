@@ -20,6 +20,10 @@ provider, terminal, or storage backend — those are supplied by other crates.
   for spawning child agents.
 - **Policy & safety** — `permission`, `policy`, `hooks` (and `builtin_hooks`),
   used to gate side effects.
+- **Provider profiles** — `provider_profile` resolves a provider id to its
+  kind, endpoint, API-key env var, default model, and capability flags from
+  the checked-in `providers.toml` plus settings `providers` overrides. See
+  `docs/providers.md`.
 - **Supporting types** — conversations, events, settings, skills, slash
   commands, plans, todos, compaction, telemetry, and checkpoint traits.
 

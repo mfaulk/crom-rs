@@ -333,7 +333,15 @@ fn cmd_list(args: EvalListArgs) -> Result<()> {
     Ok(())
 }
 
-const KNOWN_LIVE_PROVIDERS: &[&str] = &["anthropic"];
+/// Settings-level provider-profile overrides for live eval runs, loaded
+/// from user + project settings rooted at the current directory.
+fn eval_provider_profiles(
+) -> Result<std::collections::BTreeMap<String, crom_core::ProviderProfileConfig>> {
+    let cwd = std::env::current_dir().context("current dir")?;
+    let settings = crom_core::settings::load(&cwd, crom_core::SettingSource::UserAndProject)
+        .context("load settings for provider profiles")?;
+    Ok(settings.providers)
+}
 
 /// Select the tasks to run via the requested adapter.
 fn select_tasks(args: &EvalRunArgs) -> Result<Vec<EvalTask>> {
@@ -405,14 +413,18 @@ fn build_repair_policy(args: &EvalRunArgs) -> Result<crom_core::repair::RepairPo
 
 async fn cmd_run(args: EvalRunArgs) -> Result<()> {
     let provider = ProviderMode::parse(&args.provider);
-    if let ProviderMode::Live(name) = &provider {
-        if !KNOWN_LIVE_PROVIDERS.contains(&name.as_str()) {
-            return Err(anyhow!(
-                "unknown provider '{name}'; expected one of: fake, golden, {}",
-                KNOWN_LIVE_PROVIDERS.join(", ")
-            ));
-        }
-    }
+    let provider_profiles = if let ProviderMode::Live(name) = &provider {
+        let profiles = eval_provider_profiles()?;
+        crom_eval::providers::resolve_live_profile(name, &profiles).map_err(|u| {
+            anyhow!(
+                "unknown provider '{name}'; expected fake, golden, or a provider profile: {}",
+                u.reason
+            )
+        })?;
+        profiles
+    } else {
+        Default::default()
+    };
     let isolation = IsolationKind::parse(&args.isolation).map_err(|e| anyhow!("{e}"))?;
     let selected = select_tasks(&args)?;
 
@@ -448,6 +460,7 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
         seed: 0,
         attempts: args.attempts.max(1),
         repair,
+        provider_profiles,
     };
 
     let results = run_tasks_repeated(&selected, &run, &config, repetitions).await;

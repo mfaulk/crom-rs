@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crom_auth::{AccountId, ProviderId, ResolvedCredential, StoredCredentialSecret};
+use crom_core::provider_profile::ProviderProfile;
 use crom_core::ModelProvider;
 
 pub use crom_auth::SecretString;
@@ -25,6 +26,12 @@ pub enum ProviderConfig {
     GeminiApiKey {
         api_key: SecretString,
         base_url: Option<String>,
+    },
+    /// A resolved provider profile (see `docs/providers.md`) plus its API
+    /// key. Endpoint, request shape, and default model come from the profile.
+    Profile {
+        profile: ProviderProfile,
+        api_key: SecretString,
     },
     OAuthCredential {
         provider: ProviderId,
@@ -65,6 +72,13 @@ impl ProviderConfig {
         }
     }
 
+    pub fn profile(profile: ProviderProfile, key: impl Into<SecretString>) -> Self {
+        Self::Profile {
+            profile,
+            api_key: key.into(),
+        }
+    }
+
     pub fn external(provider: Arc<dyn ModelProvider>) -> Self {
         Self::External {
             provider,
@@ -76,12 +90,27 @@ impl ProviderConfig {
         Self::Fake { provider }
     }
 
+    /// Endpoint host (`host[:port]`) for run metadata, when the config
+    /// names an endpoint. Never includes the scheme, path, or userinfo.
+    pub fn endpoint_host(&self) -> Option<String> {
+        match self {
+            Self::Profile { profile, .. } => profile.base_url_host(),
+            Self::AnthropicApiKey { base_url, .. }
+            | Self::OpenAiApiKey { base_url, .. }
+            | Self::GeminiApiKey { base_url, .. } => base_url
+                .as_deref()
+                .and_then(crom_core::provider_profile::url_host),
+            _ => None,
+        }
+    }
+
     /// Provider id reported in events and final results.
     pub fn provider_id(&self) -> ProviderId {
         match self {
             Self::AnthropicApiKey { .. } => ProviderId::Anthropic,
             Self::OpenAiApiKey { .. } => ProviderId::OpenAi,
             Self::GeminiApiKey { .. } => ProviderId::Gemini,
+            Self::Profile { profile, .. } => ProviderId::parse(&profile.id),
             Self::OAuthCredential { provider, .. } | Self::FromAuthStore { provider, .. } => {
                 provider.clone()
             }
@@ -100,6 +129,11 @@ impl std::fmt::Debug for ProviderConfig {
             Self::AnthropicApiKey { .. } => f.write_str("AnthropicApiKey { .. <redacted> }"),
             Self::OpenAiApiKey { .. } => f.write_str("OpenAiApiKey { .. <redacted> }"),
             Self::GeminiApiKey { .. } => f.write_str("GeminiApiKey { .. <redacted> }"),
+            Self::Profile { profile, .. } => f
+                .debug_struct("Profile")
+                .field("profile", profile)
+                .field("api_key", &"<redacted>")
+                .finish(),
             Self::OAuthCredential { provider, .. } => f
                 .debug_struct("OAuthCredential")
                 .field("provider", provider)

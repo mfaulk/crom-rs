@@ -2,8 +2,9 @@ name: Eval (live provider)
 
 # Manual-only. Live-provider evals are informative, not a deterministic CI
 # gate, and cost real model tokens — so they never run on push/PR. Trigger this
-# workflow by hand from the Actions tab. It requires an ANTHROPIC_API_KEY
-# repository secret; without it the run skips cleanly.
+# workflow by hand from the Actions tab. It requires the API-key secret for
+# the chosen provider profile (ANTHROPIC_API_KEY, or DEEPSEEK_API_KEY for
+# deepseek); without it the run skips cleanly.
 on:
   workflow_dispatch:
     inputs:
@@ -12,7 +13,7 @@ on:
         required: false
         default: 'rust-small'
       provider:
-        description: 'Live provider name'
+        description: 'Live provider profile id (anthropic, deepseek, ...)'
         required: false
         default: 'anthropic'
 
@@ -27,6 +28,7 @@ jobs:
       # as skipped rather than failing.
       CROM_EVAL_LIVE: '1'
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

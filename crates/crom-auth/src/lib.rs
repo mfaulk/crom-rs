@@ -27,7 +27,9 @@ pub use events::{
     ModelListLoaded, ModelSelected,
 };
 pub use model_registry::{starter_registry, ModelAvailability, ModelInfo, ModelRegistry};
-pub use precedence::{provider_env_var, resolve_credential, AuthResolverInputs, ResolvedAuth};
+pub use precedence::{
+    provider_env_var, provider_env_var_for, resolve_credential, AuthResolverInputs, ResolvedAuth,
+};
 pub use provider::{
     AuthContext, AuthProvider, AuthProviderRegistry, BrowserOpener, FailingBrowserOpener,
     RecordingBrowserOpener,

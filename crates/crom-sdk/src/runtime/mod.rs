@@ -56,6 +56,8 @@ impl std::fmt::Debug for AgentRuntime {
 pub(crate) struct RuntimeInner {
     pub(crate) provider: Arc<dyn ModelProvider>,
     pub(crate) provider_id: ProviderId,
+    /// Endpoint host recorded in `RunStarted` (no scheme, path, or userinfo).
+    pub(crate) endpoint_host: Option<String>,
     pub(crate) default_model: String,
     /// Runtime-level system prompt; a per-request override takes precedence.
     pub(crate) default_system_prompt: Option<String>,
@@ -141,6 +143,7 @@ impl AgentRuntime {
             session_id: session_id.clone(),
             provider: provider_id.clone(),
             model: model.clone(),
+            endpoint_host: inner.endpoint_host.clone(),
             metadata: metadata.clone(),
         });
         run::emit_event(&inner, &event_tx, storage_session.as_ref(), start_event).await;
@@ -248,6 +251,12 @@ impl AgentRuntime {
     /// Provider id (e.g. `anthropic`, `fake`).
     pub fn provider_id(&self) -> ProviderId {
         self.inner.provider_id.clone()
+    }
+
+    /// Provider endpoint host (e.g. `api.deepseek.com`) when the provider
+    /// config names an endpoint.
+    pub fn endpoint_host(&self) -> Option<String> {
+        self.inner.endpoint_host.clone()
     }
 
     /// Default model id.

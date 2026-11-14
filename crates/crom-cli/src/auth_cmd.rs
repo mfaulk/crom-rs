@@ -309,6 +309,7 @@ pub async fn cmd_auth_status(args: AuthCommonArgs) -> Result<()> {
         let resolved = resolve_credential(AuthResolverInputs {
             provider: Some(provider_id.clone()),
             mode: AuthPrecedenceMode::ExplicitFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: active.as_ref(),
@@ -519,6 +520,7 @@ pub async fn cmd_auth_doctor(args: AuthCommonArgs) -> Result<()> {
         let resolved = resolve_credential(AuthResolverInputs {
             provider: Some(provider_id.clone()),
             mode: AuthPrecedenceMode::ExplicitFirst,
+            api_key_env: None,
             explicit_api_key: None,
             explicit_account: None,
             active_account: active.as_ref(),

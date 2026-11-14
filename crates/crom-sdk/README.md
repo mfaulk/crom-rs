@@ -40,6 +40,10 @@ println!("summary = {}", result.summary);
 Provider integrations are Cargo features: `anthropic`, `openai`, and
 `gemini` are on by default, so `ProviderConfig::anthropic_api_key`,
 `openai_api_key`, and `gemini_api_key` build HTTP-backed providers directly.
+`ProviderConfig::profile(profile, key)` builds any provider profile (e.g.
+DeepSeek or a local OpenAI-compatible server) via
+`crom_sdk::profile::build_profile_provider`, the same path the CLI and eval
+use; see `docs/providers.md`.
 `checkpointing` and `fake-provider` (for tests and examples) are opt-in.
 Disabling a provider feature makes its config fail with
 `provider.feature_disabled`. See `examples/` for runnable usage:

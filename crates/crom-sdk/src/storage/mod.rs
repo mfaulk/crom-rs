@@ -296,6 +296,7 @@ mod tests {
             session_id: None,
             provider: ProviderId::Fake,
             model: "fake".into(),
+            endpoint_host: None,
             metadata: crate::request::RequestMetadata::default(),
         })
     }

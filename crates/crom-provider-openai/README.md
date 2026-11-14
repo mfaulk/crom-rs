@@ -26,6 +26,10 @@ let provider = OpenAiProvider::from_config(OpenAiConfig::default(), resolved_cre
 ```
 
 `OpenAiConfig` defaults: `connect_timeout` 30s, `request_timeout` 120s.
+`max_tokens_field` (default `MaxTokensField::MaxTokens`) selects whether the
+output limit is sent as `max_tokens` or `max_completion_tokens`; provider
+profiles set it per endpoint (see `docs/providers.md`). `base_url` is the
+endpoint root; `/v1/chat/completions` is appended.
 `OpenAiConfig` also carries `max_retries` (default 3): 408/429/5xx
 responses are retried with 250ms·2^n backoff (capped at 30s). Network
 errors, including timeouts, are not retried.

@@ -336,6 +336,7 @@ pub async fn run_doctor(cwd: &Path, settings: &Settings, redact_secrets: bool) -
             let resolved = crom_auth::resolve_credential(crom_auth::AuthResolverInputs {
                 provider: Some(provider_id.clone()),
                 mode: crom_auth::AuthPrecedenceMode::ExplicitFirst,
+                api_key_env: None,
                 explicit_api_key: None,
                 explicit_account: None,
                 active_account: active.as_ref(),
