@@ -28,9 +28,13 @@ and a one-call constructor:
 let provider = GeminiProvider::from_config(GeminiConfig::default(), resolved_credential)?;
 ```
 
-`GeminiConfig` defaults: `connect_timeout` 30s, `request_timeout` 120s.
-Gemini does not retry: 429/5xx and network errors surface immediately
-as `ProviderError::Http`.
+`GeminiConfig` defaults: `connect_timeout` 30s, `read_timeout` (idle) 300s,
+`request_timeout` (total) 600s, `max_retries` 3, `retry_base_delay` 250ms.
+Failures map to typed `ProviderError` variants (`Auth`, `InvalidRequest`,
+`RateLimited { retry_after }`, `Timeout`, `Connect`, `ServerError`). 408, 429,
+5xx, connect errors, and timeouts are retried through the shared core policy
+with jittered exponential backoff, honouring `Retry-After`. See
+[`docs/providers.md`](../../docs/providers.md).
 
 Build with `default-features = false` to drop the reqwest transport and
 supply your own `GeminiTransport` via `GeminiProvider::new`.
@@ -42,4 +46,6 @@ Enabled in `crom-sdk` via the `gemini` feature (on by default) as
 go through `from_config`.
 
 HTTP-level tests (`tests/http_transport.rs`) run the reqwest transport
-against a `wiremock` server: success, 429, 5xx, and timeout.
+against a `wiremock` server: success, status classification (401/403, 400,
+408, 429 + `Retry-After`, 5xx), connect errors, read/total timeouts, and
+retries (reported through `with_retry_observer`).

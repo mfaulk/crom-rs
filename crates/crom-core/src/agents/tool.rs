@@ -900,7 +900,7 @@ async fn run_subagent(
         .pricing
         .as_ref()
         .zip(final_usage.as_ref())
-        .map(|(p, u)| p.estimate(u));
+        .and_then(|(p, u)| p.estimate(u));
     if let Some(t) = &runtime.telemetry_sink {
         match status {
             SubagentStatus::Succeeded => {

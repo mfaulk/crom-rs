@@ -10,7 +10,9 @@ M15 extends the M14 harness into an adapter-based, schema-versioned,
 isolation-aware, flake-aware, behavior-aware, regression-tracking platform.
 Companion docs:
 
-- [eval-schema.md](eval-schema.md) — the task manifest schema (v1 + v2).
+- [eval-schema.md](eval-schema.md) — the task manifest schema (v1, v2, v3).
+- [eval-authoring.md](eval-authoring.md) — task authoring guide (kinds, levels,
+  capability-task requirements).
 - [eval-adapters.md](eval-adapters.md) — adapters (internal, directory, and the
   external benchmark MVPs).
 - [eval-isolation.md](eval-isolation.md) — isolation backends and environment
@@ -161,12 +163,16 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
 ## Adding a new task
 
 1. Create a directory under `crates/crom-eval/eval/tasks/<task-id>/`.
-2. Add a `task.toml` manifest (see the reference below).
+2. Add a `task.toml` manifest (see the reference below). New tasks should use
+   schema v3 (`schema_version = 3` with `task_version`, `kind`, `level`); see
+   [eval-authoring.md](eval-authoring.md) and the
+   [v3 field reference](eval-schema.md#schema-v3-m17).
 3. Add a `repo/` fixture directory containing the starting project. Keep it
    tiny. If it is a Rust crate, put an empty `[workspace]` table at the top of
    its `Cargo.toml` so the parent workspace never absorbs the fixture.
 4. (Optional) Add the task to a suite and/or register a golden script in
    `crates/crom-eval/src/providers.rs` keyed by the task id.
+5. Run `crom eval validate-task <task-id>`; it must report 0 errors.
 
 Example layout:
 
@@ -340,7 +346,7 @@ target/crom-eval/
       verification.json    # per-check public/hidden verification results
       behavior.json        # behavior metrics for the task
       score.json
-      result.json          # the full task result (status, resolved, failure class, …)
+      result.json          # the full task result (status, resolved, failure class, usage, model_round_trips, …)
       index-entry.json     # the row appended to index.jsonl
       report.md
       triage.md

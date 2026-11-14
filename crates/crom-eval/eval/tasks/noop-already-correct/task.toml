@@ -1,4 +1,9 @@
-schema_version = 2
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
+expected_outcome = "no_change"
 id = "noop-already-correct"
 title = "Negative: recognise an already-correct project and make no changes"
 category = "negative"
@@ -39,3 +44,9 @@ text = "ALL_GOOD"
 kind = "file_contains"
 path = "README.md"
 text = "Do not change anything"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"

@@ -583,19 +583,50 @@ pub struct ModelPricing {
 }
 
 impl ModelPricing {
-    /// Estimate USD cost of a single usage record.
-    pub fn estimate(&self, u: &TokenUsage) -> f64 {
-        let input = u.input_tokens as f64;
-        let output = u.output_tokens as f64;
-        let cache_create = u.cache_creation_input_tokens.unwrap_or(0) as f64;
-        let cache_read = u.cache_read_input_tokens.unwrap_or(0) as f64;
+    /// Estimate USD cost of a usage record. `None` when input or output is
+    /// unknown, or when a configured cache rate applies to an unknown cache
+    /// quantity — an unknown is never priced as zero.
+    pub fn estimate(&self, u: &TokenUsage) -> Option<f64> {
+        let input = u.input_tokens? as f64;
+        let output = u.output_tokens? as f64;
         let mut cost = (input * self.input_per_million + output * self.output_per_million) / 1.0e6;
         if let Some(rate) = self.cache_creation_per_million {
-            cost += (cache_create * rate) / 1.0e6;
+            cost += (u.cache_creation_input_tokens? as f64 * rate) / 1.0e6;
         }
         if let Some(rate) = self.cache_read_per_million {
-            cost += (cache_read * rate) / 1.0e6;
+            cost += (u.cache_read_input_tokens? as f64 * rate) / 1.0e6;
         }
-        cost
+        Some(cost)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pricing(cache_read: Option<f64>) -> ModelPricing {
+        ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 2.0,
+            cache_creation_per_million: None,
+            cache_read_per_million: cache_read,
+        }
+    }
+
+    // Known input/output are priced; unknown input/output or a priced-but-unreported cache field yields None.
+    #[test]
+    fn estimate_is_none_for_unknown_usage() {
+        let known = TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+        assert_eq!(pricing(None).estimate(&known), Some(3.0));
+        let partial = TokenUsage {
+            output_tokens: None,
+            ..known.clone()
+        };
+        assert_eq!(pricing(None).estimate(&partial), None);
+        assert_eq!(pricing(Some(0.1)).estimate(&known), None);
     }
 }

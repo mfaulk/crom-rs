@@ -2,14 +2,15 @@
 //!
 //! Available behind the `fake-provider` feature flag (NOT enabled by default).
 //! Applications that ship to production should never rely on this provider —
-//! it is intentionally simple and does not call any real model.
+//! it is intentionally simple and does not call any real model. The built-in
+//! responses report no token usage (`usage: None`), so run usage is unknown.
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use crom_core::{
     AssistantContent, ContentBlock, MessageRole, ModelEvent, ModelProvider, ModelRequest,
-    ProviderError, TokenUsage, ToolCall,
+    ProviderError, ToolCall,
 };
 use futures::stream::{self, BoxStream};
 
@@ -45,7 +46,7 @@ impl ScriptedFakeProvider {
                 }),
                 ModelEvent::MessageStop {
                     stop_reason: Some("tool_use".into()),
-                    usage: Some(TokenUsage::default()),
+                    usage: None,
                 },
             ],
             // After the tool result, the model produces a final text and stops.
@@ -55,7 +56,7 @@ impl ScriptedFakeProvider {
                 },
                 ModelEvent::MessageStop {
                     stop_reason: Some("end_turn".into()),
-                    usage: Some(TokenUsage::default()),
+                    usage: None,
                 },
             ],
         ])
@@ -69,7 +70,7 @@ impl ScriptedFakeProvider {
             ModelEvent::TextDelta { text },
             ModelEvent::MessageStop {
                 stop_reason: Some("end_turn".into()),
-                usage: Some(TokenUsage::default()),
+                usage: None,
             },
         ]])
     }
@@ -123,7 +124,7 @@ impl ModelProvider for EchoFakeProvider {
             Ok(ModelEvent::TextDelta { text: response }),
             Ok(ModelEvent::MessageStop {
                 stop_reason: Some("end_turn".into()),
-                usage: Some(TokenUsage::default()),
+                usage: None,
             }),
         ])))
     }

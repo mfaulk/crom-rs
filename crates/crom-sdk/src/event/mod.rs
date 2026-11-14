@@ -53,6 +53,8 @@ pub enum SdkEvent {
     AssistantTextDelta(AssistantTextDelta),
     ToolCallStarted(ToolCallStartedEvent),
     ToolCallCompleted(ToolCallCompletedEvent),
+    /// One model round trip finished. Emitted under `Standard` and `Full`.
+    ModelTurnCompleted(ModelTurnCompletedEvent),
     ApprovalRequired(ApprovalRequiredEvent),
     ApprovalResolved(ApprovalResolvedEvent),
     PatchProposed(PatchProposedEvent),
@@ -60,6 +62,8 @@ pub enum SdkEvent {
     ValidationStarted(ValidationStartedEvent),
     ValidationCompleted(ValidationCompletedEvent),
     Diagnostic(DiagnosticEvent),
+    /// A provider call failed transiently and is being retried.
+    ProviderRetry(ProviderRetryEvent),
     RunCompleted(RunCompletedEvent),
     RunFailed(RunFailedEvent),
     RunCancelled(RunCancelledEvent),
@@ -133,6 +137,22 @@ pub struct ToolCallCompletedEvent {
     pub duration_ms: u64,
 }
 
+/// Per-round-trip usage. `usage` is `None` when the provider reported no
+/// usage for this turn (never zero-filled). `turn` is 1-based and restarts
+/// per agent loop, so plan-then-act runs number planning and act turns
+/// separately.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelTurnCompletedEvent {
+    pub run_id: RunId,
+    pub turn: u32,
+    /// Provider that served the turn; `None` only for a mapper built without
+    /// one (the runtime always sets it).
+    pub provider: Option<ProviderId>,
+    pub model: String,
+    pub usage: Option<TokenUsage>,
+    pub latency_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequiredEvent {
     pub run_id: RunId,
@@ -194,6 +214,16 @@ pub struct ValidationCompletedEvent {
 pub struct DiagnosticEvent {
     pub run_id: RunId,
     pub diagnostic: Diagnostic,
+}
+
+/// Emitted before each provider retry so hosts and eval can count retries
+/// and separate provider instability from agent failures. Emitted at
+/// `Standard` and `Full` verbosity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderRetryEvent {
+    pub run_id: RunId,
+    #[serde(flatten)]
+    pub retry: crom_core::ProviderRetry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

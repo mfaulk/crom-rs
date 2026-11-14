@@ -10,8 +10,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use crom_auth::{ProviderId, ResolvedCredential, SecretString};
 use crom_core::{
-    ContentBlock, MessageRole, ModelEvent, ModelProvider, ModelRequest, ProviderError, TokenUsage,
-    ToolCall, ToolResultContent,
+    retry_provider_call, ContentBlock, MessageRole, ModelEvent, ModelProvider, ModelRequest,
+    ProviderError, RetryPolicy, TokenUsage, ToolCall, ToolResultContent,
 };
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
@@ -51,15 +51,36 @@ pub trait GeminiTransport: Send + Sync {
 pub struct TransportResponse {
     pub status: u16,
     pub body: String,
+    /// Server back-off hint from `Retry-After`, if sent.
+    pub retry_after: Option<Duration>,
+}
+
+impl TransportResponse {
+    pub fn new(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+            retry_after: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct GeminiConfig {
     pub base_url: String,
-    /// TCP connect timeout for the built-in reqwest transport. Defaults to 30s.
+    /// Retries after the first attempt for transient failures (408, 429,
+    /// 5xx, connect errors, timeouts). Total attempts = 1 + max_retries.
+    pub max_retries: u32,
+    /// Backoff before the first retry; doubles per retry (jittered, capped
+    /// at 30s). A server `Retry-After` hint raises it.
+    pub retry_base_delay: Duration,
+    /// TCP connect timeout for the built-in reqwest transport.
     pub connect_timeout: Duration,
-    /// Whole-request timeout for the built-in reqwest transport. Defaults to
-    /// 120s; without it a stalled non-streaming endpoint hangs the agent.
+    /// Idle timeout: maximum gap between bytes received, including the wait
+    /// for response headers on this non-streaming endpoint.
+    pub read_timeout: Duration,
+    /// Whole-request timeout, a backstop so a stalled endpoint cannot hang
+    /// the agent. Sized for slow reasoning models.
     pub request_timeout: Duration,
 }
 
@@ -67,8 +88,21 @@ impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE.into(),
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(250),
             connect_timeout: Duration::from_secs(30),
-            request_timeout: Duration::from_secs(120),
+            read_timeout: Duration::from_secs(300),
+            request_timeout: Duration::from_secs(600),
+        }
+    }
+}
+
+impl GeminiConfig {
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
+            max_retries: self.max_retries,
+            base_delay: self.retry_base_delay,
+            ..RetryPolicy::default()
         }
     }
 }
@@ -99,7 +133,11 @@ impl GeminiProvider {
         cfg: GeminiConfig,
         credential: ResolvedCredential,
     ) -> Result<Self, ProviderError> {
-        let transport = ReqwestGeminiTransport::new(cfg.connect_timeout, cfg.request_timeout)?;
+        let transport = ReqwestGeminiTransport::new(
+            cfg.connect_timeout,
+            cfg.read_timeout,
+            cfg.request_timeout,
+        )?;
         Ok(Self::new(
             cfg,
             Arc::new(transport),
@@ -111,17 +149,13 @@ impl GeminiProvider {
         let cred = (self.credential)();
         let key = require_api_key(&cred)?;
         let url = format!("{}/v1beta/models", self.cfg.base_url);
-        let resp = self.transport.list_models(&url, &key).await?;
-        if resp.status >= 200 && resp.status < 300 {
-            let parsed: ModelsList = serde_json::from_str(&resp.body)
-                .map_err(|e| ProviderError::InvalidResponse(format!("models: {e}")))?;
-            Ok(parsed.models.into_iter().map(|m| m.name).collect())
-        } else {
-            Err(ProviderError::Http(format!(
-                "models: status {}",
-                resp.status
-            )))
-        }
+        let resp = check_status(
+            "gemini models",
+            self.transport.list_models(&url, &key).await?,
+        )?;
+        let parsed: ModelsList = serde_json::from_str(&resp.body)
+            .map_err(|e| ProviderError::InvalidResponse(format!("models: {e}")))?;
+        Ok(parsed.models.into_iter().map(|m| m.name).collect())
     }
 }
 
@@ -140,18 +174,30 @@ impl ModelProvider for GeminiProvider {
         );
         let body = serde_json::to_string(&build_body(&request))
             .map_err(|e| ProviderError::Other(format!("encode body: {e}")))?;
-        let resp = self.transport.post_generate(&url, &key, &body).await?;
-        if resp.status < 200 || resp.status >= 300 {
-            return Err(ProviderError::Http(format!(
-                "gemini: status {}: {}",
-                resp.status, resp.body
-            )));
-        }
+        let resp = retry_provider_call("gemini", &self.cfg.retry_policy(), || async {
+            let r = self.transport.post_generate(&url, &key, &body).await?;
+            check_status("gemini", r)
+        })
+        .await?;
         let parsed: GenerateResponse = serde_json::from_str(&resp.body).map_err(|e| {
             ProviderError::InvalidResponse(format!("gemini generateContent response: {e}"))
         })?;
         let events = generate_response_to_events(parsed);
         Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+    }
+}
+
+/// Pass a 2xx response through; classify anything else into a typed error.
+fn check_status(context: &str, r: TransportResponse) -> Result<TransportResponse, ProviderError> {
+    if (200..300).contains(&r.status) {
+        Ok(r)
+    } else {
+        Err(ProviderError::from_status(
+            context,
+            r.status,
+            &r.body,
+            r.retry_after,
+        ))
     }
 }
 
@@ -391,12 +437,38 @@ struct GeminiCandidateFunctionCall {
     args: Value,
 }
 
+/// Gemini serializes usage as proto3 JSON, which omits zero-valued counts, so
+/// a missing count inside a present `usageMetadata` means zero. A missing
+/// `usageMetadata` means usage is unreported.
 #[derive(Deserialize, Default)]
 struct UsageMetadata {
     #[serde(default, rename = "promptTokenCount")]
     prompt_token_count: u64,
     #[serde(default, rename = "candidatesTokenCount")]
     candidates_token_count: u64,
+    #[serde(default, rename = "cachedContentTokenCount")]
+    cached_content_token_count: u64,
+    #[serde(default, rename = "thoughtsTokenCount")]
+    thoughts_token_count: u64,
+}
+
+/// Normalize to [`TokenUsage`]: `promptTokenCount` includes cached content,
+/// so it is split out of `input_tokens`; thought tokens are billed as output
+/// but reported outside `candidatesTokenCount`, so they are added back.
+fn usage_metadata_to_token_usage(u: UsageMetadata) -> TokenUsage {
+    TokenUsage {
+        input_tokens: Some(
+            u.prompt_token_count
+                .saturating_sub(u.cached_content_token_count),
+        ),
+        output_tokens: Some(
+            u.candidates_token_count
+                .saturating_add(u.thoughts_token_count),
+        ),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: Some(u.cached_content_token_count),
+        reasoning_tokens: Some(u.thoughts_token_count),
+    }
 }
 
 fn generate_response_to_events(resp: GenerateResponse) -> Vec<ModelEvent> {
@@ -433,12 +505,7 @@ fn generate_response_to_events(resp: GenerateResponse) -> Vec<ModelEvent> {
             }
         }
     }
-    let usage = resp.usage.map(|u| TokenUsage {
-        input_tokens: u.prompt_token_count,
-        output_tokens: u.candidates_token_count,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
-    });
+    let usage = resp.usage.map(usage_metadata_to_token_usage);
     events.push(ModelEvent::MessageStop { stop_reason, usage });
     events
 }
@@ -466,6 +533,46 @@ mod tests {
     use crom_core::Message;
     use futures::StreamExt;
 
+    fn usage_from_fixture(body: &str) -> Option<TokenUsage> {
+        let resp: GenerateResponse = serde_json::from_str(body).unwrap();
+        match generate_response_to_events(resp).pop() {
+            Some(ModelEvent::MessageStop { usage, .. }) => usage,
+            other => panic!("expected MessageStop, got {other:?}"),
+        }
+    }
+
+    // cachedContentTokenCount is split out of input and thoughtsTokenCount counts as reasoning output.
+    #[test]
+    fn usage_gemini_cached_and_thought_tokens() {
+        let u = usage_from_fixture(include_str!("../tests/fixtures/usage_cached_thoughts.json"))
+            .expect("usage reported");
+        assert_eq!(u.input_tokens, Some(500));
+        assert_eq!(u.cache_read_input_tokens, Some(1000));
+        assert_eq!(u.cache_creation_input_tokens, None);
+        assert_eq!(u.output_tokens, Some(150));
+        assert_eq!(u.reasoning_tokens, Some(50));
+    }
+
+    // Gemini omits zero counts (proto3 JSON), so omitted fields inside usageMetadata are zero.
+    #[test]
+    fn usage_gemini_omitted_counts_are_zero() {
+        let u = usage_from_fixture(include_str!("../tests/fixtures/usage_minimal.json"))
+            .expect("usage reported");
+        assert_eq!(u.input_tokens, Some(2));
+        assert_eq!(u.output_tokens, Some(1));
+        assert_eq!(u.cache_read_input_tokens, Some(0));
+        assert_eq!(u.reasoning_tokens, Some(0));
+    }
+
+    // A response without usageMetadata yields None, never zeros.
+    #[test]
+    fn usage_absent_is_none() {
+        assert_eq!(
+            usage_from_fixture(include_str!("../tests/fixtures/usage_absent.json")),
+            None
+        );
+    }
+
     #[derive(Default)]
     struct MockTransport {
         gen_response: Option<TransportResponse>,
@@ -488,10 +595,7 @@ mod tests {
             *self.captured.lock().unwrap() = Some(body.to_string());
             *self.captured_url.lock().unwrap() = Some(url.to_string());
             *self.captured_key.lock().unwrap() = Some(api_key.expose().to_string());
-            Ok(self.gen_response.clone().unwrap_or(TransportResponse {
-                status: 200,
-                body: r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1}}"#.into(),
-            }))
+            Ok(self.gen_response.clone().unwrap_or(TransportResponse::new(200, r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1}}"#)))
         }
 
         async fn list_models(
@@ -501,10 +605,7 @@ mod tests {
         ) -> Result<TransportResponse, ProviderError> {
             *self.captured_models_url.lock().unwrap() = Some(url.to_string());
             *self.captured_models_key.lock().unwrap() = Some(api_key.expose().to_string());
-            Ok(self.models_response.clone().unwrap_or(TransportResponse {
-                status: 200,
-                body: r#"{"models":[{"name":"models/gemini-1.5-pro"},{"name":"models/gemini-1.5-flash"}]}"#.into(),
-            }))
+            Ok(self.models_response.clone().unwrap_or(TransportResponse::new(200, r#"{"models":[{"name":"models/gemini-1.5-pro"},{"name":"models/gemini-1.5-flash"}]}"#)))
         }
     }
 
@@ -612,10 +713,7 @@ mod tests {
             }]
         }"#;
         let transport = Arc::new(MockTransport {
-            gen_response: Some(TransportResponse {
-                status: 200,
-                body: body.into(),
-            }),
+            gen_response: Some(TransportResponse::new(200, body)),
             ..Default::default()
         });
         let provider = GeminiProvider::new(
@@ -679,10 +777,7 @@ mod tests {
             }]
         }"#;
         let transport = Arc::new(MockTransport {
-            gen_response: Some(TransportResponse {
-                status: 200,
-                body: body.into(),
-            }),
+            gen_response: Some(TransportResponse::new(200, body)),
             ..Default::default()
         });
         let provider = GeminiProvider::new(

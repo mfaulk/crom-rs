@@ -45,6 +45,32 @@ fn discovers_at_least_eight_tasks() {
     assert!(tasks.iter().any(|t| t.in_suite("safety")));
 }
 
+/// Every shipped task is a v3 manifest labelled with a kind and level.
+#[test]
+fn every_shipped_task_is_v3_with_kind_and_level() {
+    for t in load_all() {
+        assert_eq!(t.schema_version, 3, "{} is not schema v3", t.id);
+        assert!(t.kind.is_some(), "{} has no kind", t.id);
+        assert!(t.level.is_some(), "{} has no level", t.id);
+        assert!(t.task_version.is_some(), "{} has no task_version", t.id);
+    }
+}
+
+/// Tasks in the scripted/offline CI suites are harness tasks at L0, never capability tasks.
+#[test]
+fn offline_ci_suites_are_harness_l0() {
+    use crom_eval::schema::{Level, TaskKind};
+    for t in load_all() {
+        if ["smoke", "golden", "safety", "repair-smoke", "repair-mini"]
+            .iter()
+            .any(|s| t.in_suite(s))
+        {
+            assert_eq!(t.kind, Some(TaskKind::Harness), "{}", t.id);
+            assert_eq!(t.level, Some(Level::L0), "{}", t.id);
+        }
+    }
+}
+
 #[tokio::test]
 async fn smoke_noop_passes_under_fake_provider() {
     let tmp = tempfile::tempdir().unwrap();
@@ -102,6 +128,61 @@ async fn golden_edit_recover_passes_and_recovers() {
     // The command oracle confirms the post-run workspace satisfies the goal.
     let data = std::fs::read_to_string(result.workspace_path.join("data.txt")).unwrap();
     assert!(data.contains("value=42"));
+}
+
+fn read_result_json(run: &RunDir, task_id: &str) -> serde_json::Value {
+    let path = run.task(task_id).unwrap().dir.join("result.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// The golden provider reports input/output but not cache/reasoning, so result.json sums the known fields, keeps the unreported ones null, and counts round trips.
+#[tokio::test]
+async fn golden_result_json_records_partial_usage_and_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = RunDir::create(tmp.path(), "test-golden-usage").unwrap();
+    let tasks = load_all();
+    let task = find(&tasks, "golden-edit-recover");
+    let config = RunConfig {
+        provider: ProviderMode::Golden,
+        timeout_grace: Duration::from_secs(20),
+        ..RunConfig::default()
+    };
+    let result = run_task(task, &run, &config).await;
+    assert_eq!(result.status, EvalStatus::Passed);
+
+    let json = read_result_json(&run, "golden-edit-recover");
+    // golden-edit-recover scripts 5 model turns at 100 input / 20 output each.
+    assert_eq!(json["model_round_trips"], 5);
+    let usage = &json["usage"];
+    assert_eq!(usage["input_tokens"], 500);
+    assert_eq!(usage["output_tokens"], 100);
+    assert!(usage["cache_read_input_tokens"].is_null());
+    assert!(usage["cache_creation_input_tokens"].is_null());
+    assert!(usage["reasoning_tokens"].is_null());
+}
+
+/// A provider that reports no usage yields `usage: null` (never zeros) in result.json while still counting round trips.
+#[tokio::test]
+async fn unreported_usage_is_null_in_result_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = RunDir::create(tmp.path(), "test-fake-usage").unwrap();
+    let tasks = load_all();
+    let task = find(&tasks, "smoke-noop");
+    let config = RunConfig {
+        provider: ProviderMode::Fake,
+        timeout_grace: Duration::from_secs(10),
+        ..RunConfig::default()
+    };
+    let result = run_task(task, &run, &config).await;
+    assert_eq!(result.usage, None);
+
+    let json = read_result_json(&run, "smoke-noop");
+    assert!(
+        json["usage"].is_null(),
+        "usage must be null: {}",
+        json["usage"]
+    );
+    assert_eq!(json["model_round_trips"], 1);
 }
 
 #[tokio::test]

@@ -27,10 +27,11 @@ let cfg = ProviderConfig::anthropic_api_key(SecretString::new(
 `OpenAiApiKey` and `GeminiApiKey` call `OpenAiProvider::from_config` /
 `GeminiProvider::from_config` from the provider crates, the same constructors
 the `crom` CLI uses. `base_url: Some(..)` overrides the API endpoint (useful
-for proxies and mock servers). Timeouts are 30s connect / 120s per request;
-OpenAI retries 408/429/5xx up to 3 times with exponential backoff, Gemini
-does not retry. A disabled provider feature fails with
-`provider.feature_disabled`.
+for proxies and mock servers). OpenAI and Gemini use 30s connect / 300s idle /
+600s total timeouts and retry transient failures (408, 429, 5xx, connect
+errors, timeouts) up to 3 times; Anthropic retries up to 2 times. Each retry
+emits `SdkEvent::ProviderRetry`; see [`../providers.md`](../providers.md). A
+disabled provider feature fails with `provider.feature_disabled`.
 
 ## Provider profiles
 

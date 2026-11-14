@@ -6,6 +6,7 @@
 
 mod adapters;
 mod builder;
+mod retry;
 mod run;
 mod validation;
 

@@ -20,6 +20,7 @@ pub mod plugins;
 pub mod policy;
 pub mod provider;
 pub mod provider_profile;
+pub mod provider_retry;
 pub mod repair;
 pub mod run_id;
 pub mod settings;
@@ -148,6 +149,9 @@ pub use provider_profile::{
     MaxTokensField, ProfileError, ProviderCapabilities, ProviderKind, ProviderProfile,
     ProviderProfileConfig,
 };
+pub use provider_retry::{
+    retry_provider_call, with_retry_observer, ProviderRetry, RetryObserver, RetryPolicy,
+};
 pub use run_id::RunId;
 pub use settings::{
     merge_settings_file_into, AgentsSettingsConfig, AuthProviderEntry, AuthSettingsConfig,
@@ -194,4 +198,4 @@ pub use ui::{
     StatusLineConfig, StatusLineContext, StatusLineSettingsConfig, SubmitKey, TerminalCapabilities,
     TerminalRenderer, UiConfig, UiSettingsConfig, UiSettingsError, DEFAULT_STATUSLINE_TEMPLATE,
 };
-pub use usage::TokenUsage;
+pub use usage::{TokenUsage, UsageTotals};

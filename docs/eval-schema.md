@@ -1,22 +1,32 @@
 # Eval task manifest schema
 
 Tasks are described by a `task.toml` manifest plus an adjacent fixture
-directory. The harness supports two schema versions:
+directory. The harness supports three schema versions:
 
 - **v1** — the M14 manifest. No `schema_version` field; everything defaults.
 - **v2** — the M15 manifest. Declares `schema_version = 2` and may add
   capability labels, behavior rules, hidden verification, quarantine,
   visibility, prompt variants, and required/forbidden path policy.
+- **v3** — the M17 manifest. Declares `schema_version = 3` and adds a content
+  version, capability level, task kind, provenance, limits, network,
+  toolchain, reference, and expected outcome. See
+  [Schema v3 (M17)](#schema-v3-m17).
 
 A manifest that omits `schema_version` is treated as v1. Unknown versions are
-rejected; there is no CLI flag to opt into a newer schema. Both versions run
-through the same runner; every v2 field has a default, so v1 manifests parse
-unchanged.
+rejected; there is no CLI flag to opt into a newer schema. All versions run
+through the same runner; every later-version field has a default, so v1 and v2
+manifests parse unchanged. v3-only fields in a v1/v2 manifest are a load error
+rather than being silently ignored.
+
+All shipped tasks under `crates/crom-eval/eval/tasks/` are v3.
 
 ## Field reference
 
+v1/v2 fields (all still valid in v3; v3 fields are listed
+[below](#schema-v3-m17)):
+
 ```toml
-schema_version = 2                  # 1 (default) or 2
+schema_version = 2                  # 1 (default), 2, or 3
 id = "rust-bugfix-cli-arg-001"      # unique id (also the directory name)
 title = "Fix CLI arg parsing bug"
 description = "optional long description"
@@ -111,6 +121,80 @@ can therefore never fire.
 the network — for example a Rust fixture with crates.io dependencies
 (`rust-serde-edge-case`) on a host without a warm registry cache.
 
+## Schema v3 (M17)
+
+```toml
+schema_version = 3
+task_version = "1.0.0"          # required; MAJOR.MINOR.PATCH. Bump on any prompt/fixture/oracle change
+kind = "capability"             # required; harness | capability | security
+level = "L1"                    # required; L0..L5 (capability tasks must be L1+)
+network = "none"                # optional; none | registry (registry implies requires_network)
+toolchain = "1.88.0"            # optional Rust toolchain pin (non-empty)
+reference = "oracle_patch"      # oracle_patch | validated_oracle; required for capability tasks
+oracle_patch = "oracle.patch"   # required when reference = "oracle_patch"
+expected_outcome = "change"     # change (default) | no_change
+
+[provenance]                    # optional; unknown keys rejected
+author = "crom maintainers"
+source = "original"             # or an upstream URL / benchmark name
+license = "Apache-2.0 OR MIT"   # SPDX expression
+created = "2026-11-14"          # YYYY-MM-DD
+
+[limits]                        # optional; unknown keys rejected, zero values rejected
+wall_secs = 300                 # overrides timeout_secs
+max_turns = 16                  # overrides max_turns
+cpu = 2.0                       # declared; not yet enforced by the runner
+memory_mb = 2048                # declared; not yet enforced by the runner
+max_tool_calls = 60             # declared; not yet enforced by the runner
+max_cost_usd = 0.50             # declared; not yet enforced by the runner
+```
+
+### Kinds and levels
+
+| `kind` | Meaning |
+|---|---|
+| `harness` | Validates the runtime, scripted (`golden`) or `fake` providers, and policy plumbing. Succeeds by construction offline; never a capability signal. Always `L0`. |
+| `capability` | Measures coding capability at `L1`..`L5`. Must satisfy the rules below. |
+| `security` | Adversarial/policy tasks (M17.3). No extra validation rules yet. |
+
+Levels follow the capability ladder in
+[MILESTONE_17.md](milestones/MILESTONE_17.md#5-capability-ladder): `L0`
+runtime correctness, `L1` single-file coding, `L2` multi-step coding and
+repair, `L3` real-repository engineering, `L4` genuine engineering issues,
+`L5` external benchmark comparison.
+
+### Load-time rules (`schema_version = 3`)
+
+Checked whenever a manifest is loaded (`eval run`, `eval list`,
+`validate-task`, ...); a violation is a load error:
+
+- `task_version`, `kind`, and `level` are present; `task_version` is
+  `MAJOR.MINOR.PATCH`.
+- `kind = "capability"` is not `L0`.
+- `network = "none"` is not combined with `requires_network = true`.
+- `reference = "oracle_patch"` has an `oracle_patch` path.
+- `reference = "validated_oracle"` is only used with
+  `expected_outcome = "no_change"`.
+- `provenance.created` is `YYYY-MM-DD`; `toolchain` is non-empty; limits are
+  positive (`max_cost_usd` may be 0).
+
+### Capability-task rules (`validate-task` / `validate-suite`)
+
+For `kind = "capability"`, `crom eval validate-task` additionally runs the
+fixture and fails (error) unless:
+
+- `capability_hidden`: `[hidden]` declares at least one check.
+- `capability_reference`: a `reference` is declared.
+- `capability_base_outcome`: the unmodified fixture **fails** public + hidden
+  verification, or — for `expected_outcome = "no_change"` — **passes** it.
+- With `reference = "oracle_patch"`, the existing `oracle_patch_applies`,
+  `oracle_patch_passes_public`, and `oracle_patch_passes_hidden` checks must
+  pass. With `reference = "validated_oracle"` the unmodified fixture is the
+  reference, so `capability_base_outcome` covers it.
+
+`expected_outcome = "no_change"` (or the v2 `capabilities.negative_noop`
+label) also suppresses the `base_fails_hidden` warning.
+
 ## Hidden verification
 
 `[hidden]` holds checks that run **only after the agent completes**. If
@@ -135,11 +219,16 @@ Reports and the regression index aggregate resolved-rate by `category`, each
 `tag`, each enabled capability label, adapter, isolation backend, provider, and
 model — so a regression scoped to (say) `requires_multifile_edit` is visible.
 
+Run reports do not yet aggregate by v3 `kind`/`level`. Until they do, compute
+capability pass rates only from suites whose tasks are all
+`kind = "capability"`; the offline CI suites (`smoke`, `golden`, `safety`,
+`repair-*`) are entirely `kind = "harness"`.
+
 ## Complete example
 
-See `crates/crom-eval/eval/tasks/rust-hidden-sum-bug/task.toml` for a full v2 task
-with hidden tests, an oracle patch, capability labels, behavior rules, and path
-policy.
+See `crates/crom-eval/eval/tasks/rust-hidden-sum-bug/task.toml` for a full v3
+capability task with hidden tests, an oracle patch reference, provenance,
+capability labels, behavior rules, and path policy.
 
 ## Repair metrics (M16)
 
@@ -190,3 +279,38 @@ The run `summary.json`/`summary.md` include an aggregate `repair` object and a
 **Repair loop** report section (tasks with failed validation, recovered after
 repair, unrecovered compile/test errors, repeated failures, median attempts,
 focused-validation usage, validation-after-edit rate) plus a per-task table.
+
+## Token usage and round trips (M17.1)
+
+Every task `result.json` carries two additive fields:
+
+```text
+usage               # TokenUsage object, or null
+model_round_trips   # number of model round trips across all attempts
+```
+
+`model_round_trips` counts the SDK `ModelTurnCompleted` events for the task,
+including plan-then-act planning turns and turns whose usage is unknown.
+
+`usage` is the strict sum of each round trip's usage:
+
+- `null` when there were no round trips, or when **any** round trip reported
+  no usage at all (e.g. the fake echo provider, or a stream that errored).
+- Otherwise an object whose fields are summed across round trips; a field is
+  `null` when any round trip left that quantity unreported.
+
+```json
+"usage": {
+  "input_tokens": 500,
+  "output_tokens": 100,
+  "cache_creation_input_tokens": null,
+  "cache_read_input_tokens": null,
+  "reasoning_tokens": null
+}
+```
+
+Field meanings follow `crom_core::TokenUsage`: `input_tokens` excludes cache
+reads/writes, `output_tokens` includes `reasoning_tokens`. Unknown counts are
+never reported as `0`. The `golden` provider reports 100 input / 20 output
+tokens per turn and leaves cache/reasoning unreported, so golden results show
+partial usage.

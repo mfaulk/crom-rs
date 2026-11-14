@@ -21,6 +21,7 @@ use crate::plan::{ActRequest, PlanRequest, PlanResult};
 use crate::request::{AgentMode, AgentRequest, PatchPolicy, PlanPolicy};
 use crate::result::{AgentRunResult, AgentRunStatus, EventSummary, ValidationReport};
 use crate::runtime::adapters::SdkPermissionCallback;
+use crate::runtime::retry::{retry_event, RetryObservingProvider};
 use crate::runtime::validation;
 use crate::runtime::RuntimeInner;
 use crate::workspace::{
@@ -52,6 +53,20 @@ impl Drop for AbortOnDrop {
 ///   silently discarded (#151). They are intentionally non-fatal: a
 ///   closed consumer channel or a transient storage error must not abort
 ///   an otherwise-healthy run.
+async fn emit_model_turns(
+    runtime: &RuntimeInner,
+    event_tx: &mpsc::Sender<Result<SdkEvent, AgentSdkError>>,
+    storage_session: Option<&SessionId>,
+    mapper: &SdkEventMapper,
+    turns: &[AgentEvent],
+) {
+    for ev in turns {
+        if let Some(sdk_ev) = mapper.map(ev) {
+            emit_event(runtime, event_tx, storage_session, sdk_ev).await;
+        }
+    }
+}
+
 pub(crate) async fn emit_event(
     runtime: &RuntimeInner,
     event_tx: &mpsc::Sender<Result<SdkEvent, AgentSdkError>>,
@@ -88,7 +103,8 @@ pub(crate) async fn execute_request(
 ) -> Result<AgentRunResult, AgentSdkError> {
     let metadata = request.metadata.clone();
     let started = Instant::now();
-    let mapper = SdkEventMapper::new(run_id.clone(), runtime.verbosity);
+    let mapper =
+        SdkEventMapper::new(run_id.clone(), runtime.verbosity).with_provider(provider_id.clone());
 
     // SDK-managed persistence only happens for InMemory/Persisted session
     // policies. The session id may still be set (e.g. HostManaged), but the
@@ -162,7 +178,7 @@ pub(crate) async fn execute_request(
         // background task may continue briefly until it finishes
         // naturally.
         let plan_result = tokio::select! {
-            r = execute_plan(runtime.clone(), plan_req) => r?,
+            r = execute_plan_with_turns(runtime.clone(), plan_req) => r?,
             _ = cancellation.cancelled() => {
                 let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 // A deadline-driven cancel must surface as TimedOut, not
@@ -202,6 +218,15 @@ pub(crate) async fn execute_request(
                 });
             }
         };
+        let (plan_result, plan_turns) = plan_result;
+        emit_model_turns(
+            &runtime,
+            &event_tx,
+            storage_session.as_ref(),
+            &mapper,
+            &plan_turns,
+        )
+        .await;
         let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         return Ok(AgentRunResult {
             run_id,
@@ -246,7 +271,7 @@ pub(crate) async fn execute_request(
         // Race plan-then-act against cancellation at the SDK boundary
         // so cancel/deadline can stop the run (#145 / #155 follow-up).
         let plan_result = tokio::select! {
-            r = execute_plan(runtime.clone(), plan_req) => r?,
+            r = execute_plan_with_turns(runtime.clone(), plan_req) => r?,
             _ = cancellation.cancelled() => return Ok(cancelled_result(
                 run_id.clone(),
                 session_id,
@@ -258,6 +283,15 @@ pub(crate) async fn execute_request(
                 deadline_fired.load(Ordering::SeqCst),
             )),
         };
+        let (plan_result, plan_turns) = plan_result;
+        emit_model_turns(
+            &runtime,
+            &event_tx,
+            storage_session.as_ref(),
+            &mapper,
+            &plan_turns,
+        )
+        .await;
         // Emit PlanCreated once the plan is produced so consumers (e.g. the
         // eval harness) can observe planning natively from the event stream
         // rather than reconstructing it from the result (#34).
@@ -285,8 +319,13 @@ pub(crate) async fn execute_request(
             storage_session: storage_session.clone(),
             mapper: &mapper,
         };
+        let plan_usage = plan_result.usage.clone();
         return tokio::select! {
-            r = execute_act(runtime.clone(), act_req, Some(act_emit)) => r,
+            // Run usage covers both phases (strict: unknown if either is).
+            r = execute_act(runtime.clone(), act_req, Some(act_emit)) => r.map(|mut res| {
+                res.usage = crom_core::TokenUsage::combine(plan_usage.as_ref(), res.usage.as_ref());
+                res
+            }),
             _ = cancellation.cancelled() => Ok(cancelled_result(
                 run_id,
                 None,
@@ -335,7 +374,7 @@ pub(crate) async fn execute_request(
     });
     options.permission_callback = Some(approval_cb);
 
-    let provider = runtime.provider.clone();
+    let (provider, mut retry_rx) = RetryObservingProvider::wrap(runtime.provider.clone());
     // Thread the SDK-level cancellation pair (#145, #155) into the core
     // agent loop so external cancel, deadline expiry, and budget
     // breaches actually stop the run instead of being advisory.
@@ -369,11 +408,24 @@ pub(crate) async fn execute_request(
                 Some(ev) => ev,
                 None => break,
             },
+            Some(retry) = retry_rx.recv() => {
+                if let Some(sdk_ev) = retry_event(&run_id, runtime.verbosity, retry) {
+                    emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
+                }
+                continue;
+            }
             _ = cancellation.cancelled() => {
                 status = AgentRunStatus::Cancelled;
                 break;
             }
         };
+        // `select!` is unbiased: flush retries reported before this agent
+        // event so they are emitted in causal order.
+        while let Ok(retry) = retry_rx.try_recv() {
+            if let Some(sdk_ev) = retry_event(&run_id, runtime.verbosity, retry) {
+                emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
+            }
+        }
         events_total += 1;
         // Track key counts.
         match &ev {
@@ -433,6 +485,11 @@ pub(crate) async fn execute_request(
         }
     }
     drop(event_stream);
+    while let Ok(retry) = retry_rx.try_recv() {
+        if let Some(sdk_ev) = retry_event(&run_id, runtime.verbosity, retry) {
+            emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
+        }
+    }
 
     // Compute patch from workspace if appropriate.
     let mut patch: Option<PatchSet> = None;
@@ -699,6 +756,17 @@ pub(crate) async fn execute_plan(
     runtime: Arc<RuntimeInner>,
     request: PlanRequest,
 ) -> Result<PlanResult, AgentSdkError> {
+    execute_plan_with_turns(runtime, request)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// [`execute_plan`] plus the planning loop's `ModelTurnCompleted` events, so
+/// `run_once` can surface planning-phase round trips on the event stream.
+pub(crate) async fn execute_plan_with_turns(
+    runtime: Arc<RuntimeInner>,
+    request: PlanRequest,
+) -> Result<(PlanResult, Vec<AgentEvent>), AgentSdkError> {
     let workspace = resolve_workspace(&runtime, request.workspace).await?;
     let mut options = AgentOptions {
         model: request
@@ -748,7 +816,13 @@ pub(crate) async fn execute_plan(
     if let Err(e) = runtime.storage.save_plan(&outcome.plan).await {
         tracing::warn!(error = %e, "failed to persist plan to storage");
     }
-    Ok(PlanResult {
+    let model_turns: Vec<AgentEvent> = outcome
+        .events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ModelTurnCompleted(_)))
+        .cloned()
+        .collect();
+    let result = PlanResult {
         plan: outcome.plan,
         diagnostics,
         usage: outcome.events.iter().rev().find_map(|ev| match ev {
@@ -767,7 +841,8 @@ pub(crate) async fn execute_plan(
             diagnostics_count: 0,
             duration_ms,
         },
-    })
+    };
+    Ok((result, model_turns))
 }
 
 /// Context that lets `execute_act` route the act phase's core
@@ -847,6 +922,7 @@ pub(crate) async fn execute_act(
         metadata: metadata.clone(),
     }));
     let tools = build_tool_registry(&runtime.tool_policy, workspace_for_run.clone());
+    let (act_provider, mut retry_rx) = RetryObservingProvider::wrap(runtime.provider.clone());
 
     let act_req = crom_core::plan::ActRequest {
         plan_id: plan.id.clone(),
@@ -855,7 +931,7 @@ pub(crate) async fn execute_act(
             enabled: true,
             ..Default::default()
         },
-        provider: runtime.provider.clone(),
+        provider: act_provider,
         tools,
         plan_store: store.clone(),
         user_callback: None,
@@ -885,6 +961,16 @@ pub(crate) async fn execute_act(
     // they on the regular run path, which also emits solely via
     // `mapper.map`. That approval-event mapping gap is shared by both paths
     // and is out of scope for this change.
+    //
+    // Provider retries are not interleaved with the collected events, so
+    // they are emitted ahead of the replay.
+    if let Some(ctx) = &emit {
+        while let Ok(retry) = retry_rx.try_recv() {
+            if let Some(sdk_ev) = retry_event(&run_id, runtime.verbosity, retry) {
+                emit_event(&runtime, ctx.event_tx, ctx.storage_session.as_ref(), sdk_ev).await;
+            }
+        }
+    }
     let mut tool_calls = 0usize;
     let mut approvals_requested = 0usize;
     for ev in &outcome.events {
