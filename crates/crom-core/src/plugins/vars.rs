@@ -92,6 +92,8 @@ fn lookup_var(
             message: "empty variable name".to_string(),
         });
     }
+    let canonical = crate::legacy::canonical_var_name(var);
+    let var = canonical.as_str();
     if var == "CROM_PLUGIN_ROOT" {
         return paths(ctx, var, field).map(|p| p.root.display().to_string());
     }
@@ -206,6 +208,21 @@ mod tests {
         );
         assert_eq!(
             substitute_str("${CROM_PLUGIN_DATA}/y", "f", &c).unwrap(),
+            "/d/y"
+        );
+    }
+
+    #[test]
+    // Legacy CODE_AGENT_PLUGIN_* variables still resolve to the plugin paths.
+    fn substitutes_legacy_plugin_path_vars() {
+        let p = ctx("/r", "/d");
+        let c = PluginVarContext::new(&p);
+        assert_eq!(
+            substitute_str("${CODE_AGENT_PLUGIN_ROOT}/x", "f", &c).unwrap(),
+            "/r/x"
+        );
+        assert_eq!(
+            substitute_str("${CODE_AGENT_PLUGIN_DATA}/y", "f", &c).unwrap(),
             "/d/y"
         );
     }

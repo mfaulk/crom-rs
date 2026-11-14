@@ -92,7 +92,7 @@ pub fn build(mode: &ProviderMode, task: &EvalTask) -> Result<ProviderSetup, Prov
 }
 
 fn build_live(name: &str) -> Result<ProviderSetup, ProviderUnavailable> {
-    if std::env::var(LIVE_ENV).ok().as_deref() != Some("1") {
+    if crom_core::legacy::env_var(LIVE_ENV).as_deref() != Some("1") {
         return Err(ProviderUnavailable {
             reason: format!("live provider '{name}' requires {LIVE_ENV}=1 (opt-in); skipping"),
         });
@@ -105,8 +105,8 @@ fn build_live(name: &str) -> Result<ProviderSetup, ProviderUnavailable> {
             match key {
                 Some(key) => Ok(ProviderSetup {
                     config: ProviderConfig::anthropic_api_key(crom_sdk::SecretString::new(key)),
-                    model: std::env::var("CROM_EVAL_MODEL")
-                        .unwrap_or_else(|_| "claude-sonnet-4-6".to_string()),
+                    model: crom_core::legacy::env_var("CROM_EVAL_MODEL")
+                        .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
                     label: "anthropic".to_string(),
                 }),
                 None => Err(ProviderUnavailable {

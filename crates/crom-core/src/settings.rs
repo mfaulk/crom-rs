@@ -2,6 +2,7 @@
 //!
 //! Project settings:    `<cwd>/.agent/settings.json`
 //! User settings:       `${CROM_CONFIG_HOME:-$HOME/.config/crom}/settings.json`
+//! (read-only fallback to the pre-rename location: see [`crate::legacy`])
 //!
 //! Project settings override user settings on scalar fields. List-like fields
 //! are concatenated (user first, then project), preserving order.
@@ -679,24 +680,18 @@ pub fn project_settings_path(cwd: &Path) -> PathBuf {
     cwd.join(".agent").join("settings.json")
 }
 
-/// Resolve the user-settings path. Honors `CROM_CONFIG_HOME` first,
-/// then `XDG_CONFIG_HOME`, then `$HOME/.config/crom`.
+/// Resolve the user-settings path for reading. Honors `CROM_CONFIG_HOME`
+/// first, then `XDG_CONFIG_HOME`, then `$HOME/.config/crom`, with the
+/// read-only legacy fallbacks in [`crate::legacy`].
 pub fn user_settings_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CROM_CONFIG_HOME") {
+    if let Some(p) = crate::legacy::env_var("CROM_CONFIG_HOME") {
         return Some(PathBuf::from(p).join("settings.json"));
     }
-    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(p).join("crom").join("settings.json"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return Some(
-            PathBuf::from(home)
-                .join(".config")
-                .join("crom")
-                .join("settings.json"),
-        );
-    }
-    None
+    let parent = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .ok()?;
+    Some(crate::legacy::config_dir_for_read(&parent).join("settings.json"))
 }
 
 /// Load and merge settings according to `source`.
@@ -1485,6 +1480,44 @@ mod tests {
             path,
             Some(cfg_home.path().join("settings.json")),
             "CROM_CONFIG_HOME should produce <dir>/settings.json"
+        );
+    }
+
+    #[test]
+    // A legacy CODE_AGENT_CONFIG_HOME is honoured when CROM_CONFIG_HOME is unset.
+    fn legacy_config_home_env_resolves_user_settings_path() {
+        let cfg_home = TempDir::new().unwrap();
+        let path = temp_env::with_vars(
+            [
+                ("CROM_CONFIG_HOME", None),
+                (
+                    "CODE_AGENT_CONFIG_HOME",
+                    Some(cfg_home.path().to_str().unwrap()),
+                ),
+                ("XDG_CONFIG_HOME", None),
+                ("HOME", None),
+            ],
+            user_settings_path,
+        );
+        assert_eq!(path, Some(cfg_home.path().join("settings.json")));
+    }
+
+    #[test]
+    // With only `<XDG_CONFIG_HOME>/code-agent` present, user settings are read from it.
+    fn legacy_config_dir_used_when_new_absent() {
+        let xdg = TempDir::new().unwrap();
+        std::fs::create_dir(xdg.path().join("code-agent")).unwrap();
+        let path = temp_env::with_vars(
+            [
+                ("CROM_CONFIG_HOME", None),
+                ("CODE_AGENT_CONFIG_HOME", None),
+                ("XDG_CONFIG_HOME", Some(xdg.path().to_str().unwrap())),
+            ],
+            user_settings_path,
+        );
+        assert_eq!(
+            path,
+            Some(xdg.path().join("code-agent").join("settings.json"))
         );
     }
 
