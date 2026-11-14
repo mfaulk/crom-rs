@@ -114,6 +114,13 @@ impl fmt::Display for WorkspacePath {
     }
 }
 
+impl std::str::FromStr for WorkspacePath {
+    type Err = AgentSdkError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
 impl TryFrom<&str> for WorkspacePath {
     type Error = AgentSdkError;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
@@ -131,6 +138,15 @@ impl TryFrom<String> for WorkspacePath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `str::parse` applies the same validation as `WorkspacePath::new`.
+    #[test]
+    fn parse_validates_like_new() {
+        let p: WorkspacePath = "src/lib.rs".parse().unwrap();
+        assert_eq!(p, WorkspacePath::new("src/lib.rs").unwrap());
+        assert!("/etc/passwd".parse::<WorkspacePath>().is_err());
+        assert!("../x".parse::<WorkspacePath>().is_err());
+    }
 
     /// Absolute paths are rejected.
     #[test]
