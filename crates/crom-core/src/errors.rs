@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -39,13 +41,24 @@ impl ToolError {
     }
 }
 
+/// Provider failures, classified so callers (agent loop, eval) can tell an
+/// upstream outage or quota problem from an agent bug. Retryability is
+/// defined by [`ProviderError::is_retryable`] and consumed by
+/// [`crate::provider_retry::retry_provider_call`].
 #[derive(Debug, Error)]
 pub enum ProviderError {
+    /// Unclassified HTTP-layer failure (unexpected status, body read error).
     #[error("HTTP error: {0}")]
     Http(String),
 
+    /// 401/403 or a missing/unsupported credential.
     #[error("auth error: {0}")]
     Auth(String),
+
+    /// 4xx other than auth/408/429: malformed request, context too long,
+    /// unsupported parameter, unknown model.
+    #[error("invalid request (status {status}): {message}")]
+    InvalidRequest { status: u16, message: String },
 
     #[error("invalid response: {0}")]
     InvalidResponse(String),
@@ -53,11 +66,24 @@ pub enum ProviderError {
     #[error("stream error: {0}")]
     Stream(String),
 
-    #[error("rate limited")]
-    RateLimited,
+    /// 429. `retry_after` carries the server's `Retry-After` hint when sent.
+    #[error("rate limited: {message}")]
+    RateLimited {
+        retry_after: Option<Duration>,
+        message: String,
+    },
 
-    #[error("timeout")]
-    Timeout,
+    /// 408 or a client-side connect/read/total timeout.
+    #[error("timeout: {0}")]
+    Timeout(String),
+
+    /// The TCP/TLS connection could not be established.
+    #[error("connection error: {0}")]
+    Connect(String),
+
+    /// 5xx.
+    #[error("server error (status {status}): {message}")]
+    ServerError { status: u16, message: String },
 
     #[error("cancelled")]
     Cancelled,
@@ -69,6 +95,65 @@ pub enum ProviderError {
 impl ProviderError {
     pub fn other(msg: impl Into<String>) -> Self {
         Self::Other(msg.into())
+    }
+
+    /// Map a non-2xx HTTP status and its body to a typed variant. `context`
+    /// prefixes the message (e.g. `"openai"`).
+    pub fn from_status(
+        context: &str,
+        status: u16,
+        body: &str,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        let message = format!("{context}: status {status}: {body}");
+        match status {
+            401 | 403 => Self::Auth(message),
+            408 => Self::Timeout(message),
+            429 => Self::RateLimited {
+                retry_after,
+                message,
+            },
+            500..=599 => Self::ServerError { status, message },
+            400..=499 => Self::InvalidRequest { status, message },
+            _ => Self::Http(message),
+        }
+    }
+
+    /// Transient failures worth retrying: rate limits, timeouts, connection
+    /// failures, and 5xx.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited { .. }
+                | Self::Timeout(_)
+                | Self::Connect(_)
+                | Self::ServerError { .. }
+        )
+    }
+
+    /// Server-provided `Retry-After` hint, if any.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::RateLimited { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// Stable snake_case label for events, metrics, and eval reports.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Http(_) => "http",
+            Self::Auth(_) => "auth",
+            Self::InvalidRequest { .. } => "invalid_request",
+            Self::InvalidResponse(_) => "invalid_response",
+            Self::Stream(_) => "stream",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::Timeout(_) => "timeout",
+            Self::Connect(_) => "connect",
+            Self::ServerError { .. } => "server_error",
+            Self::Cancelled => "cancelled",
+            Self::Other(_) => "other",
+        }
     }
 }
 

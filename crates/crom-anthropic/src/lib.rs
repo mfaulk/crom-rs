@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use crom_core::provider_retry::{parse_retry_after, retry_provider_call, RetryPolicy};
 use crom_core::{
     ContentBlock, MessageRole, ModelEvent, ModelProvider, ModelRequest, NativeToolSearchMode,
     ProviderError, TokenUsage, ToolCall, ToolResultContent,
@@ -63,14 +64,16 @@ impl AnthropicConfig {
 pub(crate) enum MessagesResponse {
     /// 2xx: the SSE byte stream to feed into `parse_sse`.
     Stream(BoxStream<'static, Result<Bytes, ProviderError>>),
-    /// Non-2xx HTTP status with its (already read) response body.
+    /// Non-2xx HTTP status with its (already read) response body and any
+    /// `Retry-After` hint.
     Status {
-        status: reqwest::StatusCode,
+        status: u16,
         body: String,
+        retry_after: Option<Duration>,
     },
-    /// A network-shaped failure (connect/read timeout, connection error).
-    /// `retryable` mirrors `reqwest::Error::{is_timeout, is_connect}`.
-    Transport { message: String, retryable: bool },
+    /// A network-shaped failure, already classified (`Timeout`, `Connect`,
+    /// or `Http`).
+    Transport(ProviderError),
 }
 
 /// Transport seam for the Anthropic Messages API. The production
@@ -115,15 +118,32 @@ impl MessagesClient for ReqwestMessagesClient {
                 Ok(MessagesResponse::Stream(Box::pin(stream)))
             }
             Ok(r) => {
-                let status = r.status();
+                let status = r.status().as_u16();
+                let retry_after = r
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_retry_after);
                 let body = r.text().await.unwrap_or_else(|_| "<no body>".into());
-                Ok(MessagesResponse::Status { status, body })
+                Ok(MessagesResponse::Status {
+                    status,
+                    body,
+                    retry_after,
+                })
             }
-            Err(e) => Ok(MessagesResponse::Transport {
-                message: format!("{e}"),
-                retryable: e.is_timeout() || e.is_connect(),
-            }),
+            Err(e) => Ok(MessagesResponse::Transport(classify_reqwest_error(&e))),
         }
+    }
+}
+
+fn classify_reqwest_error(e: &reqwest::Error) -> ProviderError {
+    let message = format!("anthropic post: {e}");
+    if e.is_timeout() {
+        ProviderError::Timeout(message)
+    } else if e.is_connect() {
+        ProviderError::Connect(message)
+    } else {
+        ProviderError::Http(message)
     }
 }
 
@@ -169,26 +189,25 @@ impl ModelProvider for AnthropicProvider {
         let url = format!("{}/v1/messages", self.config.base_url);
         let api_key = self.config.api_key.clone();
         let client = self.client.clone();
-        let max_retries = self.config.max_retries;
+        let policy = RetryPolicy::with_max_retries(self.config.max_retries);
 
-        let mut attempt: u32 = 0;
-        let byte_stream = loop {
+        let byte_stream = retry_provider_call("anthropic", &policy, || async {
             match client.post_messages(&url, &api_key, &body).await? {
-                MessagesResponse::Stream(s) => break s,
-                MessagesResponse::Status { status, body } => {
-                    if !is_retryable(status) || attempt >= max_retries {
-                        return Err(ProviderError::Http(format!("status {status}: {body}")));
-                    }
-                }
-                MessagesResponse::Transport { message, retryable } => {
-                    if !retryable || attempt >= max_retries {
-                        return Err(ProviderError::Http(message));
-                    }
-                }
+                MessagesResponse::Stream(s) => Ok(s),
+                MessagesResponse::Status {
+                    status,
+                    body,
+                    retry_after,
+                } => Err(ProviderError::from_status(
+                    "anthropic",
+                    status,
+                    &body,
+                    retry_after,
+                )),
+                MessagesResponse::Transport(err) => Err(err),
             }
-            attempt += 1;
-            tokio::time::sleep(retry_delay(attempt)).await;
-        };
+        })
+        .await?;
 
         let stream = byte_stream.eventsource().map(|res| match res {
             Ok(ev) => Ok(ev),
@@ -198,18 +217,6 @@ impl ModelProvider for AnthropicProvider {
         let parsed = parse_sse(stream);
         Ok(Box::pin(parsed))
     }
-}
-
-fn is_retryable(status: reqwest::StatusCode) -> bool {
-    status.as_u16() == 408 || status.as_u16() == 429 || (500..=599).contains(&status.as_u16())
-}
-
-/// 250ms * 2^attempt, capped at 30s. Saturating and capped so a high
-/// configured `max_retries` cannot overflow the shift, mirroring the
-/// OpenAI provider's curve.
-fn retry_delay(attempt: u32) -> Duration {
-    let ms = 250u64.saturating_mul(1u64 << attempt.min(7)).min(30_000);
-    Duration::from_millis(ms)
 }
 
 #[derive(Serialize)]
@@ -697,19 +704,6 @@ pub fn fixture_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    // Backoff grows then saturates at the 30s cap, and a large attempt count
-    // does not overflow the `1 << attempt` shift.
-    fn retry_delay_caps_and_does_not_overflow() {
-        assert_eq!(retry_delay(1), Duration::from_millis(500));
-        assert_eq!(retry_delay(2), Duration::from_millis(1000));
-        // Cap reached around attempt 7 (250 * 128 = 32_000 -> 30_000).
-        assert_eq!(retry_delay(7), Duration::from_millis(30_000));
-        // Very high attempt counts saturate rather than overflow/panic.
-        assert_eq!(retry_delay(64), Duration::from_millis(30_000));
-        assert_eq!(retry_delay(u32::MAX), Duration::from_millis(30_000));
-    }
 
     #[test]
     // Request body serialization preserves model, system prompt, tools, and message roles.
@@ -1398,11 +1392,16 @@ mod tests {
                     Ok(MessagesResponse::Stream(Box::pin(stream)))
                 }
                 MockOutcome::Status { status, body } => Ok(MessagesResponse::Status {
-                    status: reqwest::StatusCode::from_u16(status).unwrap(),
+                    status,
                     body,
+                    retry_after: None,
                 }),
                 MockOutcome::Transport { message, retryable } => {
-                    Ok(MessagesResponse::Transport { message, retryable })
+                    Ok(MessagesResponse::Transport(if retryable {
+                        ProviderError::Connect(message)
+                    } else {
+                        ProviderError::Http(message)
+                    }))
                 }
             }
         }
@@ -1477,9 +1476,12 @@ mod tests {
         let provider = AnthropicProvider::with_client(test_config(2), client.clone());
         let result = provider.stream_turn(simple_request()).await;
         match result {
-            Err(ProviderError::Http(msg)) => assert!(msg.contains("500") && msg.contains("boom")),
-            Err(other) => panic!("expected Http error, got {other:?}"),
-            Ok(_) => panic!("expected Http error, got Ok"),
+            Err(ProviderError::ServerError {
+                status: 500,
+                message,
+            }) => assert!(message.contains("boom")),
+            Err(other) => panic!("expected ServerError, got {other:?}"),
+            Ok(_) => panic!("expected ServerError, got Ok"),
         }
         // 1 initial + 2 retries = 3 attempts.
         assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
@@ -1495,7 +1497,10 @@ mod tests {
         });
         let provider = AnthropicProvider::with_client(test_config(3), client.clone());
         let result = provider.stream_turn(simple_request()).await;
-        assert!(matches!(result, Err(ProviderError::Http(_))));
+        assert!(matches!(
+            result,
+            Err(ProviderError::InvalidRequest { status: 400, .. })
+        ));
         assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -1539,19 +1544,6 @@ mod tests {
             Ok(_) => panic!("expected Http error, got Ok"),
         }
         assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    // is_retryable classifies 408/429/5xx as retryable and others not.
-    fn is_retryable_classifies_statuses() {
-        use reqwest::StatusCode;
-        assert!(is_retryable(StatusCode::REQUEST_TIMEOUT)); // 408
-        assert!(is_retryable(StatusCode::TOO_MANY_REQUESTS)); // 429
-        assert!(is_retryable(StatusCode::INTERNAL_SERVER_ERROR)); // 500
-        assert!(is_retryable(StatusCode::SERVICE_UNAVAILABLE)); // 503
-        assert!(!is_retryable(StatusCode::BAD_REQUEST)); // 400
-        assert!(!is_retryable(StatusCode::UNAUTHORIZED)); // 401
-        assert!(!is_retryable(StatusCode::NOT_FOUND)); // 404
     }
 
     #[tokio::test]

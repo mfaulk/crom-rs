@@ -2,14 +2,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use crom_auth::SecretString;
+use crom_core::provider_retry::{parse_retry_after, parse_retry_after_ms};
 use crom_core::ProviderError;
 
 use crate::{OpenAiTransport, TransportResponse};
 
 /// `reqwest`-backed [`OpenAiTransport`]. Non-streaming: the chat endpoint
 /// returns a complete payload that the provider chunks into `ModelEvent`s.
-/// Network failures (including timeouts) surface as `ProviderError::Http`
-/// and are not retried by the provider.
+/// Network failures are classified as `Timeout` / `Connect` (retryable) or
+/// `Http`; status classification and retry happen in the provider.
 pub struct ReqwestOpenAiTransport {
     client: reqwest::Client,
 }
@@ -17,10 +18,12 @@ pub struct ReqwestOpenAiTransport {
 impl ReqwestOpenAiTransport {
     pub fn new(
         connect_timeout: Duration,
+        read_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
             .timeout(request_timeout)
             .build()
             .map_err(|e| ProviderError::Other(format!("openai client build: {e}")))?;
@@ -44,7 +47,7 @@ impl OpenAiTransport for ReqwestOpenAiTransport {
             .body(body.to_string())
             .send()
             .await
-            .map_err(|e| ProviderError::Http(format!("openai post: {e}")))?;
+            .map_err(|e| classify_reqwest_error("openai post", &e))?;
         read_response(resp).await
     }
 
@@ -59,16 +62,41 @@ impl OpenAiTransport for ReqwestOpenAiTransport {
             .bearer_auth(api_key.expose())
             .send()
             .await
-            .map_err(|e| ProviderError::Http(format!("openai models: {e}")))?;
+            .map_err(|e| classify_reqwest_error("openai models", &e))?;
         read_response(resp).await
+    }
+}
+
+fn classify_reqwest_error(context: &str, e: &reqwest::Error) -> ProviderError {
+    let message = format!("{context}: {e}");
+    if e.is_timeout() {
+        ProviderError::Timeout(message)
+    } else if e.is_connect() {
+        ProviderError::Connect(message)
+    } else {
+        ProviderError::Http(message)
     }
 }
 
 async fn read_response(resp: reqwest::Response) -> Result<TransportResponse, ProviderError> {
     let status = resp.status().as_u16();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    // OpenAI sends a millisecond-precision hint alongside the standard header.
+    let retry_after = header("retry-after-ms")
+        .and_then(|v| parse_retry_after_ms(&v))
+        .or_else(|| header("retry-after").and_then(|v| parse_retry_after(&v)));
     let body = resp
         .text()
         .await
-        .map_err(|e| ProviderError::Http(format!("openai body: {e}")))?;
-    Ok(TransportResponse { status, body })
+        .map_err(|e| classify_reqwest_error("openai body", &e))?;
+    Ok(TransportResponse {
+        status,
+        body,
+        retry_after,
+    })
 }

@@ -19,6 +19,7 @@ pub mod plan;
 pub mod plugins;
 pub mod policy;
 pub mod provider;
+pub mod provider_retry;
 pub mod repair;
 pub mod run_id;
 pub mod settings;
@@ -143,6 +144,9 @@ pub use policy::{
     PolicyDecision, PolicyDecisionSource, PolicyEngine, PolicyOutcome, PolicyToolContext,
 };
 pub use provider::{ModelEvent, ModelProvider, ModelRequest};
+pub use provider_retry::{
+    retry_provider_call, with_retry_observer, ProviderRetry, RetryObserver, RetryPolicy,
+};
 pub use run_id::RunId;
 pub use settings::{
     merge_settings_file_into, AgentsSettingsConfig, AuthProviderEntry, AuthSettingsConfig,

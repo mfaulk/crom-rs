@@ -21,6 +21,7 @@ use crate::plan::{ActRequest, PlanRequest, PlanResult};
 use crate::request::{AgentMode, AgentRequest, PatchPolicy, PlanPolicy};
 use crate::result::{AgentRunResult, AgentRunStatus, EventSummary, ValidationReport};
 use crate::runtime::adapters::SdkPermissionCallback;
+use crate::runtime::retry::{retry_event, RetryObservingProvider};
 use crate::runtime::validation;
 use crate::runtime::RuntimeInner;
 use crate::workspace::{
@@ -373,7 +374,7 @@ pub(crate) async fn execute_request(
     });
     options.permission_callback = Some(approval_cb);
 
-    let provider = runtime.provider.clone();
+    let (provider, mut retry_rx) = RetryObservingProvider::wrap(runtime.provider.clone());
     // Thread the SDK-level cancellation pair (#145, #155) into the core
     // agent loop so external cancel, deadline expiry, and budget
     // breaches actually stop the run instead of being advisory.
@@ -407,11 +408,24 @@ pub(crate) async fn execute_request(
                 Some(ev) => ev,
                 None => break,
             },
+            Some(retry) = retry_rx.recv() => {
+                if let Some(sdk_ev) = retry_event(&run_id, runtime.verbosity, retry) {
+                    emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
+                }
+                continue;
+            }
             _ = cancellation.cancelled() => {
                 status = AgentRunStatus::Cancelled;
                 break;
             }
         };
+        // `select!` is unbiased: flush retries reported before this agent
+        // event so they are emitted in causal order.
+        while let Ok(retry) = retry_rx.try_recv() {
+            if let Some(sdk_ev) = retry_event(&run_id, runtime.verbosity, retry) {
+                emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
+            }
+        }
         events_total += 1;
         // Track key counts.
         match &ev {
@@ -471,6 +485,11 @@ pub(crate) async fn execute_request(
         }
     }
     drop(event_stream);
+    while let Ok(retry) = retry_rx.try_recv() {
+        if let Some(sdk_ev) = retry_event(&run_id, runtime.verbosity, retry) {
+            emit_event(&runtime, &event_tx, storage_session.as_ref(), sdk_ev).await;
+        }
+    }
 
     // Compute patch from workspace if appropriate.
     let mut patch: Option<PatchSet> = None;
@@ -903,6 +922,7 @@ pub(crate) async fn execute_act(
         metadata: metadata.clone(),
     }));
     let tools = build_tool_registry(&runtime.tool_policy, workspace_for_run.clone());
+    let (act_provider, mut retry_rx) = RetryObservingProvider::wrap(runtime.provider.clone());
 
     let act_req = crom_core::plan::ActRequest {
         plan_id: plan.id.clone(),
@@ -911,7 +931,7 @@ pub(crate) async fn execute_act(
             enabled: true,
             ..Default::default()
         },
-        provider: runtime.provider.clone(),
+        provider: act_provider,
         tools,
         plan_store: store.clone(),
         user_callback: None,
@@ -941,6 +961,16 @@ pub(crate) async fn execute_act(
     // they on the regular run path, which also emits solely via
     // `mapper.map`. That approval-event mapping gap is shared by both paths
     // and is out of scope for this change.
+    //
+    // Provider retries are not interleaved with the collected events, so
+    // they are emitted ahead of the replay.
+    if let Some(ctx) = &emit {
+        while let Ok(retry) = retry_rx.try_recv() {
+            if let Some(sdk_ev) = retry_event(&run_id, runtime.verbosity, retry) {
+                emit_event(&runtime, ctx.event_tx, ctx.storage_session.as_ref(), sdk_ev).await;
+            }
+        }
+    }
     let mut tool_calls = 0usize;
     let mut approvals_requested = 0usize;
     for ev in &outcome.events {

@@ -62,6 +62,8 @@ pub enum SdkEvent {
     ValidationStarted(ValidationStartedEvent),
     ValidationCompleted(ValidationCompletedEvent),
     Diagnostic(DiagnosticEvent),
+    /// A provider call failed transiently and is being retried.
+    ProviderRetry(ProviderRetryEvent),
     RunCompleted(RunCompletedEvent),
     RunFailed(RunFailedEvent),
     RunCancelled(RunCancelledEvent),
@@ -208,6 +210,16 @@ pub struct ValidationCompletedEvent {
 pub struct DiagnosticEvent {
     pub run_id: RunId,
     pub diagnostic: Diagnostic,
+}
+
+/// Emitted before each provider retry so hosts and eval can count retries
+/// and separate provider instability from agent failures. Emitted at
+/// `Standard` and `Full` verbosity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderRetryEvent {
+    pub run_id: RunId,
+    #[serde(flatten)]
+    pub retry: crom_core::ProviderRetry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -23,3 +23,4 @@ bytes = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 insta = { workspace = true }
 proptest = { workspace = true }
+wiremock = { workspace = true }
