@@ -130,7 +130,7 @@ jobs:
         run: cargo check --workspace --manifest-path examples/${{ matrix.example }}/Cargo.toml
 
   eval:
-    name: eval / smoke (fake provider)
+    name: eval / offline suites (fake + golden providers)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -146,14 +146,32 @@ jobs:
         run: cargo test --locked -p crom-eval
       - name: Eval smoke suite (fake provider)
         run: cargo run --locked -p crom-cli -- eval run --suite smoke --provider fake
-      # Surface the artifact bundle when the smoke suite regresses so failures
+      - name: Eval golden suite (golden provider)
+        run: cargo run --locked -p crom-cli -- eval run --suite golden --provider golden
+      - name: Eval safety suite (fake provider)
+        run: cargo run --locked -p crom-cli -- eval run --suite safety --provider fake
+      # repair-smoke contains a negative task (repair-grep-trap) that must NOT
+      # resolve, so the CLI's resolved-gate is relaxed with --allow-failures and
+      # the expected per-task outcomes are asserted from the artifacts instead.
+      - name: Eval repair-smoke suite (golden provider, repair enabled)
+        run: |
+          runs=target/crom-eval/repair-smoke
+          cargo run --locked -p crom-cli -- eval run --suite repair-smoke \
+            --provider golden --repair enabled --allow-failures --runs-dir "$runs"
+          run_dir=$(find "$runs" -mindepth 1 -maxdepth 1 -type d -name 'run-*' | sort | tail -n 1)
+          jq -e '.resolved == true' "$run_dir/tasks/repair-grep-recover/result.json"
+          jq -e '.resolved == false and .repair.same_error_repeated == true' \
+            "$run_dir/tasks/repair-grep-trap/result.json"
+      # Surface the artifact bundle when an offline suite regresses so failures
       # are debuggable from the CI run.
       - name: Upload eval artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: eval-runs
-          path: target/crom-eval/runs
+          path: |
+            target/crom-eval/runs
+            target/crom-eval/repair-smoke
           if-no-files-found: ignore
 
   coverage:
