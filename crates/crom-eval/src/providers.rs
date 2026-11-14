@@ -7,6 +7,9 @@
 //!   calls for a specific task (read → edit → run check → observe failure →
 //!   edit → pass). Catches regressions in tool schemas, event handling,
 //!   sessions, and command execution.
+//! - **Fault** — returns a classified provider error on every turn. Built only
+//!   in code (not reachable from `--provider`) so tests can prove provider
+//!   failures are recorded as `provider_error`, not agent failures.
 //! - **Live** — a real model provider resolved from a provider profile
 //!   (`anthropic`, `openai`, `deepseek`, `gemini`, `local`, or a
 //!   settings-defined id). Opt-in only, gated by the `CROM_EVAL_LIVE`
@@ -34,6 +37,35 @@ pub enum ProviderMode {
     Golden,
     /// Live model provider by provider-profile id.
     Live(String),
+    /// Injected provider failure (test-only; never parsed from the CLI).
+    Fault(ProviderFault),
+}
+
+/// Provider failure injected by [`ProviderMode::Fault`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFault {
+    /// Every turn fails with HTTP 503.
+    ServerError,
+}
+
+struct FaultProvider(ProviderFault);
+
+#[async_trait::async_trait]
+impl ModelProvider for FaultProvider {
+    async fn stream_turn(
+        &self,
+        _request: crom_core::ModelRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<ModelEvent, crom_core::ProviderError>>,
+        crom_core::ProviderError,
+    > {
+        match self.0 {
+            ProviderFault::ServerError => Err(crom_core::ProviderError::ServerError {
+                status: 503,
+                message: "injected fault: status 503".to_string(),
+            }),
+        }
+    }
 }
 
 impl ProviderMode {
@@ -50,6 +82,7 @@ impl ProviderMode {
         match self {
             ProviderMode::Fake => "fake".to_string(),
             ProviderMode::Golden => "golden".to_string(),
+            ProviderMode::Fault(_) => "fault".to_string(),
             ProviderMode::Live(name) => name.clone(),
         }
     }
@@ -113,6 +146,11 @@ pub fn build(
                 label: "golden".to_string(),
             })
         }
+        ProviderMode::Fault(fault) => Ok(ProviderSetup {
+            config: ProviderConfig::fake(Arc::new(FaultProvider(*fault))),
+            model: "fault".to_string(),
+            label: "fault".to_string(),
+        }),
         ProviderMode::Live(name) => build_live(name, profiles),
     }
 }

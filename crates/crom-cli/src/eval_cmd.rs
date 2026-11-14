@@ -118,6 +118,10 @@ pub struct EvalRunArgs {
     /// Max attempts (Aider-style retry with test feedback).
     #[arg(long, default_value_t = 1)]
     pub attempts: usize,
+    /// Base seed for prompt-variant selection; repetition `n` uses `seed + n`.
+    /// Recorded in `run.json` and each result's `repro` block.
+    #[arg(long, default_value_t = 0)]
+    pub seed: u64,
     /// M16: repair loop — `enabled` or `disabled` (default `disabled`). When
     /// enabled, failed validations are parsed into structured diagnostics and a
     /// targeted repair brief drives bounded retries.
@@ -457,10 +461,11 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
         memory_limit: args.memory_limit,
         prompt_variant: args.prompt_variant.clone(),
         repetition: 0,
-        seed: 0,
+        seed: args.seed,
         attempts: args.attempts.max(1),
         repair,
         provider_profiles,
+        environment: Some(crom_eval::result_schema::RunEnvironment::gather()),
     };
 
     let results = run_tasks_repeated(&selected, &run, &config, repetitions).await;
@@ -478,7 +483,11 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
     }
 
     write_behavior_summary(&run.root, &results);
-    write_run_metadata(&run.root, &args, &provider, &isolation, repetitions);
+    let _ = std::fs::write(
+        run.root.join("run.json"),
+        serde_json::to_string_pretty(&crom_eval::runner::run_metadata(&config, repetitions))
+            .unwrap_or_default(),
+    );
 
     // Index + per-task index-entry.json.
     if !args.no_index {
@@ -615,28 +624,6 @@ fn write_behavior_summary(run_root: &Path, results: &[EvalResult]) {
     let _ = std::fs::write(
         run_root.join("behavior-summary.json"),
         serde_json::to_string_pretty(&summary).unwrap_or_default(),
-    );
-}
-
-fn write_run_metadata(
-    run_root: &Path,
-    args: &EvalRunArgs,
-    provider: &ProviderMode,
-    isolation: &IsolationKind,
-    repetitions: usize,
-) {
-    let meta = serde_json::json!({
-        "adapter": args.adapter,
-        "provider": provider.label(),
-        "isolation": isolation.id(),
-        "network": args.network,
-        "repetitions": repetitions,
-        "attempts": args.attempts,
-        "prompt_variant": args.prompt_variant,
-    });
-    let _ = std::fs::write(
-        run_root.join("run.json"),
-        serde_json::to_string_pretty(&meta).unwrap_or_default(),
     );
 }
 

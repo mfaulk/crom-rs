@@ -151,6 +151,9 @@ pub struct TaskSummary {
     pub repair_focused_used: Option<bool>,
     #[serde(default)]
     pub repair_final_validation: String,
+    /// M17.4 outcome class (`None` in pre-v2 summaries).
+    #[serde(default)]
+    pub outcome: Option<crate::result_schema::Outcome>,
 }
 
 /// Aggregate repair-loop statistics across a run (M16M).
@@ -224,6 +227,15 @@ pub struct RunSummary {
     /// M16 repair-loop aggregate.
     #[serde(default)]
     pub repair: RepairSummaryAgg,
+    /// M17.4 outcome-class counts.
+    #[serde(default)]
+    pub outcomes: crate::result_schema::OutcomeCounts,
+    /// `resolved / (resolved + failed)`; `None` when nothing was scored.
+    #[serde(default)]
+    pub pass_rate: Option<f64>,
+    /// Provider + infra errors exceed 10% of attempts; do not compare.
+    #[serde(default)]
+    pub unreliable: bool,
 }
 
 /// Aggregate resolved-rate by a key extractor (possibly multi-valued).
@@ -339,6 +351,9 @@ impl RunSummary {
             by_provider: Vec::new(),
             by_model: Vec::new(),
             repair: RepairSummaryAgg::default(),
+            outcomes: Default::default(),
+            pass_rate: None,
+            unreliable: false,
         };
         let mut score_sum = 0.0;
         for r in results {
@@ -398,9 +413,14 @@ impl RunSummary {
                 repair_repeated: r.repair.same_error_repeated,
                 repair_focused_used: r.repair.focused_validation_used,
                 repair_final_validation: final_validation_label(r.repair.final_validation_status),
+                outcome: Some(r.outcome()),
             });
         }
         summary.repair = aggregate_repair(results);
+        summary.outcomes =
+            crate::result_schema::OutcomeCounts::from_outcomes(results.iter().map(|r| r.outcome()));
+        summary.pass_rate = summary.outcomes.pass_rate();
+        summary.unreliable = summary.outcomes.unreliable();
         if !results.is_empty() {
             summary.mean_score = (score_sum / results.len() as f64 * 1000.0).round() / 1000.0;
         }
@@ -438,6 +458,23 @@ impl RunSummary {
         ));
         if self.quarantined > 0 {
             s.push_str(&format!("- quarantined: {}\n", self.quarantined));
+        }
+        let o = &self.outcomes;
+        s.push_str(&format!(
+            "- outcomes: resolved {}, failed {}, provider_error {}, infra_error {}, skipped {}, unscorable {}\n",
+            o.resolved, o.failed, o.provider_error, o.infra_error, o.skipped, o.unscorable
+        ));
+        match self.pass_rate {
+            Some(rate) => s.push_str(&format!(
+                "- pass rate: {:.3} ({}/{} resolved + failed)\n",
+                rate,
+                o.resolved,
+                o.scored()
+            )),
+            None => s.push_str("- pass rate: n/a (nothing scored)\n"),
+        }
+        if self.unreliable {
+            s.push_str("- **UNRELIABLE**: provider + infra errors exceed 10% of attempts; do not compare\n");
         }
         s.push_str(&format!("- mean score: {:.3}\n\n", self.mean_score));
 
@@ -732,6 +769,46 @@ mod tests {
         let md = summary.to_markdown();
         assert!(md.contains("run-1"));
         assert!(md.contains("| a |"));
+    }
+
+    /// summary.json counts outcome classes and computes pass rate over resolved + failed only.
+    #[test]
+    fn summary_reports_outcomes_and_pass_rate_denominator() {
+        let mut provider_err = result("p", EvalStatus::Errored, 0.0);
+        provider_err.failure_class = Some(crate::failure::FailureClass::ProviderError);
+        let results = vec![
+            result("a", EvalStatus::Passed, 1.0),
+            result("b", EvalStatus::Failed, 0.0),
+            provider_err,
+            result("s", EvalStatus::Skipped, 0.0),
+        ];
+        let summary = RunSummary::from_results("run-1", "fake", &results);
+        assert_eq!(summary.outcomes.resolved, 1);
+        assert_eq!(summary.outcomes.failed, 1);
+        assert_eq!(summary.outcomes.provider_error, 1);
+        assert_eq!(summary.outcomes.skipped, 1);
+        assert_eq!(summary.pass_rate, Some(0.5));
+        assert!(summary.unreliable, "1 of 3 attempts errored");
+        assert_eq!(
+            summary.tasks[2].outcome,
+            Some(crate::result_schema::Outcome::ProviderError)
+        );
+        let md = summary.to_markdown();
+        assert!(md.contains("provider_error 1"), "{md}");
+        assert!(md.contains("UNRELIABLE"), "{md}");
+    }
+
+    /// A pre-v2 summary.json without outcome fields still deserializes.
+    #[test]
+    fn v1_summary_without_outcomes_loads() {
+        let v1 = serde_json::json!({
+            "run_id": "r", "provider": "fake", "total": 0, "passed": 0,
+            "partial": 0, "failed": 0, "errored": 0, "timed_out": 0,
+            "skipped": 0, "mean_score": 0.0, "tasks": []
+        });
+        let s: RunSummary = serde_json::from_value(v1).unwrap();
+        assert_eq!(s.outcomes, crate::result_schema::OutcomeCounts::default());
+        assert_eq!(s.pass_rate, None);
     }
 
     #[test]

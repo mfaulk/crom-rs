@@ -26,6 +26,10 @@ use crate::fixture::{copy_dir_recursive, generate_patch, prepare_workspace, Patc
 use crate::isolation::{self, CommandLimits, EnvMetadata, IsolationKind};
 use crate::oracle::{self, OracleReport};
 use crate::providers::{self, ProviderMode};
+use crate::result_schema::{
+    Outcome, ReproInputs, ReproMetadata, RunEnvironment, LEGACY_RESULT_SCHEMA_VERSION,
+    RESULT_SCHEMA_VERSION,
+};
 use crate::score::{self, EvalScore, ScoreInputs};
 use crate::task::{EvalTask, TaskMode};
 
@@ -68,6 +72,10 @@ impl EvalStatus {
 /// The result of evaluating a single task. Serialised into the run summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalResult {
+    /// Result schema version: 2 for results written by this build; 1 when
+    /// the field is absent (pre-M17.4 results).
+    #[serde(default = "legacy_result_schema_version")]
+    pub schema_version: u32,
     pub task_id: String,
     pub title: String,
     pub status: EvalStatus,
@@ -129,6 +137,26 @@ pub struct EvalResult {
     /// attempts, including planning turns and turns with unknown usage.
     #[serde(default)]
     pub model_round_trips: usize,
+    /// M17.4 outcome class. Always set on v2 results; `None` on v1 results,
+    /// where [`EvalResult::outcome`] derives it.
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
+    /// M17.4 reproducibility metadata. `None` on v1 results.
+    #[serde(default)]
+    pub repro: Option<ReproMetadata>,
+}
+
+fn legacy_result_schema_version() -> u32 {
+    LEGACY_RESULT_SCHEMA_VERSION
+}
+
+impl EvalResult {
+    /// The recorded outcome, or one derived from status/resolution/failure
+    /// class for v1 results.
+    pub fn outcome(&self) -> Outcome {
+        self.outcome
+            .unwrap_or_else(|| Outcome::derive(self.status, self.resolved, self.failure_class))
+    }
 }
 
 /// Configuration for an eval run.
@@ -167,6 +195,9 @@ pub struct RunConfig {
     /// providers (same resolver as the CLI and SDK).
     pub provider_profiles:
         std::collections::BTreeMap<String, crom_core::provider_profile::ProviderProfileConfig>,
+    /// Run-level git/host/build context recorded in each result's `repro`.
+    /// Gathered once per `run_tasks` call when `None`.
+    pub environment: Option<RunEnvironment>,
 }
 
 impl Default for RunConfig {
@@ -186,6 +217,7 @@ impl Default for RunConfig {
             attempts: 1,
             repair: crom_core::repair::RepairPolicy::disabled(),
             provider_profiles: Default::default(),
+            environment: None,
         }
     }
 }
@@ -208,6 +240,36 @@ struct RunOutcome {
     summary: String,
     timed_out: bool,
     errored: bool,
+    /// The model provider failed (HTTP 5xx, auth, connect, stream error).
+    provider_errored: bool,
+    /// The harness/runtime failed for a reason other than the provider.
+    harness_errored: bool,
+}
+
+/// Prefix the core agent loop puts on a provider failure's result message.
+const PROVIDER_ERROR_PREFIX: &str = "provider error:";
+
+/// Whether SDK diagnostics carry a provider failure.
+fn diagnostics_show_provider_error(diags: &[crom_sdk::Diagnostic]) -> bool {
+    diags.iter().any(|d| {
+        d.code == "model.provider_error"
+            || d.code.starts_with("provider.")
+            || d.message.starts_with(PROVIDER_ERROR_PREFIX)
+    })
+}
+
+/// Classify an SDK error as (provider, harness) failure. Budget, timeout,
+/// tool, permission, and similar kinds are agent outcomes (neither).
+fn classify_sdk_error(err: &crom_sdk::AgentSdkError) -> (bool, bool) {
+    use crom_sdk::AgentSdkErrorKind as K;
+    if err.kind == K::Provider || diagnostics_show_provider_error(&err.diagnostics) {
+        return (true, false);
+    }
+    let harness = matches!(
+        err.kind,
+        K::Internal | K::Storage | K::Workspace | K::InvalidRequest
+    );
+    (false, harness)
 }
 
 /// Build the tool policy for a task from its `allowed_tools` list.
@@ -229,6 +291,9 @@ fn tool_policy_for(task: &EvalTask) -> ToolPolicy {
         ..Default::default()
     }
 }
+
+/// The fixed approval mode the harness runs agents under.
+const EVAL_APPROVALS: &str = "allow_all";
 
 /// Drive the agent for a task in the prepared workspace.
 async fn drive_agent(
@@ -253,8 +318,21 @@ async fn drive_agent(
         .approval_callback(Arc::new(AllowAllApprovals))
         .event_sink(sink)
         .build()
-        .await
-        .map_err(|e| format!("runtime build failed: {}", e.message))?;
+        .await;
+    let runtime = match runtime {
+        Ok(r) => r,
+        Err(e) => {
+            let (provider_errored, harness_errored) = classify_sdk_error(&e);
+            return Ok(RunOutcome {
+                events: Vec::new(),
+                summary: format!("runtime build failed: {}", e.message),
+                timed_out: false,
+                errored: true,
+                provider_errored,
+                harness_errored,
+            });
+        }
+    };
 
     let mut request = AgentRequest::new(prompt.to_string())
         .max_turns(task.max_turns as u32)
@@ -281,13 +359,20 @@ async fn drive_agent(
             summary: "run exceeded the hard wall-clock deadline".to_string(),
             timed_out: true,
             errored: true,
+            provider_errored: false,
+            harness_errored: false,
         }),
-        Ok(Err(sdk_err)) => Ok(RunOutcome {
-            events: collected,
-            summary: format!("run failed: {}", sdk_err.message),
-            timed_out: false,
-            errored: true,
-        }),
+        Ok(Err(sdk_err)) => {
+            let (provider_errored, harness_errored) = classify_sdk_error(&sdk_err);
+            Ok(RunOutcome {
+                events: collected,
+                summary: format!("run failed: {}", sdk_err.message),
+                timed_out: false,
+                errored: true,
+                provider_errored,
+                harness_errored,
+            })
+        }
         Ok(Ok(run_result)) => {
             use crom_sdk::AgentRunStatus;
             let errored = !matches!(run_result.status, AgentRunStatus::Completed);
@@ -298,11 +383,15 @@ async fn drive_agent(
             // synthesizes a PlanCreated from `run_result.plan` (#34). Approval
             // events remain counted-only (not emitted as SdkEvents) on both
             // the plan/act and regular run paths.
+            let provider_errored = matches!(run_result.status, AgentRunStatus::Failed)
+                && diagnostics_show_provider_error(&run_result.diagnostics);
             Ok(RunOutcome {
                 events: collected,
                 summary: run_result.summary,
                 timed_out,
                 errored,
+                provider_errored,
+                harness_errored: false,
             })
         }
     }
@@ -358,6 +447,7 @@ fn default_result(
     dir: &std::path::Path,
 ) -> EvalResult {
     EvalResult {
+        schema_version: RESULT_SCHEMA_VERSION,
         task_id: task.id.clone(),
         title: task.title.clone(),
         status,
@@ -405,13 +495,39 @@ fn default_result(
         repair: crate::repair::RepairMetrics::default(),
         usage: None,
         model_round_trips: 0,
+        outcome: None,
+        repro: None,
     }
+}
+
+/// Stamp the v2 outcome and reproducibility metadata onto a finished result.
+/// Call immediately before writing `result.json`.
+fn stamp_v2(r: &mut EvalResult, task: &EvalTask, config: &RunConfig, prompt: &str) {
+    let env = config
+        .environment
+        .clone()
+        .unwrap_or_else(RunEnvironment::gather);
+    let policy = tool_policy_for(task);
+    r.schema_version = RESULT_SCHEMA_VERSION;
+    r.outcome = Some(Outcome::derive(r.status, r.resolved, r.failure_class));
+    r.repro = Some(ReproMetadata::build(ReproInputs {
+        task,
+        config,
+        env: &env,
+        prompt,
+        model: provider_model(config),
+        base_url_host: endpoint_host(config),
+        builtin_tools: serde_json::to_value(policy.enable_builtin_tools).unwrap_or_default(),
+        side_effects: serde_json::to_value(policy.side_effect_policy).unwrap_or_default(),
+        approvals: EVAL_APPROVALS,
+    }));
 }
 
 fn provider_model(config: &RunConfig) -> String {
     match &config.provider {
         ProviderMode::Fake => "fake-echo".to_string(),
         ProviderMode::Golden => "golden".to_string(),
+        ProviderMode::Fault(_) => "fault".to_string(),
         ProviderMode::Live(name) => {
             providers::resolve_live_profile(name, &config.provider_profiles)
                 .ok()
@@ -424,19 +540,58 @@ fn provider_model(config: &RunConfig) -> String {
 /// Provider run metadata: id, model, and endpoint host. Never the API key
 /// or the full base URL.
 fn provider_metadata(config: &RunConfig) -> serde_json::Value {
-    let endpoint_host = match &config.provider {
+    serde_json::json!({
+        "provider": config.provider.label(),
+        "model": provider_model(config),
+        "endpoint_host": endpoint_host(config),
+    })
+}
+
+/// Run-level `run.json` (schema v2). Per-task reproducibility metadata lives
+/// in each `result.json` `repro` block; this records the shared run inputs.
+pub fn run_metadata(config: &RunConfig, repetitions: usize) -> serde_json::Value {
+    let env = config
+        .environment
+        .clone()
+        .unwrap_or_else(RunEnvironment::gather);
+    serde_json::json!({
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "adapter": config.adapter,
+        "provider": config.provider.label(),
+        "model": provider_model(config),
+        "base_url_host": endpoint_host(config),
+        "isolation": config.isolation.id(),
+        "network": config.network,
+        "cpu_limit": config.cpu_limit,
+        "memory_limit": config.memory_limit,
+        "container_image": config.container_image,
+        "repetitions": repetitions,
+        "attempts": config.attempts,
+        "prompt_variant": config.prompt_variant,
+        "prompt_template_version": crate::result_schema::PROMPT_TEMPLATE_VERSION,
+        "seed": config.seed,
+        "repair": {
+            "enabled": config.repair.enabled,
+            "max_attempts": config.repair.max_attempts,
+            "require_validation_after_mutation": config.repair.require_validation_after_mutation,
+        },
+        "git": env.git,
+        "host": env.host,
+        "crom_version": env.crom_version,
+        "pricing_source_version": serde_json::Value::Null,
+    })
+}
+
+/// Endpoint host of a live provider profile (never the full URL).
+fn endpoint_host(config: &RunConfig) -> Option<String> {
+    match &config.provider {
         ProviderMode::Live(name) => {
             providers::resolve_live_profile(name, &config.provider_profiles)
                 .ok()
                 .and_then(|p| p.base_url_host())
         }
         _ => None,
-    };
-    serde_json::json!({
-        "provider": config.provider.label(),
-        "model": provider_model(config),
-        "endpoint_host": endpoint_host,
-    })
+    }
 }
 
 /// Per-command isolation limits for a task under a run config.
@@ -533,6 +688,8 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
             r.score = EvalScore::zero(format!("errored: artifact dir: {e}"));
             r.failure_class = Some(FailureClass::HarnessError);
             r.duration_ms = started.elapsed().as_millis() as u64;
+            let prompt = task.resolved_prompt(config.prompt_variant.as_deref(), config.seed);
+            stamp_v2(&mut r, task, config, &prompt);
             return r;
         }
     };
@@ -547,7 +704,14 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
 
     // Provider availability is checked first so skips are clean and cheap.
     if let Err(unavailable) = providers::build(&config.provider, task, &config.provider_profiles) {
-        return skipped_result(task, &artifacts, config, unavailable.reason, started);
+        return skipped_result(
+            task,
+            &artifacts,
+            config,
+            unavailable.reason,
+            started,
+            &prompt,
+        );
     }
 
     // Build the isolation backend; a missing engine is an isolation error.
@@ -559,6 +723,7 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
             r.score = EvalScore::zero(format!("isolation: {e}"));
             r.failure_class = Some(FailureClass::IsolationError);
             r.duration_ms = started.elapsed().as_millis() as u64;
+            stamp_v2(&mut r, task, config, &prompt);
             let _ = artifacts.write_string(
                 "report.md",
                 &format!("# {} — isolation error\n\n{e}\n", task.id),
@@ -582,6 +747,7 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         r.score = EvalScore::zero(format!("errored: workspace setup: {e}"));
         r.failure_class = Some(FailureClass::HarnessError);
         r.duration_ms = started.elapsed().as_millis() as u64;
+        stamp_v2(&mut r, task, config, &prompt);
         let _ = artifacts.write_json("result.json", &r);
         return r;
     }
@@ -591,6 +757,8 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     let mut summary = String::new();
     let mut timed_out = false;
     let mut errored = false;
+    let mut provider_errored = false;
+    let mut harness_errored = false;
     let mut public_report = OracleReport {
         commands: Vec::new(),
         assertions: Vec::new(),
@@ -623,10 +791,13 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
                 summary = o.summary;
                 timed_out |= o.timed_out;
                 errored = o.errored;
+                provider_errored = o.provider_errored;
+                harness_errored = o.harness_errored;
             }
             Err(reason) => {
                 summary = reason;
                 errored = true;
+                harness_errored = true;
             }
         }
         public_report = oracle::evaluate_oracle(
@@ -679,6 +850,7 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         Ok(p) => p,
         Err(e) => {
             errored = true;
+            harness_errored = true;
             summary = format!("{summary}; patch generation failed: {e}");
             PatchInfo::default()
         }
@@ -729,8 +901,8 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     // Failure classification.
     let signals = FailureSignals {
         timed_out,
-        provider_unavailable: false,
-        harness_errored: false,
+        provider_unavailable: provider_errored,
+        harness_errored,
         empty_patch: patch.is_empty(),
         public_passed,
         hidden_present: hidden_report.is_some(),
@@ -761,7 +933,12 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     };
     // M16: refine the primary class with repair-loop signals. The original
     // class is demoted to a secondary label so existing taxonomy is preserved.
-    if !resolved {
+    // Provider/harness failures are not agent failures and are never refined.
+    let infra_failure = matches!(
+        failure_class,
+        Some(FailureClass::ProviderError | FailureClass::HarnessError)
+    );
+    if !resolved && !infra_failure {
         let refined = repair_refined_class(&repair_metrics);
         if let Some(refined) = refined {
             if let Some(prev) = failure_class {
@@ -792,6 +969,8 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         summary,
         timed_out,
         errored,
+        provider_errored,
+        harness_errored,
     };
     let status = status_for(resolved, &outcome, &merged);
 
@@ -839,6 +1018,7 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     result.repair = repair_metrics;
     result.usage = usage;
     result.model_round_trips = model_round_trips;
+    stamp_v2(&mut result, task, config, &prompt);
 
     let _ = artifacts.write_json("result.json", &result);
     result
@@ -1117,6 +1297,7 @@ fn skipped_result(
     config: &RunConfig,
     reason: String,
     started: Instant,
+    prompt: &str,
 ) -> EvalResult {
     let score = EvalScore::zero(format!("skipped: {reason}"));
     let _ = artifacts.write_json("score.json", &score);
@@ -1128,6 +1309,7 @@ fn skipped_result(
     r.score = score;
     r.skipped_reason = Some(reason);
     r.duration_ms = started.elapsed().as_millis() as u64;
+    stamp_v2(&mut r, task, config, prompt);
     let _ = artifacts.write_json("result.json", &r);
     r
 }
@@ -1138,9 +1320,13 @@ pub async fn run_tasks(
     run_dir: &RunDir,
     config: &RunConfig,
 ) -> Vec<EvalResult> {
+    let mut config = config.clone();
+    if config.environment.is_none() {
+        config.environment = Some(RunEnvironment::gather());
+    }
     let mut results = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let result = run_task(task, run_dir, config).await;
+        let result = run_task(task, run_dir, &config).await;
         results.push(result);
     }
     results
@@ -1194,6 +1380,7 @@ pub mod test_support {
         failure_class: Option<FailureClass>,
     ) -> EvalResult {
         EvalResult {
+            schema_version: RESULT_SCHEMA_VERSION,
             task_id: task_id.to_string(),
             title: task_id.to_string(),
             status: if resolved {
@@ -1240,6 +1427,8 @@ pub mod test_support {
             repair: crate::repair::RepairMetrics::default(),
             usage: None,
             model_round_trips: 0,
+            outcome: None,
+            repro: None,
         }
     }
 }
@@ -1247,6 +1436,35 @@ pub mod test_support {
 #[cfg(test)]
 mod provider_metadata_tests {
     use super::*;
+
+    /// run.json v2 records schema version, seed, budgets, git, host, and build version.
+    #[test]
+    fn run_metadata_is_v2_with_reproducibility_fields() {
+        let config = RunConfig {
+            provider: ProviderMode::Golden,
+            seed: 42,
+            environment: Some(RunEnvironment {
+                git: crate::result_schema::GitMeta {
+                    sha: Some("abc".into()),
+                    dirty: true,
+                },
+                host: crate::result_schema::HostInfo::gather(),
+                crom_version: "9.9.9".into(),
+            }),
+            ..RunConfig::default()
+        };
+        let meta = run_metadata(&config, 3);
+        assert_eq!(meta["schema_version"], RESULT_SCHEMA_VERSION);
+        assert_eq!(meta["seed"], 42);
+        assert_eq!(meta["repetitions"], 3);
+        assert_eq!(meta["model"], "golden");
+        assert_eq!(meta["git"]["sha"], "abc");
+        assert_eq!(meta["git"]["dirty"], true);
+        assert_eq!(meta["crom_version"], "9.9.9");
+        assert!(meta["host"]["cpus"].as_u64().unwrap() > 0);
+        assert!(meta["pricing_source_version"].is_null());
+        assert_eq!(meta["repair"]["enabled"], false);
+    }
 
     /// provider.json for a live profile records the endpoint host and model, never a key or full URL.
     #[test]

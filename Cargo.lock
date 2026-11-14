@@ -473,6 +473,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "similar 3.2.1",
  "tempfile",
  "thiserror",
