@@ -1,8 +1,8 @@
 # Threat model
 
 Status: M17 baseline (#276). Scope: the CLI, SDK runtime, and eval harness as
-of `5bc1fb2`. Paths are pre-rename (`crates/code-agent-*`, `crates/eval`); after
-#271 they map to `crates/crom-*` and `crates/crom-eval`.
+of `5bc1fb2`. Line numbers refer to that commit; crate paths use the
+post-rename names (`crates/crom-*`, `crates/crom-eval`) from #271.
 
 Sandbox backend choice: [`decisions/0001-sandbox-backend.md`](decisions/0001-sandbox-backend.md).
 Security ladder (S0–S4): [`MILESTONE_17.md` §6](../milestones/MILESTONE_17.md#6-security-ladder).
@@ -12,10 +12,10 @@ Security ladder (S0–S4): [`MILESTONE_17.md` §6](../milestones/MILESTONE_17.md
 | ID | Asset | Where it lives today | Why it matters |
 |---|---|---|---|
 | A1 | Host filesystem outside the workspace | Everything the user can read/write (`$HOME`, other repos, `/tmp`) | Integrity (deletion, persistence via shell rc files) and confidentiality |
-| A2 | Credentials | Provider keys in the process env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, … — `code-agent-auth/src/precedence.rs:30-31`); auth store (OS keychain or opt-in `0600` file backend, `code-agent-auth/src/store/`); `~/.ssh`, git credential helpers, cloud CLI config | Exfiltration ⇒ spend, account compromise, lateral movement |
+| A2 | Credentials | Provider keys in the process env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, … — `crom-auth/src/precedence.rs:30-31`); auth store (OS keychain or opt-in `0600` file backend, `crom-auth/src/store/`); `~/.ssh`, git credential helpers, cloud CLI config | Exfiltration ⇒ spend, account compromise, lateral movement |
 | A3 | Network | Unrestricted egress from the host process and every child | Exfiltration channel; reaching internal services (cloud metadata, LAN) |
-| A4 | Grader material | Eval task dir: `task.toml`, hidden fixtures and checks (`eval/src/runner.rs:453-470` copies `task.dir/<hidden.fixture>` into the workspace *after* the agent phase) | Reading it during the agent phase invalidates benchmark results |
-| A5 | Persisted state | Sessions `<cwd>/.agent/sessions/*.jsonl` (`code-agent-session/src/lib.rs:197-198`), checkpoints, audit log, eval artifacts | Tampering falsifies history/audit; sessions sit **inside** the workspace |
+| A4 | Grader material | Eval task dir: `task.toml`, hidden fixtures and checks (`crom-eval/src/runner.rs:453-470` copies `task.dir/<hidden.fixture>` into the workspace *after* the agent phase) | Reading it during the agent phase invalidates benchmark results |
+| A5 | Persisted state | Sessions `<cwd>/.agent/sessions/*.jsonl` (`crom-session/src/lib.rs:197-198`), checkpoints, audit log, eval artifacts | Tampering falsifies history/audit; sessions sit **inside** the workspace |
 | A6 | Host compute | CPU, memory, PIDs, disk | Denial of service, runaway cost |
 
 ## 2. Principals
@@ -90,19 +90,19 @@ Verified against `5bc1fb2`.
 
 | Control | Location | What it does | Limit |
 |---|---|---|---|
-| Pre-execution policy gate | `code-agent-core/src/agent.rs:1418-1506` (unknown tool → `ToolCallDenied`; `policy.evaluate_tool` at `:1454`; deny path `:1488-1506`; `execute` only at `:1673`) | No tool runs without an `Allow` decision | Decides on tool name + input, not on effects |
-| Policy pipeline | `code-agent-core/src/policy.rs:302-542` (hooks `:308-350`, disallow rules `:353`, plan mode `:371`, permission mode `:380`, approval memory `:485`, default deny `:536-540`) | Ordered allow/deny; default deny | Hook `Allow` returns before disallow rules (`:325-344`) — #290 |
-| Path checks for file tools | `code-agent-tools/src/path_sandbox.rs:44-124`, used by Read/Write/Edit; Glob/Grep canonicalize the root | Rejects `..` and symlink escapes; absolute paths are re-rooted (`:58-60`) | Path-based, TOCTOU (`:16-43`); does not apply to Bash |
-| Bash timeout | `code-agent-tools/src/bash.rs:89-94` caps caller timeout at the configured max; `:134` | Bounds wall time | — |
+| Pre-execution policy gate | `crom-core/src/agent.rs:1418-1506` (unknown tool → `ToolCallDenied`; `policy.evaluate_tool` at `:1454`; deny path `:1488-1506`; `execute` only at `:1673`) | No tool runs without an `Allow` decision | Decides on tool name + input, not on effects |
+| Policy pipeline | `crom-core/src/policy.rs:302-542` (hooks `:308-350`, disallow rules `:353`, plan mode `:371`, permission mode `:380`, approval memory `:485`, default deny `:536-540`) | Ordered allow/deny; default deny | Hook `Allow` returns before disallow rules (`:325-344`) — #290 |
+| Path checks for file tools | `crom-tools/src/path_sandbox.rs:44-124`, used by Read/Write/Edit; Glob/Grep canonicalize the root | Rejects `..` and symlink escapes; absolute paths are re-rooted (`:58-60`) | Path-based, TOCTOU (`:16-43`); does not apply to Bash |
+| Bash timeout | `crom-tools/src/bash.rs:89-94` caps caller timeout at the configured max; `:134` | Bounds wall time | — |
 | Bash process group | `bash.rs:107-114` (`process_group(0)`), SIGKILL to the group on timeout only (`:144-160`); `kill_on_drop` (`:104`) kills bash only | Kills same-group descendants on timeout | `setsid` escapes; not killed on normal exit or cancel |
 | Bash spawn | `bash.rs:97-104` | cwd = workspace | Full env inherited (no `env_clear` anywhere in the repo), no FS/network/rlimit restriction |
-| Dangerous-bash / `.env` write hooks | `code-agent-core/src/builtin_hooks.rs:15`, `:137` | Pattern-based deny | Pattern matching, bypassable by encoding; repo settings can disable them |
+| Dangerous-bash / `.env` write hooks | `crom-core/src/builtin_hooks.rs:15`, `:137` | Pattern-based deny | Pattern matching, bypassable by encoding; repo settings can disable them |
 | Secret redaction hooks | `builtin_hooks.rs:427-441` | — | **No-ops** (`Continue`) — #291 |
-| MCP config | `code-agent-mcp/src/config.rs:290-298` auto-loads `<cwd>/.agent/mcp.json` and enables MCP; `:331`/`:468-490` interpolate `${VAR}` from the host env | — | Repo-controlled spawn with host secrets — #290 |
-| MCP stdio spawn | `code-agent-mcp/src/transport/stdio.rs:37-47` | `kill_on_drop` | Inherits env, no sandbox |
-| Eval verification isolation | `eval/src/isolation.rs:244-291` (`docker`/`podman run --rm --network none`, optional cpu/memory) | Contains verification commands when a container backend is selected | Default `LocalBackend` (`:168-190`) runs on the host; agent phase never containerized |
-| Eval agent phase | `eval/src/runner.rs:199-215` (`SideEffectPolicy::full()`), `:234` (`WorkspaceSource::filesystem`, cwd only), `:237` (`AllowAllApprovals`) | — | Live runs execute model-chosen Bash on the host — #253 |
-| Credential storage | `code-agent-auth/src/store/` (keychain; file backend writes `0600`, `store/file.rs:315-316`) | At-rest protection | Env-var keys are inherited by every child |
+| MCP config | `crom-mcp/src/config.rs:290-298` auto-loads `<cwd>/.agent/mcp.json` and enables MCP; `:331`/`:468-490` interpolate `${VAR}` from the host env | — | Repo-controlled spawn with host secrets — #290 |
+| MCP stdio spawn | `crom-mcp/src/transport/stdio.rs:37-47` | `kill_on_drop` | Inherits env, no sandbox |
+| Eval verification isolation | `crom-eval/src/isolation.rs:244-291` (`docker`/`podman run --rm --network none`, optional cpu/memory) | Contains verification commands when a container backend is selected | Default `LocalBackend` (`:168-190`) runs on the host; agent phase never containerized |
+| Eval agent phase | `crom-eval/src/runner.rs:199-215` (`SideEffectPolicy::full()`), `:234` (`WorkspaceSource::filesystem`, cwd only), `:237` (`AllowAllApprovals`) | — | Live runs execute model-chosen Bash on the host — #253 |
+| Credential storage | `crom-auth/src/store/` (keychain; file backend writes `0600`, `store/file.rs:315-316`) | At-rest protection | Env-var keys are inherited by every child |
 
 ## 6. Known gaps
 
@@ -117,7 +117,7 @@ Verified against `5bc1fb2`.
 | G7 | Slash `` !`cmd` `` expansion and SDK in-memory workspace while tools act on host cwd (`sdk/src/runtime/run.rs:1160-1175`) | S1 | #290 |
 | G8 | `PolicyDecision`/`ToolCallDenied` lack target, run id, enforcement layer; redaction hooks are no-ops | Audit | #291 |
 | G9 | Sessions and checkpoints live under `<cwd>/.agent/`, inside the future sandbox's writable set | B6 | #253 (exclude `.agent/` from rw set) |
-| G10 | Host-side helpers run untrusted repo code outside any sandbox: `git status` in checkpoints (`code-agent-checkpoint/src/lib.rs:91-94`, honours `core.fsmonitor`), validation commands (`checkpoint/src/validation.rs:38-48`, `sdk/src/runtime/validation.rs:20`), eval `LocalBackend` | P1–P6, P9 | #253 (validation), #290 (git config) |
+| G10 | Host-side helpers run untrusted repo code outside any sandbox: `git status` in checkpoints (`crom-checkpoint/src/lib.rs:91-94`, honours `core.fsmonitor`), validation commands (`checkpoint/src/validation.rs:38-48`, `sdk/src/runtime/validation.rs:20`), eval `LocalBackend` | P1–P6, P9 | #253 (validation), #290 (git config) |
 | G11 | File tools: path-based TOCTOU | P1, P2 | #15 (documented); the OS sandbox closes it for Bash only |
 
 ## 7. Required enforcement properties
