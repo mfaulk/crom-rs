@@ -743,3 +743,150 @@ async fn cancellation_stops_a_blocked_run() {
         result.status
     );
 }
+
+/// A file name unique to this test process, relative to the workspace.
+fn unique_name(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("crom-sdk-{tag}-{}-{nanos}.txt", std::process::id())
+}
+
+fn write_runtime_builder(provider: ScriptedFakeProvider) -> crom_sdk::AgentRuntimeBuilder {
+    AgentRuntime::builder()
+        .provider(ProviderConfig::fake(Arc::new(provider)))
+        .tool_policy(ToolPolicy {
+            enable_builtin_tools: BuiltinToolSet::cli_defaults(),
+            side_effect_policy: SideEffectPolicy::full(),
+            ..Default::default()
+        })
+        .approval_callback(Arc::new(AllowAllApprovals))
+        .interactivity(InteractivityMode::Interactive)
+}
+
+/// With the default in-memory workspace, a built-in Write never lands in the host process cwd;
+/// under ReturnOnly it is captured in the returned patch instead.
+#[tokio::test]
+async fn in_memory_workspace_write_does_not_touch_process_cwd() {
+    let name = unique_name("inmem");
+    let host_path = std::env::current_dir().unwrap().join(&name);
+    let provider = ScriptedFakeProvider::one_shot_tool_call(
+        "Write",
+        serde_json::json!({"file_path": name, "content": "leak\n"}),
+    );
+    let runtime = write_runtime_builder(provider).build().await.unwrap();
+    let result = runtime
+        .run_once(
+            AgentRequest::new("write a file")
+                .mode(AgentMode::GeneratePatch)
+                .patch_policy(PatchPolicy::ReturnOnly)
+                .approval_policy(ApprovalPolicy::CallbackRequired)
+                .max_turns(3),
+        )
+        .await
+        .unwrap();
+    let leaked = host_path.exists();
+    let _ = std::fs::remove_file(&host_path);
+    assert!(!leaked, "built-in Write escaped into the process cwd");
+    let patch = result.patch.expect("patch produced");
+    assert!(
+        patch.files.iter().any(|f| matches!(
+            f,
+            crom_sdk::FilePatch::Create { path, .. } if path.as_str() == name
+        )),
+        "write should be captured in the patch: {:?}",
+        patch.files
+    );
+}
+
+/// An in-memory workspace with an apply policy has no directory to bind built-in tools to,
+/// so a Write never reaches the process cwd.
+#[tokio::test]
+async fn in_memory_apply_policy_does_not_touch_process_cwd() {
+    let name = unique_name("inmem-apply");
+    let host_path = std::env::current_dir().unwrap().join(&name);
+    let provider = ScriptedFakeProvider::one_shot_tool_call(
+        "Write",
+        serde_json::json!({"file_path": name, "content": "leak\n"}),
+    );
+    let runtime = write_runtime_builder(provider)
+        .workspace(WorkspaceSource::in_memory(InMemoryWorkspace::new()))
+        .build()
+        .await
+        .unwrap();
+    let _ = runtime
+        .run_once(
+            AgentRequest::new("write a file")
+                .mode(AgentMode::ModifyWorkspace)
+                .patch_policy(PatchPolicy::ApplyToWorkspace)
+                .approval_policy(ApprovalPolicy::CallbackRequired)
+                .max_turns(3),
+        )
+        .await
+        .unwrap();
+    let leaked = host_path.exists();
+    let _ = std::fs::remove_file(&host_path);
+    assert!(!leaked, "built-in Write escaped into the process cwd");
+}
+
+/// RejectMutations on a filesystem workspace never lets a built-in Write reach the real root.
+#[tokio::test]
+async fn reject_mutations_does_not_mutate_fs() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"old\n").unwrap();
+    let provider = ScriptedFakeProvider::one_shot_tool_call(
+        "Write",
+        serde_json::json!({"file_path": "a.txt", "content": "new\n"}),
+    );
+    let runtime = write_runtime_builder(provider).build().await.unwrap();
+    let _ = runtime
+        .run_once(
+            AgentRequest::new("review")
+                .workspace(WorkspaceSource::filesystem(dir.path()))
+                .mode(AgentMode::ReviewOnly)
+                .patch_policy(PatchPolicy::RejectMutations)
+                .approval_policy(ApprovalPolicy::CallbackRequired)
+                .max_turns(3),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "old\n"
+    );
+}
+
+/// ReturnOnly on a filesystem workspace runs built-in tools against a scratch copy:
+/// a Bash side effect outside the snapshotted file set never reaches the real root.
+#[tokio::test]
+async fn return_only_bash_does_not_touch_real_root() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"old\n").unwrap();
+    let provider = ScriptedFakeProvider::one_shot_tool_call(
+        "Bash",
+        serde_json::json!({"command": "echo new > a.txt && mkdir -p .hidden && touch .hidden/marker"}),
+    );
+    let runtime = write_runtime_builder(provider).build().await.unwrap();
+    let result = runtime
+        .run_once(
+            AgentRequest::new("edit")
+                .workspace(WorkspaceSource::filesystem(dir.path()))
+                .mode(AgentMode::GeneratePatch)
+                .patch_policy(PatchPolicy::ReturnOnly)
+                .approval_policy(ApprovalPolicy::CallbackRequired)
+                .max_turns(3),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "old\n"
+    );
+    assert!(!dir.path().join(".hidden").exists());
+    let patch = result.patch.expect("patch produced");
+    assert!(patch.files.iter().any(|f| matches!(
+        f,
+        crom_sdk::FilePatch::Modify { path, .. } if path.as_str() == "a.txt"
+    )));
+}

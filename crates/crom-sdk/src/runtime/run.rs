@@ -24,7 +24,7 @@ use crate::runtime::adapters::SdkPermissionCallback;
 use crate::runtime::validation;
 use crate::runtime::RuntimeInner;
 use crate::workspace::{
-    DiffBase, InMemoryWorkspace, PatchOnlyWorkspace, ReadOnlyWorkspace, Workspace, WorkspacePath,
+    DiffBase, FilesystemWorkspace, InMemoryWorkspace, ReadOnlyWorkspace, Workspace, WorkspacePath,
     WorkspaceSource,
 };
 use crate::{RunId, SessionId};
@@ -105,17 +105,11 @@ pub(crate) async fn execute_request(
     // Resolve workspace.
     let workspace = resolve_workspace(&runtime, request.workspace).await?;
 
-    // Apply patch policy by wrapping the workspace. For filesystem workspaces
-    // the tools write to disk, so PatchOnly only redirects writes that go
-    // through the SDK Workspace trait; the rollback step covers tool writes.
-    let workspace_for_run: Arc<dyn Workspace> = match request.patch_policy {
-        PatchPolicy::ReturnOnly if workspace.filesystem_root().is_none() => {
-            Arc::new(PatchOnlyWorkspace::new(workspace.clone()))
-        }
-        PatchPolicy::ReturnOnly => workspace.clone(),
-        PatchPolicy::RejectMutations => Arc::new(ReadOnlyWorkspace::new(workspace.clone())),
-        _ => workspace.clone(),
-    };
+    // Bind built-in tools per patch policy (see `bind_workspace`). Any I/O
+    // error while snapshotting is fatal: a partial snapshot would produce a
+    // wrong patch (#144).
+    let bound = bind_workspace(workspace, request.patch_policy).await?;
+    let workspace_for_run = bound.workspace.clone();
 
     // Apply deadline.
     let deadline = request.deadline.or(request.budgets.max_duration);
@@ -306,32 +300,6 @@ pub(crate) async fn execute_request(
         };
     }
 
-    // Snapshot the workspace state before the regular run for any patch
-    // policy that needs to return a meaningful diff. Built-in tools
-    // write directly to disk; without a baseline the post-run diff
-    // would treat every file in a filesystem workspace as newly
-    // created. We snapshot for ReturnOnly (where we also use the
-    // snapshot to roll back disk mutations) and for ApplyAndReturn
-    // (where mutations stay on disk but the diff still needs a
-    // baseline). Hoisted below the PlanOnly / PlanThenAct
-    // short-circuits so plan-only modes do not pay (or fail on) a
-    // snapshot they never use (#144 codex review).
-    //
-    // Any I/O error during snapshot is fatal — proceeding with a
-    // partial snapshot would let the post-run rollback delete every
-    // file that snapshot missed, which was the silent-data-loss
-    // regression in #144.
-    let baseline_snapshot: Option<std::collections::BTreeMap<WorkspacePath, Vec<u8>>> = if matches!(
-        request.patch_policy,
-        PatchPolicy::ReturnOnly | PatchPolicy::ApplyAndReturn
-    )
-        && workspace.filesystem_root().is_some()
-    {
-        Some(snapshot_workspace(&*workspace).await?)
-    } else {
-        None
-    };
-
     // Regular run.
     let tools = build_tool_registry(&runtime.tool_policy, workspace_for_run.clone());
     let mut options = AgentOptions {
@@ -473,10 +441,9 @@ pub(crate) async fn execute_request(
         request.patch_policy,
         PatchPolicy::ReturnOnly | PatchPolicy::ApplyAndReturn
     ) {
-        let diff_base = if let Some(snap) = &baseline_snapshot {
-            DiffBase::Snapshot(snap.clone())
-        } else {
-            DiffBase::Initial
+        let diff_base = match &bound.baseline {
+            Some(snap) => DiffBase::Snapshot(snap.clone()),
+            None => DiffBase::Initial,
         };
         match workspace_for_run.diff(diff_base).await {
             Ok(p) => {
@@ -525,31 +492,11 @@ pub(crate) async fn execute_request(
                 patch = Some(p);
             }
             Err(e) => {
-                // Diff failure must NOT silently drop the rollback —
-                // disk mutations would stay on disk while the run
-                // still reported success. Record the diff failure as
-                // a diagnostic and fall through; the rollback block
-                // below still runs.
                 diagnostics.push(Diagnostic::error(
                     "patch.diff_failed",
                     format!("workspace.diff failed: {e}"),
                 ));
                 status = AgentRunStatus::Failed;
-            }
-        }
-        // ReturnOnly + filesystem: roll back any disk mutations to the
-        // baseline snapshot we took before the agent ran. Hoisted out
-        // of the diff `Ok(_)` arm so a diff failure cannot silently
-        // skip rollback (#144 codex review).
-        if matches!(request.patch_policy, PatchPolicy::ReturnOnly) {
-            if let Some(snap) = &baseline_snapshot {
-                if let Err(e) = restore_workspace(&*workspace, snap).await {
-                    diagnostics.push(Diagnostic::error(
-                        "workspace.rollback_failed",
-                        e.message.clone(),
-                    ));
-                    status = AgentRunStatus::Failed;
-                }
             }
         }
     }
@@ -863,12 +810,8 @@ pub(crate) async fn execute_act(
         .unwrap_or_else(|| runtime.default_model.clone());
     let provider_id = runtime.provider_id.clone();
 
-    // Apply patch policy by wrapping the workspace.
-    let workspace_for_run: Arc<dyn Workspace> = match request.patch_policy {
-        PatchPolicy::ReturnOnly => Arc::new(PatchOnlyWorkspace::new(workspace.clone())),
-        PatchPolicy::RejectMutations => Arc::new(ReadOnlyWorkspace::new(workspace.clone())),
-        _ => workspace.clone(),
-    };
+    let bound = bind_workspace(workspace, request.patch_policy).await?;
+    let workspace_for_run = bound.workspace.clone();
 
     // Prep plan store under a temp dir so the core driver can persist
     // intermediate state. We use an in-memory store wrapper.
@@ -971,7 +914,11 @@ pub(crate) async fn execute_act(
     // Compute the patch from the wrapped workspace.
     let patch = match request.patch_policy {
         PatchPolicy::ReturnOnly | PatchPolicy::ApplyAndReturn => {
-            workspace_for_run.diff(DiffBase::Initial).await.ok()
+            let base = match &bound.baseline {
+                Some(snap) => DiffBase::Snapshot(snap.clone()),
+                None => DiffBase::Initial,
+            };
+            workspace_for_run.diff(base).await.ok()
         }
         _ => None,
     };
@@ -1088,65 +1035,89 @@ async fn snapshot_workspace(
     Ok(out)
 }
 
-/// Restore `workspace` to match `snapshot`. Used after a `ReturnOnly` run
-/// to roll back any mutations the model performed through filesystem
-/// tools.
+/// The workspace a run's built-in tools are bound to.
 ///
-/// Errors from `delete_file` and `write_file` are collected and
-/// surfaced as a single `workspace.rollback_failed` error so partial
-/// rollback can still complete (one bad file does not block the rest)
-/// while the caller still learns the workspace is inconsistent.
-///
-/// Per-file resilience tweaks from review feedback:
-/// - `workspace.not_found` on delete is benign (file already gone) and
-///   is not recorded as an error.
-/// - A `list_files` failure does *not* skip rollback entirely. We fall
-///   back to "restore every snapshot entry", which is the best we can
-///   do without an authoritative current-files list. New files created
-///   during the run that we cannot enumerate stay on disk — that is
-///   strictly safer than full inaction.
-async fn restore_workspace(
-    workspace: &dyn Workspace,
+/// Only `ApplyToWorkspace` / `ApplyAndReturn` bind tools to a caller's real
+/// directory. `ReturnOnly` and `RejectMutations` bind them to a private
+/// scratch copy of the workspace's files (for any workspace kind), so Write,
+/// Edit and Bash side effects never reach the caller's root or the host
+/// process cwd; the patch is the diff of the scratch copy against the
+/// snapshot it was built from. `RejectMutations` additionally wraps the copy
+/// read-only, which drops the mutating tools. A rootless workspace under an
+/// apply policy gets no filesystem or shell tools at all.
+struct BoundWorkspace {
+    workspace: Arc<dyn Workspace>,
+    baseline: Option<std::collections::BTreeMap<WorkspacePath, Vec<u8>>>,
+    _scratch: Option<tempfile::TempDir>,
+}
+
+async fn bind_workspace(
+    workspace: Arc<dyn Workspace>,
+    patch_policy: PatchPolicy,
+) -> Result<BoundWorkspace, AgentSdkError> {
+    match patch_policy {
+        PatchPolicy::ReturnOnly | PatchPolicy::RejectMutations => {
+            let snapshot = snapshot_workspace(&*workspace).await?;
+            let scratch = materialize_scratch(&snapshot, workspace.filesystem_root()).await?;
+            let fs: Arc<dyn Workspace> = Arc::new(FilesystemWorkspace::new(scratch.path())?);
+            let bound: Arc<dyn Workspace> = if patch_policy == PatchPolicy::RejectMutations {
+                Arc::new(ReadOnlyWorkspace::new(fs))
+            } else {
+                fs
+            };
+            Ok(BoundWorkspace {
+                workspace: bound,
+                baseline: Some(snapshot),
+                _scratch: Some(scratch),
+            })
+        }
+        PatchPolicy::ApplyAndReturn if workspace.filesystem_root().is_some() => {
+            // Tools write to disk; the diff needs a pre-run baseline.
+            let snapshot = snapshot_workspace(&*workspace).await?;
+            Ok(BoundWorkspace {
+                workspace,
+                baseline: Some(snapshot),
+                _scratch: None,
+            })
+        }
+        _ => Ok(BoundWorkspace {
+            workspace,
+            baseline: None,
+            _scratch: None,
+        }),
+    }
+}
+
+/// Write `snapshot` into a fresh temp dir. When the source has a filesystem
+/// root, file permission bits are copied too so scripts stay executable.
+async fn materialize_scratch(
     snapshot: &std::collections::BTreeMap<WorkspacePath, Vec<u8>>,
-) -> Result<(), AgentSdkError> {
-    let mut errors: Vec<String> = Vec::new();
-    match workspace
-        .list_files(crate::workspace::FileQuery::new())
-        .await
-    {
-        Ok(current) => {
-            for path in &current {
-                if !snapshot.contains_key(path) {
-                    // File was created during the run; delete it. A
-                    // concurrent external delete is fine.
-                    match workspace.delete_file(path).await {
-                        Ok(()) => {}
-                        Err(e) if e.code == "workspace.not_found" => continue,
-                        Err(e) => errors.push(format!("delete {}: {}", path.as_str(), e)),
-                    }
-                }
+    source_root: Option<std::path::PathBuf>,
+) -> Result<tempfile::TempDir, AgentSdkError> {
+    let io_err = |what: &str, e: std::io::Error| {
+        AgentSdkError::workspace("workspace.scratch_failed", format!("{what}: {e}"))
+    };
+    let scratch = tempfile::Builder::new()
+        .prefix("crom-sdk-workspace-")
+        .tempdir()
+        .map_err(|e| io_err("create scratch dir", e))?;
+    for (path, bytes) in snapshot {
+        let dest = scratch.path().join(path.as_str());
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| io_err(path.as_str(), e))?;
+        }
+        tokio::fs::write(&dest, bytes)
+            .await
+            .map_err(|e| io_err(path.as_str(), e))?;
+        if let Some(root) = &source_root {
+            if let Ok(meta) = tokio::fs::metadata(root.join(path.as_str())).await {
+                let _ = tokio::fs::set_permissions(&dest, meta.permissions()).await;
             }
         }
-        Err(e) => {
-            // Cannot enumerate; record the failure but still restore
-            // the snapshot below so original file content gets put back.
-            errors.push(format!("list_files: {e}"));
-        }
     }
-    for (path, bytes) in snapshot {
-        // Restore original content (or recreate deleted file).
-        if let Err(e) = workspace.write_file(path, bytes).await {
-            errors.push(format!("write {}: {}", path.as_str(), e));
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(AgentSdkError::new(
-            AgentSdkErrorKind::Workspace,
-            format!("workspace.rollback_failed: {}", errors.join("; ")),
-        ))
-    }
+    Ok(scratch)
 }
 
 /// Resolve the workspace for a request. The request's workspace overrides
@@ -1168,30 +1139,36 @@ async fn resolve_workspace(
 /// Build a `ToolRegistry` from the SDK's `ToolPolicy`. Honors the builtin
 /// set and side-effect policy by selectively registering core tools. Custom
 /// tools always run regardless of the builtin set.
+///
+/// Built-in file and shell tools act on `cwd`, so they are only registered
+/// when `workspace` has a filesystem root (otherwise they would act on the
+/// host process cwd), and Write/Edit/Bash only when it is writable.
 fn build_tool_registry(
     policy: &crate::policy::ToolPolicy,
-    _workspace: Arc<dyn Workspace>,
+    workspace: Arc<dyn Workspace>,
 ) -> ToolRegistry {
     use crom_tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, ToolLimits, WriteTool};
     let mut registry = ToolRegistry::new();
     let limits = Arc::new(ToolLimits::default());
     let builtins = policy.enable_builtin_tools;
-    if builtins.read {
+    let has_root = workspace.filesystem_root().is_some();
+    let writable = has_root && workspace.capabilities().can_write;
+    if builtins.read && has_root {
         registry.register(Arc::new(ReadTool::new(limits.clone())));
     }
-    if builtins.glob {
+    if builtins.glob && has_root {
         registry.register(Arc::new(GlobTool::new(limits.clone())));
     }
-    if builtins.grep {
+    if builtins.grep && has_root {
         registry.register(Arc::new(GrepTool::new(limits.clone())));
     }
-    if builtins.write && policy.side_effect_policy.allow_workspace_write {
+    if builtins.write && writable && policy.side_effect_policy.allow_workspace_write {
         registry.register(Arc::new(WriteTool::new(limits.clone())));
     }
-    if builtins.edit && policy.side_effect_policy.allow_workspace_write {
+    if builtins.edit && writable && policy.side_effect_policy.allow_workspace_write {
         registry.register(Arc::new(EditTool::new(limits.clone())));
     }
-    if builtins.bash && policy.side_effect_policy.allow_command_execution {
+    if builtins.bash && writable && policy.side_effect_policy.allow_command_execution {
         registry.register(Arc::new(BashTool::new(limits.clone())));
     }
     if builtins.todo {
@@ -1560,8 +1537,8 @@ mod budget_tests {
 
 #[cfg(test)]
 mod snapshot_tests {
-    //! Tests for the `snapshot_workspace` / `restore_workspace` helpers
-    //! that underpin `PatchPolicy::ReturnOnly`'s rollback (#144).
+    //! Tests for `snapshot_workspace`, the baseline behind the scratch copy
+    //! and diff for `PatchPolicy::ReturnOnly` (#144).
 
     use super::*;
     use crate::workspace::{
@@ -1707,72 +1684,6 @@ mod snapshot_tests {
             .expect_err("read_file error must abort snapshot");
         assert_eq!(err.kind, AgentSdkErrorKind::Workspace);
         assert!(err.message.contains("secret.bin"), "got: {err}");
-    }
-
-    // restore_workspace must surface rollback failures (delete/write
-    // errors) as an Err, not silently leave the workspace half-restored.
-    #[tokio::test]
-    async fn restore_surfaces_write_errors() {
-        let ws = FaultyWorkspace {
-            fail_write: true,
-            ..FaultyWorkspace::empty()
-        };
-        let mut snap: std::collections::BTreeMap<WorkspacePath, Vec<u8>> =
-            std::collections::BTreeMap::new();
-        snap.insert(WorkspacePath::new("kept.txt").unwrap(), b"hi".to_vec());
-        let err = restore_workspace(&ws, &snap)
-            .await
-            .expect_err("write error must surface");
-        assert_eq!(err.kind, AgentSdkErrorKind::Workspace);
-        assert!(err.message.contains("rollback_failed"), "got: {err}");
-    }
-
-    // restore_workspace must also surface list_files errors so the
-    // run is marked failed instead of completed-as-if-rolled-back.
-    // Updated for the gemini-review fix: a list_files failure no
-    // longer aborts rollback entirely; the snapshot's tracked files
-    // are still restored. We assert the error is surfaced AND a
-    // snapshot entry was still written.
-    #[tokio::test]
-    async fn restore_surfaces_list_errors() {
-        let ws = FaultyWorkspace {
-            fail_list: true,
-            ..FaultyWorkspace::with_file("kept.txt", b"current")
-        };
-        let mut snap: std::collections::BTreeMap<WorkspacePath, Vec<u8>> =
-            std::collections::BTreeMap::new();
-        snap.insert(
-            WorkspacePath::new("kept.txt").unwrap(),
-            b"original".to_vec(),
-        );
-        let err = restore_workspace(&ws, &snap)
-            .await
-            .expect_err("list_files error must surface");
-        assert_eq!(err.kind, AgentSdkErrorKind::Workspace);
-        // Snapshot was still written despite list_files failure.
-        let after = ws.files.lock().unwrap().get("kept.txt").cloned().unwrap();
-        assert_eq!(after, b"original");
-    }
-
-    // Delete-error path: write_file succeeds for the snapshot, but
-    // delete_file fails when restore_workspace tries to remove a file
-    // that exists in `current` but not in `snapshot`. The rollback
-    // must surface the delete failure as part of the aggregated
-    // rollback_failed error.
-    #[tokio::test]
-    async fn restore_surfaces_delete_errors() {
-        let ws = FaultyWorkspace {
-            fail_delete: true,
-            ..FaultyWorkspace::with_file("agent_created.txt", b"new")
-        };
-        // Empty snapshot: every file in `current` should be deleted.
-        let snap: std::collections::BTreeMap<WorkspacePath, Vec<u8>> =
-            std::collections::BTreeMap::new();
-        let err = restore_workspace(&ws, &snap)
-            .await
-            .expect_err("delete error must surface");
-        assert_eq!(err.kind, AgentSdkErrorKind::Workspace);
-        assert!(err.message.contains("delete"), "got: {err}");
     }
 
     // External-delete TOCTOU on snapshot: a file disappears between

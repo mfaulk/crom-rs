@@ -34,9 +34,16 @@ Every layer enforces:
 6. `RunBudgets` caps turns, tool calls, duration, files changed, patch
    size — independent of the model.
 
+Built-in file and shell tools are bound to the workspace, never to the
+host process cwd: `ReturnOnly`/`RejectMutations` run them in a private
+scratch copy, apply policies use the real root, and a rootless workspace
+under an apply policy gets none (see [Workspaces](workspaces.md)).
+
 ## Threats addressed
 
 - **Inadvertent mutation**: ReturnOnly + read-only side effects + no Bash.
+  Under `ReturnOnly` and `RejectMutations` the tools never see the
+  caller's root.
 - **Credential leakage**: `SecretString` redacts in `Debug`; the
   `SecretRedactor` runs on diagnostics and assistant text.
 - **Tenant contamination**: no global state across runs; `SessionPolicy`
