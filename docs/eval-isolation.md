@@ -1,7 +1,7 @@
 # Eval isolation backends
 
-Verification commands run through an **isolation backend**, selected with
-`--isolation`:
+Verification commands (public and hidden oracles) run through an **isolation
+backend**, selected with `--isolation`:
 
 | backend  | description                                              | availability |
 |----------|----------------------------------------------------------|--------------|
@@ -14,10 +14,16 @@ if the engine is missing or the opt-in flag is unset, constructing the backend
 fails and the run is reported with an `isolation_error` (it is not silently
 downgraded).
 
+> **Agent tool calls always run on the host.** The isolation backend applies
+> only to verification. The agent's own tool calls (`Bash`, `Edit`, `Write`,
+> …) execute directly on the host with the workspace directory as their
+> working directory, under every backend including `docker` and `podman`. A
+> container backend does **not** sandbox what the agent runs.
+
 ## Flags
 
 ```console
-$ crom eval run <suite> \
+$ crom eval run --suite <suite> \
     --isolation docker \
     --network false \
     --container-image rust:latest \
@@ -39,8 +45,8 @@ Container backends are gated behind environment variables, mirroring the
 live-provider lane:
 
 ```console
-$ CROM_EVAL_DOCKER=1 crom eval run <suite> --isolation docker
-$ CROM_EVAL_PODMAN=1 crom eval run <suite> --isolation podman
+$ CROM_EVAL_DOCKER=1 crom eval run --suite <suite> --isolation docker
+$ CROM_EVAL_PODMAN=1 crom eval run --suite <suite> --isolation podman
 ```
 
 Without the opt-in variable (or without the engine on `PATH`), the backend is
@@ -69,8 +75,10 @@ the agent completes regardless of backend.
 
 ## Known limitations
 
-- The `local` backend isolates by working directory, not OS sandboxing. Run live
-  evals that enable Bash only against trusted tasks, or under a container backend
-  / externally sandboxed environment.
+- No backend sandboxes the agent: tool calls run on the host under `local`,
+  `docker`, and `podman` alike (container backends confine verification only).
+  The workspace is isolated by working directory, not by OS sandboxing. Run
+  live evals that enable Bash only against trusted tasks, or run the whole
+  harness inside an externally sandboxed environment (container/VM).
 - On timeout the harness kills the wrapping `sh`; a long-running child (e.g.
   cargo) may briefly outlive the timeout before exiting.

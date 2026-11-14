@@ -24,8 +24,9 @@ Companion docs:
 - **Adapters** (`eval adapters`): `internal`, `directory`, plus MVP `swebench`,
   `aider`, and `terminal` adapters that run local benchmark-style slices through
   the same pipeline.
-- **Isolation backends** (`--isolation local|docker|podman`) with recorded
-  environment metadata; `local` is the default and works everywhere.
+- **Isolation backends** (`--isolation local|docker|podman`) for verification
+  commands, with recorded environment metadata; `local` is the default and
+  works everywhere. Agent tool calls always run on the host.
 - **Validation** (`eval validate-task`, `eval validate-suite [--repeat N]`) with
   flake detection and canary checks (leak detection).
 - **Hidden verification**: checks (and an optional fixture overlay) applied only
@@ -43,11 +44,12 @@ Companion docs:
 
 ```console
 $ crom eval adapters
-$ crom eval run <suite|task> --adapter internal
+$ crom eval run --suite <suite> --adapter internal
+$ crom eval run <task-id> --adapter internal
 $ crom eval run <path> --adapter directory
-$ crom eval run <suite> --isolation local --network false
-$ crom eval run <suite> --repetitions 5
-$ crom eval run <suite> --prompt-variant concise
+$ crom eval run --suite <suite> --isolation local --network false
+$ crom eval run --suite <suite> --repetitions 5
+$ crom eval run --suite <suite> --prompt-variant concise
 $ crom eval run <path> --adapter aider --attempts 2
 $ crom eval validate-task <id-or-path>
 $ crom eval validate-suite <suite> --repeat 5
@@ -59,6 +61,10 @@ $ crom eval triage <run-id>
 $ crom eval show <run-id> <task-id>
 $ crom eval open <run-id> <task-id>
 ```
+
+`eval run` takes a suite only via `--suite`; a positional argument is a task
+id (internal adapter) or a path (other adapters). With neither, it runs
+`smoke`.
 
 A run that uses repetitions writes per-repetition artifacts under
 `<run-id>/rep-<n>/tasks/<task-id>/` and aggregate stats to
@@ -125,7 +131,7 @@ The `--provider` flag selects how the agent is driven for the whole run:
 |-------------|-------------|
 | `fake`      | A trivial echo provider. Proves the harness plumbing (workspace setup, event capture, oracles, scoring, artifacts) without proving model intelligence. Offline and deterministic. |
 | `golden`    | A scripted provider that replays a canned sequence of tool calls for a specific task (read → edit → run check → observe failure → edit → pass). Catches regressions in tool schemas, event handling, sessions, and command execution. |
-| `anthropic` (or any other name) | A real model provider. **Opt-in only**: requires `CROM_EVAL_LIVE=1` and provider credentials (`ANTHROPIC_API_KEY`). If the opt-in flag or credentials are missing, affected tasks are reported as **skipped**, never failed. Never runs in ordinary CI. |
+| `anthropic` | A real model provider; currently the only accepted live name (any other value is rejected with `unknown provider`). **Opt-in only**: requires `CROM_EVAL_LIVE=1` and provider credentials (`ANTHROPIC_API_KEY`). If the opt-in flag or credentials are missing, affected tasks are reported as **skipped**, never failed. Never runs in ordinary CI. |
 
 Set `CROM_EVAL_MODEL` to override the live model (default
 `claude-sonnet-4-6`).
@@ -139,8 +145,17 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
 - `golden` — tasks with a scripted golden provider sequence.
 - `rust-small` — realistic Rust bug-fix / feature / refactor tasks intended for
   a live provider.
+- `rust-mini` — the M15 Rust slice: the `rust-small` tasks except
+  `golden-rust-recover`, plus `rust-hidden-sum-bug` (hidden verification).
+  Intended for a live provider.
 - `safety` — tasks exercising permission and destructive-command behavior.
+  Passes deterministically under the **fake** provider.
 - `planning` — tasks that require explicit plan-then-act behavior.
+- `repair-smoke` / `repair-mini` — M16 repair-loop tasks scripted for the
+  **golden** provider. `repair-grep-trap` is a negative task: it is expected
+  *not* to resolve (see [Repair loop](#repair-loop-m16)).
+- `private` — tasks with `visibility = "private"`. Excluded from suite
+  selection and `eval list` unless `--include-private` is passed.
 
 ## Adding a new task
 
@@ -295,22 +310,45 @@ Each task gets a structured score in `[0, 1]`, serialised to `score.json`:
 Every run writes a self-contained bundle:
 
 ```text
-target/crom-eval/runs/<run-id>/
-  summary.json
-  summary.md
-  tasks/<task-id>/
-    task.toml          # copy of the manifest
-    prompt.md          # the prompt sent to the agent
-    transcript.jsonl   # conversation-relevant events
-    events.jsonl       # every SDK event
-    final.patch        # unified diff vs the fixture baseline
-    final.diff         # diff --stat summary
-    final_summary.md   # one-page outcome
-    command-output/    # NNN-<cmd>.stdout / .stderr / .status per oracle command
-    score.json
-    report.md
-    workspace/         # the isolated workspace (preserved on success and failure)
+target/crom-eval/
+  index.jsonl              # regression index, one entry per task result
+  runs/<run-id>/
+    run.json               # run metadata (provider, adapter, isolation, flags)
+    summary.json
+    summary.md
+    behavior-summary.json  # behavior metrics aggregated over the run
+    repetitions.json       # only with --repetitions > 1
+    tasks/<task-id>/
+      task.toml            # copy of the manifest
+      normalized-task.json # the task after adapter normalization
+      adapter.json         # adapter that produced the task
+      isolation.json       # isolation backend + settings
+      environment.json     # host/toolchain metadata
+      prompt.md            # the prompt sent to the agent
+      transcript.jsonl     # conversation-relevant events
+      events.jsonl         # every SDK event
+      tool-calls.jsonl     # tool invocations
+      final.patch          # unified diff vs the fixture baseline
+      patch.diff           # same diff, for adapter/benchmark tooling
+      final.diff           # diff --stat summary
+      final_summary.md     # one-page outcome
+      command-output/      # NNN-<cmd>.stdout / .stderr / .status per oracle command
+      public-test.log      # public verification command log
+      hidden-test.log      # hidden verification log (tasks with [hidden])
+      verification.json    # per-check public/hidden verification results
+      behavior.json        # behavior metrics for the task
+      score.json
+      result.json          # the full task result (status, resolved, failure class, …)
+      index-entry.json     # the row appended to index.jsonl
+      report.md
+      triage.md
+      repair.json, repair.md, diagnostics.jsonl, validation-attempts.jsonl
+                           # repair-loop artifacts (--repair enabled)
+      workspace/           # the isolated workspace (preserved on success and failure)
 ```
+
+With `--repetitions k` (k > 1) each repetition writes its own
+`<run-id>/rep-<n>/tasks/<task-id>/` tree.
 
 Each task runs in its own git-initialised workspace; the final patch is the diff
 against the baseline commit.
@@ -323,9 +361,18 @@ offline lane on every push/PR:
 ```console
 cargo test -p crom-eval
 crom eval run --suite smoke --provider fake
+crom eval run --suite golden --provider golden
+crom eval run --suite safety --provider fake
+crom eval run --suite repair-smoke --provider golden --repair enabled --allow-failures
 ```
 
-It uploads the artifact bundle when the smoke suite regresses. Live-provider
+`repair-smoke` runs with `--allow-failures` because `repair-grep-trap` is a
+negative task; the job then asserts from each task's `result.json` that
+`repair-grep-recover` resolved and `repair-grep-trap` did not, with
+`repair.same_error_repeated = true`. Golden Rust tasks run `cargo test` inside
+the fixture, so the job needs a working cargo toolchain.
+
+It uploads the artifact bundle when any offline suite regresses. Live-provider
 evals never run here.
 
 Live evals are available manually via the `Eval (live provider)` workflow
@@ -342,7 +389,8 @@ without the secret, live tasks skip cleanly.
 - Scoring heuristics (patch/process/efficiency) are pragmatic, not calibrated;
   treat sub-scores as signal, not ground truth.
 - Oracle commands run in the host environment, so Rust tasks require a working
-  cargo toolchain (and network for fixtures with external dependencies).
+  cargo toolchain (and network for fixtures with external dependencies; those
+  tasks set `requires_network = true`, e.g. `rust-serde-edge-case`).
 - The workspace is isolated by directory (cwd), **not** by OS sandboxing. Under
   a live provider a task that enables Bash can in principle run commands that
   reach outside the fixture directory. Run live evals with Bash only against
@@ -354,7 +402,7 @@ without the secret, live tasks skip cleanly.
 
 ## Repair loop (M16)
 
-`crom eval run <suite> --repair enabled` turns on the bounded repair loop:
+`crom eval run --suite <suite> --repair enabled` turns on the bounded repair loop:
 failed validations are parsed into structured diagnostics, a targeted repair
 brief drives bounded retries, repeated identical failures are detected and
 stopped, and repair metrics + artifacts (`repair.json`, `repair.md`,

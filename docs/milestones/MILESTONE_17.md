@@ -637,5 +637,22 @@ Filled by #275 (offline) and #297 (live).
 | Item | Value |
 |---|---|
 | Planning commit | `bbff6ab` |
-| Offline baseline commit | _pending #275_ |
+| Offline baseline commit | `d9bd61b` (`main` at the start of #275) |
 | Live baseline | _pending #297_ |
+
+### Offline (L0 harness) baseline — #275
+
+Run on `d9bd61b` plus the #275 changes (docs, CI, and `requires_network` on
+`rust-serde-edge-case`, none of which affect these suites), Linux x86_64,
+rustc 1.99.1. These suites prove harness and tool plumbing, not model
+capability, and are reported separately from L1–L4 results.
+
+| Command | Result |
+|---|---|
+| `crom eval run --suite smoke --provider fake` | 5/5 resolved |
+| `crom eval run --suite golden --provider golden` | 2/2 resolved |
+| `crom eval run --suite safety --provider fake` | 2/2 resolved |
+| `crom eval run --suite repair-smoke --provider golden --repair enabled --allow-failures` | 1/2 resolved, as designed: `repair-grep-recover` resolves; `repair-grep-trap` (negative task) does not, with `failure_class = repeated_same_failure` |
+
+All four run in the CI `eval` job. No git tag has been created for the
+baseline commit.

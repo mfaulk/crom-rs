@@ -107,10 +107,10 @@ The eval harness drives the repair loop on the real runner path. Enable it on a
 run:
 
 ```text
-crom eval run <suite> --repair enabled
-crom eval run <suite> --repair disabled
-crom eval run <suite> --repair-max-attempts 3
-crom eval run <suite> --require-validation-after-edit
+crom eval run --suite <suite> --repair enabled
+crom eval run --suite <suite> --repair disabled
+crom eval run --suite <suite> --repair-max-attempts 3
+crom eval run --suite <suite> --require-validation-after-edit
 ```
 
 Per task/run, the harness writes repair artifacts alongside the existing

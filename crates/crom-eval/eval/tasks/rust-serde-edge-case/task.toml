@@ -14,6 +14,9 @@ keep the existing tests passing.
 
 max_turns = 20
 timeout_secs = 300
+# The fixture depends on serde / serde_json from crates.io, so verification
+# (`cargo test`) needs network access unless the registry is already cached.
+requires_network = true
 
 [capabilities]
 requires_repo_search = true

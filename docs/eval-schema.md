@@ -9,8 +9,9 @@ directory. The harness supports two schema versions:
   visibility, prompt variants, and required/forbidden path policy.
 
 A manifest that omits `schema_version` is treated as v1. Unknown versions are
-rejected unless `--allow-future-schema` is passed. Both versions run through the
-same runner; every v2 field has a default, so v1 manifests parse unchanged.
+rejected; there is no CLI flag to opt into a newer schema. Both versions run
+through the same runner; every v2 field has a default, so v1 manifests parse
+unchanged.
 
 ## Field reference
 
@@ -36,7 +37,7 @@ allowed_tools = ["Read", "Edit", "Bash"]  # empty = all built-in tools
 
 # Path policy (v2).
 required_paths = ["src/lib.rs"]     # must exist after a correct solution
-forbidden_paths = ["Cargo.lock"]    # a change here is a policy violation
+forbidden_paths = ["Cargo.toml", "tests/"]  # a change here is a policy violation
 oracle_patch = "oracle.patch"       # reference solution (validates solvability)
 requires_network = false            # must be true to allow network in verify
 
@@ -97,6 +98,19 @@ kind = "command"
 commands = ["cargo test --test hidden"]
 ```
 
+### Path policy matching
+
+`required_paths` / `forbidden_paths` entries match a changed file by exact
+path, by directory prefix (`tests/`), or by a trailing `*` wildcard
+(`src/gen*`). They are evaluated against `final.patch`, which never contains
+`target/` or the workspace-root `Cargo.lock` (oracle commands regenerate them,
+so the harness excludes them from the diff). A forbidden rule on those paths
+can therefore never fire.
+
+`requires_network = true` is required for any task whose verification needs
+the network — for example a Rust fixture with crates.io dependencies
+(`rust-serde-edge-case`) on a host without a warm registry cache.
+
 ## Hidden verification
 
 `[hidden]` holds checks that run **only after the agent completes**. If
@@ -129,7 +143,7 @@ policy.
 
 ## Repair metrics (M16)
 
-When the repair loop is enabled (`crom eval run <suite> --repair enabled`),
+When the repair loop is enabled (`crom eval run --suite <suite> --repair enabled`),
 each task result carries a `repair` object and the run writes repair artifacts
 (`repair.json`, `repair.md`, `diagnostics.jsonl`, `validation-attempts.jsonl`).
 See [repair-loop.md](repair-loop.md) for the end-to-end flow.
