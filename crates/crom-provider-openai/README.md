@@ -25,10 +25,13 @@ and a one-call constructor:
 let provider = OpenAiProvider::from_config(OpenAiConfig::default(), resolved_credential)?;
 ```
 
-`OpenAiConfig` defaults: `connect_timeout` 30s, `request_timeout` 120s.
-`OpenAiConfig` also carries `max_retries` (default 3): 408/429/5xx
-responses are retried with 250ms·2^n backoff (capped at 30s). Network
-errors, including timeouts, are not retried.
+`OpenAiConfig` defaults: `connect_timeout` 30s, `read_timeout` (idle) 300s,
+`request_timeout` (total) 600s, `max_retries` 3, `retry_base_delay` 250ms.
+Failures map to typed `ProviderError` variants (`Auth`, `InvalidRequest`,
+`RateLimited { retry_after }`, `Timeout`, `Connect`, `ServerError`). 408, 429,
+5xx, connect errors, and timeouts are retried through the shared core policy
+with jittered exponential backoff, honouring `retry-after-ms` / `Retry-After`.
+See [`docs/providers.md`](../../docs/providers.md).
 
 Build with `default-features = false` to drop the reqwest transport and
 supply your own `OpenAiTransport` via `OpenAiProvider::new`.
@@ -40,4 +43,6 @@ Enabled in `crom-sdk` via the `openai` feature (on by default) as
 go through `from_config`.
 
 HTTP-level tests (`tests/http_transport.rs`) run the reqwest transport
-against a `wiremock` server: success, 429, 5xx, and timeout.
+against a `wiremock` server: success, status classification (401/403, 400,
+408, 429 + `Retry-After`, 5xx), connect errors, read/total timeouts, and
+retries (reported through `with_retry_observer`).

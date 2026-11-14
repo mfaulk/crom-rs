@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use crom_auth::SecretString;
+use crom_core::provider_retry::parse_retry_after;
 use crom_core::ProviderError;
 
 use crate::{GeminiTransport, TransportResponse, GEMINI_API_KEY_HEADER};
@@ -16,10 +17,12 @@ pub struct ReqwestGeminiTransport {
 impl ReqwestGeminiTransport {
     pub fn new(
         connect_timeout: Duration,
+        read_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
             .timeout(request_timeout)
             .build()
             .map_err(|e| ProviderError::Other(format!("gemini client build: {e}")))?;
@@ -43,7 +46,7 @@ impl GeminiTransport for ReqwestGeminiTransport {
             .body(body.to_string())
             .send()
             .await
-            .map_err(|e| ProviderError::Http(format!("gemini post: {e}")))?;
+            .map_err(|e| classify_reqwest_error("gemini post", &e))?;
         read_response(resp).await
     }
 
@@ -58,16 +61,36 @@ impl GeminiTransport for ReqwestGeminiTransport {
             .header(GEMINI_API_KEY_HEADER, api_key.expose())
             .send()
             .await
-            .map_err(|e| ProviderError::Http(format!("gemini models: {e}")))?;
+            .map_err(|e| classify_reqwest_error("gemini models", &e))?;
         read_response(resp).await
+    }
+}
+
+fn classify_reqwest_error(context: &str, e: &reqwest::Error) -> ProviderError {
+    let message = format!("{context}: {e}");
+    if e.is_timeout() {
+        ProviderError::Timeout(message)
+    } else if e.is_connect() {
+        ProviderError::Connect(message)
+    } else {
+        ProviderError::Http(message)
     }
 }
 
 async fn read_response(resp: reqwest::Response) -> Result<TransportResponse, ProviderError> {
     let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_retry_after);
     let body = resp
         .text()
         .await
-        .map_err(|e| ProviderError::Http(format!("gemini body: {e}")))?;
-    Ok(TransportResponse { status, body })
+        .map_err(|e| classify_reqwest_error("gemini body", &e))?;
+    Ok(TransportResponse {
+        status,
+        body,
+        retry_after,
+    })
 }

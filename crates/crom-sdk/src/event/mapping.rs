@@ -116,6 +116,10 @@ pub fn redact_event(redactor: &dyn SecretRedactor, mut event: SdkEvent) -> SdkEv
         SdkEvent::Diagnostic(e) => {
             e.diagnostic.message = redactor.redact(&e.diagnostic.message);
         }
+        // Provider error bodies can echo request content.
+        SdkEvent::ProviderRetry(e) => {
+            e.retry.message = redactor.redact(&e.retry.message);
+        }
         SdkEvent::RunFailed(e) => {
             e.message = redactor.redact(&e.message);
             for d in &mut e.diagnostics {

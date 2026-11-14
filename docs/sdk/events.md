@@ -24,6 +24,10 @@ variants:
 - `PatchProposed`, `FileGenerated`
 - `ValidationStarted`, `ValidationCompleted`
 - `Diagnostic`
+- `ProviderRetry` — a transient provider failure is being retried
+  (`provider`, `attempt`, `max_retries`, `delay_ms`, `error_kind`,
+  `message`). `Standard` and `Full` only. See
+  [`../providers.md`](../providers.md#observing-retries).
 - `PlanningStarted`, `PlanCreated`, `PlanApproved`, `ActStarted`
 - `Internal` — opaque wrapper carrying serialized internal `AgentEvent`.
 

@@ -14,6 +14,10 @@ provider, terminal, or storage backend — those are supplied by other crates.
 - **Provider contract** — `ModelProvider`, `ModelRequest`, `ModelEvent`,
   `TokenUsage`. Implemented by `crom-anthropic`,
   `crom-provider-openai`, and `crom-provider-gemini`.
+- **Provider errors & retries** — typed `ProviderError` classification and
+  the shared `provider_retry` policy (`RetryPolicy`, `retry_provider_call`,
+  `with_retry_observer`) used by all three providers. See
+  [`docs/providers.md`](../../docs/providers.md).
 - **Tools** — the `Tool` trait, `ToolRegistry`, and `ToolCatalog` for
   exposing local and MCP tools, including tool-search filtering.
 - **Subagents** — `AgentRegistry`, `AgentDefinition`, and the `SubagentRuntime`

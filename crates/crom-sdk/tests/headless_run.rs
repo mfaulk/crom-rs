@@ -890,3 +890,69 @@ async fn return_only_bash_does_not_touch_real_root() {
         crom_sdk::FilePatch::Modify { path, .. } if path.as_str() == "a.txt"
     )));
 }
+
+/// Fails its first provider call with a connection error, retries through
+/// the shared core retry loop (zero backoff), then answers like the echo
+/// provider.
+struct FlakyOnceProvider;
+
+#[async_trait::async_trait]
+impl crom_core::provider::ModelProvider for FlakyOnceProvider {
+    async fn stream_turn(
+        &self,
+        request: crom_core::provider::ModelRequest,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<crom_core::ModelEvent, crom_core::ProviderError>,
+        >,
+        crom_core::ProviderError,
+    > {
+        let policy = crom_core::RetryPolicy {
+            max_retries: 2,
+            base_delay: Duration::ZERO,
+            ..crom_core::RetryPolicy::default()
+        };
+        let mut calls = 0;
+        crom_core::retry_provider_call("flaky", &policy, || {
+            calls += 1;
+            let first = calls == 1;
+            async move {
+                if first {
+                    Err(crom_core::ProviderError::Connect("refused".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await?;
+        EchoFakeProvider.stream_turn(request).await
+    }
+}
+
+// A provider retry inside a run surfaces as a ProviderRetry SDK event before RunCompleted.
+#[tokio::test]
+async fn provider_retry_is_emitted_as_sdk_event() {
+    let runtime = AgentRuntime::builder()
+        .provider(ProviderConfig::fake(Arc::new(FlakyOnceProvider)))
+        .build()
+        .await
+        .unwrap();
+    let mut handle = runtime.run(AgentRequest::new("hi")).await.unwrap();
+    let mut kinds = Vec::new();
+    while let Some(ev) = handle.events.next().await {
+        match ev.unwrap() {
+            SdkEvent::ProviderRetry(r) => {
+                assert_eq!(r.retry.provider, "flaky");
+                assert_eq!(r.retry.attempt, 1);
+                assert_eq!(r.retry.error_kind, "connect");
+                kinds.push("retry");
+            }
+            SdkEvent::RunCompleted(_) => kinds.push("completed"),
+            _ => {}
+        }
+    }
+    assert_eq!(kinds, vec!["retry", "completed"]);
+    let result = handle.final_result().await.unwrap();
+    assert!(matches!(result.status, AgentRunStatus::Completed));
+}

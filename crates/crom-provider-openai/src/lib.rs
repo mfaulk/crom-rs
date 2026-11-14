@@ -12,8 +12,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use crom_auth::{AuthError, AuthErrorKind, ProviderId, ResolvedCredential, SecretString};
 use crom_core::{
-    AssistantContent, ContentBlock, MessageRole, ModelEvent, ModelProvider, ModelRequest,
-    ProviderError, TokenUsage, ToolCall, ToolResultContent,
+    retry_provider_call, AssistantContent, ContentBlock, MessageRole, ModelEvent, ModelProvider,
+    ModelRequest, ProviderError, RetryPolicy, TokenUsage, ToolCall, ToolResultContent,
 };
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
@@ -49,19 +49,36 @@ pub trait OpenAiTransport: Send + Sync {
 pub struct TransportResponse {
     pub status: u16,
     pub body: String,
+    /// Server back-off hint from `retry-after-ms` / `Retry-After`, if sent.
+    pub retry_after: Option<Duration>,
+}
+
+impl TransportResponse {
+    pub fn new(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+            retry_after: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct OpenAiConfig {
     pub base_url: String,
-    /// Maximum number of retry *attempts* on 408 / 429 / 5xx responses,
-    /// matching the Anthropic provider. Total request attempts = 1 +
-    /// max_retries. Defaults to 3.
+    /// Retries after the first attempt for transient failures (408, 429,
+    /// 5xx, connect errors, timeouts). Total attempts = 1 + max_retries.
     pub max_retries: u32,
-    /// TCP connect timeout for the built-in reqwest transport. Defaults to 30s.
+    /// Backoff before the first retry; doubles per retry (jittered, capped
+    /// at 30s). A server `Retry-After` hint raises it.
+    pub retry_base_delay: Duration,
+    /// TCP connect timeout for the built-in reqwest transport.
     pub connect_timeout: Duration,
-    /// Whole-request timeout for the built-in reqwest transport. Defaults to
-    /// 120s; without it a stalled non-streaming endpoint hangs the agent.
+    /// Idle timeout: maximum gap between bytes received, including the wait
+    /// for response headers on this non-streaming endpoint.
+    pub read_timeout: Duration,
+    /// Whole-request timeout, a backstop so a stalled endpoint cannot hang
+    /// the agent. Sized for slow reasoning models.
     pub request_timeout: Duration,
 }
 
@@ -70,8 +87,20 @@ impl Default for OpenAiConfig {
         Self {
             base_url: DEFAULT_BASE.into(),
             max_retries: 3,
+            retry_base_delay: Duration::from_millis(250),
             connect_timeout: Duration::from_secs(30),
-            request_timeout: Duration::from_secs(120),
+            read_timeout: Duration::from_secs(300),
+            request_timeout: Duration::from_secs(600),
+        }
+    }
+}
+
+impl OpenAiConfig {
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
+            max_retries: self.max_retries,
+            base_delay: self.retry_base_delay,
+            ..RetryPolicy::default()
         }
     }
 }
@@ -103,7 +132,11 @@ impl OpenAiProvider {
         cfg: OpenAiConfig,
         credential: ResolvedCredential,
     ) -> Result<Self, ProviderError> {
-        let transport = ReqwestOpenAiTransport::new(cfg.connect_timeout, cfg.request_timeout)?;
+        let transport = ReqwestOpenAiTransport::new(
+            cfg.connect_timeout,
+            cfg.read_timeout,
+            cfg.request_timeout,
+        )?;
         Ok(Self::new(
             cfg,
             Arc::new(transport),
@@ -115,17 +148,13 @@ impl OpenAiProvider {
         let cred = (self.credential)();
         let key = require_api_key(&cred)?;
         let url = format!("{}/v1/models", self.cfg.base_url);
-        let resp = self.transport.list_models(&url, &key).await?;
-        if resp.status >= 200 && resp.status < 300 {
-            let parsed: ModelsList = serde_json::from_str(&resp.body)
-                .map_err(|e| ProviderError::InvalidResponse(format!("models: {e}")))?;
-            Ok(parsed.data.into_iter().map(|m| m.id).collect())
-        } else {
-            Err(ProviderError::Http(format!(
-                "models: status {}",
-                resp.status
-            )))
-        }
+        let resp = check_status(
+            "openai models",
+            self.transport.list_models(&url, &key).await?,
+        )?;
+        let parsed: ModelsList = serde_json::from_str(&resp.body)
+            .map_err(|e| ProviderError::InvalidResponse(format!("models: {e}")))?;
+        Ok(parsed.data.into_iter().map(|m| m.id).collect())
     }
 }
 
@@ -140,34 +169,11 @@ impl ModelProvider for OpenAiProvider {
         let url = format!("{}/v1/chat/completions", self.cfg.base_url);
         let body = serde_json::to_string(&build_body(&request))
             .map_err(|e| ProviderError::Other(format!("encode body: {e}")))?;
-        let max_retries = self.cfg.max_retries;
-
-        // Retry on 408 / 429 / 5xx with exponential backoff, mirroring the
-        // Anthropic provider. Without this a single transient rate-limit
-        // kills the turn even though the request would succeed on retry.
-        //
-        // Scope: we retry status-shaped failures only. Network-shaped
-        // failures (connect timeout, body-read error) come back through
-        // the trait as `ProviderError::Http` without retryable structure,
-        // so they propagate immediately — matching pre-fix behavior. A
-        // follow-up could distinguish them by extending the transport
-        // error type or moving retry into the reqwest backend, where
-        // `reqwest::Error::{is_timeout,is_connect}` is still available.
-        let mut attempt: u32 = 0;
-        let resp = loop {
+        let resp = retry_provider_call("openai", &self.cfg.retry_policy(), || async {
             let r = self.transport.post_chat(&url, &key, &body).await?;
-            if (200..300).contains(&r.status) {
-                break r;
-            }
-            if !is_retryable_status(r.status) || attempt >= max_retries {
-                return Err(ProviderError::Http(format!(
-                    "openai: status {}: {}",
-                    r.status, r.body
-                )));
-            }
-            attempt += 1;
-            backoff(attempt).await;
-        };
+            check_status("openai", r)
+        })
+        .await?;
 
         let parsed: ChatResponse = serde_json::from_str(&resp.body)
             .map_err(|e| ProviderError::InvalidResponse(format!("openai chat response: {e}")))?;
@@ -176,20 +182,18 @@ impl ModelProvider for OpenAiProvider {
     }
 }
 
-fn is_retryable_status(status: u16) -> bool {
-    status == 408 || status == 429 || (500..=599).contains(&status)
-}
-
-/// 250ms * 2^attempt, capped at 30s. Pure: split out from `backoff` so
-/// tests can advance virtual time deterministically with
-/// `tokio::time::pause`, matching the Anthropic provider's curve.
-fn retry_delay(attempt: u32) -> std::time::Duration {
-    let ms = 250u64.saturating_mul(1u64 << attempt.min(7)).min(30_000);
-    std::time::Duration::from_millis(ms)
-}
-
-async fn backoff(attempt: u32) {
-    tokio::time::sleep(retry_delay(attempt)).await;
+/// Pass a 2xx response through; classify anything else into a typed error.
+fn check_status(context: &str, r: TransportResponse) -> Result<TransportResponse, ProviderError> {
+    if (200..300).contains(&r.status) {
+        Ok(r)
+    } else {
+        Err(ProviderError::from_status(
+            context,
+            r.status,
+            &r.body,
+            r.retry_after,
+        ))
+    }
 }
 
 fn require_api_key(cred: &ResolvedCredential) -> Result<SecretString, ProviderError> {
@@ -503,10 +507,7 @@ mod tests {
                 return Ok(queue.remove(0));
             }
             drop(queue);
-            Ok(self.chat_response.clone().unwrap_or(TransportResponse {
-                status: 200,
-                body: r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#.into(),
-            }))
+            Ok(self.chat_response.clone().unwrap_or(TransportResponse::new(200, r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#)))
         }
 
         async fn list_models(
@@ -514,10 +515,13 @@ mod tests {
             _url: &str,
             _api_key: &SecretString,
         ) -> Result<TransportResponse, ProviderError> {
-            Ok(self.models_response.clone().unwrap_or(TransportResponse {
-                status: 200,
-                body: r#"{"data":[{"id":"gpt-4.1"},{"id":"gpt-4o"}]}"#.into(),
-            }))
+            Ok(self
+                .models_response
+                .clone()
+                .unwrap_or(TransportResponse::new(
+                    200,
+                    r#"{"data":[{"id":"gpt-4.1"},{"id":"gpt-4o"}]}"#,
+                )))
         }
     }
 
@@ -629,10 +633,7 @@ mod tests {
             }]
         }"#;
         let transport = Arc::new(MockTransport {
-            chat_response: Some(TransportResponse {
-                status: 200,
-                body: chat_body.into(),
-            }),
+            chat_response: Some(TransportResponse::new(200, chat_body)),
             ..Default::default()
         });
         let provider = OpenAiProvider::new(
@@ -727,20 +728,6 @@ mod tests {
         assert!(!s.contains("\"type\":\"tool_result\""));
     }
 
-    /// The `retry_delay` curve is exactly `250ms * 2^attempt`, capped
-    /// at 30s. This locks in the schedule independently of any test
-    /// that exercises `stream_turn` under paused time.
-    #[test]
-    fn retry_delay_curve_matches_anthropic() {
-        use std::time::Duration;
-        assert_eq!(retry_delay(0), Duration::from_millis(250));
-        assert_eq!(retry_delay(1), Duration::from_millis(500));
-        assert_eq!(retry_delay(2), Duration::from_millis(1_000));
-        assert_eq!(retry_delay(3), Duration::from_millis(2_000));
-        // Cap kicks in at ~30s.
-        assert_eq!(retry_delay(20), Duration::from_millis(30_000));
-    }
-
     fn req(model: &str) -> ModelRequest {
         ModelRequest {
             model: model.into(),
@@ -760,14 +747,8 @@ mod tests {
     async fn stream_turn_retries_on_429_then_succeeds() {
         let transport = Arc::new(MockTransport::default());
         transport.chat_queue.lock().unwrap().extend(vec![
-            TransportResponse {
-                status: 429,
-                body: r#"{"error":{"message":"rate limited"}}"#.into(),
-            },
-            TransportResponse {
-                status: 200,
-                body: r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#.into(),
-            },
+            TransportResponse::new(429, r#"{"error":{"message":"rate limited"}}"#),
+            TransportResponse::new(200, r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#),
         ]);
         let provider = OpenAiProvider::new(
             OpenAiConfig::default(),
@@ -795,14 +776,11 @@ mod tests {
     async fn stream_turn_retries_on_503_then_succeeds() {
         let transport = Arc::new(MockTransport::default());
         transport.chat_queue.lock().unwrap().extend(vec![
-            TransportResponse {
-                status: 503,
-                body: "service unavailable".into(),
-            },
-            TransportResponse {
-                status: 200,
-                body: r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#.into(),
-            },
+            TransportResponse::new(503, "service unavailable"),
+            TransportResponse::new(
+                200,
+                r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            ),
         ]);
         let provider = OpenAiProvider::new(
             OpenAiConfig::default(),
@@ -826,17 +804,17 @@ mod tests {
             .chat_queue
             .lock()
             .unwrap()
-            .push(TransportResponse {
-                status: 400,
-                body: r#"{"error":"bad request"}"#.into(),
-            });
+            .push(TransportResponse::new(400, r#"{"error":"bad request"}"#));
         let provider = OpenAiProvider::new(
             OpenAiConfig::default(),
             transport.clone(),
             Arc::new(|| cred("sk-1")),
         );
         let result = provider.stream_turn(req("gpt-4.1")).await;
-        assert!(matches!(result, Err(ProviderError::Http(_))));
+        assert!(matches!(
+            result,
+            Err(ProviderError::InvalidRequest { status: 400, .. })
+        ));
         assert_eq!(
             transport
                 .chat_call_count
@@ -854,10 +832,7 @@ mod tests {
                 .chat_queue
                 .lock()
                 .unwrap()
-                .push(TransportResponse {
-                    status: 429,
-                    body: "rate limited".into(),
-                });
+                .push(TransportResponse::new(429, "rate limited"));
         }
         let provider = OpenAiProvider::new(
             OpenAiConfig {
@@ -868,7 +843,7 @@ mod tests {
             Arc::new(|| cred("sk-1")),
         );
         let result = provider.stream_turn(req("gpt-4.1")).await;
-        assert!(matches!(result, Err(ProviderError::Http(_))));
+        assert!(matches!(result, Err(ProviderError::RateLimited { .. })));
         // 1 initial attempt + 2 retries = 3 total.
         assert_eq!(
             transport

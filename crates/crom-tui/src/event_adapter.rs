@@ -164,6 +164,19 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
             body: vec![preview(&d.diagnostic.message, 240)],
             ..Default::default()
         }),
+        SdkEvent::ProviderRetry(r) => SdkEventOutcome::with_card(EventCard {
+            kind: "provider_retry",
+            headline: format!(
+                "↻ {} retry {}/{} in {}ms ({})",
+                r.retry.provider,
+                r.retry.attempt,
+                r.retry.max_retries,
+                r.retry.delay_ms,
+                r.retry.error_kind
+            ),
+            body: vec![preview(&r.retry.message, 240)],
+            ..Default::default()
+        }),
         SdkEvent::RunCompleted(e) => SdkEventOutcome {
             card: Some(EventCard {
                 kind: "run_completed",
@@ -268,6 +281,26 @@ mod tests {
         let out = map_sdk_event(&ev);
         assert!(out.card.is_none());
         assert_eq!(out.coalesce_assistant_delta.as_deref(), Some("partial"));
+    }
+
+    #[test]
+    // ProviderRetry renders a provider_retry card naming provider, attempt, and error kind.
+    fn provider_retry_card() {
+        let ev = SdkEvent::ProviderRetry(crom_sdk::event::ProviderRetryEvent {
+            run_id: rid(),
+            retry: crom_core::ProviderRetry {
+                provider: "openai".into(),
+                attempt: 2,
+                max_retries: 3,
+                delay_ms: 500,
+                error_kind: "rate_limited".into(),
+                message: "slow down".into(),
+            },
+        });
+        let card = map_sdk_event(&ev).card.unwrap();
+        assert_eq!(card.kind, "provider_retry");
+        assert!(card.headline.contains("openai retry 2/3"));
+        assert!(card.headline.contains("rate_limited"));
     }
 
     #[test]
