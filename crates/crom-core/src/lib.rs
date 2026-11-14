@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod errors;
 pub mod events;
 pub mod hooks;
+pub mod legacy;
 pub mod mcp;
 pub mod options;
 pub mod permission;

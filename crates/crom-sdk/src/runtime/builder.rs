@@ -262,17 +262,39 @@ async fn materialize_provider(
             "provider.feature_disabled",
             "anthropic feature is disabled",
         )),
+        #[cfg(feature = "openai")]
+        ProviderConfig::OpenAiApiKey { api_key, base_url } => {
+            let mut cfg = crom_provider_openai::OpenAiConfig::default();
+            if let Some(url) = base_url {
+                cfg.base_url = url;
+            }
+            let credential = api_key_credential(ProviderId::OpenAi, api_key);
+            let provider = crom_provider_openai::OpenAiProvider::from_config(cfg, credential)
+                .map_err(|e| AgentSdkError::provider("provider.init_failed", e.to_string()))?;
+            let provider: Arc<dyn ModelProvider> = Arc::new(provider);
+            Ok((provider, "gpt-4.1"))
+        }
+        #[cfg(not(feature = "openai"))]
         ProviderConfig::OpenAiApiKey { .. } => Err(AgentSdkError::invalid_request(
-            "provider.openai_not_wired",
-            "OpenAI provider needs a transport + credential factory; wrap your \
-             OpenAiProvider into ProviderConfig::External and pass the resolved \
-             credential explicitly",
+            "provider.feature_disabled",
+            "openai feature is disabled",
         )),
+        #[cfg(feature = "gemini")]
+        ProviderConfig::GeminiApiKey { api_key, base_url } => {
+            let mut cfg = crom_provider_gemini::GeminiConfig::default();
+            if let Some(url) = base_url {
+                cfg.base_url = url;
+            }
+            let credential = api_key_credential(ProviderId::Gemini, api_key);
+            let provider = crom_provider_gemini::GeminiProvider::from_config(cfg, credential)
+                .map_err(|e| AgentSdkError::provider("provider.init_failed", e.to_string()))?;
+            let provider: Arc<dyn ModelProvider> = Arc::new(provider);
+            Ok((provider, "gemini-1.5-pro"))
+        }
+        #[cfg(not(feature = "gemini"))]
         ProviderConfig::GeminiApiKey { .. } => Err(AgentSdkError::invalid_request(
-            "provider.gemini_not_wired",
-            "Gemini provider needs a transport + credential factory; wrap your \
-             GeminiProvider into ProviderConfig::External and pass the resolved \
-             credential explicitly",
+            "provider.feature_disabled",
+            "gemini feature is disabled",
         )),
         ProviderConfig::OAuthCredential { .. } => Err(AgentSdkError::invalid_request(
             "provider.oauth_not_wired",
@@ -289,6 +311,20 @@ async fn materialize_provider(
     }
 }
 
+/// SDK-injected keys are explicit caller input, so they are tagged with the
+/// same `Cli` source the CLI uses for `--api-key`.
+#[cfg(any(feature = "openai", feature = "gemini"))]
+fn api_key_credential(
+    provider: ProviderId,
+    key: crate::provider::SecretString,
+) -> crom_auth::ResolvedCredential {
+    crom_auth::ResolvedCredential::ApiKey {
+        provider,
+        source: crom_auth::CredentialSource::Cli,
+        key,
+    }
+}
+
 // Verify `ProviderId` is in scope.
 #[allow(dead_code)]
 fn _provider_id(_p: ProviderId) {}
@@ -296,9 +332,9 @@ fn _provider_id(_p: ProviderId) {}
 #[cfg(all(test, feature = "fake-provider"))]
 mod tests {
     //! Builder validation beyond `builder_without_provider_fails`: the
-    //! `materialize_provider` branches that reject not-yet-wired provider
-    //! configs (OpenAI/Gemini/OAuth/FromAuthStore) with a stable error code,
-    //! the External/Fake success branches and their default model ids, and
+    //! `materialize_provider` branches for OpenAI/Gemini API keys, the
+    //! still-unwired FromAuthStore rejection, the
+    //! External/Fake success branches and their default model ids, and
     //! the explicit-model-override-wins rule.
 
     use super::*;
@@ -368,24 +404,68 @@ mod tests {
         );
     }
 
-    // OpenAI API-key config is not wired through the SDK builder yet and must
-    // fail with a stable, specific InvalidRequest code (not a panic / generic
-    // error) so callers can branch on it.
+    // An OpenAI API-key config builds a real HTTP-backed provider (no
+    // External wrapper needed) and defaults to the starter OpenAI model.
+    #[cfg(feature = "openai")]
     #[tokio::test]
-    async fn openai_api_key_not_wired() {
+    async fn openai_api_key_builds() {
+        let rt = AgentRuntime::builder()
+            .provider(ProviderConfig::OpenAiApiKey {
+                api_key: secret("sk-test"),
+                base_url: Some("http://127.0.0.1:9".into()),
+            })
+            .build()
+            .await
+            .expect("openai provider builds");
+        assert_eq!(rt.default_model(), "gpt-4.1");
+        assert_eq!(rt.provider_id().as_str(), "openai");
+    }
+
+    // A Gemini API-key config builds a real HTTP-backed provider and
+    // defaults to the starter Gemini model.
+    #[cfg(feature = "gemini")]
+    #[tokio::test]
+    async fn gemini_api_key_builds() {
+        let rt = AgentRuntime::builder()
+            .provider(ProviderConfig::gemini_api_key(secret("g-test")))
+            .build()
+            .await
+            .expect("gemini provider builds");
+        assert_eq!(rt.default_model(), "gemini-1.5-pro");
+        assert_eq!(rt.provider_id().as_str(), "gemini");
+    }
+
+    // FromAuthStore is still opt-in/unwired and rejected with a stable code.
+    #[tokio::test]
+    async fn from_auth_store_not_wired() {
         assert_invalid_request(
-            ProviderConfig::openai_api_key(secret("sk-test")),
-            "provider.openai_not_wired",
+            ProviderConfig::FromAuthStore {
+                provider: ProviderId::OpenAi,
+                account: None,
+            },
+            "provider.auth_store_disabled",
         )
         .await;
     }
 
-    // Gemini API-key config: same not-wired contract.
+    // With the openai feature off, the config is rejected with a stable code.
+    #[cfg(not(feature = "openai"))]
     #[tokio::test]
-    async fn gemini_api_key_not_wired() {
+    async fn openai_api_key_feature_disabled() {
+        assert_invalid_request(
+            ProviderConfig::openai_api_key(secret("sk-test")),
+            "provider.feature_disabled",
+        )
+        .await;
+    }
+
+    // With the gemini feature off, the config is rejected with a stable code.
+    #[cfg(not(feature = "gemini"))]
+    #[tokio::test]
+    async fn gemini_api_key_feature_disabled() {
         assert_invalid_request(
             ProviderConfig::gemini_api_key(secret("g-test")),
-            "provider.gemini_not_wired",
+            "provider.feature_disabled",
         )
         .await;
     }

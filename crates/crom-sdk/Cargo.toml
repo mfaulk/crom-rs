@@ -8,7 +8,7 @@ rust-version.workspace = true
 description = "Embeddable headless Rust SDK for crom."
 
 [features]
-default = ["filesystem-workspace", "in-memory-workspace", "anthropic", "planning"]
+default = ["filesystem-workspace", "in-memory-workspace", "anthropic", "openai", "gemini", "planning"]
 
 # Core feature flags
 filesystem-workspace = []

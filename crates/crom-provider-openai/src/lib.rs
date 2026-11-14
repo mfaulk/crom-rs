@@ -7,6 +7,7 @@
 //! time so credential storage stays out of the hot path.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use crom_auth::{AuthError, AuthErrorKind, ProviderId, ResolvedCredential, SecretString};
@@ -19,6 +20,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const DEFAULT_BASE: &str = "https://api.openai.com";
+
+#[cfg(feature = "http")]
+mod http;
+#[cfg(feature = "http")]
+pub use http::ReqwestOpenAiTransport;
 
 /// Minimal HTTP transport: separate from the auth crate's transport so
 /// model providers can use streaming response bodies later. Tests use a
@@ -52,6 +58,11 @@ pub struct OpenAiConfig {
     /// matching the Anthropic provider. Total request attempts = 1 +
     /// max_retries. Defaults to 3.
     pub max_retries: u32,
+    /// TCP connect timeout for the built-in reqwest transport. Defaults to 30s.
+    pub connect_timeout: Duration,
+    /// Whole-request timeout for the built-in reqwest transport. Defaults to
+    /// 120s; without it a stalled non-streaming endpoint hangs the agent.
+    pub request_timeout: Duration,
 }
 
 impl Default for OpenAiConfig {
@@ -59,6 +70,8 @@ impl Default for OpenAiConfig {
         Self {
             base_url: DEFAULT_BASE.into(),
             max_retries: 3,
+            connect_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -81,6 +94,21 @@ impl OpenAiProvider {
             transport,
             credential,
         }
+    }
+
+    /// Build a provider backed by the reqwest transport, using `cfg`'s
+    /// timeouts and a fixed credential.
+    #[cfg(feature = "http")]
+    pub fn from_config(
+        cfg: OpenAiConfig,
+        credential: ResolvedCredential,
+    ) -> Result<Self, ProviderError> {
+        let transport = ReqwestOpenAiTransport::new(cfg.connect_timeout, cfg.request_timeout)?;
+        Ok(Self::new(
+            cfg,
+            Arc::new(transport),
+            Arc::new(move || credential.clone()),
+        ))
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>, ProviderError> {

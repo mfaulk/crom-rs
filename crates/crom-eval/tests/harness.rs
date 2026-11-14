@@ -133,3 +133,39 @@ async fn run_summary_is_written() {
     assert!(run.summary_json_path().exists());
     assert!(run.summary_md_path().exists());
 }
+
+/// Returns true when a fixture's `Cargo.toml` declares any registry dependency.
+fn fixture_has_dependencies(task: &EvalTask) -> bool {
+    let Some(rel) = &task.fixture.path else {
+        return false;
+    };
+    let Ok(manifest) = std::fs::read_to_string(task.dir.join(rel).join("Cargo.toml")) else {
+        return false;
+    };
+    let mut in_deps = false;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_deps = matches!(
+                line,
+                "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]"
+            );
+        } else if in_deps && !line.is_empty() && !line.starts_with('#') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every task whose Rust fixture pulls crates.io dependencies declares `requires_network = true`.
+#[test]
+fn fixtures_with_registry_dependencies_require_network() {
+    let offenders: Vec<String> = load_all()
+        .iter()
+        .filter(|t| fixture_has_dependencies(t) && !t.requires_network)
+        .map(|t| t.id.clone())
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "tasks with external dependencies must set requires_network = true: {offenders:?}"
+    );
+}

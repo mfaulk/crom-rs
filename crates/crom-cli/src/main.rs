@@ -5359,40 +5359,20 @@ fn resolve_active_provider(cfg: &ResolvedRunConfig) -> String {
 
 fn build_openai_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
     let cred = resolve_runtime_credential(cfg, crom_auth::ProviderId::OpenAi)?;
-    let transport: Arc<dyn crom_provider_openai::OpenAiTransport> =
-        Arc::new(ReqwestOpenAiTransport::new()?);
-    let cred_arc = std::sync::Arc::new(parking_lot_compat::Mutex::new(Some(cred)));
-    let factory = move || {
-        cred_arc
-            .lock()
-            .as_ref()
-            .cloned()
-            .unwrap_or(crom_auth::ResolvedCredential::None)
-    };
-    Ok(Arc::new(crom_provider_openai::OpenAiProvider::new(
+    let provider = crom_provider_openai::OpenAiProvider::from_config(
         crom_provider_openai::OpenAiConfig::default(),
-        transport,
-        Arc::new(factory),
-    )) as Arc<dyn ModelProvider>)
+        cred,
+    )?;
+    Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
 }
 
 fn build_gemini_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
     let cred = resolve_runtime_credential(cfg, crom_auth::ProviderId::Gemini)?;
-    let transport: Arc<dyn crom_provider_gemini::GeminiTransport> =
-        Arc::new(ReqwestGeminiTransport::new()?);
-    let cred_arc = std::sync::Arc::new(parking_lot_compat::Mutex::new(Some(cred)));
-    let factory = move || {
-        cred_arc
-            .lock()
-            .as_ref()
-            .cloned()
-            .unwrap_or(crom_auth::ResolvedCredential::None)
-    };
-    Ok(Arc::new(crom_provider_gemini::GeminiProvider::new(
+    let provider = crom_provider_gemini::GeminiProvider::from_config(
         crom_provider_gemini::GeminiConfig::default(),
-        transport,
-        Arc::new(factory),
-    )) as Arc<dyn ModelProvider>)
+        cred,
+    )?;
+    Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
 }
 
 /// Tiny, fully-offline ModelProvider that streams a one-line acknowledgement
@@ -5520,164 +5500,6 @@ impl std::error::Error for CredentialResolveErrorKind {}
 fn is_not_logged_in_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<CredentialResolveErrorKind>()
         .is_some_and(|k| k.0 == crom_auth::AuthErrorKind::NotLoggedIn)
-}
-
-/// Drop-in `Mutex` shim so the closure above doesn't pull in `parking_lot`.
-/// Wraps `std::sync::Mutex` with `lock()` returning the guard directly so
-/// it composes with the `move` closure.
-mod parking_lot_compat {
-    pub struct Mutex<T>(std::sync::Mutex<T>);
-    impl<T> Mutex<T> {
-        pub fn new(t: T) -> Self {
-            Self(std::sync::Mutex::new(t))
-        }
-        pub fn lock(&self) -> std::sync::MutexGuard<'_, T> {
-            self.0.lock().unwrap_or_else(|e| e.into_inner())
-        }
-    }
-}
-
-/// Minimal `reqwest`-backed OpenAI transport. Streaming is left for a
-/// follow-up — the chat endpoint returns a complete payload that we
-/// then chunk into `ModelEvent`s.
-struct ReqwestOpenAiTransport {
-    client: reqwest::Client,
-}
-
-impl ReqwestOpenAiTransport {
-    fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(StdDuration::from_secs(30))
-            // 120s overall request timeout matches the Anthropic read budget;
-            // without it a stalled non-streaming endpoint hangs the agent forever.
-            .timeout(StdDuration::from_secs(120))
-            .build()
-            .context("openai client build")?;
-        Ok(Self { client })
-    }
-}
-
-#[async_trait::async_trait]
-impl crom_provider_openai::OpenAiTransport for ReqwestOpenAiTransport {
-    async fn post_chat(
-        &self,
-        url: &str,
-        api_key: &crom_auth::SecretString,
-        body: &str,
-    ) -> std::result::Result<crom_provider_openai::TransportResponse, crom_core::ProviderError>
-    {
-        let resp = self
-            .client
-            .post(url)
-            .bearer_auth(api_key.expose())
-            .header("content-type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| crom_core::ProviderError::Http(format!("openai post: {e}")))?;
-        let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| crom_core::ProviderError::Http(format!("openai body: {e}")))?;
-        Ok(crom_provider_openai::TransportResponse { status, body: text })
-    }
-
-    async fn list_models(
-        &self,
-        url: &str,
-        api_key: &crom_auth::SecretString,
-    ) -> std::result::Result<crom_provider_openai::TransportResponse, crom_core::ProviderError>
-    {
-        let resp = self
-            .client
-            .get(url)
-            .bearer_auth(api_key.expose())
-            .send()
-            .await
-            .map_err(|e| crom_core::ProviderError::Http(format!("openai models: {e}")))?;
-        let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| crom_core::ProviderError::Http(format!("openai body: {e}")))?;
-        Ok(crom_provider_openai::TransportResponse { status, body: text })
-    }
-}
-
-/// Minimal `reqwest`-backed Gemini transport. The API key is sent via
-/// the `x-goog-api-key` request header rather than `?key=<API_KEY>` so
-/// it does not leak into URL-shaped surfaces (logs, traces, panic
-/// backtraces, reqwest debug output).
-struct ReqwestGeminiTransport {
-    client: reqwest::Client,
-}
-
-impl ReqwestGeminiTransport {
-    fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(StdDuration::from_secs(30))
-            // 120s overall request timeout matches the Anthropic read budget;
-            // without it a stalled non-streaming endpoint hangs the agent forever.
-            .timeout(StdDuration::from_secs(120))
-            .build()
-            .context("gemini client build")?;
-        Ok(Self { client })
-    }
-}
-
-#[async_trait::async_trait]
-impl crom_provider_gemini::GeminiTransport for ReqwestGeminiTransport {
-    async fn post_generate(
-        &self,
-        url: &str,
-        api_key: &crom_auth::SecretString,
-        body: &str,
-    ) -> std::result::Result<crom_provider_gemini::TransportResponse, crom_core::ProviderError>
-    {
-        let resp = self
-            .client
-            .post(url)
-            .header(
-                crom_provider_gemini::GEMINI_API_KEY_HEADER,
-                api_key.expose(),
-            )
-            .header("content-type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| crom_core::ProviderError::Http(format!("gemini post: {e}")))?;
-        let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| crom_core::ProviderError::Http(format!("gemini body: {e}")))?;
-        Ok(crom_provider_gemini::TransportResponse { status, body: text })
-    }
-
-    async fn list_models(
-        &self,
-        url: &str,
-        api_key: &crom_auth::SecretString,
-    ) -> std::result::Result<crom_provider_gemini::TransportResponse, crom_core::ProviderError>
-    {
-        let resp = self
-            .client
-            .get(url)
-            .header(
-                crom_provider_gemini::GEMINI_API_KEY_HEADER,
-                api_key.expose(),
-            )
-            .send()
-            .await
-            .map_err(|e| crom_core::ProviderError::Http(format!("gemini models: {e}")))?;
-        let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| crom_core::ProviderError::Http(format!("gemini body: {e}")))?;
-        Ok(crom_provider_gemini::TransportResponse { status, body: text })
-    }
 }
 
 async fn load_agents_md(cwd: &Path) -> Option<String> {

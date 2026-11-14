@@ -5,6 +5,7 @@
 //! tests), and normalizes the response into `ModelEvent`s.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use crom_auth::{ProviderId, ResolvedCredential, SecretString};
@@ -24,6 +25,11 @@ const DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com";
 /// Exported so transport implementations can reference the canonical
 /// name rather than duplicating the literal.
 pub const GEMINI_API_KEY_HEADER: &str = "x-goog-api-key";
+
+#[cfg(feature = "http")]
+mod http;
+#[cfg(feature = "http")]
+pub use http::ReqwestGeminiTransport;
 
 #[async_trait]
 pub trait GeminiTransport: Send + Sync {
@@ -50,12 +56,19 @@ pub struct TransportResponse {
 #[derive(Debug, Clone)]
 pub struct GeminiConfig {
     pub base_url: String,
+    /// TCP connect timeout for the built-in reqwest transport. Defaults to 30s.
+    pub connect_timeout: Duration,
+    /// Whole-request timeout for the built-in reqwest transport. Defaults to
+    /// 120s; without it a stalled non-streaming endpoint hangs the agent.
+    pub request_timeout: Duration,
 }
 
 impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE.into(),
+            connect_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -77,6 +90,21 @@ impl GeminiProvider {
             transport,
             credential,
         }
+    }
+
+    /// Build a provider backed by the reqwest transport, using `cfg`'s
+    /// timeouts and a fixed credential.
+    #[cfg(feature = "http")]
+    pub fn from_config(
+        cfg: GeminiConfig,
+        credential: ResolvedCredential,
+    ) -> Result<Self, ProviderError> {
+        let transport = ReqwestGeminiTransport::new(cfg.connect_timeout, cfg.request_timeout)?;
+        Ok(Self::new(
+            cfg,
+            Arc::new(transport),
+            Arc::new(move || credential.clone()),
+        ))
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
