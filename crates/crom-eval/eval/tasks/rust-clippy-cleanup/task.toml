@@ -1,4 +1,8 @@
-schema_version = 2
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "none"
 id = "rust-clippy-cleanup"
 title = "Make the code pass clippy with -D warnings"
 category = "refactor"
@@ -29,3 +33,9 @@ clippy = true
 [[oracle.behavior]]
 kind = "must_run_command"
 command_contains = "clippy"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"

@@ -144,6 +144,16 @@ jobs:
       # not set here.
       - name: Eval harness unit + integration tests
         run: cargo test --locked -p crom-eval
+      # Model-free task validation. Capability tasks must have hidden
+      # verification and a reference that passes it (schema v3, #285);
+      # rust-small/rust-mini are not listed until their remaining capability
+      # tasks gain hidden tests + references.
+      - name: Validate offline suites and capability tasks
+        run: |
+          for suite in smoke golden safety repair-smoke; do
+            cargo run --locked -p crom-cli -- eval validate-suite "$suite"
+          done
+          cargo run --locked -p crom-cli -- eval validate-task rust-hidden-sum-bug
       - name: Eval smoke suite (fake provider)
         run: cargo run --locked -p crom-cli -- eval run --suite smoke --provider fake
       - name: Eval golden suite (golden provider)

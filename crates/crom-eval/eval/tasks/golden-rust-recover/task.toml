@@ -1,3 +1,8 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
 id = "golden-rust-recover"
 title = "Golden: fix a failing Rust test and re-run cargo"
 tags = ["golden", "rust", "recovery", "small"]
@@ -26,3 +31,9 @@ tool = "Edit"
 [[oracle.behavior]]
 kind = "must_run_command"
 command_contains = "cargo test"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"

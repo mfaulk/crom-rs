@@ -1,4 +1,8 @@
-schema_version = 2
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "registry"
 id = "rust-serde-edge-case"
 title = "Fix a JSON deserialization edge case"
 category = "bugfix"
@@ -38,3 +42,9 @@ text = "default"
 [[oracle.behavior]]
 kind = "must_run_command"
 command_contains = "cargo test"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"

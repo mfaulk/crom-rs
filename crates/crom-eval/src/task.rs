@@ -10,8 +10,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{
-    default_schema_version, validate_schema_version, BehaviorRules, Capabilities, HiddenSpec,
-    PromptVariants, Quarantine, Visibility,
+    default_schema_version, validate_schema_version, BehaviorRules, Capabilities, ExpectedOutcome,
+    HiddenSpec, Level, NetworkPolicy, PromptVariants, Provenance, Quarantine, ReferenceKind,
+    TaskKind, TaskLimits, Visibility,
 };
 
 /// A resolved, ready-to-run evaluation task.
@@ -64,6 +65,22 @@ pub struct EvalTask {
     pub oracle_patch: Option<String>,
     /// Whether the task legitimately requires network access during verify.
     pub requires_network: bool,
+
+    // --- M17 schema v3 additions (None/default for v1/v2 manifests) ---
+    /// Task content version (`MAJOR.MINOR.PATCH`); bumped on any prompt,
+    /// fixture, or oracle change so results are only compared like-for-like.
+    pub task_version: Option<String>,
+    pub level: Option<Level>,
+    pub kind: Option<TaskKind>,
+    pub provenance: Option<Provenance>,
+    /// Declared limits (`wall_secs`/`max_turns` are already folded into
+    /// `timeout`/`max_turns`).
+    pub limits: TaskLimits,
+    pub network: Option<NetworkPolicy>,
+    /// Rust toolchain pin (e.g. `1.88.0`, `stable`).
+    pub toolchain: Option<String>,
+    pub reference: Option<ReferenceKind>,
+    pub expected_outcome: ExpectedOutcome,
 }
 
 impl EvalTask {
@@ -105,7 +122,22 @@ impl EvalTask {
             forbidden_paths: Vec::new(),
             oracle_patch: None,
             requires_network: false,
+            task_version: None,
+            level: None,
+            kind: None,
+            provenance: None,
+            limits: TaskLimits::default(),
+            network: None,
+            toolchain: None,
+            reference: None,
+            expected_outcome: ExpectedOutcome::default(),
         }
+    }
+
+    /// Whether this task expects the agent to leave the workspace unchanged,
+    /// via either the v3 `expected_outcome` or the v2 `negative_noop` label.
+    pub fn expects_no_change(&self) -> bool {
+        self.expected_outcome == ExpectedOutcome::NoChange || self.capabilities.negative_noop
     }
 
     /// The golden script name to look up for this task.
@@ -407,9 +439,132 @@ pub struct Manifest {
     pub oracle_patch: Option<String>,
     #[serde(default)]
     pub requires_network: bool,
+
+    // --- v3 additions ---
+    #[serde(default)]
+    pub task_version: Option<String>,
+    #[serde(default)]
+    pub level: Option<Level>,
+    #[serde(default)]
+    pub kind: Option<TaskKind>,
+    #[serde(default)]
+    pub provenance: Option<Provenance>,
+    #[serde(default)]
+    pub limits: Option<TaskLimits>,
+    #[serde(default)]
+    pub network: Option<NetworkPolicy>,
+    #[serde(default)]
+    pub toolchain: Option<String>,
+    #[serde(default)]
+    pub reference: Option<ReferenceKind>,
+    #[serde(default)]
+    pub expected_outcome: Option<ExpectedOutcome>,
+}
+
+/// Strict `MAJOR.MINOR.PATCH` (no leading zeros, no pre-release/build).
+fn is_semver_core(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && (p.len() == 1 || !p.starts_with('0'))
+        })
+}
+
+fn is_iso_date(v: &str) -> bool {
+    let b = v.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
 }
 
 impl Manifest {
+    /// Names of v3-only fields this manifest sets.
+    fn v3_fields_present(&self) -> Vec<&'static str> {
+        let present = [
+            ("task_version", self.task_version.is_some()),
+            ("level", self.level.is_some()),
+            ("kind", self.kind.is_some()),
+            ("provenance", self.provenance.is_some()),
+            ("limits", self.limits.is_some()),
+            ("network", self.network.is_some()),
+            ("toolchain", self.toolchain.is_some()),
+            ("reference", self.reference.is_some()),
+            ("expected_outcome", self.expected_outcome.is_some()),
+        ];
+        present
+            .into_iter()
+            .filter_map(|(name, set)| set.then_some(name))
+            .collect()
+    }
+
+    /// Static (fixture-independent) v3 rules. Rules that need to run the
+    /// fixture live in `validate::validate_task`.
+    fn validate_v3(&self) -> Result<(), String> {
+        if self.schema_version < 3 {
+            let present = self.v3_fields_present();
+            if !present.is_empty() {
+                return Err(format!(
+                    "field(s) {present:?} require schema_version = 3 (manifest declares {})",
+                    self.schema_version
+                ));
+            }
+            return Ok(());
+        }
+        let version = self
+            .task_version
+            .as_deref()
+            .ok_or("schema v3 requires task_version")?;
+        if !is_semver_core(version) {
+            return Err(format!(
+                "task_version {version:?} is not semver MAJOR.MINOR.PATCH"
+            ));
+        }
+        let level = self.level.ok_or("schema v3 requires level (L0..L5)")?;
+        let kind = self
+            .kind
+            .ok_or("schema v3 requires kind (harness | capability | security)")?;
+        if kind == TaskKind::Capability && level == Level::L0 {
+            return Err("kind = capability requires level L1..L5 (L0 is harness-only)".into());
+        }
+        if self.network == Some(NetworkPolicy::None) && self.requires_network {
+            return Err("network = \"none\" contradicts requires_network = true".into());
+        }
+        if self
+            .toolchain
+            .as_deref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            return Err("toolchain must not be empty".into());
+        }
+        if let Some(created) = self.provenance.as_ref().and_then(|p| p.created.as_deref()) {
+            if !is_iso_date(created) {
+                return Err(format!("provenance.created {created:?} is not YYYY-MM-DD"));
+            }
+        }
+        if let Some(limits) = &self.limits {
+            limits.validate()?;
+        }
+        match self.reference {
+            Some(ReferenceKind::OraclePatch) if self.oracle_patch.is_none() => {
+                return Err("reference = \"oracle_patch\" requires an oracle_patch path".into());
+            }
+            Some(ReferenceKind::ValidatedOracle)
+                if self.expected_outcome.unwrap_or_default() != ExpectedOutcome::NoChange =>
+            {
+                return Err(
+                    "reference = \"validated_oracle\" is only valid with expected_outcome = \"no_change\""
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        Ok(())
+    }
     /// Parse a manifest from TOML text (no schema-version gating).
     pub fn from_toml(text: &str) -> Result<Self, TaskError> {
         toml::from_str(text).map_err(|e| TaskError::Parse(e.to_string()))
@@ -429,6 +584,9 @@ impl Manifest {
                 manifest.id
             )));
         }
+        manifest
+            .validate_v3()
+            .map_err(|e| TaskError::Validation(format!("task '{}': {e}", manifest.id)))?;
         Ok(manifest)
     }
 
@@ -440,6 +598,9 @@ impl Manifest {
                 suites.push(s);
             }
         }
+        let limits = self.limits.unwrap_or_default();
+        let requires_network =
+            self.requires_network || self.network == Some(NetworkPolicy::Registry);
         EvalTask {
             id: self.id,
             title: self.title,
@@ -447,8 +608,8 @@ impl Manifest {
             prompt: self.prompt,
             fixture: self.fixture,
             allowed_tools: self.allowed_tools,
-            max_turns: self.max_turns,
-            timeout: Duration::from_secs(self.timeout_secs),
+            max_turns: limits.max_turns.unwrap_or(self.max_turns),
+            timeout: Duration::from_secs(limits.wall_secs.unwrap_or(self.timeout_secs)),
             oracle: self.oracle,
             tags: self.tags,
             mode: self.mode,
@@ -467,7 +628,16 @@ impl Manifest {
             required_paths: self.required_paths,
             forbidden_paths: self.forbidden_paths,
             oracle_patch: self.oracle_patch,
-            requires_network: self.requires_network,
+            requires_network,
+            task_version: self.task_version,
+            level: self.level,
+            kind: self.kind,
+            provenance: self.provenance,
+            limits,
+            network: self.network,
+            toolchain: self.toolchain,
+            reference: self.reference,
+            expected_outcome: self.expected_outcome.unwrap_or_default(),
         }
     }
 }
@@ -614,6 +784,170 @@ prompt = "do it"
         let task = m.into_task(".");
         assert_eq!(task.fixture.kind, FixtureKind::CopyDir);
         assert_eq!(task.golden_script_name(), "x");
+    }
+
+    const V3: &str = r#"
+schema_version = 3
+id = "v3-task"
+title = "v3"
+prompt = "fix it"
+task_version = "1.2.0"
+level = "L1"
+kind = "capability"
+network = "registry"
+toolchain = "1.88.0"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+expected_outcome = "change"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "MIT OR Apache-2.0"
+created = "2026-11-14"
+
+[limits]
+wall_secs = 90
+cpu = 2.0
+memory_mb = 1024
+max_turns = 7
+max_tool_calls = 40
+max_cost_usd = 0.25
+"#;
+
+    fn v3_with(replace: &str, with: &str) -> String {
+        assert!(V3.contains(replace), "fixture lacks {replace:?}");
+        V3.replacen(replace, with, 1)
+    }
+
+    /// A manifest without `schema_version` (v1) still loads and carries no v3 labels.
+    #[test]
+    fn v1_manifest_still_loads() {
+        let m = Manifest::from_toml_validated("id = \"x\"\ntitle = \"x\"\nprompt = \"p\"\n", false)
+            .expect("v1 loads");
+        let task = m.into_task(".");
+        assert_eq!(task.schema_version, 1);
+        assert!(task.kind.is_none());
+        assert!(task.level.is_none());
+        assert_eq!(task.expected_outcome, ExpectedOutcome::Change);
+    }
+
+    /// A v2 manifest still loads unchanged.
+    #[test]
+    fn v2_manifest_still_loads() {
+        let toml = "schema_version = 2\nid = \"x\"\ntitle = \"x\"\nprompt = \"p\"\nrequires_network = true\n";
+        let task = Manifest::from_toml_validated(toml, false)
+            .expect("v2 loads")
+            .into_task(".");
+        assert_eq!(task.schema_version, 2);
+        assert!(task.requires_network);
+        assert!(task.kind.is_none());
+    }
+
+    /// Every v3 field parses and resolves onto the task; `[limits]` drive turns/timeout.
+    #[test]
+    fn v3_manifest_parses_all_fields() {
+        let task = Manifest::from_toml_validated(V3, false)
+            .expect("v3 loads")
+            .into_task(".");
+        assert_eq!(task.schema_version, 3);
+        assert_eq!(task.task_version.as_deref(), Some("1.2.0"));
+        assert_eq!(task.level, Some(Level::L1));
+        assert_eq!(task.kind, Some(TaskKind::Capability));
+        assert_eq!(task.network, Some(NetworkPolicy::Registry));
+        assert!(
+            task.requires_network,
+            "network = registry implies requires_network"
+        );
+        assert_eq!(task.toolchain.as_deref(), Some("1.88.0"));
+        assert_eq!(task.reference, Some(ReferenceKind::OraclePatch));
+        assert_eq!(task.expected_outcome, ExpectedOutcome::Change);
+        let p = task.provenance.as_ref().expect("provenance");
+        assert_eq!(p.created.as_deref(), Some("2026-11-14"));
+        assert_eq!(task.limits.memory_mb, Some(1024));
+        assert_eq!(task.limits.max_tool_calls, Some(40));
+        assert_eq!(task.max_turns, 7);
+        assert_eq!(task.timeout, Duration::from_secs(90));
+    }
+
+    /// A v3 manifest must declare `kind`, `level`, and a semver `task_version`.
+    #[test]
+    fn v3_requires_kind_level_and_semver_version() {
+        for (from, to, needle) in [
+            ("kind = \"capability\"\n", "", "kind"),
+            ("level = \"L1\"\n", "", "level"),
+            ("task_version = \"1.2.0\"\n", "", "task_version"),
+            (
+                "task_version = \"1.2.0\"",
+                "task_version = \"v1\"",
+                "semver",
+            ),
+        ] {
+            let err = Manifest::from_toml_validated(&v3_with(from, to), false)
+                .expect_err(needle)
+                .to_string();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
+    /// v3-only fields are rejected in a v1/v2 manifest instead of being silently ignored.
+    #[test]
+    fn v3_fields_require_schema_v3() {
+        let err = Manifest::from_toml_validated(
+            &v3_with("schema_version = 3", "schema_version = 2"),
+            false,
+        )
+        .expect_err("v3 fields in v2")
+        .to_string();
+        assert!(err.contains("schema_version = 3"), "{err}");
+    }
+
+    /// Contradictory or incomplete v3 declarations fail manifest validation.
+    #[test]
+    fn v3_rejects_inconsistent_declarations() {
+        let cases = [
+            (
+                v3_with(
+                    "network = \"registry\"",
+                    "network = \"none\"\nrequires_network = true",
+                ),
+                "network",
+            ),
+            (
+                v3_with("oracle_patch = \"oracle.patch\"\n", ""),
+                "oracle_patch",
+            ),
+            (
+                v3_with(
+                    "reference = \"oracle_patch\"",
+                    "reference = \"validated_oracle\"",
+                ),
+                "validated_oracle",
+            ),
+            (v3_with("level = \"L1\"", "level = \"L0\""), "L0"),
+            (
+                v3_with("created = \"2026-11-14\"", "created = \"yesterday\""),
+                "created",
+            ),
+            (v3_with("memory_mb = 1024", "memory_mb = 0"), "memory_mb"),
+            (
+                v3_with("toolchain = \"1.88.0\"", "toolchain = \" \""),
+                "toolchain",
+            ),
+        ];
+        for (toml, needle) in cases {
+            let err = Manifest::from_toml_validated(&toml, false)
+                .expect_err(needle)
+                .to_string();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
+    /// Unknown keys inside `[limits]` are rejected so typos do not silently drop a limit.
+    #[test]
+    fn v3_limits_reject_unknown_keys() {
+        let toml = v3_with("max_turns = 7", "max_turn = 7");
+        assert!(Manifest::from_toml_validated(&toml, false).is_err());
     }
 
     #[test]
