@@ -12,6 +12,8 @@
 //!     prompt.md
 //!     transcript.jsonl
 //!     events.jsonl
+//!     security.jsonl          (SecurityDecision audit records)
+//!     security-summary.json   (audit coverage, blocked/executed counts)
 //!     final.patch
 //!     final.diff
 //!     final_summary.md
@@ -20,6 +22,8 @@
 //!     report.md
 //!     workspace/        (preserved on success and failure)
 //! ```
+//!
+//! Everything except `workspace/` is written through [`write_redacted`].
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -97,15 +101,16 @@ impl TaskArtifacts {
         self.dir.join("final.diff")
     }
 
-    /// Write a string artifact.
+    /// Write a string artifact. Every artifact writer goes through
+    /// [`write_redacted`], so secret-shaped strings never reach disk.
     pub fn write_string(&self, name: &str, content: &str) -> io::Result<()> {
-        std::fs::write(self.dir.join(name), content)
+        write_redacted(&self.dir.join(name), content)
     }
 
     /// Write a JSON artifact (pretty-printed).
     pub fn write_json<T: Serialize>(&self, name: &str, value: &T) -> io::Result<()> {
         let text = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
-        std::fs::write(self.dir.join(name), text)
+        write_redacted(&self.dir.join(name), &text)
     }
 
     /// Write a JSONL artifact (one JSON value per line).
@@ -116,7 +121,7 @@ impl TaskArtifacts {
             out.push_str(&line);
             out.push('\n');
         }
-        std::fs::write(self.dir.join(name), out)
+        write_redacted(&self.dir.join(name), &out)
     }
 
     /// Write captured stdout/stderr for each oracle command under
@@ -130,12 +135,12 @@ impl TaskArtifacts {
         for (i, r) in results.iter().enumerate() {
             let slug = slugify(&r.command);
             let base = format!("{:03}-{}", i + 1, slug);
-            std::fs::write(dir.join(format!("{base}.stdout")), &r.stdout)?;
-            std::fs::write(dir.join(format!("{base}.stderr")), &r.stderr)?;
+            write_redacted(&dir.join(format!("{base}.stdout")), &r.stdout)?;
+            write_redacted(&dir.join(format!("{base}.stderr")), &r.stderr)?;
             // A tiny status sidecar makes exit codes greppable.
-            std::fs::write(
-                dir.join(format!("{base}.status")),
-                format!(
+            write_redacted(
+                &dir.join(format!("{base}.status")),
+                &format!(
                     "command: {}\nexit_code: {:?}\nsuccess: {}\ntimed_out: {}\nduration_ms: {}\n",
                     r.command, r.exit_code, r.success, r.timed_out, r.duration_ms
                 ),
@@ -143,6 +148,13 @@ impl TaskArtifacts {
         }
         Ok(())
     }
+}
+
+/// Write `content` with secret-shaped substrings replaced by `[REDACTED]`
+/// (see `crom_core::redact_secrets_in_str`). Patches and logs that carried a
+/// secret are therefore not byte-exact; the task workspace keeps the original.
+pub fn write_redacted(path: &Path, content: &str) -> io::Result<()> {
+    std::fs::write(path, crom_core::redact_secrets_in_str(content))
 }
 
 /// Turn a command into a short filesystem-safe slug.

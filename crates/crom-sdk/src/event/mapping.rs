@@ -92,6 +92,7 @@ impl SdkEventMapper {
                     name: d.tool_name.clone(),
                 }),
             })),
+            AgentEvent::SecurityDecision(d) => Some(SdkEvent::SecurityDecision(d.clone())),
             other if full => {
                 // Wrap any other internal event opaquely.
                 let payload = serde_json::to_value(other).unwrap_or_default();
@@ -152,6 +153,14 @@ pub fn redact_event(redactor: &dyn SecretRedactor, mut event: SdkEvent) -> SdkEv
         }
         SdkEvent::RunCompleted(e) => {
             e.summary = redactor.redact(&e.summary);
+        }
+        SdkEvent::SecurityDecision(e) => {
+            if let Some(r) = e.reason.as_mut() {
+                *r = redactor.redact(r);
+            }
+            if let Some(r) = e.resource.as_mut() {
+                *r = redactor.redact(r);
+            }
         }
         SdkEvent::ToolCallStarted(e) => {
             redact_json_strings(redactor, &mut e.input);
@@ -346,6 +355,64 @@ mod tests {
                 other => panic!("unexpected: {other:?}"),
             }
         }
+    }
+
+    /// SecurityDecision maps to a public SecurityDecision under every verbosity
+    /// so audit records are never filtered out.
+    #[test]
+    fn security_decision_maps_under_every_verbosity() {
+        let d = crom_core::events::SecurityDecision {
+            session_id: crom_core::SessionId::new(),
+            run_id: crom_core::RunId::new(),
+            turn_index: 1,
+            principal: crom_core::events::SecurityPrincipal::Session,
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            action_class: Some(crom_core::PermissionKind::Execution),
+            resource: Some("rm".into()),
+            policy_source: Some(crom_core::PolicyDecisionSource::DisallowRule),
+            rule: None,
+            decision: crom_core::PolicyOutcome::Deny,
+            enforcement: crom_core::events::EnforcementLayer::Policy,
+            outcome: crom_core::events::SecurityOutcome::Blocked,
+            reason: None,
+        };
+        let ev = AgentEvent::SecurityDecision(d.clone());
+        for v in [
+            EventVerbosity::Minimal,
+            EventVerbosity::Standard,
+            EventVerbosity::Full,
+        ] {
+            match mapper(v).map(&ev) {
+                Some(SdkEvent::SecurityDecision(out)) => assert_eq!(out, d),
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    /// The SDK redactor scrubs secrets from a SecurityDecision's reason and resource.
+    #[test]
+    fn redact_event_scrubs_security_decision_text() {
+        let secret = "sk-ant-api03-SYNTHETICabcdefghijklmnop0123";
+        let ev = SdkEvent::SecurityDecision(crom_core::events::SecurityDecision {
+            session_id: crom_core::SessionId::new(),
+            run_id: crom_core::RunId::new(),
+            turn_index: 0,
+            principal: crom_core::events::SecurityPrincipal::Session,
+            tool_use_id: "t1".into(),
+            tool_name: "Read".into(),
+            action_class: None,
+            resource: Some(format!("dir/{secret}")),
+            policy_source: None,
+            rule: None,
+            decision: crom_core::PolicyOutcome::Deny,
+            enforcement: crom_core::events::EnforcementLayer::Policy,
+            outcome: crom_core::events::SecurityOutcome::Blocked,
+            reason: Some(format!("denied {secret}")),
+        });
+        let out = redact_event(&crate::DefaultSecretRedactor, ev);
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains(secret));
     }
 
     /// An otherwise-unmapped internal event (UserToolResult) is dropped under

@@ -197,6 +197,8 @@ the agent against a real model.
 Milestone specs live in [`docs/milestones/`](docs/milestones/). The current
 plan is [M17 — Measurable Agent Capability and Secure Execution](docs/milestones/MILESTONE_17.md).
 The security threat model is in [`docs/security/threat-model.md`](docs/security/threat-model.md).
+Security audit events (`SecurityDecision`) and secret redaction are described in
+[`docs/security/audit.md`](docs/security/audit.md).
 
 ## License
 

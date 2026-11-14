@@ -336,6 +336,8 @@ target/crom-eval/
       transcript.jsonl     # conversation-relevant events
       events.jsonl         # every SDK event
       tool-calls.jsonl     # tool invocations
+      security.jsonl       # SecurityDecision audit records (docs/security/audit.md)
+      security-summary.json # audit coverage + blocked/executed counts
       final.patch          # unified diff vs the fixture baseline
       patch.diff           # same diff, for adapter/benchmark tooling
       final.diff           # diff --stat summary

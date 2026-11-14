@@ -97,7 +97,7 @@ Verified against `5bc1fb2`.
 | Bash process group | `bash.rs:107-114` (`process_group(0)`), SIGKILL to the group on timeout only (`:144-160`); `kill_on_drop` (`:104`) kills bash only | Kills same-group descendants on timeout | `setsid` escapes; not killed on normal exit or cancel |
 | Bash spawn | `bash.rs:97-104` | cwd = workspace | Full env inherited (no `env_clear` anywhere in the repo), no FS/network/rlimit restriction |
 | Dangerous-bash / `.env` write hooks | `crom-core/src/builtin_hooks.rs:15`, `:137` | Pattern-based deny | Pattern matching, bypassable by encoding; repo settings can disable them |
-| Secret redaction hooks | `builtin_hooks.rs:427-441` | — | **No-ops** (`Continue`) — #291 |
+| Secret redaction | `builtin_hooks.rs` (`redact_secrets_in_str`), applied in `agent.rs` `emit`/`emit_telemetry` and `crom-eval/src/artifacts.rs` `write_redacted` | Scrubs known secret shapes from session JSONL, the event stream, telemetry, and eval artifacts (#291) | Pattern-based; the redaction hooks themselves remain `Continue` |
 | MCP config | `crom-mcp/src/config.rs:290-298` auto-loads `<cwd>/.agent/mcp.json` and enables MCP; `:331`/`:468-490` interpolate `${VAR}` from the host env | — | Repo-controlled spawn with host secrets — #290 |
 | MCP stdio spawn | `crom-mcp/src/transport/stdio.rs:37-47` | `kill_on_drop` | Inherits env, no sandbox |
 | Eval verification isolation | `crom-eval/src/isolation.rs:244-291` (`docker`/`podman run --rm --network none`, optional cpu/memory) | Contains verification commands when a container backend is selected | Default `LocalBackend` (`:168-190`) runs on the host; agent phase never containerized |
@@ -115,7 +115,7 @@ Verified against `5bc1fb2`.
 | G5 | Repo `.agent/settings.json` / `.agent/mcp.json` loosen policy and spawn processes without a trust decision; MCP `${VAR}` interpolation | P9 | #290 |
 | G6 | ~~Hook `Allow` short-circuits disallow rules; subagents raise `permission_mode`~~ Fixed: disallow rules run before hook `Allow`; child mode is capped at the parent's and inherits parent disallow rules (`agents.inherit_permissions`) | S0 | #290 |
 | G7 | ~~Slash `` !`cmd` `` expansion skips the policy gate; SDK tools act on host cwd~~ Fixed: slash `!`/`@` expansions go through `PolicyEngine::evaluate_tool`; SDK `ReturnOnly`/`RejectMutations` run tools in a scratch copy, rootless apply runs get no built-in file/shell tools | S1 | #290 |
-| G8 | `PolicyDecision`/`ToolCallDenied` lack target, run id, enforcement layer; redaction hooks are no-ops | Audit | #291 |
+| G8 | ~~`PolicyDecision`/`ToolCallDenied` lack target, run id, enforcement layer; redaction hooks are no-ops~~ Fixed: `SecurityDecision` audit events on every gated tool call and always-on redaction of recorded events ([`audit.md`](audit.md)) | Audit | #291 |
 | G9 | Sessions and checkpoints live under `<cwd>/.agent/`, inside the future sandbox's writable set | B6 | #253 (exclude `.agent/` from rw set) |
 | G10 | Host-side helpers run untrusted repo code outside any sandbox: `git status` in checkpoints (`crom-checkpoint/src/lib.rs:91-94`, honours `core.fsmonitor`), validation commands (`checkpoint/src/validation.rs:38-48`, `sdk/src/runtime/validation.rs:20`), eval `LocalBackend` | P1–P6, P9 | #253 (validation), #290 (git config) |
 | G11 | File tools: path-based TOCTOU | P1, P2 | #15 (documented); the OS sandbox closes it for Bash only |

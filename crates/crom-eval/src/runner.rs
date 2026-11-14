@@ -994,9 +994,17 @@ fn write_run_artifacts(w: WriteArtifacts<'_>) {
         })
         .collect();
     let _ = a.write_jsonl("tool-calls.jsonl", &tool_calls);
+    let _ = a.write_jsonl(
+        "security.jsonl",
+        &crate::security::security_records(&w.outcome.events),
+    );
+    let _ = a.write_json(
+        "security-summary.json",
+        &crate::security::summarize(&w.outcome.events),
+    );
 
-    let _ = std::fs::write(a.final_patch_path(), &w.patch.unified_diff);
-    let _ = std::fs::write(a.final_diff_path(), &w.patch.stat);
+    let _ = crate::artifacts::write_redacted(&a.final_patch_path(), &w.patch.unified_diff);
+    let _ = crate::artifacts::write_redacted(&a.final_diff_path(), &w.patch.stat);
     let _ = a.write_string("patch.diff", &w.patch.unified_diff);
     let _ = a.write_command_outputs(&w.merged.commands);
     let _ = a.write_string("public-test.log", &commands_log(w.public));

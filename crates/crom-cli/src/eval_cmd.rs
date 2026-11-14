@@ -470,7 +470,7 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
     // Multi-run statistics.
     if repetitions > 1 {
         let stats = multirun::aggregate(&results, repetitions);
-        let _ = std::fs::write(
+        let _ = write_artifact(
             run.root.join("repetitions.json"),
             serde_json::to_string_pretty(&stats).unwrap_or_default(),
         );
@@ -505,7 +505,7 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
                 run.root.join("tasks").join(&r.task_id)
             };
             if dir.exists() {
-                let _ = std::fs::write(
+                let _ = write_artifact(
                     dir.join("index-entry.json"),
                     serde_json::to_string_pretty(e).unwrap_or_default(),
                 );
@@ -612,10 +612,15 @@ fn write_behavior_summary(run_root: &Path, results: &[EvalResult]) {
         "skipped_reading_before_writing": skipped_reading,
         "broad_or_suspicious_edits": broad_edits,
     });
-    let _ = std::fs::write(
+    let _ = write_artifact(
         run_root.join("behavior-summary.json"),
         serde_json::to_string_pretty(&summary).unwrap_or_default(),
     );
+}
+
+/// Run-level eval files go through the same secret redaction as task artifacts.
+fn write_artifact(path: std::path::PathBuf, content: String) -> std::io::Result<()> {
+    crom_eval::artifacts::write_redacted(&path, &content)
 }
 
 fn write_run_metadata(
@@ -634,7 +639,7 @@ fn write_run_metadata(
         "attempts": args.attempts,
         "prompt_variant": args.prompt_variant,
     });
-    let _ = std::fs::write(
+    let _ = write_artifact(
         run_root.join("run.json"),
         serde_json::to_string_pretty(&meta).unwrap_or_default(),
     );

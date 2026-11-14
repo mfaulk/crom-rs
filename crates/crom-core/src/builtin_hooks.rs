@@ -243,9 +243,11 @@ impl Hook for AuditLogHook {
     }
 }
 
-/// Redact secret-like values from the metadata payload of an event by
-/// replacing values whose keys match common patterns. The hook itself
-/// returns Continue: it never blocks, only side-effects rewriting.
+/// Compatibility marker for the `hooks.secret_redaction` setting. Hook
+/// outputs cannot rewrite tool results, so this hook always returns
+/// `Continue`. Redaction of recorded events (session JSONL, event stream,
+/// telemetry) is enforced unconditionally by the agent loop's emit path via
+/// [`redact_secrets_in_serializable`]; see `docs/security/audit.md`.
 pub struct SecretRedactionHook;
 
 impl Default for SecretRedactionHook {
@@ -421,6 +423,8 @@ impl Hook for McpResultSizeLimitHook {
     }
 }
 
+/// MCP counterpart of [`SecretRedactionHook`]; same semantics. MCP tool
+/// results are redacted in recorded events like every other tool result.
 #[derive(Default)]
 pub struct McpSecretRedactionHook;
 
@@ -472,34 +476,97 @@ pub fn redact_secrets_in_value(v: &Value) -> Value {
 }
 
 /// Replace well-known secret token shapes inside a free-form string with
-/// `[REDACTED]`. Targets the common formats users tend to paste into
-/// prompts/plans by accident: provider API keys (Anthropic `sk-ant-…`,
-/// OpenAI `sk-…`, Google `AIza…`), AWS access key ids (`AKIA…`), and
-/// generic GitHub-style tokens (`ghp_…`, `gho_…`, `ghu_…`, `ghs_…`,
-/// `ghr_…`). Conservative by design — non-matching content is returned
-/// unchanged so plan summaries and goals are not mangled.
+/// `[REDACTED]`: provider API keys (Anthropic `sk-ant-…`, OpenAI `sk-…`,
+/// Google `AIza…`), AWS access key ids, GitHub and Slack tokens, bearer
+/// header values, PEM private-key blocks, and the value half of
+/// `*_API_KEY=` / `*TOKEN=` / `*SECRET=` / `*PASSWORD=` assignments.
+/// Conservative by design — non-matching content is returned unchanged.
 pub fn redact_secrets_in_str(s: &str) -> String {
-    static PATTERNS: &[&str] = &[
-        // Anthropic: sk-ant-api03-... and sk-ant-...
-        r"sk-ant-(?:api[0-9]+-)?[A-Za-z0-9_\-]{16,}",
-        // OpenAI / generic sk- token (>=20 trailing chars to avoid false positives).
-        r"sk-[A-Za-z0-9_\-]{20,}",
-        // Google API key.
-        r"AIza[A-Za-z0-9_\-]{35,}",
-        // AWS access key id.
-        r"AKIA[A-Z0-9]{16}",
-        // GitHub personal/oauth/server tokens.
-        r"gh[pousr]_[A-Za-z0-9]{20,}",
-        // Bearer header values.
-        r"(?i)bearer\s+[A-Za-z0-9_\-\.=+/]{16,}",
-    ];
+    if !contains_secret(s) {
+        return s.to_string();
+    }
     let mut out = s.to_string();
-    for pat in PATTERNS {
-        if let Ok(re) = regex::Regex::new(pat) {
-            out = re.replace_all(&out, "[REDACTED]").into_owned();
+    for (re, replacement) in secret_patterns() {
+        if re.is_match(&out) {
+            out = re.replace_all(&out, *replacement).into_owned();
         }
     }
     out
+}
+
+/// True when `s` contains anything [`redact_secrets_in_str`] would replace.
+pub fn contains_secret(s: &str) -> bool {
+    secret_patterns().iter().any(|(re, _)| re.is_match(s))
+}
+
+fn secret_patterns() -> &'static [(regex::Regex, &'static str)] {
+    static PATTERNS: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> =
+        std::sync::OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        const RAW: &[(&str, &str)] = &[
+            (
+                r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+                "[REDACTED]",
+            ),
+            // Anthropic: sk-ant-api03-... and sk-ant-...
+            (r"sk-ant-(?:api[0-9]+-)?[A-Za-z0-9_\-]{16,}", "[REDACTED]"),
+            // OpenAI / DeepSeek / generic sk- token.
+            (r"sk-[A-Za-z0-9_\-]{20,}", "[REDACTED]"),
+            (r"AIza[A-Za-z0-9_\-]{35,}", "[REDACTED]"),
+            // AWS access key ids (long-lived and STS).
+            (r"(?:AKIA|ASIA)[A-Z0-9]{16}", "[REDACTED]"),
+            (r"gh[pousr]_[A-Za-z0-9]{20,}", "[REDACTED]"),
+            (r"github_pat_[A-Za-z0-9_]{20,}", "[REDACTED]"),
+            (r"xox[abposr]-[A-Za-z0-9\-]{10,}", "[REDACTED]"),
+            (r"(?i)bearer\s+[A-Za-z0-9_\-\.=+/]{16,}", "[REDACTED]"),
+            // NAME=value / NAME: value where NAME looks secret; keep NAME.
+            (
+                r#"(?i)\b([A-Z0-9_]*(?:API_?KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_]*)(\s*[=:]\s*)["']?[^\s"',;\[]{8,}["']?"#,
+                "${1}${2}[REDACTED]",
+            ),
+        ];
+        RAW.iter()
+            .map(|(p, r)| (regex::Regex::new(p).expect("static secret pattern"), *r))
+            .collect()
+    })
+}
+
+/// Redact secret-shaped substrings in every string leaf of a JSON value.
+/// Unlike [`redact_secrets_in_value`] this never replaces values by key
+/// name, so numeric fields such as `input_tokens` keep their type.
+pub fn redact_secret_strings_in_value(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if contains_secret(s) {
+                *s = redact_secrets_in_str(s);
+            }
+        }
+        Value::Array(arr) => arr.iter_mut().for_each(redact_secret_strings_in_value),
+        Value::Object(map) => map.values_mut().for_each(redact_secret_strings_in_value),
+        _ => {}
+    }
+}
+
+/// Return a copy of `value` with secret-shaped substrings redacted in every
+/// string field, via a JSON round trip. Returns `value` untouched when it
+/// contains no secret. If the redacted JSON no longer deserializes into
+/// `T`, returns `Err` with the redacted JSON so the caller can fail closed.
+pub fn redact_secrets_in_serializable<T>(value: T) -> Result<T, Value>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let Ok(text) = serde_json::to_string(&value) else {
+        return Ok(value);
+    };
+    if !contains_secret(&text) {
+        return Ok(value);
+    }
+    let mut json: Value = match serde_json::from_str(&text) {
+        Ok(j) => j,
+        Err(_) => return Ok(value),
+    };
+    redact_secret_strings_in_value(&mut json);
+    serde_json::from_value(json.clone()).map_err(|_| json)
 }
 
 /// Block Write/Edit when the new payload exceeds a configured byte threshold.
@@ -777,6 +844,65 @@ mod tests {
         assert_eq!(red["list"][0]["token"], "[REDACTED]");
         assert_eq!(red["user"], "alice");
         assert_eq!(red["nested"]["id"], 5);
+    }
+
+    #[test]
+    // Each supported secret shape is replaced while surrounding text survives.
+    fn redact_str_covers_supported_secret_shapes() {
+        let cases = [
+            "sk-ant-api03-SYNTHETICabcdefghijklmnop0123",
+            "sk-proj-SYNTHETICabcdefghijklmnop0123",
+            "AIzaSYNTHETICabcdefghijklmnopqrstuvwxyz0123",
+            "AKIASYNTHETIC0000000",
+            "ASIASYNTHETIC0000000",
+            "ghp_SYNTHETICabcdefghijklmnop01",
+            "github_pat_SYNTHETICabcdefghijklmnop01",
+            "xoxb-SYNTHETIC-0123456789",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEsynthetic\n-----END RSA PRIVATE KEY-----",
+        ];
+        for secret in cases {
+            let out = redact_secrets_in_str(&format!("before {secret} after"));
+            assert!(!out.contains(secret), "not redacted: {secret}");
+            assert!(
+                out.starts_with("before ") && out.ends_with(" after"),
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    // Secret-named env assignments keep the name but lose the value; short values and plain text are untouched.
+    fn redact_str_masks_secret_assignment_values() {
+        assert_eq!(
+            redact_secrets_in_str("DEEPSEEK_API_KEY=abcdefgh12345678"),
+            "DEEPSEEK_API_KEY=[REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets_in_str("db_password: \"hunter2hunter2\""),
+            "db_password: [REDACTED]"
+        );
+        assert_eq!(redact_secrets_in_str("max_tokens=4096"), "max_tokens=4096");
+        assert_eq!(redact_secrets_in_str("hello world"), "hello world");
+        // Idempotent: redacting twice changes nothing further.
+        let once = redact_secrets_in_str("API_TOKEN=abcdefgh12345678");
+        assert_eq!(redact_secrets_in_str(&once), once);
+    }
+
+    #[test]
+    // Serializable redaction only rewrites string leaves, so numeric token counts keep their type.
+    fn redact_serializable_preserves_non_string_fields() {
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct Rec {
+            text: String,
+            input_tokens: u64,
+        }
+        let rec = Rec {
+            text: "key sk-ant-api03-SYNTHETICabcdefghijklmnop0123".into(),
+            input_tokens: 42,
+        };
+        let out = redact_secrets_in_serializable(rec).unwrap();
+        assert_eq!(out.text, "key [REDACTED]");
+        assert_eq!(out.input_tokens, 42);
     }
 
     #[tokio::test]
