@@ -3010,15 +3010,18 @@ fn make_cli_expansion_executor(
     // `!`bash`` reuse the existing path sandbox, output cap, timeout, and
     // secret-redaction logic — there is no shadow code path for the
     // riskiest expansion surface to bypass.
+    // Each expansion is also evaluated by the same policy engine as a model
+    // tool call (hooks, disallow rules, permission mode, allow rules,
+    // approval callback, default deny).
     let limits = std::sync::Arc::new(tool_limits_from_settings(&cfg.settings));
-    Ok(Arc::new(CliExpansionExecutor {
-        cwd: cfg.options.cwd.clone(),
-        session_id: cfg.options.session_id.clone().unwrap_or_default(),
-        read: std::sync::Arc::new(crom_tools::ReadTool::new(limits.clone())),
-        bash: std::sync::Arc::new(crom_tools::BashTool::new(limits)),
-        hooks: cfg.hooks.clone(),
-        secret_redaction: cfg.settings.hooks.secret_redaction.unwrap_or(true),
-    }))
+    Ok(Arc::new(CliExpansionExecutor::new(
+        cfg.options.cwd.clone(),
+        cfg.options.session_id.clone().unwrap_or_default(),
+        limits,
+        &cfg.options,
+        cfg.hooks.clone(),
+        cfg.settings.hooks.secret_redaction.unwrap_or(true),
+    )))
 }
 
 fn tool_limits_from_settings(settings: &Settings) -> ToolLimits {
@@ -3046,41 +3049,75 @@ struct CliExpansionExecutor {
     session_id: SessionId,
     read: std::sync::Arc<crom_tools::ReadTool>,
     bash: std::sync::Arc<crom_tools::BashTool>,
-    hooks: Hooks,
+    policy: crom_core::PolicyEngine,
     secret_redaction: bool,
 }
 
 impl CliExpansionExecutor {
-    /// Run the configured PreToolUse hooks. Returns an error if any hook
-    /// denies, so denials surface through the same `SlashCommandFailed`
-    /// path as other expansion failures.
-    async fn check_pre_tool_use(
+    fn new(
+        cwd: PathBuf,
+        session_id: SessionId,
+        limits: Arc<ToolLimits>,
+        options: &AgentOptions,
+        hooks: Hooks,
+        secret_redaction: bool,
+    ) -> Self {
+        let policy = crom_core::PolicyEngine::new(
+            crom_core::PolicyConfig {
+                allowed_tools: options.allowed_tool_rules.clone(),
+                allowed_tool_names: options.allowed_tools.clone(),
+                disallowed_tools: options.disallowed_tool_rules.clone(),
+                permission_mode: options.permission_mode,
+                callback: options.permission_callback.clone(),
+                memory: crom_core::ApprovalMemory::new(),
+                memory_mode: ApprovalMemoryMode::None,
+                mcp_external_effect_policy: options.mcp.external_effect_policy,
+            },
+            hooks,
+        );
+        Self {
+            cwd,
+            session_id,
+            read: Arc::new(crom_tools::ReadTool::new(limits.clone())),
+            bash: Arc::new(crom_tools::BashTool::new(limits)),
+            policy,
+            secret_redaction,
+        }
+    }
+
+    /// Run the full policy pipeline for an expansion. Returns the (possibly
+    /// hook-rewritten) input on Allow, or an error that surfaces through the
+    /// same `SlashCommandFailed` path as other expansion failures.
+    async fn check_policy(
         &self,
         tool_name: &str,
+        permission_kind: crom_core::PermissionKind,
         input: serde_json::Value,
-    ) -> std::result::Result<(), crom_core::SlashCommandError> {
-        use crom_core::HookEventName;
-        let hook_input = crom_core::HookInput {
-            event: HookEventName::PreToolUse,
-            session_id: self.session_id.clone(),
-            cwd: self.cwd.clone(),
-            run_id: crom_core::RunId::new(),
-            turn_index: 0,
-            tool_name: Some(tool_name.to_string()),
-            tool_input: Some(input),
-            tool_result: None,
-            prompt: None,
-            stop_reason: None,
-            metadata: serde_json::Value::Null,
-        };
-        let records = self.hooks.dispatch(&hook_input).await;
-        let (decision, _) = crom_core::aggregate(&records);
-        if let crom_core::HookAggregateDecision::Deny { reason } = decision {
-            return Err(crom_core::SlashCommandError::ExpansionFailed(format!(
-                "pre-tool-use hook denied: {reason}"
-            )));
+        summary: String,
+    ) -> std::result::Result<serde_json::Value, crom_core::SlashCommandError> {
+        let run_id = RunId::new();
+        let decision = self
+            .policy
+            .evaluate_tool(crom_core::PolicyToolContext {
+                session_id: &self.session_id,
+                run_id: &run_id,
+                turn_index: 0,
+                cwd: &self.cwd,
+                tool_name,
+                permission_kind,
+                tool_input: input.clone(),
+                tool_summary: summary,
+                metadata: serde_json::json!({"source": "slash_expansion"}),
+            })
+            .await;
+        match decision.outcome {
+            crom_core::PolicyOutcome::Allow => Ok(decision.updated_tool_input.unwrap_or(input)),
+            _ => Err(crom_core::SlashCommandError::ExpansionFailed(format!(
+                "{tool_name} expansion denied by policy ({:?}): {}",
+                decision.source,
+                decision.reason.unwrap_or_default()
+            ))),
         }
-        Ok(())
     }
 }
 
@@ -3090,8 +3127,14 @@ impl crom_core::slash::expansion::SlashExpansionExecutor for CliExpansionExecuto
         &self,
         path: &str,
     ) -> std::result::Result<String, crom_core::SlashCommandError> {
-        let input = serde_json::json!({"file_path": path});
-        self.check_pre_tool_use("Read", input.clone()).await?;
+        let input = self
+            .check_policy(
+                "Read",
+                crom_core::PermissionKind::ReadOnly,
+                serde_json::json!({"file_path": path}),
+                format!("Read {path} (slash-command @file expansion)"),
+            )
+            .await?;
         let ctx = crom_core::ToolContext::new_minimal(self.cwd.clone(), self.session_id.clone());
         use crom_core::Tool;
         let result = self
@@ -3111,8 +3154,14 @@ impl crom_core::slash::expansion::SlashExpansionExecutor for CliExpansionExecuto
         &self,
         command: &str,
     ) -> std::result::Result<String, crom_core::SlashCommandError> {
-        let input = serde_json::json!({"command": command});
-        self.check_pre_tool_use("Bash", input.clone()).await?;
+        let input = self
+            .check_policy(
+                "Bash",
+                crom_core::PermissionKind::Execution,
+                serde_json::json!({"command": command}),
+                format!("Bash: {command} (slash-command !`cmd` expansion)"),
+            )
+            .await?;
         let ctx = crom_core::ToolContext::new_minimal(self.cwd.clone(), self.session_id.clone());
         use crom_core::Tool;
         let result = self
@@ -8304,5 +8353,94 @@ mod provider_route_tests {
         assert!(
             tui_provider_config_from_credential(&crom_auth::ResolvedCredential::None).is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod slash_expansion_policy_tests {
+    use super::*;
+    use crom_core::slash::expansion::SlashExpansionExecutor;
+
+    fn executor(dir: &Path, options: &AgentOptions) -> CliExpansionExecutor {
+        CliExpansionExecutor::new(
+            dir.to_path_buf(),
+            SessionId::new(),
+            Arc::new(ToolLimits::default()),
+            options,
+            Hooks::new(),
+            false,
+        )
+    }
+
+    fn options(dir: &Path) -> AgentOptions {
+        AgentOptions {
+            cwd: dir.to_path_buf(),
+            ..AgentOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    // A `!`cmd`` expansion matching a disallow rule is refused before the command runs.
+    async fn bash_expansion_respects_disallow_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = options(dir.path());
+        o.permission_mode = PermissionMode::DontAsk;
+        o.allowed_tool_rules = vec![ToolRule::ExactTool("Bash".into())];
+        o.disallowed_tool_rules = vec![ToolRule::BashCommandRegex("^touch ".into())];
+        let err = executor(dir.path(), &o).run_bash("touch marker").await;
+        assert!(err.is_err(), "expansion should be denied");
+        assert!(!dir.path().join("marker").exists());
+    }
+
+    #[tokio::test]
+    // A `!`cmd`` expansion is refused in plan mode before the command runs.
+    async fn bash_expansion_denied_in_plan_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = options(dir.path());
+        o.permission_mode = PermissionMode::Plan;
+        let err = executor(dir.path(), &o).run_bash("touch marker").await;
+        assert!(err.is_err());
+        assert!(!dir.path().join("marker").exists());
+    }
+
+    #[tokio::test]
+    // Without an allow rule or approval callback, a `!`cmd`` expansion falls to default deny.
+    async fn bash_expansion_requires_approval_in_default_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = options(dir.path());
+        let err = executor(dir.path(), &o).run_bash("touch marker").await;
+        assert!(err.is_err());
+        assert!(!dir.path().join("marker").exists());
+    }
+
+    #[tokio::test]
+    // An approval callback that allows the call lets the `!`cmd`` expansion run.
+    async fn bash_expansion_runs_when_approved() {
+        struct AllowAll;
+        #[async_trait]
+        impl PermissionCallback for AllowAll {
+            async fn approve(&self, _: PermissionRequest) -> PermissionDecision {
+                PermissionDecision::AllowOnce
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = options(dir.path());
+        o.permission_callback = Some(Arc::new(AllowAll));
+        executor(dir.path(), &o)
+            .run_bash("touch marker")
+            .await
+            .expect("approved expansion runs");
+        assert!(dir.path().join("marker").exists());
+    }
+
+    #[tokio::test]
+    // An `@file` expansion matching a disallow rule is refused.
+    async fn file_expansion_respects_disallow_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        let mut o = options(dir.path());
+        o.disallowed_tool_rules = vec![ToolRule::ExactTool("Read".into())];
+        let err = executor(dir.path(), &o).read_file(".env").await;
+        assert!(err.is_err());
     }
 }
