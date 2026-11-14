@@ -11,7 +11,8 @@ session persistence, checkpointing, authentication, and the terminal UI.
 - Runs the agent against a workspace, interactively (via `crom-tui`) or
   headless.
 - Manages provider login and credentials (`crom-auth`).
-- Selects a provider — Anthropic, OpenAI, or Gemini.
+- Selects a provider by profile id (`--provider anthropic|openai|deepseek|gemini|local`
+  or a settings-defined id; see `docs/providers.md`), plus `codex` and `fake`.
 - Persists, resumes, forks, and exports sessions (`crom-session`).
 - Captures checkpoints and supports rewind (`crom-checkpoint`).
 - Enforces permissions, policies, and built-in safety hooks (block dangerous

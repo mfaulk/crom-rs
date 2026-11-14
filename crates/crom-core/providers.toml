@@ -1,0 +1,74 @@
+# Built-in provider profiles. Compiled into crom-core via `include_str!`.
+#
+# Settings can override any field of a built-in profile, or add new
+# profiles, under the `providers` key of `settings.json`. See
+# docs/providers.md.
+#
+# Rules:
+# - Profiles never hold secrets. `api_key_env` names the environment
+#   variable that holds the key; it is not the key.
+# - `base_url` excludes the API version path: the openai-chat transport
+#   appends `/v1/chat/completions`.
+# - Any capability that is omitted is unknown (`None`). Do not fill in
+#   values that have not been verified against the provider's docs.
+
+[profiles.anthropic]
+kind = "anthropic"
+# base_url intentionally unset: falls back to ANTHROPIC_BASE_URL, then
+# https://api.anthropic.com.
+api_key_env = "ANTHROPIC_API_KEY"
+default_model = "claude-sonnet-4-6"
+
+[profiles.anthropic.capabilities]
+tool_calls = true
+parallel_tool_calls = true
+streaming = true
+reasoning_content = false
+
+[profiles.openai]
+kind = "openai-chat"
+base_url = "https://api.openai.com"
+api_key_env = "OPENAI_API_KEY"
+default_model = "gpt-4.1"
+max_tokens_field = "max_completion_tokens"
+
+[profiles.openai.capabilities]
+tool_calls = true
+parallel_tool_calls = true
+streaming = true
+reasoning_content = false
+
+[profiles.deepseek]
+kind = "openai-chat"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+default_model = "deepseek-chat"
+max_tokens_field = "max_tokens"
+
+# Values describe the default model (deepseek-chat). `reasoning_content`
+# is returned by deepseek-reasoner; crom drops it from responses and never
+# sends it back (see docs/providers.md).
+[profiles.deepseek.capabilities]
+tool_calls = true
+streaming = true
+reasoning_content = true
+context_window = 128000
+max_output_tokens = 8192
+
+[profiles.gemini]
+kind = "gemini"
+base_url = "https://generativelanguage.googleapis.com"
+api_key_env = "GEMINI_API_KEY"
+default_model = "gemini-2.5-pro"
+
+[profiles.gemini.capabilities]
+tool_calls = true
+
+# Example local OpenAI-compatible server (Ollama shown; vLLM defaults to
+# http://localhost:8000). Servers that ignore auth still need the env var
+# set to any placeholder value. No default model: pass --model.
+[profiles.local]
+kind = "openai-chat"
+base_url = "http://localhost:11434"
+api_key_env = "LOCAL_OPENAI_API_KEY"
+max_tokens_field = "max_tokens"

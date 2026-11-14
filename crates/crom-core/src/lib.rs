@@ -19,6 +19,7 @@ pub mod plan;
 pub mod plugins;
 pub mod policy;
 pub mod provider;
+pub mod provider_profile;
 pub mod provider_retry;
 pub mod repair;
 pub mod run_id;
@@ -144,6 +145,10 @@ pub use policy::{
     PolicyDecision, PolicyDecisionSource, PolicyEngine, PolicyOutcome, PolicyToolContext,
 };
 pub use provider::{ModelEvent, ModelProvider, ModelRequest};
+pub use provider_profile::{
+    MaxTokensField, ProfileError, ProviderCapabilities, ProviderKind, ProviderProfile,
+    ProviderProfileConfig,
+};
 pub use provider_retry::{
     retry_provider_call, with_retry_observer, ProviderRetry, RetryObserver, RetryPolicy,
 };

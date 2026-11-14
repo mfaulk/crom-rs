@@ -23,6 +23,7 @@ tempfile = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 fs4 = { workspace = true }
+toml = "1.1"
 crom-mcp = { workspace = true }
 
 [dev-dependencies]

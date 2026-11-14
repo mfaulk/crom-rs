@@ -261,6 +261,7 @@ mod tests {
             session_id: None,
             provider: ProviderId::Fake,
             model: "fake-model".to_string(),
+            endpoint_host: None,
             metadata: RequestMetadata::default(),
         });
         let out = map_sdk_event(&ev);

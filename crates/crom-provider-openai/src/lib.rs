@@ -12,8 +12,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use crom_auth::{AuthError, AuthErrorKind, ProviderId, ResolvedCredential, SecretString};
 use crom_core::{
-    retry_provider_call, AssistantContent, ContentBlock, MessageRole, ModelEvent, ModelProvider,
-    ModelRequest, ProviderError, RetryPolicy, TokenUsage, ToolCall, ToolResultContent,
+    retry_provider_call, AssistantContent, ContentBlock, MaxTokensField, MessageRole, ModelEvent,
+    ModelProvider, ModelRequest, ProviderError, RetryPolicy, TokenUsage, ToolCall,
+    ToolResultContent,
 };
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,10 @@ pub struct OpenAiConfig {
     /// Whole-request timeout, a backstop so a stalled endpoint cannot hang
     /// the agent. Sized for slow reasoning models.
     pub request_timeout: Duration,
+    /// Body field carrying the output-token limit. OpenAI's newer models
+    /// require `max_completion_tokens`; most compatible servers (DeepSeek,
+    /// Ollama, vLLM) use `max_tokens`. Defaults to `max_tokens`.
+    pub max_tokens_field: MaxTokensField,
 }
 
 impl Default for OpenAiConfig {
@@ -91,6 +96,7 @@ impl Default for OpenAiConfig {
             connect_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(300),
             request_timeout: Duration::from_secs(600),
+            max_tokens_field: MaxTokensField::MaxTokens,
         }
     }
 }
@@ -167,7 +173,9 @@ impl ModelProvider for OpenAiProvider {
         let cred = (self.credential)();
         let key = require_api_key(&cred)?;
         let url = format!("{}/v1/chat/completions", self.cfg.base_url);
-        let body = serde_json::to_string(&build_body(&request))
+        let mut body = build_body(&request);
+        rename_max_tokens(&mut body, self.cfg.max_tokens_field);
+        let body = serde_json::to_string(&body)
             .map_err(|e| ProviderError::Other(format!("encode body: {e}")))?;
         let resp = retry_provider_call("openai", &self.cfg.retry_policy(), || async {
             let r = self.transport.post_chat(&url, &key, &body).await?;
@@ -179,6 +187,17 @@ impl ModelProvider for OpenAiProvider {
             .map_err(|e| ProviderError::InvalidResponse(format!("openai chat response: {e}")))?;
         let events = chat_response_to_events(parsed);
         Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+    }
+}
+
+fn rename_max_tokens(body: &mut Value, field: MaxTokensField) {
+    if field == MaxTokensField::MaxTokens {
+        return;
+    }
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(v) = obj.remove("max_tokens") {
+            obj.insert(field.as_str().to_string(), v);
+        }
     }
 }
 

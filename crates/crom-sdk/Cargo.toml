@@ -72,6 +72,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+wiremock = { workspace = true }
 
 # Each example below requires the fake-provider feature for an offline
 # build. Run with: `cargo run --example <name> --features fake-provider -p crom-sdk`

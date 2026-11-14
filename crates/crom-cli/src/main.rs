@@ -700,14 +700,15 @@ struct CommonArgs {
     /// Workspace directory; tools are sandboxed to this path.
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
-    /// Anthropic model id. When omitted, settings.model wins; otherwise
-    /// falls back to the built-in default `claude-sonnet-4-6`.
+    /// Model id. When omitted: settings.model, then model_config.model,
+    /// then the active provider profile's default_model.
     #[arg(long)]
     model: Option<String>,
-    /// Model-access provider to use for this run: anthropic | openai |
-    /// gemini | fake. When omitted, falls back to .agent/active-provider.json
-    /// (set by `crom provider use`), then to the built-in default
-    /// `anthropic`.
+    /// Provider profile id for this run: anthropic | openai | deepseek |
+    /// gemini | local | a settings-defined id, or codex | fake. When omitted,
+    /// falls back to .agent/active-provider.json (set by `crom provider
+    /// use`), auth.active_provider, model_config.provider, then `anthropic`.
+    /// See docs/providers.md.
     #[arg(long)]
     provider: Option<String>,
     /// Comma-separated list of tools to expose by name.
@@ -1611,13 +1612,28 @@ async fn resolve_common(
         PermissionMode::Default
     };
 
-    // Determine model: explicit CLI flag wins over settings.
+    // Determine model: --model > settings.model > model_config.model > the
+    // active provider profile's default_model > `claude-sonnet-4-6` (only
+    // for ids without a profile, e.g. `fake`).
     let model = if let Some(m) = &common.model {
         m.clone()
     } else if let Some(m) = &settings.model {
         m.clone()
+    } else if let Some(m) = &settings.model_config.model {
+        m.clone()
     } else {
-        "claude-sonnet-4-6".to_string()
+        let active = active_provider_id(common.provider.as_deref(), &cwd, &settings);
+        match classify_provider_id_with(&active, &settings.providers) {
+            ProviderRoute::Anthropic(p) | ProviderRoute::Profile(p) => {
+                p.default_model.clone().ok_or_else(|| {
+                    anyhow!(
+                        "provider profile {:?} has no default_model; pass --model",
+                        p.id
+                    )
+                })?
+            }
+            _ => "claude-sonnet-4-6".to_string(),
+        }
     };
 
     // Determine allowed tool names: CLI overrides settings if non-empty.
@@ -5233,28 +5249,35 @@ async fn cmd_rewind(args: RewindArgs) -> Result<()> {
 
 fn build_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
     let provider_id = resolve_active_provider(cfg);
-    match classify_provider_id(&provider_id) {
-        ProviderRoute::Anthropic => build_anthropic_provider(cfg),
-        ProviderRoute::OpenAi | ProviderRoute::Codex => build_openai_provider(cfg),
-        ProviderRoute::Gemini => build_gemini_provider(cfg),
+    match classify_provider_id_with(&provider_id, &cfg.settings.providers) {
+        ProviderRoute::Anthropic(p) => build_anthropic_provider(cfg, p.base_url.as_deref()),
+        ProviderRoute::Profile(p) => build_profile_provider(cfg, &p),
+        ProviderRoute::Codex => build_openai_provider(cfg),
         ProviderRoute::Fake => Ok(Arc::new(build_fake_provider())),
         ProviderRoute::Unimplemented(canonical) => {
             Err(anyhow!(unimplemented_provider_message(&canonical)))
         }
-        ProviderRoute::Unknown => Err(anyhow!(unknown_provider_message(&provider_id))),
+        ProviderRoute::InvalidProfile(msg) => Err(anyhow!(msg)),
+        ProviderRoute::Unknown => Err(anyhow!(unknown_provider_message(
+            &provider_id,
+            &cfg.settings.providers
+        ))),
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProviderRoute {
-    Anthropic,
-    OpenAi,
+    /// The `anthropic` profile: keeps the dedicated builder (stored
+    /// credential, then `ANTHROPIC_API_KEY` fallback).
+    Anthropic(Box<crom_core::ProviderProfile>),
+    /// Any other provider profile (built-in or settings-defined), built via
+    /// the shared `crom_sdk::profile::build_profile_provider`.
+    Profile(Box<crom_core::ProviderProfile>),
     /// Codex shares the OpenAI runtime path (chat-completions over the
     /// OpenAI transport) but stays a distinct routing variant so a
     /// future Codex-specific provider can be swapped in without
     /// re-aliasing the id.
     Codex,
-    Gemini,
     Fake,
     /// A `ProviderId` that the rest of the workspace recognizes (e.g.
     /// `vertex_ai`, `bedrock`, `foundry`) but for which no runtime
@@ -5262,38 +5285,59 @@ enum ProviderRoute {
     /// message can name it accurately, even if the user typed
     /// `vertex-ai` and we canonicalized to `vertex_ai`.
     Unimplemented(String),
+    /// A profile exists but is malformed (missing kind, bad api_key_env).
+    InvalidProfile(String),
     Unknown,
 }
 
-/// Map a resolved provider id to a [`ProviderRoute`] by routing through
-/// the canonical [`crom_auth::ProviderId::parse`] so the set of known providers
-/// cannot drift between the auth crate and the CLI runtime dispatch.
-///
-/// Each first-party variant maps to its dedicated runtime when one
-/// exists, or to `Unimplemented(canonical)` when the provider is
-/// recognized but not yet wired up (Vertex AI / Bedrock / Foundry).
-/// `ProviderId::Custom` — strings the auth crate didn't recognize — is
-/// the only path that returns `Unknown`, so a typo and a known-but-
-/// unimplemented provider never share an error message.
+/// [`classify_provider_id_with`] against built-in profiles only.
+#[cfg(test)]
 fn classify_provider_id(id: &str) -> ProviderRoute {
+    classify_provider_id_with(id, &Default::default())
+}
+
+/// Map a resolved provider id to a [`ProviderRoute`]. Ids are canonicalized
+/// with [`crom_auth::ProviderId::parse`]; `codex`, `fake`, and the
+/// recognized-but-unimplemented ids (Vertex AI / Bedrock / Foundry) keep
+/// their dedicated routes. Everything else resolves as a provider profile
+/// against the settings `providers` overrides, through the same
+/// `crom_core::provider_profile::resolve_profile` used by the SDK and eval.
+/// Only an id with no profile returns `Unknown`, so a typo and a malformed
+/// or unimplemented provider never share an error message.
+fn classify_provider_id_with(
+    id: &str,
+    profiles: &std::collections::BTreeMap<String, crom_core::ProviderProfileConfig>,
+) -> ProviderRoute {
     use crom_auth::ProviderId;
-    match ProviderId::parse(id) {
-        ProviderId::Anthropic => ProviderRoute::Anthropic,
-        ProviderId::OpenAi => ProviderRoute::OpenAi,
-        ProviderId::Codex => ProviderRoute::Codex,
-        ProviderId::Gemini => ProviderRoute::Gemini,
-        ProviderId::Fake => ProviderRoute::Fake,
+    use crom_core::provider_profile::{resolve_profile, ProfileError, ProviderKind};
+    let parsed = ProviderId::parse(id);
+    match &parsed {
+        ProviderId::Codex => return ProviderRoute::Codex,
+        ProviderId::Fake => return ProviderRoute::Fake,
         p @ (ProviderId::VertexAi | ProviderId::Bedrock | ProviderId::Foundry) => {
-            ProviderRoute::Unimplemented(p.as_str().to_string())
+            return ProviderRoute::Unimplemented(p.as_str().to_string())
         }
-        ProviderId::Custom(_) => ProviderRoute::Unknown,
+        _ => {}
+    }
+    match resolve_profile(parsed.as_str(), profiles) {
+        Ok(p) if p.id == "anthropic" && p.kind == ProviderKind::Anthropic => {
+            ProviderRoute::Anthropic(Box::new(p))
+        }
+        Ok(p) => ProviderRoute::Profile(Box::new(p)),
+        Err(ProfileError::Unknown { .. }) => ProviderRoute::Unknown,
+        Err(e) => ProviderRoute::InvalidProfile(e.to_string()),
     }
 }
 
-fn unknown_provider_message(id: &str) -> String {
+fn unknown_provider_message(
+    id: &str,
+    profiles: &std::collections::BTreeMap<String, crom_core::ProviderProfileConfig>,
+) -> String {
+    let known = crom_core::provider_profile::known_profile_ids(profiles).join(", ");
     format!(
-        "unknown provider {id:?}; expected one of anthropic, openai, codex, gemini, fake \
-         (recognized-but-not-yet-implemented: vertex_ai, bedrock, foundry)"
+        "unknown provider {id:?}; expected a provider profile ({known}), codex, or fake \
+         (recognized-but-not-yet-implemented: vertex_ai, bedrock, foundry); \
+         define custom profiles under `providers` in settings.json"
     )
 }
 
@@ -5309,7 +5353,10 @@ fn unimplemented_provider_message(canonical_id: &str) -> String {
 /// over the legacy `ANTHROPIC_API_KEY` env var. Falls back to
 /// `AnthropicConfig::from_env()` when no stored credential is present,
 /// so existing workflows keep working.
-fn build_anthropic_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
+fn build_anthropic_provider(
+    cfg: &ResolvedRunConfig,
+    profile_base_url: Option<&str>,
+) -> Result<Arc<dyn ModelProvider>> {
     // Distinguish "no stored credential" (fall back to `ANTHROPIC_API_KEY` via
     // `AnthropicConfig::from_env`) from a real credential-store failure, which
     // must propagate rather than be silently swallowed — matching the OpenAI
@@ -5319,7 +5366,7 @@ fn build_anthropic_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProv
         Err(e) if is_not_logged_in_error(&e) => crom_auth::ResolvedCredential::None,
         Err(e) => return Err(e),
     };
-    let acfg = match credential {
+    let mut acfg = match credential {
         crom_auth::ResolvedCredential::ApiKey { key, .. } => {
             let base_url = std::env::var("ANTHROPIC_BASE_URL")
                 .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
@@ -5335,6 +5382,10 @@ fn build_anthropic_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProv
             "No Anthropic credential available; run `crom auth login anthropic --api-key` or set ANTHROPIC_API_KEY",
         )?,
     };
+    // A settings `providers.anthropic.base_url` wins over ANTHROPIC_BASE_URL.
+    if let Some(url) = profile_base_url {
+        acfg.base_url = url.to_string();
+    }
     let provider = AnthropicProvider::new(acfg)?;
     Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
 }
@@ -5343,12 +5394,21 @@ fn build_anthropic_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProv
 /// 1. `--provider` CLI flag,
 /// 2. `.agent/active-provider.json` written by `crom provider use`,
 /// 3. `auth.active_provider` from settings,
-/// 4. the built-in default `"anthropic"`.
+/// 4. `model_config.provider` from settings,
+/// 5. the built-in default `"anthropic"`.
 fn resolve_active_provider(cfg: &ResolvedRunConfig) -> String {
-    if let Some(p) = cfg.provider_override.as_deref() {
+    active_provider_id(cfg.provider_override.as_deref(), &cfg.cwd, &cfg.settings)
+}
+
+fn active_provider_id(
+    provider_override: Option<&str>,
+    cwd: &std::path::Path,
+    settings: &Settings,
+) -> String {
+    if let Some(p) = provider_override {
         return p.to_string();
     }
-    let marker = cfg.cwd.join(".agent").join("active-provider.json");
+    let marker = cwd.join(".agent").join("active-provider.json");
     if let Ok(bytes) = std::fs::read(&marker) {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
             if let Some(s) = v.get("provider").and_then(|v| v.as_str()) {
@@ -5356,7 +5416,10 @@ fn resolve_active_provider(cfg: &ResolvedRunConfig) -> String {
             }
         }
     }
-    if let Some(s) = cfg.settings.auth.active_provider.as_deref() {
+    if let Some(s) = settings.auth.active_provider.as_deref() {
+        return s.to_string();
+    }
+    if let Some(s) = settings.model_config.provider.as_deref() {
         return s.to_string();
     }
     "anthropic".to_string()
@@ -5371,13 +5434,38 @@ fn build_openai_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvide
     Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
 }
 
-fn build_gemini_provider(cfg: &ResolvedRunConfig) -> Result<Arc<dyn ModelProvider>> {
-    let cred = resolve_runtime_credential(cfg, crom_auth::ProviderId::Gemini)?;
-    let provider = crom_provider_gemini::GeminiProvider::from_config(
-        crom_provider_gemini::GeminiConfig::default(),
-        cred,
-    )?;
-    Ok(Arc::new(provider) as Arc<dyn ModelProvider>)
+/// Build a non-Anthropic provider from its profile through the shared SDK
+/// constructor. The credential honors the usual precedence ladder, with the
+/// profile's `api_key_env` as the env-var source.
+fn build_profile_provider(
+    cfg: &ResolvedRunConfig,
+    profile: &crom_core::ProviderProfile,
+) -> Result<Arc<dyn ModelProvider>> {
+    let provider_id = crom_auth::ProviderId::parse(&profile.id);
+    let allow_file = cfg
+        .settings
+        .auth
+        .allow_file_credential_store
+        .unwrap_or(false);
+    let cred = resolve_stored_credential_with_env(
+        &cfg.cwd,
+        allow_file,
+        provider_id,
+        profile.api_key_env.clone(),
+    )
+    .with_context(|| match &profile.api_key_env {
+        Some(env) => format!(
+            "provider {:?}: set {env} or run `crom auth login`",
+            profile.id
+        ),
+        None => format!("provider {:?}: no credential", profile.id),
+    })?;
+    tracing::info!(
+        provider = %profile.id,
+        endpoint_host = ?profile.base_url_host(),
+        "provider profile resolved"
+    );
+    crom_sdk::profile::build_profile_provider(profile, cred).map_err(|e| anyhow!("{e}"))
 }
 
 /// Tiny, fully-offline ModelProvider that streams a one-line acknowledgement
@@ -5452,6 +5540,17 @@ fn resolve_stored_credential(
     allow_file: bool,
     provider: crom_auth::ProviderId,
 ) -> Result<crom_auth::ResolvedCredential> {
+    resolve_stored_credential_with_env(cwd, allow_file, provider, None)
+}
+
+/// [`resolve_stored_credential`] with a provider-profile `api_key_env`
+/// overriding the static env-var mapping.
+fn resolve_stored_credential_with_env(
+    cwd: &std::path::Path,
+    allow_file: bool,
+    provider: crom_auth::ProviderId,
+    api_key_env: Option<String>,
+) -> Result<crom_auth::ResolvedCredential> {
     let store = crom_auth::CredentialStore::build(
         crom_auth::CredentialStoreMode::Auto,
         allow_file,
@@ -5464,6 +5563,7 @@ fn resolve_stored_credential(
     let res = crom_auth::resolve_credential(crom_auth::AuthResolverInputs {
         provider: Some(provider.clone()),
         mode: crom_auth::AuthPrecedenceMode::ExplicitFirst,
+        api_key_env,
         explicit_api_key: None,
         explicit_account: None,
         active_account: active.as_ref(),
@@ -8041,12 +8141,30 @@ mod provider_route_tests {
     // Known provider ids map to their dedicated routes (codex shares
     // the openai runtime but stays a distinct variant).
     fn known_providers_map_to_dedicated_routes() {
-        assert_eq!(classify_provider_id("anthropic"), ProviderRoute::Anthropic);
-        assert_eq!(classify_provider_id("openai"), ProviderRoute::OpenAi);
+        use crom_core::ProviderKind;
+        let kind_of = |id: &str| match classify_provider_id(id) {
+            ProviderRoute::Anthropic(p) | ProviderRoute::Profile(p) => Some((p.id, p.kind)),
+            _ => None,
+        };
+        assert!(matches!(
+            classify_provider_id("anthropic"),
+            ProviderRoute::Anthropic(_)
+        ));
+        assert_eq!(
+            kind_of("openai"),
+            Some(("openai".into(), ProviderKind::OpenAiChat))
+        );
+        assert_eq!(
+            kind_of("deepseek"),
+            Some(("deepseek".into(), ProviderKind::OpenAiChat))
+        );
+        assert_eq!(
+            kind_of("gemini"),
+            Some(("gemini".into(), ProviderKind::Gemini))
+        );
         assert_eq!(classify_provider_id("codex"), ProviderRoute::Codex);
         // `chatgpt` is a canonical alias of codex via ProviderId::parse.
         assert_eq!(classify_provider_id("chatgpt"), ProviderRoute::Codex);
-        assert_eq!(classify_provider_id("gemini"), ProviderRoute::Gemini);
         assert_eq!(classify_provider_id("fake"), ProviderRoute::Fake);
     }
 
@@ -8096,12 +8214,54 @@ mod provider_route_tests {
     // The error message for an unknown provider names the bad id and
     // enumerates the supported ones so the operator can fix the config.
     fn unknown_provider_message_is_actionable() {
-        let msg = unknown_provider_message("nope");
+        let msg = unknown_provider_message("nope", &Default::default());
         assert!(msg.contains("nope"));
         assert!(msg.contains("anthropic"));
         assert!(msg.contains("openai"));
         assert!(msg.contains("codex"));
         assert!(msg.contains("gemini"));
+        assert!(msg.contains("deepseek"));
+    }
+
+    #[test]
+    // One profile id resolves identically through the CLI router, the
+    // SDK `ProviderConfig::Profile`, and the eval live-provider resolver.
+    fn profile_resolves_identically_in_cli_sdk_and_eval() {
+        let overrides: std::collections::BTreeMap<String, crom_core::ProviderProfileConfig> =
+            serde_json::from_value(serde_json::json!({
+                "deepseek": { "base_url": "http://127.0.0.1:9" }
+            }))
+            .unwrap();
+        let core = crom_core::provider_profile::resolve_profile("deepseek", &overrides).unwrap();
+        let cli = match classify_provider_id_with("DeepSeek", &overrides) {
+            ProviderRoute::Profile(p) => *p,
+            other => panic!("unexpected route {other:?}"),
+        };
+        let eval = crom_eval::providers::resolve_live_profile("deepseek", &overrides).unwrap();
+        assert_eq!(cli, core);
+        assert_eq!(eval, core);
+        let sdk = crom_sdk::ProviderConfig::profile(
+            core.clone(),
+            crom_sdk::SecretString::new("k".into()),
+        );
+        assert_eq!(sdk.provider_id().as_str(), core.id);
+        assert_eq!(sdk.endpoint_host(), core.base_url_host());
+        let oa = crom_sdk::profile::openai_config(&core);
+        assert_eq!(oa.base_url, "http://127.0.0.1:9");
+        assert_eq!(oa.max_tokens_field, core.max_tokens_field);
+    }
+
+    #[test]
+    // A settings profile missing `kind` surfaces as an invalid-profile error,
+    // not as "unknown provider".
+    fn malformed_settings_profile_is_reported() {
+        let overrides: std::collections::BTreeMap<String, crom_core::ProviderProfileConfig> =
+            serde_json::from_value(serde_json::json!({ "mine": { "base_url": "http://x" } }))
+                .unwrap();
+        assert!(matches!(
+            classify_provider_id_with("mine", &overrides),
+            ProviderRoute::InvalidProfile(m) if m.contains("kind")
+        ));
     }
 
     #[test]
@@ -8110,7 +8270,7 @@ mod provider_route_tests {
     // diagnosable hint instead of a misleading "expected one of …".
     fn unimplemented_provider_message_differs_from_unknown() {
         let unimpl = unimplemented_provider_message("vertex_ai");
-        let unknown = unknown_provider_message("vertex_ai");
+        let unknown = unknown_provider_message("vertex_ai", &Default::default());
         assert!(unimpl.contains("not yet supported"));
         assert!(unimpl.contains("vertex_ai"));
         assert_ne!(unimpl, unknown);

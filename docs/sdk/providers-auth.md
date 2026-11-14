@@ -18,6 +18,7 @@ let cfg = ProviderConfig::anthropic_api_key(SecretString::new(
 | `AnthropicApiKey`       | Direct `SecretString`. Default model `claude-sonnet-4-6`. `anthropic` feature. |
 | `OpenAiApiKey`          | Direct API key. Default model `gpt-4.1`. `openai` feature (default on).        |
 | `GeminiApiKey`          | Direct API key. Default model `gemini-1.5-pro`. `gemini` feature (default on). |
+| `Profile`               | A resolved provider profile (`docs/providers.md`) plus API key. Endpoint, request shape, and default model come from the profile; a profile without `default_model` requires `.model(..)` (`provider.no_default_model`). |
 | `OAuthCredential`       | Pre-resolved `StoredCredentialSecret`. (Reserved; wrap in `External` for now.) |
 | `FromAuthStore`         | Reserved; rejected with `provider.auth_store_disabled`. Use an API-key variant. |
 | `External`              | Bring your own `Arc<dyn ModelProvider>` and a `ResolvedCredential`.            |
@@ -31,6 +32,26 @@ for proxies and mock servers). OpenAI and Gemini use 30s connect / 300s idle /
 errors, timeouts) up to 3 times; Anthropic retries up to 2 times. Each retry
 emits `SdkEvent::ProviderRetry`; see [`../providers.md`](../providers.md). A
 disabled provider feature fails with `provider.feature_disabled`.
+
+## Provider profiles
+
+```rust,no_run
+use std::collections::BTreeMap;
+use crom_core::provider_profile::resolve_profile;
+use crom_sdk::{ProviderConfig, SecretString};
+
+let profile = resolve_profile("deepseek", &BTreeMap::new()).unwrap();
+let cfg = ProviderConfig::profile(
+    profile,
+    SecretString::new(std::env::var("DEEPSEEK_API_KEY").unwrap()),
+);
+```
+
+The second argument to `resolve_profile` is the settings-level `providers`
+override map. `crom_sdk::profile::build_profile_provider` is the shared
+constructor used by the SDK builder, the CLI, and the eval runner. The
+endpoint host (never the key or full URL) is reported as
+`RunStarted.endpoint_host` and `AgentRuntime::endpoint_host()`.
 
 ## Why not auto-detect?
 

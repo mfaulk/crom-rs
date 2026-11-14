@@ -116,6 +116,11 @@ pub struct SettingsFile {
     /// M10: active model + provider, plus optional fallback list.
     #[serde(default)]
     pub model_config: Option<ModelSettingsConfig>,
+    /// M17.1: provider profiles keyed by id; patches built-ins from
+    /// `providers.toml` field-wise or adds new profiles. Never holds keys.
+    #[serde(default)]
+    pub providers:
+        Option<std::collections::BTreeMap<String, crate::provider_profile::ProviderProfileConfig>>,
     /// M11: planning + act configuration.
     #[serde(default)]
     pub planning: Option<PlanningSettingsConfig>,
@@ -630,6 +635,9 @@ pub struct Settings {
     pub auth: AuthSettingsConfig,
     /// M10: active model + provider.
     pub model_config: ModelSettingsConfig,
+    /// M17.1: provider profile overrides (see [`crate::provider_profile`]).
+    pub providers:
+        std::collections::BTreeMap<String, crate::provider_profile::ProviderProfileConfig>,
     /// M11: planning settings.
     pub planning: Option<PlanningSettingsConfig>,
     /// M16: effective repair-loop configuration.
@@ -994,6 +1002,14 @@ pub fn merge_settings_file_into(
     }
     if let Some(model_cfg) = src.model_config {
         merge_model_settings(&mut dst.model_config, model_cfg);
+    }
+    if let Some(providers) = src.providers {
+        for (id, cfg) in providers {
+            dst.providers
+                .entry(id.to_ascii_lowercase())
+                .or_default()
+                .merge(cfg);
+        }
     }
     if let Some(planning) = src.planning {
         merge_planning_settings(&mut dst.planning, planning)?;
@@ -1665,5 +1681,33 @@ mod tests {
         let mut effective = Settings::default();
         let err = merge_settings_file_into(&mut effective, file).unwrap_err();
         assert!(matches!(err, SettingsError::BadIncludeBacktrace(_)));
+    }
+
+    /// `providers` entries from user then project settings merge field-wise per profile id.
+    #[test]
+    fn providers_merge_field_wise_across_files() {
+        let user: SettingsFile = serde_json::from_str(
+            r#"{ "providers": { "DeepSeek": { "base_url": "http://user", "default_model": "deepseek-chat" } } }"#,
+        )
+        .unwrap();
+        let project: SettingsFile = serde_json::from_str(
+            r#"{ "providers": { "deepseek": { "base_url": "http://proj" } } }"#,
+        )
+        .unwrap();
+        let mut effective = Settings::default();
+        merge_settings_file_into(&mut effective, user).unwrap();
+        merge_settings_file_into(&mut effective, project).unwrap();
+        let p = &effective.providers["deepseek"];
+        assert_eq!(p.base_url.as_deref(), Some("http://proj"));
+        assert_eq!(p.default_model.as_deref(), Some("deepseek-chat"));
+    }
+
+    /// A settings file that tries to store an API key inside a provider profile fails to parse.
+    #[test]
+    fn providers_reject_inline_api_key() {
+        let res: Result<SettingsFile, _> =
+            serde_json::from_str(r#"{ "providers": { "deepseek": { "api_key": "sk-leak" } } }"#);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("api_key") && !err.contains("sk-leak"), "{err}");
     }
 }

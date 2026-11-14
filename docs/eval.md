@@ -133,10 +133,11 @@ The `--provider` flag selects how the agent is driven for the whole run:
 |-------------|-------------|
 | `fake`      | A trivial echo provider. Proves the harness plumbing (workspace setup, event capture, oracles, scoring, artifacts) without proving model intelligence. Offline and deterministic. |
 | `golden`    | A scripted provider that replays a canned sequence of tool calls for a specific task (read → edit → run check → observe failure → edit → pass). Catches regressions in tool schemas, event handling, sessions, and command execution. |
-| `anthropic` | A real model provider; currently the only accepted live name (any other value is rejected with `unknown provider`). **Opt-in only**: requires `CROM_EVAL_LIVE=1` and provider credentials (`ANTHROPIC_API_KEY`). If the opt-in flag or credentials are missing, affected tasks are reported as **skipped**, never failed. Never runs in ordinary CI. |
+| any provider profile id | A real model provider resolved from a provider profile (`anthropic`, `openai`, `deepseek`, `gemini`, `local`, or an id defined under `providers` in user/project settings; see [providers.md](providers.md)). Any other value is rejected with `unknown provider`. **Opt-in only**: requires `CROM_EVAL_LIVE=1` and the profile's API-key env var (e.g. `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`). If the opt-in flag or credentials are missing, affected tasks are reported as **skipped**, never failed. Never runs in ordinary CI. |
 
-Set `CROM_EVAL_MODEL` to override the live model (default
-`claude-sonnet-4-6`).
+Set `CROM_EVAL_MODEL` to override the live model (default: the profile's
+`default_model`, e.g. `claude-sonnet-4-6` for `anthropic`, `deepseek-chat`
+for `deepseek`).
 
 ## Suites
 
@@ -328,6 +329,7 @@ target/crom-eval/
       task.toml            # copy of the manifest
       normalized-task.json # the task after adapter normalization
       adapter.json         # adapter that produced the task
+      provider.json        # provider id, model, endpoint host (never the key)
       isolation.json       # isolation backend + settings
       environment.json     # host/toolchain metadata
       prompt.md            # the prompt sent to the agent

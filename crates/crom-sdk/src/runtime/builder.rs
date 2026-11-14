@@ -191,7 +191,8 @@ impl AgentRuntimeBuilder {
         })?;
 
         let provider_id = provider_config.provider_id();
-        let (provider, default_model_default): (Arc<dyn ModelProvider>, &'static str) =
+        let endpoint_host = provider_config.endpoint_host();
+        let (provider, default_model_default): (Arc<dyn ModelProvider>, Option<String>) =
             materialize_provider(provider_config).await?;
 
         let workspace = match self.workspace {
@@ -208,13 +209,20 @@ impl AgentRuntimeBuilder {
         let storage = self.storage.unwrap_or_else(default_storage);
         let redactor = self.secret_redactor.unwrap_or_else(default_secret_redactor);
 
-        let model = self
-            .model
-            .unwrap_or_else(|| default_model_default.to_string());
+        let model = match self.model.or(default_model_default) {
+            Some(m) => m,
+            None => {
+                return Err(AgentSdkError::invalid_request(
+                    "provider.no_default_model",
+                    format!("provider profile {provider_id} has no default_model; set .model(..)"),
+                ))
+            }
+        };
 
         let inner = Arc::new(RuntimeInner {
             provider,
             provider_id,
+            endpoint_host,
             default_model: model,
             default_system_prompt: self.system_prompt,
             default_project_instructions: self.project_instructions,
@@ -236,8 +244,13 @@ impl AgentRuntimeBuilder {
 
 async fn materialize_provider(
     cfg: ProviderConfig,
-) -> Result<(Arc<dyn ModelProvider>, &'static str), AgentSdkError> {
-    match cfg {
+) -> Result<(Arc<dyn ModelProvider>, Option<String>), AgentSdkError> {
+    let (provider, model): (Arc<dyn ModelProvider>, &'static str) = match cfg {
+        ProviderConfig::Profile { profile, api_key } => {
+            let credential = api_key_credential(ProviderId::parse(&profile.id), api_key);
+            let provider = crate::profile::build_profile_provider(&profile, credential)?;
+            return Ok((provider, profile.default_model.clone()));
+        }
         #[cfg(feature = "anthropic")]
         ProviderConfig::AnthropicApiKey { api_key, base_url } => {
             let mut anthropic_cfg = crom_anthropic::AnthropicConfig {
@@ -308,12 +321,12 @@ async fn materialize_provider(
         )),
         ProviderConfig::External { provider, .. } => Ok((provider, "external-model")),
         ProviderConfig::Fake { provider } => Ok((provider, "fake-model")),
-    }
+    }?;
+    Ok((provider, Some(model.to_string())))
 }
 
 /// SDK-injected keys are explicit caller input, so they are tagged with the
 /// same `Cli` source the CLI uses for `--api-key`.
-#[cfg(any(feature = "openai", feature = "gemini"))]
 fn api_key_credential(
     provider: ProviderId,
     key: crate::provider::SecretString,

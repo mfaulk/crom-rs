@@ -367,4 +367,27 @@ fn default_config_timeouts_and_retries() {
     assert_eq!(cfg.request_timeout, Duration::from_secs(600));
     assert_eq!(cfg.max_retries, 3);
     assert_eq!(cfg.retry_base_delay, Duration::from_millis(250));
+    assert_eq!(cfg.max_tokens_field, crom_core::MaxTokensField::MaxTokens);
+}
+
+// With `max_tokens_field = MaxCompletionTokens` the limit is sent as
+// `max_completion_tokens` and `max_tokens` is omitted.
+#[tokio::test]
+async fn max_tokens_field_is_configurable() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            serde_json::json!({"max_completion_tokens": 64}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(OK_BODY))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut c = cfg(&server, 0);
+    c.max_tokens_field = crom_core::MaxTokensField::MaxCompletionTokens;
+    let provider = OpenAiProvider::from_config(c, cred()).unwrap();
+    run(&provider).await.expect("success");
+    let reqs = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(body.get("max_tokens").is_none(), "{body}");
 }

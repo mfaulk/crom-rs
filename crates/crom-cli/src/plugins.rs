@@ -1265,6 +1265,11 @@ pub fn settings_to_file(s: &Settings) -> crom_core::SettingsFile {
         recovery: Some(recovery_to_settings(&s.recovery)),
         auth: Some(s.auth.clone()),
         model_config: Some(s.model_config.clone()),
+        providers: if s.providers.is_empty() {
+            None
+        } else {
+            Some(s.providers.clone())
+        },
         planning: s.planning.clone(),
         repair: Some(s.repair.clone()),
         diagnostics: Some(s.diagnostics.clone()),

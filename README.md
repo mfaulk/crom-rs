@@ -60,6 +60,16 @@ crom auth status
 You can also export `ANTHROPIC_API_KEY` (or the provider equivalent) in your
 shell and skip `crom login` entirely.
 
+OpenAI-compatible endpoints such as DeepSeek and local Ollama/vLLM servers
+are selected by provider profile:
+
+```sh
+DEEPSEEK_API_KEY=sk-... crom run --provider deepseek --model deepseek-chat "..."
+```
+
+Built-in profiles, the `providers` settings key, and capability flags are
+documented in [`docs/providers.md`](docs/providers.md).
+
 ### Run the agent
 
 ```sh

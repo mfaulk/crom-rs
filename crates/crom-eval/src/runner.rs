@@ -163,6 +163,10 @@ pub struct RunConfig {
     /// the next attempt (up to `repair.max_attempts`). Disabled by default to
     /// preserve existing single-attempt behavior.
     pub repair: crom_core::repair::RepairPolicy,
+    /// Settings-level provider-profile overrides used to resolve live
+    /// providers (same resolver as the CLI and SDK).
+    pub provider_profiles:
+        std::collections::BTreeMap<String, crom_core::provider_profile::ProviderProfileConfig>,
 }
 
 impl Default for RunConfig {
@@ -181,6 +185,7 @@ impl Default for RunConfig {
             seed: 0,
             attempts: 1,
             repair: crom_core::repair::RepairPolicy::disabled(),
+            provider_profiles: Default::default(),
         }
     }
 }
@@ -232,7 +237,8 @@ async fn drive_agent(
     workspace_dir: &std::path::Path,
     config: &RunConfig,
 ) -> Result<RunOutcome, String> {
-    let setup = providers::build(&config.provider, task).map_err(|u| u.reason)?;
+    let setup = providers::build(&config.provider, task, &config.provider_profiles)
+        .map_err(|u| u.reason)?;
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::new(CollectingSink {
         events: events.clone(),
@@ -362,7 +368,7 @@ fn default_result(
         report_path: dir.join("report.md"),
         workspace_path: dir.join("workspace"),
         provider: config.provider.label(),
-        model: provider_model(&config.provider),
+        model: provider_model(config),
         suites: task.suites.clone(),
         tags: task.tags.clone(),
         checks_passed: 0,
@@ -402,13 +408,35 @@ fn default_result(
     }
 }
 
-fn provider_model(provider: &ProviderMode) -> String {
-    match provider {
+fn provider_model(config: &RunConfig) -> String {
+    match &config.provider {
         ProviderMode::Fake => "fake-echo".to_string(),
         ProviderMode::Golden => "golden".to_string(),
-        ProviderMode::Live(_) => crom_core::legacy::env_var("CROM_EVAL_MODEL")
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
+        ProviderMode::Live(name) => {
+            providers::resolve_live_profile(name, &config.provider_profiles)
+                .ok()
+                .and_then(|p| providers::live_model(&p))
+                .unwrap_or_default()
+        }
     }
+}
+
+/// Provider run metadata: id, model, and endpoint host. Never the API key
+/// or the full base URL.
+fn provider_metadata(config: &RunConfig) -> serde_json::Value {
+    let endpoint_host = match &config.provider {
+        ProviderMode::Live(name) => {
+            providers::resolve_live_profile(name, &config.provider_profiles)
+                .ok()
+                .and_then(|p| p.base_url_host())
+        }
+        _ => None,
+    };
+    serde_json::json!({
+        "provider": config.provider.label(),
+        "model": provider_model(config),
+        "endpoint_host": endpoint_host,
+    })
 }
 
 /// Per-command isolation limits for a task under a run config.
@@ -518,7 +546,7 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     let workspace_dir = artifacts.workspace_dir();
 
     // Provider availability is checked first so skips are clean and cheap.
-    if let Err(unavailable) = providers::build(&config.provider, task) {
+    if let Err(unavailable) = providers::build(&config.provider, task, &config.provider_profiles) {
         return skipped_result(task, &artifacts, config, unavailable.reason, started);
     }
 
@@ -1038,6 +1066,7 @@ fn write_run_artifacts(w: WriteArtifacts<'_>) {
 
 /// Write adapter/isolation/normalized-task metadata up front.
 fn write_metadata_artifacts(artifacts: &TaskArtifacts, task: &EvalTask, config: &RunConfig) {
+    let _ = artifacts.write_json("provider.json", &provider_metadata(config));
     let _ = artifacts.write_json(
         "adapter.json",
         &serde_json::json!({ "adapter": config.adapter }),
@@ -1212,5 +1241,32 @@ pub mod test_support {
             usage: None,
             model_round_trips: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_metadata_tests {
+    use super::*;
+
+    /// provider.json for a live profile records the endpoint host and model, never a key or full URL.
+    #[test]
+    fn live_provider_metadata_records_host_only() {
+        let mut config = RunConfig {
+            provider: ProviderMode::Live("deepseek".into()),
+            ..RunConfig::default()
+        };
+        config.provider_profiles.insert(
+            "deepseek".into(),
+            serde_json::from_value(serde_json::json!({
+                "base_url": "https://user:pw@ds.example:8443/proxy",
+                "default_model": "deepseek-chat"
+            }))
+            .unwrap(),
+        );
+        let meta = provider_metadata(&config);
+        assert_eq!(meta["provider"], "deepseek");
+        assert_eq!(meta["endpoint_host"], "ds.example:8443");
+        let text = meta.to_string();
+        assert!(!text.contains("pw") && !text.contains("/proxy"), "{text}");
     }
 }

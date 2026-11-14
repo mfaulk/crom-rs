@@ -54,6 +54,7 @@ pub mod event;
 pub mod patch;
 pub mod plan;
 pub mod policy;
+pub mod profile;
 pub mod provider;
 pub mod request;
 pub mod result;

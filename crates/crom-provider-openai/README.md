@@ -32,6 +32,10 @@ Failures map to typed `ProviderError` variants (`Auth`, `InvalidRequest`,
 5xx, connect errors, and timeouts are retried through the shared core policy
 with jittered exponential backoff, honouring `retry-after-ms` / `Retry-After`.
 See [`docs/providers.md`](../../docs/providers.md).
+`max_tokens_field` (default `MaxTokensField::MaxTokens`) selects whether the
+output limit is sent as `max_tokens` or `max_completion_tokens`; provider
+profiles set it per endpoint. `base_url` is the endpoint root;
+`/v1/chat/completions` is appended.
 
 Build with `default-features = false` to drop the reqwest transport and
 supply your own `OpenAiTransport` via `OpenAiProvider::new`.
