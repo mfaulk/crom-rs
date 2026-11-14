@@ -382,9 +382,8 @@ fn provider_model(provider: &ProviderMode) -> String {
     match provider {
         ProviderMode::Fake => "fake-echo".to_string(),
         ProviderMode::Golden => "golden".to_string(),
-        ProviderMode::Live(_) => {
-            std::env::var("CROM_EVAL_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string())
-        }
+        ProviderMode::Live(_) => crom_core::legacy::env_var("CROM_EVAL_MODEL")
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
     }
 }
 

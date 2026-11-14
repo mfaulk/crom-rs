@@ -210,7 +210,7 @@ impl ContainerBackend {
             "podman" => PODMAN_ENV,
             _ => "",
         };
-        if !opt_in.is_empty() && std::env::var(opt_in).ok().as_deref() != Some("1") {
+        if !opt_in.is_empty() && crom_core::legacy::env_var(opt_in).as_deref() != Some("1") {
             return Err(IsolationError {
                 backend: engine.to_string(),
                 message: format!("{engine} isolation requires {opt_in}=1 (opt-in)"),

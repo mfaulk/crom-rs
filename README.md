@@ -22,6 +22,27 @@ cargo install --path crates/crom-cli
 `cargo install` puts the `crom` binary on your `PATH` (usually
 `~/.cargo/bin/crom`).
 
+#### Upgrading from `code-agent`
+
+The project was renamed from `code-agent` to `crom`. User settings now live
+in `${CROM_CONFIG_HOME:-${XDG_CONFIG_HOME:-~/.config}/crom}/settings.json`,
+and every `CODE_AGENT_*` environment variable is now `CROM_*` (for example
+`CROM_CONFIG_HOME`, `CROM_EVAL_LIVE`, `CROM_EVAL_MODEL`).
+
+Until you migrate, `crom` falls back read-only to the old names and prints a
+one-time `warning:` on stderr:
+
+- If `<config>/crom` does not exist but `<config>/code-agent` does, user
+  settings are read from `<config>/code-agent`. Nothing is ever written there;
+  once `<config>/crom` exists it always wins.
+- If a `CROM_*` variable is unset but its `CODE_AGENT_*` spelling is set, the
+  old value is used. The new name always wins when both are set.
+- Plugin manifests using `${CODE_AGENT_PLUGIN_ROOT}` /
+  `${CODE_AGENT_PLUGIN_DATA}` still resolve.
+
+To migrate: `mv ~/.config/code-agent ~/.config/crom` and rename the
+environment variables. The project-level `.agent/` directory is unchanged.
+
 ### Authenticate
 
 Log in once and the credential is stored in the OS keychain (or a clearly

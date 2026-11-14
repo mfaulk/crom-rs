@@ -180,7 +180,7 @@ fn parse_setting_source(s: &str) -> Result<SettingSource> {
 }
 
 fn user_config_home() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CROM_CONFIG_HOME") {
+    if let Some(p) = crom_core::legacy::env_var("CROM_CONFIG_HOME") {
         return Some(PathBuf::from(p));
     }
     if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
