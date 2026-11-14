@@ -1,0 +1,138 @@
+diff --git a/crates/mdscan/src/lib.rs b/crates/mdscan/src/lib.rs
+index cf2ab67..661897d 100644
+--- a/crates/mdscan/src/lib.rs
++++ b/crates/mdscan/src/lib.rs
+@@ -31,18 +31,47 @@ pub fn parse_heading(line: &str) -> Option<(u8, String)> {
+     Some((hashes as u8, text.to_string()))
+ }
+ 
+-/// All headings in a document, in order.
++/// A code fence line: up to three spaces, then 3+ backticks or tildes.
++/// Returns the fence character, its run length, and the text after it.
++fn fence(line: &str) -> Option<(char, usize, &str)> {
++    let trimmed = line.trim_start_matches(' ');
++    if line.len() - trimmed.len() > 3 {
++        return None;
++    }
++    let ch = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
++    let len = trimmed.chars().take_while(|&c| c == ch).count();
++    if len < 3 {
++        return None;
++    }
++    Some((ch, len, &trimmed[len..]))
++}
++
++/// All headings in a document, in order. Fenced code blocks are skipped.
+ pub fn headings(doc: &str) -> Vec<Heading> {
+-    doc.lines()
+-        .enumerate()
+-        .filter_map(|(i, l)| {
+-            parse_heading(l).map(|(level, text)| Heading {
++    let mut out = Vec::new();
++    let mut open: Option<(char, usize)> = None;
++    for (i, l) in doc.lines().enumerate() {
++        if let Some((ch, len)) = open {
++            if let Some((c, n, rest)) = fence(l) {
++                if c == ch && n >= len && rest.trim().is_empty() {
++                    open = None;
++                }
++            }
++            continue;
++        }
++        if let Some((ch, len, _)) = fence(l) {
++            open = Some((ch, len));
++            continue;
++        }
++        if let Some((level, text)) = parse_heading(l) {
++            out.push(Heading {
+                 level,
+                 text,
+                 line: i + 1,
+-            })
+-        })
+-        .collect()
++            });
++        }
++    }
++    out
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/slugger/src/lib.rs b/crates/slugger/src/lib.rs
+index 64e0f72..39b24fa 100644
+--- a/crates/slugger/src/lib.rs
++++ b/crates/slugger/src/lib.rs
+@@ -1,19 +1,17 @@
+ //! Heading text -> anchor.
+ 
+-/// Lowercase, replace runs of non-alphanumerics with `-`, trim dashes.
++/// GitHub-style anchor: lowercase, keep alphanumerics, `_` and `-`, map each
++/// space to `-`, drop everything else.
+ pub fn slug(text: &str) -> String {
+     let mut out = String::new();
+-    let mut dash = false;
+     for c in text.chars() {
+-        if c.is_ascii_alphanumeric() {
+-            out.push(c.to_ascii_lowercase());
+-            dash = false;
+-        } else if !dash {
++        if c.is_alphanumeric() || c == '_' || c == '-' {
++            out.extend(c.to_lowercase());
++        } else if c == ' ' {
+             out.push('-');
+-            dash = true;
+         }
+     }
+-    out.trim_matches('-').to_string()
++    out
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/toc/src/lib.rs b/crates/toc/src/lib.rs
+index 0c857d0..1bfc0e9 100644
+--- a/crates/toc/src/lib.rs
++++ b/crates/toc/src/lib.rs
+@@ -1,6 +1,6 @@
+ //! Table-of-contents rendering.
+ 
+-use mdscan::Heading;
++use std::collections::HashSet;
+ 
+ pub const START: &str = "<!-- toc -->";
+ pub const END: &str = "<!-- /toc -->";
+@@ -14,15 +14,26 @@ pub struct Entry {
+ 
+ /// TOC entries for headings with `min_level <= level <= max_level`.
+ pub fn entries(doc: &str, min_level: u8, max_level: u8) -> Vec<Entry> {
+-    mdscan::headings(doc)
+-        .into_iter()
+-        .filter(|h: &Heading| h.level >= min_level && h.level <= max_level)
+-        .map(|h| Entry {
+-            anchor: slugger::slug(&h.text),
+-            level: h.level,
+-            text: h.text,
+-        })
+-        .collect()
++    let mut taken: HashSet<String> = HashSet::new();
++    let mut out = Vec::new();
++    for h in mdscan::headings(doc) {
++        let base = slugger::slug(&h.text);
++        let mut anchor = base.clone();
++        let mut n = 1;
++        while taken.contains(&anchor) {
++            anchor = format!("{base}-{n}");
++            n += 1;
++        }
++        taken.insert(anchor.clone());
++        if h.level >= min_level && h.level <= max_level {
++            out.push(Entry {
++                anchor,
++                level: h.level,
++                text: h.text,
++            });
++        }
++    }
++    out
+ }
+ 
+ /// Render entries as a nested Markdown list, two spaces per level below the

@@ -1,0 +1,40 @@
+diff --git a/crates/layers/src/lib.rs b/crates/layers/src/lib.rs
+index dd9878b..6e0b673 100644
+--- a/crates/layers/src/lib.rs
++++ b/crates/layers/src/lib.rs
+@@ -4,12 +4,18 @@ use confval::{ConfigError, Value};
+ 
+ pub const ENV_PREFIX: &str = "APP_";
+ 
+-/// Overlay `top` onto `base`: keys in `top` win.
++/// Overlay `top` onto `base`, merging nested tables recursively; otherwise
++/// values in `top` win.
+ pub fn merge(base: &mut Value, top: Value) {
+     match (base, top) {
+         (Value::Table(b), Value::Table(t)) => {
+             for (k, v) in t {
+-                b.insert(k, v);
++                match b.get_mut(&k) {
++                    Some(existing) => merge(existing, v),
++                    None => {
++                        b.insert(k, v);
++                    }
++                }
+             }
+         }
+         (b, t) => *b = t,
+@@ -29,8 +35,12 @@ where
+         let Some(rest) = k.as_ref().strip_prefix(ENV_PREFIX) else {
+             continue;
+         };
+-        let path = rest.to_lowercase().replace('_', ".");
+-        root.set(&path, Value::Str(v.as_ref().to_string()))?;
++        let path = rest
++            .split("__")
++            .map(str::to_lowercase)
++            .collect::<Vec<_>>()
++            .join(".");
++        root.set(&path, Value::parse_scalar(v.as_ref()))?;
+     }
+     Ok(root)
+ }

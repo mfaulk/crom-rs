@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/mdscan", "crates/slugger", "crates/toc"]
+
+[workspace.package]
+version = "0.9.3"
+edition = "2021"
+license = "Apache-2.0 OR MIT"

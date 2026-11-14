@@ -1,0 +1,9 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clock = { path = "../clock" }
+bucket = { path = "../bucket" }

@@ -1,0 +1,120 @@
+diff --git a/crates/csvread/src/lib.rs b/crates/csvread/src/lib.rs
+index 0f330c1..4ae96d5 100644
+--- a/crates/csvread/src/lib.rs
++++ b/crates/csvread/src/lib.rs
+@@ -28,20 +28,106 @@ impl std::error::Error for CsvError {}
+ 
+ pub type Record = Vec<String>;
+ 
+-/// Parse CSV text into records. Blank lines are skipped.
++/// Parse CSV text (RFC 4180) into records. Blank lines are skipped.
+ pub fn parse(input: &str) -> Result<Vec<Record>, CsvError> {
+     let mut records = Vec::new();
+-    for line in input.split('\n') {
+-        if line.is_empty() {
++    let mut chars = input.chars().peekable();
++    let mut line = 1;
++    let mut record: Record = Vec::new();
++    let mut field = String::new();
++    let mut any_quoted = false;
++
++    fn end_record(
++        records: &mut Vec<Record>,
++        record: &mut Record,
++        field: &mut String,
++        quoted: bool,
++    ) {
++        record.push(std::mem::take(field));
++        let blank = !quoted && record.len() == 1 && record[0].is_empty();
++        let done = std::mem::take(record);
++        if !blank {
++            records.push(done);
++        }
++    }
++
++    loop {
++        // Start of a field.
++        if chars.peek() == Some(&'"') {
++            chars.next();
++            any_quoted = true;
++            let start = line;
++            loop {
++                match chars.next() {
++                    None => return Err(CsvError::UnterminatedQuote { line: start }),
++                    Some('"') => {
++                        if chars.peek() == Some(&'"') {
++                            chars.next();
++                            field.push('"');
++                        } else {
++                            break;
++                        }
++                    }
++                    Some(c) => {
++                        if c == '\n' {
++                            line += 1;
++                        }
++                        field.push(c);
++                    }
++                }
++            }
++            // After the closing quote: delimiter, record end, or EOF.
++            match chars.next() {
++                None => {
++                    end_record(&mut records, &mut record, &mut field, any_quoted);
++                    return Ok(records);
++                }
++                Some(',') => record.push(std::mem::take(&mut field)),
++                Some('\n') => {
++                    end_record(&mut records, &mut record, &mut field, any_quoted);
++                    any_quoted = false;
++                    line += 1;
++                }
++                Some('\r') if chars.peek() == Some(&'\n') => {
++                    chars.next();
++                    end_record(&mut records, &mut record, &mut field, any_quoted);
++                    any_quoted = false;
++                    line += 1;
++                }
++                Some(ch) => return Err(CsvError::UnexpectedChar { line, ch }),
++            }
+             continue;
+         }
+-        records.push(
+-            line.split(',')
+-                .map(|f| f.trim_matches('"').to_string())
+-                .collect(),
+-        );
++        // Unquoted field.
++        loop {
++            match chars.next() {
++                None => {
++                    if !(record.is_empty() && field.is_empty()) {
++                        end_record(&mut records, &mut record, &mut field, any_quoted);
++                    }
++                    return Ok(records);
++                }
++                Some(',') => {
++                    record.push(std::mem::take(&mut field));
++                    break;
++                }
++                Some('\n') => {
++                    end_record(&mut records, &mut record, &mut field, any_quoted);
++                    any_quoted = false;
++                    line += 1;
++                    break;
++                }
++                Some('\r') if chars.peek() == Some(&'\n') => {
++                    chars.next();
++                    end_record(&mut records, &mut record, &mut field, any_quoted);
++                    any_quoted = false;
++                    line += 1;
++                    break;
++                }
++                Some(c) => field.push(c),
++            }
++        }
+     }
+-    Ok(records)
+ }
+ 
+ /// Quote a field for output if it needs it.

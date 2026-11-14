@@ -1,0 +1,81 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-http-header-case"
+title = "Make header and content-coding matching case-insensitive across httpkit"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "protocol", "l3"]
+suites = ["l3"]
+
+prompt = """
+The `httpkit` workspace (`http-types`, `middleware`, `server`) treats HTTP
+header names case-sensitively. Real clients send `Accept-Encoding`, `Origin`,
+`ACCEPT-ENCODING`, and so on, and as a result:
+
+- requests parsed by `server::parse_request` from a real client are never
+  compressed and CORS headers are missing;
+- a handler that sets `content-length` itself ends up with two length
+  headers after the `ContentLength` layer runs;
+- `Accept-Encoding: GZIP` is ignored.
+
+Per RFC 9110, field names and content-coding tokens are case-insensitive.
+Fix the workspace so that:
+
+1. Every `Headers` lookup/mutation by name (`get`, `get_all`, `contains`,
+   `insert`, `remove`) matches names ASCII case-insensitively. `iter()` still
+   yields names with the casing they were added with; `insert` replaces all
+   existing values for the name, whatever their casing, and stores the casing
+   passed to `insert`.
+2. Compression negotiation treats coding names case-insensitively, while the
+   `Content-Encoding` it emits stays lowercase (`gzip` / `br`).
+
+Keep public signatures unchanged and `cargo test --workspace` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --workspace --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+  "cargo test --offline -p http-types --test acceptance_headers",
+  "cargo test --offline -p server --test acceptance_case",
+]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

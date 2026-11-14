@@ -1,0 +1,62 @@
+diff --git a/crates/versions/src/req.rs b/crates/versions/src/req.rs
+index 4d02049..504c27b 100644
+--- a/crates/versions/src/req.rs
++++ b/crates/versions/src/req.rs
+@@ -63,6 +63,17 @@ impl VersionReq {
+     }
+ 
+     pub fn matches(&self, v: &Version) -> bool {
++        if v.is_prerelease() {
++            let opted_in = self.comparators.iter().any(|c| {
++                c.version.is_prerelease()
++                    && c.version.major == v.major
++                    && c.version.minor == v.minor
++                    && c.version.patch == v.patch
++            });
++            if !opted_in {
++                return false;
++            }
++        }
+         self.comparators.iter().all(|c| c.matches_release(v))
+     }
+ }
+diff --git a/crates/versions/src/version.rs b/crates/versions/src/version.rs
+index 713d2ac..b95b027 100644
+--- a/crates/versions/src/version.rs
++++ b/crates/versions/src/version.rs
+@@ -19,7 +19,7 @@ impl fmt::Display for Identifier {
+     }
+ }
+ 
+-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+ pub struct Version {
+     pub major: u64,
+     pub minor: u64,
+@@ -52,6 +52,26 @@ impl Version {
+     }
+ }
+ 
++impl Ord for Version {
++    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
++        use std::cmp::Ordering;
++        (self.major, self.minor, self.patch)
++            .cmp(&(other.major, other.minor, other.patch))
++            .then_with(|| match (self.pre.is_empty(), other.pre.is_empty()) {
++                (true, true) => Ordering::Equal,
++                (true, false) => Ordering::Greater,
++                (false, true) => Ordering::Less,
++                (false, false) => self.pre.cmp(&other.pre),
++            })
++    }
++}
++
++impl PartialOrd for Version {
++    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
++        Some(self.cmp(other))
++    }
++}
++
+ fn parse_num(part: &str, whole: &str) -> Result<u64, ParseError> {
+     if part.is_empty() || (part.len() > 1 && part.starts_with('0')) {
+         return Err(ParseError(whole.to_string()));
