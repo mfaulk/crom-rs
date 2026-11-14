@@ -9,7 +9,10 @@
 //! 6. Default deny
 //!
 //! Hook decisions can rewrite the tool input; downstream stages then see the
-//! rewritten input. Disallow rules always override allow rules.
+//! rewritten input. Disallow rules always override allow rules and hook
+//! `Allow`: a hook `Allow` only skips stages 3b-5 (mode auto-allow, allow
+//! rules, approval callback) after disallow rules, deny memory, and plan mode
+//! have been checked against the rewritten input.
 
 use std::sync::Arc;
 
@@ -304,6 +307,9 @@ impl PolicyEngine {
         // When a hook returns `Ask`, downstream stages must NOT auto-allow
         // (e.g. acceptEdits-on-Edit, default-on-readonly). Track the demand.
         let mut force_callback = false;
+        // A hook Allow skips allow rules and the approval callback, but never
+        // disallow rules, deny-for-session memory, or plan mode.
+        let mut hook_allowed = false;
         if !self.hooks.is_empty() {
             let mut input = HookInput::new(
                 HookEventName::PreToolUse,
@@ -325,21 +331,7 @@ impl PolicyEngine {
                     if let Some(v) = updated_input {
                         tool_input = v;
                     }
-                    // Plan mode is an unconditional execution block: a hook
-                    // saying "allow" must not bypass it. Hooks have already
-                    // fired (observability is preserved); the *outcome* in
-                    // Plan mode is always Deny.
-                    if matches!(self.config.permission_mode, PermissionMode::Plan) {
-                        return PolicyDecision::deny(
-                            PolicyDecisionSource::PermissionMode,
-                            "plan mode does not execute tools".into(),
-                        );
-                    }
-                    let mut d =
-                        PolicyDecision::allow(PolicyDecisionSource::Hook, Some("hook".into()));
-                    d.updated_tool_input = Some(tool_input.clone());
-                    // Hook Allow short-circuits ahead of allow rules / callback.
-                    return d;
+                    hook_allowed = true;
                 }
                 HookAggregateDecision::Ask { reason: _ } => {
                     force_callback = true;
@@ -374,6 +366,12 @@ impl PolicyEngine {
                 PolicyDecisionSource::PermissionMode,
                 "plan mode does not execute tools".into(),
             );
+        }
+
+        if hook_allowed {
+            let mut d = PolicyDecision::allow(PolicyDecisionSource::Hook, Some("hook".into()));
+            d.updated_tool_input = Some(tool_input);
+            return d;
         }
 
         // 3b. Permission mode pre-checks. Skipped when a hook returned `Ask`
@@ -1134,11 +1132,8 @@ mod tests {
     }
 
     #[tokio::test]
-    // Pipeline order: hooks come before disallow rules, so a hook Allow
-    // does NOT bypass a disallow rule? Actually no — hooks come first;
-    // a hook Deny wins, but a hook Allow short-circuits past disallow.
-    // This test pins down that hook Allow short-circuits past disallow.
-    async fn hook_allow_short_circuits() {
+    // A hook Allow must not bypass a matching disallow rule.
+    async fn hook_allow_does_not_bypass_disallow() {
         struct AllowHook;
         #[async_trait]
         impl Hook for AllowHook {
@@ -1168,8 +1163,70 @@ mod tests {
                 serde_json::json!({"command": "ls"}),
             ))
             .await;
-        assert_eq!(d.outcome, PolicyOutcome::Allow);
-        assert_eq!(d.source, PolicyDecisionSource::Hook);
+        assert_eq!(d.outcome, PolicyOutcome::Deny);
+        assert_eq!(d.source, PolicyDecisionSource::DisallowRule);
+    }
+
+    #[tokio::test]
+    // A hook Allow still auto-allows (skipping the approval callback) when no disallow rule matches,
+    // and a disallow rule is matched against the hook-rewritten input.
+    async fn hook_allow_checks_disallow_against_rewritten_input() {
+        struct RewriteHook;
+        #[async_trait]
+        impl Hook for RewriteHook {
+            async fn call(&self, input: HookInput) -> Result<HookOutput, HookError> {
+                let cmd = input
+                    .tool_input
+                    .as_ref()
+                    .and_then(|v| v["command"].as_str())
+                    .unwrap_or("");
+                Ok(HookOutput::Allow {
+                    updated_input: Some(
+                        serde_json::json!({ "command": format!("{cmd} --rewritten") }),
+                    ),
+                })
+            }
+        }
+        let hooks = Hooks::new()
+            .pre_tool_use("*", Arc::new(RewriteHook))
+            .unwrap();
+        let cfg = PolicyConfig {
+            disallowed_tools: vec![ToolRule::BashCommandRegex("^rm ".into())],
+            permission_mode: PermissionMode::Default,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, hooks);
+        let sid = sid();
+        let rid = rid();
+        let cwd = std::path::Path::new(".");
+        let ok = engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                cwd,
+                "Bash",
+                PermissionKind::Execution,
+                serde_json::json!({"command": "ls"}),
+            ))
+            .await;
+        assert_eq!(ok.outcome, PolicyOutcome::Allow);
+        assert_eq!(ok.source, PolicyDecisionSource::Hook);
+        assert_eq!(
+            ok.updated_tool_input,
+            Some(serde_json::json!({"command": "ls --rewritten"}))
+        );
+        let blocked = engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                cwd,
+                "Bash",
+                PermissionKind::Execution,
+                serde_json::json!({"command": "rm -rf /"}),
+            ))
+            .await;
+        assert_eq!(blocked.outcome, PolicyOutcome::Deny);
+        assert_eq!(blocked.source, PolicyDecisionSource::DisallowRule);
     }
 
     #[tokio::test]
