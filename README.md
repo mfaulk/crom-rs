@@ -161,6 +161,11 @@ the agent against a real model.
 --workspace --all-targets -- -D warnings`, `cargo build --workspace`, and
 `cargo test --workspace --all-targets` on each push and pull request.
 
+## Roadmap
+
+Milestone specs live in [`docs/milestones/`](docs/milestones/). The current
+plan is [M17 — Measurable Agent Capability and Secure Execution](docs/milestones/MILESTONE_17.md).
+
 ## License
 
 Apache-2.0 OR MIT
