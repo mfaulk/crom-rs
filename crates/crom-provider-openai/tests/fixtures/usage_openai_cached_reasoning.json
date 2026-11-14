@@ -1,0 +1,24 @@
+{
+  "id": "chatcmpl-fixture",
+  "object": "chat.completion",
+  "model": "o4-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "done" },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1200,
+    "completion_tokens": 300,
+    "total_tokens": 1500,
+    "prompt_tokens_details": { "cached_tokens": 1024, "audio_tokens": 0 },
+    "completion_tokens_details": {
+      "reasoning_tokens": 256,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  }
+}

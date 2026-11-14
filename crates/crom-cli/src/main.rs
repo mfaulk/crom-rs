@@ -1357,6 +1357,11 @@ mod parse_cli_rule_tests {
     }
 }
 
+/// Render a token count, showing unreported counts as `unknown` rather than 0.
+fn fmt_tokens(v: Option<u64>) -> String {
+    v.map_or_else(|| "unknown".to_string(), |n| n.to_string())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -3738,7 +3743,7 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
                             let cost = r.total_cost_usd
                                 .map(|c| format!(", est. cost=${:.4}", c))
                                 .unwrap_or_default();
-                            println!("[usage] turns={} input={} output={}{}", r.num_turns, u.input_tokens, u.output_tokens, cost);
+                            println!("[usage] turns={} input={} output={}{}", r.num_turns, fmt_tokens(u.input_tokens), fmt_tokens(u.output_tokens), cost);
                         }
                     }
                 }
@@ -5411,10 +5416,9 @@ fn build_fake_provider() -> impl ModelProvider {
                 ModelEvent::MessageStop {
                     stop_reason: Some("end_turn".into()),
                     usage: Some(TokenUsage {
-                        input_tokens: 0,
-                        output_tokens: 1,
-                        cache_creation_input_tokens: None,
-                        cache_read_input_tokens: None,
+                        input_tokens: Some(0),
+                        output_tokens: Some(1),
+                        ..Default::default()
                     }),
                 },
             ];
@@ -5526,7 +5530,10 @@ async fn drain_events_inline(
                         .unwrap_or_default();
                     println!(
                         "[usage] turns={} input={} output={}{}",
-                        r.num_turns, u.input_tokens, u.output_tokens, cost
+                        r.num_turns,
+                        fmt_tokens(u.input_tokens),
+                        fmt_tokens(u.output_tokens),
+                        cost
                     );
                 }
             }
@@ -5579,6 +5586,8 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
             println!("[denied] {}: {}", d.tool_name, d.reason);
         }
         AgentEvent::UserToolResult(_) => {}
+        // Per-turn usage is surfaced via JSON logs and `--show-usage` totals.
+        AgentEvent::ModelTurnCompleted(_) => {}
         AgentEvent::HookEvaluated(h) => {
             if !quiet
                 && (matches!(

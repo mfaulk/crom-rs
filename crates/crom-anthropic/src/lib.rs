@@ -491,7 +491,9 @@ where
         }
 
         let mut pending: HashMap<u32, PendingTool> = HashMap::new();
-        let mut usage_accum = TokenUsage::default();
+        // `None` until the stream reports a usage block, so a stream with no
+        // usage yields `MessageStop { usage: None }` rather than zeros.
+        let mut usage_accum: Option<TokenUsage> = None;
         let mut started = false;
 
         tokio::pin!(stream);
@@ -536,9 +538,7 @@ where
                         send_or_stop!(Ok(ModelEvent::MessageStart));
                     }
                     if let Some(u) = message.usage {
-                        usage_accum.input_tokens += u.input_tokens;
-                        usage_accum.output_tokens += u.output_tokens;
-                        merge_cache(&mut usage_accum, &u);
+                        merge_usage(&mut usage_accum, &u);
                     }
                 }
                 SseEvent::ContentBlockStart {
@@ -614,13 +614,11 @@ where
                 }
                 SseEvent::MessageDelta { delta, usage } => {
                     if let Some(u) = usage {
-                        usage_accum.input_tokens += u.input_tokens;
-                        usage_accum.output_tokens += u.output_tokens;
-                        merge_cache(&mut usage_accum, &u);
+                        merge_usage(&mut usage_accum, &u);
                     }
                     send_or_stop!(Ok(ModelEvent::MessageStop {
                         stop_reason: delta.stop_reason,
-                        usage: Some(usage_accum.clone()),
+                        usage: usage_accum.clone(),
                     }));
                 }
                 SseEvent::MessageStop => {
@@ -659,6 +657,24 @@ where
     });
 
     ReceiverStream::new(rx)
+}
+
+/// Fold one SSE usage block into the stream's running usage. Anthropic does
+/// not break out thinking tokens (they are inside `output_tokens`), so
+/// `reasoning_tokens` stays `None`.
+fn merge_usage(acc: &mut Option<TokenUsage>, u: &SseUsage) {
+    let total = acc.get_or_insert_with(|| TokenUsage {
+        input_tokens: Some(0),
+        output_tokens: Some(0),
+        ..Default::default()
+    });
+    if let Some(v) = total.input_tokens.as_mut() {
+        *v = v.saturating_add(u.input_tokens);
+    }
+    if let Some(v) = total.output_tokens.as_mut() {
+        *v = v.saturating_add(u.output_tokens);
+    }
+    merge_cache(total, u);
 }
 
 fn merge_cache(total: &mut TokenUsage, u: &SseUsage) {
@@ -1082,6 +1098,22 @@ mod tests {
     }
 
     #[tokio::test]
+    // A stream that never reports a usage block ends with MessageStop { usage: None }, not zeros.
+    async fn parse_sse_without_usage_reports_none() {
+        let out = collect_events(&[
+            r#"{"type":"message_start","message":{"id":"m"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ])
+        .await;
+        let events: Vec<ModelEvent> = out.into_iter().map(|r| r.unwrap()).collect();
+        match events.last().unwrap() {
+            ModelEvent::MessageStop { usage, .. } => assert_eq!(usage, &None),
+            other => panic!("expected MessageStop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     // A text-delta-only stream produces MessageStart, the text deltas in
     // order, and a final MessageStop carrying accumulated usage.
     async fn parse_sse_text_delta_only() {
@@ -1111,8 +1143,8 @@ mod tests {
                 assert_eq!(stop_reason.as_deref(), Some("end_turn"));
                 let u = usage.as_ref().unwrap();
                 // input from message_start (10) + message_delta (0); output 0 + 5.
-                assert_eq!(u.input_tokens, 10);
-                assert_eq!(u.output_tokens, 5);
+                assert_eq!(u.input_tokens, Some(10));
+                assert_eq!(u.output_tokens, Some(5));
             }
             other => panic!("expected MessageStop, got {other:?}"),
         }
@@ -1191,8 +1223,8 @@ mod tests {
         match events.last().unwrap() {
             ModelEvent::MessageStop { usage, .. } => {
                 let u = usage.as_ref().unwrap();
-                assert_eq!(u.input_tokens, 100);
-                assert_eq!(u.output_tokens, 25);
+                assert_eq!(u.input_tokens, Some(100));
+                assert_eq!(u.output_tokens, Some(25));
                 assert_eq!(u.cache_creation_input_tokens, Some(40));
                 // cache_read merged across both frames: 10 + 5.
                 assert_eq!(u.cache_read_input_tokens, Some(15));

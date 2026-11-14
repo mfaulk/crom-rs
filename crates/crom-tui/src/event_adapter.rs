@@ -105,6 +105,8 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
             body: Vec::new(),
             ..Default::default()
         }),
+        // Per-turn usage is accounting data, not transcript content.
+        SdkEvent::ModelTurnCompleted(_) => SdkEventOutcome::default(),
         SdkEvent::ApprovalRequired(a) => SdkEventOutcome {
             card: Some(EventCard {
                 kind: "approval_required",

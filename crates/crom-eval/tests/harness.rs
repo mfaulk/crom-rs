@@ -104,6 +104,61 @@ async fn golden_edit_recover_passes_and_recovers() {
     assert!(data.contains("value=42"));
 }
 
+fn read_result_json(run: &RunDir, task_id: &str) -> serde_json::Value {
+    let path = run.task(task_id).unwrap().dir.join("result.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// The golden provider reports input/output but not cache/reasoning, so result.json sums the known fields, keeps the unreported ones null, and counts round trips.
+#[tokio::test]
+async fn golden_result_json_records_partial_usage_and_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = RunDir::create(tmp.path(), "test-golden-usage").unwrap();
+    let tasks = load_all();
+    let task = find(&tasks, "golden-edit-recover");
+    let config = RunConfig {
+        provider: ProviderMode::Golden,
+        timeout_grace: Duration::from_secs(20),
+        ..RunConfig::default()
+    };
+    let result = run_task(task, &run, &config).await;
+    assert_eq!(result.status, EvalStatus::Passed);
+
+    let json = read_result_json(&run, "golden-edit-recover");
+    // golden-edit-recover scripts 5 model turns at 100 input / 20 output each.
+    assert_eq!(json["model_round_trips"], 5);
+    let usage = &json["usage"];
+    assert_eq!(usage["input_tokens"], 500);
+    assert_eq!(usage["output_tokens"], 100);
+    assert!(usage["cache_read_input_tokens"].is_null());
+    assert!(usage["cache_creation_input_tokens"].is_null());
+    assert!(usage["reasoning_tokens"].is_null());
+}
+
+/// A provider that reports no usage yields `usage: null` (never zeros) in result.json while still counting round trips.
+#[tokio::test]
+async fn unreported_usage_is_null_in_result_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = RunDir::create(tmp.path(), "test-fake-usage").unwrap();
+    let tasks = load_all();
+    let task = find(&tasks, "smoke-noop");
+    let config = RunConfig {
+        provider: ProviderMode::Fake,
+        timeout_grace: Duration::from_secs(10),
+        ..RunConfig::default()
+    };
+    let result = run_task(task, &run, &config).await;
+    assert_eq!(result.usage, None);
+
+    let json = read_result_json(&run, "smoke-noop");
+    assert!(
+        json["usage"].is_null(),
+        "usage must be null: {}",
+        json["usage"]
+    );
+    assert_eq!(json["model_round_trips"], 1);
+}
+
 #[tokio::test]
 async fn run_summary_is_written() {
     let tmp = tempfile::tempdir().unwrap();
