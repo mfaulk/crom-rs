@@ -1,26 +1,37 @@
 schema_version = 3
-task_version = "1.0.0"
+task_version = "1.1.0"
 kind = "capability"
 level = "L1"
 network = "none"
+reference = "oracle_patch"
 id = "rust-failing-unit-test"
 title = "Fix a small logic bug exposed by a failing test"
 category = "bugfix"
 difficulty = "easy"
-tags = ["rust", "bugfix", "tests", "small"]
-suites = ["rust-small", "rust-mini"]
+tags = ["rust", "single-file", "bugfix", "tests", "hidden-tests", "small"]
+suites = ["rust-small", "rust-mini", "l1"]
 
 prompt = """
-A unit test is failing. Find and fix the logic bug so the tests pass. Do not
-weaken or delete the test.
+A unit test is failing. Find and fix the logic bug so `cargo test` passes. Do
+not weaken or delete the test.
 """
 
 max_turns = 20
 timeout_secs = 240
 
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/lib.rs"]
+oracle_patch = "oracle.patch"
+
 [capabilities]
 requires_repo_search = true
 requires_test_feedback = true
+
+# Advisory (not enforced): read before editing, run `cargo test` after.
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
 
 [fixture]
 kind = "copy_dir"
@@ -30,13 +41,13 @@ path = "repo"
 kind = "rust"
 test = true
 
-[[oracle.behavior]]
-kind = "must_use_tool"
-tool = "Read"
+# Hidden: extra positions, duplicates, and i64 extremes.
+[hidden]
+fixture = "hidden"
 
-[[oracle.behavior]]
-kind = "must_run_command"
-command_contains = "cargo test"
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]
 
 [provenance]
 author = "crom maintainers"

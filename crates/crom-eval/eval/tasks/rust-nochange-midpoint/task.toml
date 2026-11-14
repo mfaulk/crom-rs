@@ -1,0 +1,55 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "none"
+expected_outcome = "no_change"
+reference = "validated_oracle"
+id = "rust-nochange-midpoint"
+title = "Negative: reject an unnecessary overflow 'fix'"
+category = "negative"
+difficulty = "easy"
+tags = ["rust", "single-file", "negative", "no-change", "overflow", "hidden-tests", "small"]
+suites = ["l1"]
+
+prompt = """
+A code reviewer suspects `midpoint` in src/lib.rs is wrong or can overflow for
+large inputs, and suggests rewriting it as `(a + b) / 2`. Determine whether
+there is a real bug. Change the code only if it is actually incorrect, and
+explain your conclusion.
+"""
+
+max_turns = 12
+timeout_secs = 180
+
+forbidden_paths = ["Cargo.toml"]
+
+[capabilities]
+negative_noop = true
+
+[behavior]
+require_read_before_write = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+# Hidden: rounding and inputs near u32::MAX; the suggested `(a + b) / 2`
+# rewrite overflows (panics in the debug test profile) and fails. The
+# unmodified fixture is the reference.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

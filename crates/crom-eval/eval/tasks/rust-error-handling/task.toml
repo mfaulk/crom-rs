@@ -1,0 +1,59 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "none"
+reference = "oracle_patch"
+id = "rust-error-handling"
+title = "Replace panics with a typed Result error"
+category = "refactor"
+difficulty = "medium"
+tags = ["rust", "single-file", "error-handling", "result", "hidden-tests", "small"]
+suites = ["l1"]
+
+prompt = """
+`parse_entry` in src/lib.rs panics on malformed input. Change it to return
+`Result<(String, i64), ParseError>`, using the existing `ParseError` enum
+exactly as its doc comments describe, so it never panics. Also make
+`ParseError` a standard error type (implement `std::fmt::Display` and
+`std::error::Error`) so callers can propagate it with `?`. Update the existing
+test for the new return type.
+"""
+
+max_turns = 20
+timeout_secs = 240
+
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/lib.rs"]
+oracle_patch = "oracle.patch"
+
+[capabilities]
+requires_test_feedback = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+# Hidden: each ParseError variant, check order, i64 overflow, and use through
+# Box<dyn Error> with `?`. Does not compile against the unmodified fixture.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

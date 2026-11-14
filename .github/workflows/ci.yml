@@ -154,6 +154,10 @@ jobs:
             cargo run --locked -p crom-cli -- eval validate-suite "$suite"
           done
           cargo run --locked -p crom-cli -- eval validate-task rust-hidden-sum-bug
+      # L1 capability corpus (#287): every reference passes public + hidden
+      # verification and every unmodified fixture fails it (no_change: passes).
+      - name: Validate L1 capability suite
+        run: cargo run --locked -p crom-cli -- eval validate-suite l1
       - name: Eval smoke suite (fake provider)
         run: cargo run --locked -p crom-cli -- eval run --suite smoke --provider fake
       - name: Eval golden suite (golden provider)

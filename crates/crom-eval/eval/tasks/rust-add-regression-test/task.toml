@@ -1,14 +1,15 @@
 schema_version = 3
-task_version = "1.0.0"
+task_version = "1.1.0"
 kind = "capability"
 level = "L1"
 network = "none"
+reference = "oracle_patch"
 id = "rust-add-regression-test"
-title = "Fix a bug and add a regression test"
+title = "Fix a bug and add a regression test that catches it"
 category = "test_writing"
 difficulty = "medium"
-tags = ["rust", "bugfix", "tests", "small"]
-suites = ["rust-small", "rust-mini"]
+tags = ["rust", "single-file", "bugfix", "tests", "hidden-tests", "mutation", "small"]
+suites = ["rust-small", "rust-mini", "l1"]
 
 prompt = """
 The function `slugify` mishandles consecutive separators, producing doubled
@@ -19,8 +20,18 @@ that locks in the fix. Keep the public API unchanged.
 max_turns = 20
 timeout_secs = 240
 
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/lib.rs"]
+oracle_patch = "oracle.patch"
+
 [capabilities]
 requires_test_feedback = true
+
+# Advisory (not enforced): run `cargo test` after editing.
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
 
 [fixture]
 kind = "copy_dir"
@@ -35,9 +46,19 @@ kind = "file_contains"
 path = "src/lib.rs"
 text = "collapses_repeated_separators"
 
-[[oracle.behavior]]
-kind = "must_run_command"
-command_contains = "cargo test"
+# Hidden: (1) slugify behavior on separator runs and trimming; (2) a mutation
+# check — the agent's `collapses_repeated_separators` test must pass on the
+# workspace and FAIL once `slugify` is reverted to the original buggy body, so
+# a vacuous test does not resolve the task.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+    "cargo test --test hidden",
+    "sh hidden_checks/regression_test_kills_mutant.sh",
+]
 
 [provenance]
 author = "crom maintainers"
