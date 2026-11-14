@@ -267,10 +267,11 @@ snapshots (the 2k–30k LoC target in #289) need a separate storage decision
 (git bundle plus vendored-deps tarball, or a fixtures repository) and are
 not part of this corpus.
 
-Leakage: `task.toml`, `hidden/`, and `oracle.patch` sit beside `repo/` in
-the task directory, as for every other task. Until #286 lands they remain
-reachable from the agent workspace by relative or absolute path; #286 must
-move or withhold them for `l3-*` tasks along with the rest of the corpus.
+Leakage: as for every task (#286), only `repo/` is copied into the agent
+workspace; `hidden/` is overlaid onto the workspace root recursively after
+the agent exits, so `hidden/crates/<crate>/tests/acceptance_*.rs` lands next
+to that crate's existing `tests/`. `task.toml` and `oracle.patch` never enter
+the workspace.
 
 ## Adding a new task
 
