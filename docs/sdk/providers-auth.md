@@ -15,13 +15,21 @@ let cfg = ProviderConfig::anthropic_api_key(SecretString::new(
 
 | Variant                 | Source of credentials                                                          |
 | ----------------------- | ------------------------------------------------------------------------------ |
-| `AnthropicApiKey`       | Direct `SecretString`. Default for the SDK.                                    |
-| `OpenAiApiKey`          | Direct API key. Requires the `openai` feature and a transport via `External`.  |
-| `GeminiApiKey`          | Direct API key. Same caveat as OpenAI.                                         |
+| `AnthropicApiKey`       | Direct `SecretString`. Default model `claude-sonnet-4-6`. `anthropic` feature. |
+| `OpenAiApiKey`          | Direct API key. Default model `gpt-4.1`. `openai` feature (default on).        |
+| `GeminiApiKey`          | Direct API key. Default model `gemini-1.5-pro`. `gemini` feature (default on). |
 | `OAuthCredential`       | Pre-resolved `StoredCredentialSecret`. (Reserved; wrap in `External` for now.) |
-| `FromAuthStore`         | Look up via the M10 auth store. Explicit opt-in.                               |
+| `FromAuthStore`         | Reserved; rejected with `provider.auth_store_disabled`. Use an API-key variant. |
 | `External`              | Bring your own `Arc<dyn ModelProvider>` and a `ResolvedCredential`.            |
 | `Fake`                  | Use a deterministic provider for tests.                                        |
+
+`OpenAiApiKey` and `GeminiApiKey` call `OpenAiProvider::from_config` /
+`GeminiProvider::from_config` from the provider crates, the same constructors
+the `crom` CLI uses. `base_url: Some(..)` overrides the API endpoint (useful
+for proxies and mock servers). Timeouts are 30s connect / 120s per request;
+OpenAI retries 408/429/5xx up to 3 times with exponential backoff, Gemini
+does not retry. A disabled provider feature fails with
+`provider.feature_disabled`.
 
 ## Why not auto-detect?
 
@@ -33,7 +41,7 @@ let cfg = ProviderConfig::anthropic_api_key(SecretString::new(
 
 ## Safety
 
-- `ProviderConfig::AnthropicApiKey` is `Debug`-redacted; the raw key never
+- The `*ApiKey` variants of `ProviderConfig` are `Debug`-redacted; the raw key never
   appears in logs.
 - `SecretString` zeroes its bytes on drop.
 - Credentials are never serialized into events, diagnostics, or session
