@@ -391,12 +391,38 @@ struct GeminiCandidateFunctionCall {
     args: Value,
 }
 
+/// Gemini serializes usage as proto3 JSON, which omits zero-valued counts, so
+/// a missing count inside a present `usageMetadata` means zero. A missing
+/// `usageMetadata` means usage is unreported.
 #[derive(Deserialize, Default)]
 struct UsageMetadata {
     #[serde(default, rename = "promptTokenCount")]
     prompt_token_count: u64,
     #[serde(default, rename = "candidatesTokenCount")]
     candidates_token_count: u64,
+    #[serde(default, rename = "cachedContentTokenCount")]
+    cached_content_token_count: u64,
+    #[serde(default, rename = "thoughtsTokenCount")]
+    thoughts_token_count: u64,
+}
+
+/// Normalize to [`TokenUsage`]: `promptTokenCount` includes cached content,
+/// so it is split out of `input_tokens`; thought tokens are billed as output
+/// but reported outside `candidatesTokenCount`, so they are added back.
+fn usage_metadata_to_token_usage(u: UsageMetadata) -> TokenUsage {
+    TokenUsage {
+        input_tokens: Some(
+            u.prompt_token_count
+                .saturating_sub(u.cached_content_token_count),
+        ),
+        output_tokens: Some(
+            u.candidates_token_count
+                .saturating_add(u.thoughts_token_count),
+        ),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: Some(u.cached_content_token_count),
+        reasoning_tokens: Some(u.thoughts_token_count),
+    }
 }
 
 fn generate_response_to_events(resp: GenerateResponse) -> Vec<ModelEvent> {
@@ -433,12 +459,7 @@ fn generate_response_to_events(resp: GenerateResponse) -> Vec<ModelEvent> {
             }
         }
     }
-    let usage = resp.usage.map(|u| TokenUsage {
-        input_tokens: u.prompt_token_count,
-        output_tokens: u.candidates_token_count,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
-    });
+    let usage = resp.usage.map(usage_metadata_to_token_usage);
     events.push(ModelEvent::MessageStop { stop_reason, usage });
     events
 }
@@ -465,6 +486,46 @@ mod tests {
     use crom_core::provider::ToolSchema;
     use crom_core::Message;
     use futures::StreamExt;
+
+    fn usage_from_fixture(body: &str) -> Option<TokenUsage> {
+        let resp: GenerateResponse = serde_json::from_str(body).unwrap();
+        match generate_response_to_events(resp).pop() {
+            Some(ModelEvent::MessageStop { usage, .. }) => usage,
+            other => panic!("expected MessageStop, got {other:?}"),
+        }
+    }
+
+    // cachedContentTokenCount is split out of input and thoughtsTokenCount counts as reasoning output.
+    #[test]
+    fn usage_gemini_cached_and_thought_tokens() {
+        let u = usage_from_fixture(include_str!("../tests/fixtures/usage_cached_thoughts.json"))
+            .expect("usage reported");
+        assert_eq!(u.input_tokens, Some(500));
+        assert_eq!(u.cache_read_input_tokens, Some(1000));
+        assert_eq!(u.cache_creation_input_tokens, None);
+        assert_eq!(u.output_tokens, Some(150));
+        assert_eq!(u.reasoning_tokens, Some(50));
+    }
+
+    // Gemini omits zero counts (proto3 JSON), so omitted fields inside usageMetadata are zero.
+    #[test]
+    fn usage_gemini_omitted_counts_are_zero() {
+        let u = usage_from_fixture(include_str!("../tests/fixtures/usage_minimal.json"))
+            .expect("usage reported");
+        assert_eq!(u.input_tokens, Some(2));
+        assert_eq!(u.output_tokens, Some(1));
+        assert_eq!(u.cache_read_input_tokens, Some(0));
+        assert_eq!(u.reasoning_tokens, Some(0));
+    }
+
+    // A response without usageMetadata yields None, never zeros.
+    #[test]
+    fn usage_absent_is_none() {
+        assert_eq!(
+            usage_from_fixture(include_str!("../tests/fixtures/usage_absent.json")),
+            None
+        );
+    }
 
     #[derive(Default)]
     struct MockTransport {

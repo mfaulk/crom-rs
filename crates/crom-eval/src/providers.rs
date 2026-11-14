@@ -122,6 +122,16 @@ fn build_live(name: &str) -> Result<ProviderSetup, ProviderUnavailable> {
 
 // --- Golden script construction helpers ---------------------------------
 
+/// Golden turns report input/output but leave cache and reasoning tokens
+/// unreported, exercising partial-usage accounting end to end.
+fn golden_usage() -> TokenUsage {
+    TokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(20),
+        ..Default::default()
+    }
+}
+
 fn tool_call_turn(id: &str, name: &str, input: serde_json::Value) -> Vec<ModelEvent> {
     vec![
         ModelEvent::ToolCall(ToolCall {
@@ -131,7 +141,7 @@ fn tool_call_turn(id: &str, name: &str, input: serde_json::Value) -> Vec<ModelEv
         }),
         ModelEvent::MessageStop {
             stop_reason: Some("tool_use".to_string()),
-            usage: Some(TokenUsage::default()),
+            usage: Some(golden_usage()),
         },
     ]
 }
@@ -143,7 +153,7 @@ fn final_text_turn(text: &str) -> Vec<ModelEvent> {
         },
         ModelEvent::MessageStop {
             stop_reason: Some("end_turn".to_string()),
-            usage: Some(TokenUsage::default()),
+            usage: Some(golden_usage()),
         },
     ]
 }

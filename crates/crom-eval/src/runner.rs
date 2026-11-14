@@ -119,6 +119,16 @@ pub struct EvalResult {
     /// repair loop was off).
     #[serde(default)]
     pub repair: crate::repair::RepairMetrics,
+    /// Token usage summed strictly over every model round trip in every
+    /// attempt. `None` (JSON `null`) when there were no round trips or any
+    /// round trip reported no usage; individual fields are `null` when any
+    /// round trip left that quantity unreported. Never zero-filled.
+    #[serde(default)]
+    pub usage: Option<crom_core::TokenUsage>,
+    /// Number of model round trips (`ModelTurnCompleted` events) across all
+    /// attempts, including planning turns and turns with unknown usage.
+    #[serde(default)]
+    pub model_round_trips: usize,
 }
 
 /// Configuration for an eval run.
@@ -300,6 +310,18 @@ fn count_turns(events: &[SdkEvent]) -> usize {
         .count()
 }
 
+/// Strict usage total and round-trip count from the per-turn usage events.
+fn usage_from_events(events: &[SdkEvent]) -> (Option<crom_core::TokenUsage>, usize) {
+    let totals: crom_core::UsageTotals = events
+        .iter()
+        .filter_map(|e| match e {
+            SdkEvent::ModelTurnCompleted(t) => Some(t.usage.as_ref()),
+            _ => None,
+        })
+        .collect();
+    (totals.total(), totals.turns() as usize)
+}
+
 fn count_tool_calls(events: &[SdkEvent]) -> usize {
     events
         .iter()
@@ -375,6 +397,8 @@ fn default_result(
         attempts_used: 0,
         cost_usd: None,
         repair: crate::repair::RepairMetrics::default(),
+        usage: None,
+        model_round_trips: 0,
     }
 }
 
@@ -723,6 +747,7 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
 
     let turns_used = count_turns(&events);
     let tool_calls = count_tool_calls(&events);
+    let (usage, model_round_trips) = usage_from_events(&events);
     let score = score::compute(&ScoreInputs {
         task,
         oracle: &merged,
@@ -784,6 +809,8 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     result.patch_lines_removed = patch.deletions;
     result.attempts_used = attempts_used;
     result.repair = repair_metrics;
+    result.usage = usage;
+    result.model_round_trips = model_round_trips;
 
     let _ = artifacts.write_json("result.json", &result);
     result
@@ -1182,6 +1209,8 @@ pub mod test_support {
             attempts_used: 1,
             cost_usd: None,
             repair: crate::repair::RepairMetrics::default(),
+            usage: None,
+            model_round_trips: 0,
         }
     }
 }

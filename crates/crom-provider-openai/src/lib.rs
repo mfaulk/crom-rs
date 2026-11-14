@@ -397,12 +397,57 @@ struct ChatToolCallFunction {
     arguments: String,
 }
 
+/// Chat Completions usage. Every field is optional: absent means unreported.
+/// `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` are the DeepSeek
+/// (OpenAI-compatible) cache fields.
 #[derive(Deserialize, Default)]
 struct ChatUsage {
     #[serde(default)]
-    prompt_tokens: u64,
+    prompt_tokens: Option<u64>,
     #[serde(default)]
-    completion_tokens: u64,
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
+/// Normalize to [`TokenUsage`]: `prompt_tokens` includes cached tokens, so
+/// cache reads are split out of `input_tokens`; `completion_tokens` already
+/// includes reasoning tokens.
+fn chat_usage_to_token_usage(u: ChatUsage) -> TokenUsage {
+    let cache_read = u
+        .prompt_tokens_details
+        .and_then(|d| d.cached_tokens)
+        .or(u.prompt_cache_hit_tokens);
+    let input = match (u.prompt_tokens, cache_read, u.prompt_cache_miss_tokens) {
+        (Some(p), Some(c), _) => Some(p.saturating_sub(c)),
+        (Some(p), None, _) => Some(p),
+        (None, _, miss) => miss,
+    };
+    TokenUsage {
+        input_tokens: input,
+        output_tokens: u.completion_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: cache_read,
+        reasoning_tokens: u.completion_tokens_details.and_then(|d| d.reasoning_tokens),
+    }
 }
 
 fn chat_response_to_events(resp: ChatResponse) -> Vec<ModelEvent> {
@@ -433,12 +478,7 @@ fn chat_response_to_events(resp: ChatResponse) -> Vec<ModelEvent> {
             }));
         }
     }
-    let usage = resp.usage.map(|u| TokenUsage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
-    });
+    let usage = resp.usage.map(chat_usage_to_token_usage);
     events.push(ModelEvent::MessageStop { stop_reason, usage });
     events
 }
@@ -472,6 +512,64 @@ mod tests {
     use crom_core::provider::ToolSchema;
     use crom_core::Message;
     use futures::StreamExt;
+
+    fn usage_from_fixture(body: &str) -> Option<TokenUsage> {
+        let resp: ChatResponse = serde_json::from_str(body).unwrap();
+        match chat_response_to_events(resp).pop() {
+            Some(ModelEvent::MessageStop { usage, .. }) => usage,
+            other => panic!("expected MessageStop, got {other:?}"),
+        }
+    }
+
+    // OpenAI cached_tokens become cache reads (split out of input) and reasoning_tokens are kept.
+    #[test]
+    fn usage_openai_cached_and_reasoning_tokens() {
+        let u = usage_from_fixture(include_str!(
+            "../tests/fixtures/usage_openai_cached_reasoning.json"
+        ))
+        .expect("usage reported");
+        assert_eq!(u.input_tokens, Some(176));
+        assert_eq!(u.cache_read_input_tokens, Some(1024));
+        assert_eq!(u.cache_creation_input_tokens, None);
+        assert_eq!(u.output_tokens, Some(300));
+        assert_eq!(u.reasoning_tokens, Some(256));
+    }
+
+    // DeepSeek-style prompt_cache_hit/miss tokens map to cache reads and uncached input.
+    #[test]
+    fn usage_deepseek_cache_hit_miss_tokens() {
+        let u = usage_from_fixture(include_str!("../tests/fixtures/usage_deepseek_cache.json"))
+            .expect("usage reported");
+        assert_eq!(u.input_tokens, Some(200));
+        assert_eq!(u.cache_read_input_tokens, Some(800));
+        assert_eq!(u.output_tokens, Some(50));
+        assert_eq!(u.reasoning_tokens, Some(20));
+    }
+
+    // A response without a usage object yields None, never zeros.
+    #[test]
+    fn usage_absent_is_none() {
+        assert_eq!(
+            usage_from_fixture(include_str!("../tests/fixtures/usage_absent.json")),
+            None
+        );
+    }
+
+    // Unreported breakdowns stay None while reported prompt/completion counts are kept.
+    #[test]
+    fn usage_without_details_leaves_breakdowns_unknown() {
+        let u = usage_from_fixture(
+            r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+        )
+        .expect("usage reported");
+        assert_eq!(u.input_tokens, Some(3));
+        assert_eq!(u.output_tokens, Some(1));
+        assert_eq!(u.cache_read_input_tokens, None);
+        assert_eq!(u.reasoning_tokens, None);
+        // A usage object missing completion_tokens reports output as unknown.
+        let u = usage_from_fixture(r#"{"choices":[],"usage":{"prompt_tokens":3}}"#).unwrap();
+        assert_eq!(u.output_tokens, None);
+    }
 
     #[derive(Default)]
     struct MockTransport {

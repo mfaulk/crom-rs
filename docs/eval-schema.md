@@ -279,3 +279,38 @@ The run `summary.json`/`summary.md` include an aggregate `repair` object and a
 **Repair loop** report section (tasks with failed validation, recovered after
 repair, unrecovered compile/test errors, repeated failures, median attempts,
 focused-validation usage, validation-after-edit rate) plus a per-task table.
+
+## Token usage and round trips (M17.1)
+
+Every task `result.json` carries two additive fields:
+
+```text
+usage               # TokenUsage object, or null
+model_round_trips   # number of model round trips across all attempts
+```
+
+`model_round_trips` counts the SDK `ModelTurnCompleted` events for the task,
+including plan-then-act planning turns and turns whose usage is unknown.
+
+`usage` is the strict sum of each round trip's usage:
+
+- `null` when there were no round trips, or when **any** round trip reported
+  no usage at all (e.g. the fake echo provider, or a stream that errored).
+- Otherwise an object whose fields are summed across round trips; a field is
+  `null` when any round trip left that quantity unreported.
+
+```json
+"usage": {
+  "input_tokens": 500,
+  "output_tokens": 100,
+  "cache_creation_input_tokens": null,
+  "cache_read_input_tokens": null,
+  "reasoning_tokens": null
+}
+```
+
+Field meanings follow `crom_core::TokenUsage`: `input_tokens` excludes cache
+reads/writes, `output_tokens` includes `reasoning_tokens`. Unknown counts are
+never reported as `0`. The `golden` provider reports 100 input / 20 output
+tokens per turn and leaves cache/reasoning unreported, so golden results show
+partial usage.

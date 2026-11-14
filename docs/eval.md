@@ -344,7 +344,7 @@ target/crom-eval/
       verification.json    # per-check public/hidden verification results
       behavior.json        # behavior metrics for the task
       score.json
-      result.json          # the full task result (status, resolved, failure class, …)
+      result.json          # the full task result (status, resolved, failure class, usage, model_round_trips, …)
       index-entry.json     # the row appended to index.jsonl
       report.md
       triage.md
