@@ -1,0 +1,53 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "none"
+expected_outcome = "no_change"
+reference = "validated_oracle"
+id = "rust-nochange-leap-year"
+title = "Negative: reject a bogus leap-year bug report"
+category = "negative"
+difficulty = "easy"
+tags = ["rust", "single-file", "negative", "no-change", "hidden-tests", "small"]
+suites = ["l1"]
+
+prompt = """
+A user filed a bug: `days_in_month(1900, 2)` in src/lib.rs returns 28, but 1900
+is divisible by 4, so they expect 29. Investigate. If the code is actually
+wrong, fix it; if it is already correct, leave it unchanged and explain why.
+"""
+
+max_turns = 12
+timeout_secs = 180
+
+forbidden_paths = ["Cargo.toml"]
+
+[capabilities]
+negative_noop = true
+
+[behavior]
+require_read_before_write = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+# Hidden: pins the Gregorian century rule (1900 is NOT a leap year), so
+# "fixing" the reported non-bug fails. The unmodified fixture is the reference.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

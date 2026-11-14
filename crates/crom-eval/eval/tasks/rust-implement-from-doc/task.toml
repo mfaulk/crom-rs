@@ -1,0 +1,57 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "none"
+reference = "oracle_patch"
+id = "rust-implement-from-doc"
+title = "Implement a function from its doc comment and examples"
+category = "feature"
+difficulty = "easy"
+tags = ["rust", "single-file", "implement", "hidden-tests", "small"]
+suites = ["l1"]
+
+prompt = """
+`encode` in src/lib.rs is an unimplemented stub. Implement it exactly as its
+doc comment specifies, including the doc example. Keep the public signature
+unchanged and make `cargo test` pass.
+"""
+
+max_turns = 20
+timeout_secs = 240
+
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/lib.rs"]
+oracle_patch = "oracle.patch"
+
+[capabilities]
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# Public: unit tests + the doc example (the stub panics with todo!()).
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+# Hidden: repeated runs of one char, multi-digit counts, Unicode, whitespace.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

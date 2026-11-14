@@ -1,0 +1,13 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,8 +11,7 @@
+     }
+ 
+     pub fn area(&self) -> u32 {
+-        // Bug: uses the old field names `w` and `h`.
+-        self.w * self.h
++        self.width * self.height
+     }
+ }
+ 

@@ -1,0 +1,58 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,5 @@
++use std::fmt;
++
+ /// Errors a `key = value` line can produce.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum ParseError {
+@@ -10,17 +12,33 @@
+     InvalidNumber(String),
+ }
+ 
++impl fmt::Display for ParseError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            ParseError::MissingSeparator => write!(f, "missing '=' separator"),
++            ParseError::EmptyKey => write!(f, "empty key"),
++            ParseError::InvalidNumber(v) => write!(f, "invalid number: {v:?}"),
++        }
++    }
++}
++
++impl std::error::Error for ParseError {}
++
+ /// Parse a `key = value` line into its trimmed key and integer value.
+ ///
+ /// The line is split at the first `=`. Checks apply in order: separator,
+ /// then key, then value.
+-///
+-/// Currently this panics on malformed input instead of reporting a
+-/// [`ParseError`].
+-pub fn parse_entry(line: &str) -> (String, i64) {
+-    let (key, value) = line.split_once('=').unwrap();
+-    let value: i64 = value.trim().parse().unwrap();
+-    (key.trim().to_string(), value)
++pub fn parse_entry(line: &str) -> Result<(String, i64), ParseError> {
++    let (key, value) = line.split_once('=').ok_or(ParseError::MissingSeparator)?;
++    let key = key.trim();
++    if key.is_empty() {
++        return Err(ParseError::EmptyKey);
++    }
++    let value = value.trim();
++    let number = value
++        .parse()
++        .map_err(|_| ParseError::InvalidNumber(value.to_string()))?;
++    Ok((key.to_string(), number))
+ }
+ 
+ #[cfg(test)]
+@@ -29,6 +47,6 @@
+ 
+     #[test]
+     fn parses_valid_entry() {
+-        assert_eq!(parse_entry("retries = 3"), ("retries".to_string(), 3));
++        assert_eq!(parse_entry("retries = 3"), Ok(("retries".to_string(), 3)));
+     }
+ }

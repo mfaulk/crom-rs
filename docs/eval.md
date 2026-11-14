@@ -160,6 +160,31 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
   *not* to resolve (see [Repair loop](#repair-loop-m16)).
 - `private` — tasks with `visibility = "private"`. Excluded from suite
   selection and `eval list` unless `--include-private` is passed.
+- `l1` — the L1 capability corpus (M17.2, #287): single-file Rust tasks, all
+  `kind = "capability"`, `level = "L1"`, `network = "none"`, each with hidden
+  verification and a validated reference. Intended for a live provider; CI
+  validates it model-free with `crom eval validate-suite l1`.
+
+### L1 capability corpus
+
+| Task | Skill | Reference | Hidden verification |
+|---|---|---|---|
+| `rust-failing-unit-test` | bug fix (visible failing test) | `oracle_patch` | `max_value` at all positions, duplicates, `i64` extremes |
+| `rust-hidden-sum-bug` | bug fix (no visible failing test) | `oracle_patch` | `add` on mixed-sign inputs |
+| `rust-compiler-error` | compile error after a field rename | `oracle_patch` | `area` values; public `width`/`height` fields kept |
+| `rust-implement-from-doc` | implement a `todo!()` fn from its doc | `oracle_patch` | run-length encoding: repeated runs, multi-digit counts, Unicode |
+| `rust-edge-case-paginate` | edge-case handling / overflow | `oracle_patch` | page 0, `per_page` 0, past-the-end, `usize` overflow |
+| `rust-refactor-preserve` | refactor preserving behavior | `oracle_patch` | behavior on all radii + at most one PI literal / negative check |
+| `rust-api-addition` | small API addition | `oracle_patch` | `peek`, `is_empty`, `Default`, `FromIterator` |
+| `rust-add-regression-test` | test writing | `oracle_patch` | slugify behavior + mutation check: the agent's test must fail against the original bug |
+| `rust-error-handling` | panics → typed `Result` | `oracle_patch` | each `ParseError` variant, check order, `?` via `Box<dyn Error>` |
+| `rust-borrow-iter-fix` | iterator ownership/borrowing | `oracle_patch` | order/boundary, borrowed (pointer-equal) names, change count |
+| `rust-nochange-leap-year` | negative (`no_change`) | `validated_oracle` | Gregorian century rule; "fixing" 1900 fails |
+| `rust-nochange-midpoint` | negative (`no_change`) | `validated_oracle` | rounding and `u32::MAX` inputs; `(a + b) / 2` fails |
+
+Hidden fixtures live in each task's `hidden/` directory (outside `repo/`) and
+are overlaid only after the agent finishes; oracle patches live beside
+`task.toml`. Script checks under `hidden/hidden_checks/` run via `sh`.
 
 ## Adding a new task
 

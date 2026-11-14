@@ -1,0 +1,38 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,22 +1,22 @@
+-const PI: f64 = 3.141_592_653_589_793;
++use std::f64::consts::PI;
+ 
+-/// Area of a circle. Returns 0.0 for a negative radius.
+-pub fn area_of_circle(radius: f64) -> f64 {
++/// The radius, or `None` when it is negative (the shared validation rule).
++fn valid_radius(radius: f64) -> Option<f64> {
+     if radius < 0.0 {
+-        return 0.0;
++        None
++    } else {
++        Some(radius)
+     }
+-    PI * radius * radius
++}
++
++/// Area of a circle. Returns 0.0 for a negative radius.
++pub fn area_of_circle(radius: f64) -> f64 {
++    valid_radius(radius).map_or(0.0, |r| PI * r * r)
+ }
+ 
+ /// Circumference of a circle. Returns 0.0 for a negative radius.
+-///
+-/// Note the duplicated PI constant and the duplicated radius validation — a
+-/// refactor should give these a single source of truth.
+ pub fn circumference(radius: f64) -> f64 {
+-    if radius < 0.0 {
+-        return 0.0;
+-    }
+-    2.0 * PI * radius
++    valid_radius(radius).map_or(0.0, |r| 2.0 * PI * r)
+ }
+ 
+ #[cfg(test)]
