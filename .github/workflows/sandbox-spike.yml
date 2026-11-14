@@ -72,3 +72,13 @@ jobs:
         run: |
           set +e
           systemd-run --user --scope -q -p TasksMax=512 python3 "$RUNNER_TEMP/spike/forkcount.py"
+
+      - name: bwrap with AppArmor userns restriction lifted (admin opt-in)
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          SPIKE_DIR: ${{ runner.temp }}/spike
+          BACKENDS: bwrap
+          N: "20"
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bash "$RUNNER_TEMP/spike/spike.sh"

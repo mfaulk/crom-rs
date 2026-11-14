@@ -77,7 +77,7 @@ run() { # backend, cmd...
         --chdir "$WS" "$@" ;;
     podman|docker)
       local img=$IMG_CARGO; [ "$1" = true ] && img=$IMG_TRUE
-      local extra=(); [ $b = podman ] && extra=(--userns=keep-id --security-opt label=disable)
+      local extra=(--user "$(id -u):$(id -g)"); [ $b = podman ] && extra=(--userns=keep-id --security-opt label=disable)
       $b run --rm --network none --pids-limit 512 --memory 2g "${extra[@]}" \
         -v "$WS:$WS" -v "$TC:$TC:ro" -v "$CH:$CH:ro" -w "$WS" \
         $(for e in $ENVS; do printf -- '-e %s ' "$e"; done) \
@@ -100,9 +100,9 @@ for b in $BACKENDS; do
     $b pull -q "$IMG_TRUE" >/dev/null 2>&1; $b pull -q "$IMG_CARGO" >/dev/null 2>&1
   fi
   rm -f "$OUT/pwned"
-  ( cd "$WS" && run $b bash "$WS/probe.sh" ) 2>&1 | sed 's/^/  /'
+  ( cd "$WS" && run $b bash "$WS/probe.sh"; echo "probe_rc=$?" ) 2>&1 | sed 's/^/  /'
   sleep 0.5
-  if pgrep -f '^sleep 4242$' >/dev/null; then echo "  setsid_child=SURVIVED $(pgrep -af "^sleep 4242$" | head -2 | tr "\n" ";")"; pkill -f 'sleep (4242|3)$'; else echo "  setsid_child=reaped"; fi
+  if pgrep -f '^sleep 4242$' >/dev/null; then echo "  setsid_child=SURVIVED"; pkill -f '^sleep 4242$'; else echo "  setsid_child=reaped"; fi
   [ -e "$OUT/pwned" ] && echo "  (outside file exists)"
   # first true includes cold-start; then N warm reps
   run $b true >/dev/null 2>&1
@@ -116,4 +116,5 @@ for b in $BACKENDS; do
   done
 done
 kill $HTTP_PID 2>/dev/null
-rm -rf "$ROOT"
+rm -rf "$ROOT" 2>/dev/null
+exit 0
