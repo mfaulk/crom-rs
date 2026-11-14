@@ -314,3 +314,93 @@ reads/writes, `output_tokens` includes `reasoning_tokens`. Unknown counts are
 never reported as `0`. The `golden` provider reports 100 input / 20 output
 tokens per turn and leaves cache/reasoning unreported, so golden results show
 partial usage.
+
+## Result schema v2 (M17.4)
+
+Every task `result.json` written by this build declares `"schema_version": 2`
+and validates against
+[`crates/crom-eval/schemas/result-v2.schema.json`](../crates/crom-eval/schemas/result-v2.schema.json)
+(JSON Schema 2020-12). `crates/crom-eval/tests/result_schema.rs` validates
+emitted golden, fake, and provider-error results against it. v2 adds three
+top-level fields to the v1 shape: `schema_version`, `outcome`, and `repro`.
+
+### Outcome classes and denominators
+
+```text
+outcome   # resolved | failed | provider_error | infra_error | skipped | unscorable
+```
+
+| Outcome | Derived from |
+|---|---|
+| `resolved` | `resolved = true` |
+| `failed` | any other unresolved result, including `timeout` |
+| `provider_error` | failure class `provider_error` (HTTP 5xx/429/auth/connect/stream failure, runtime build failure of kind `provider`) |
+| `infra_error` | failure class `harness_error`, `isolation_error`, or `adapter_error` |
+| `skipped` | status `skipped` (e.g. live provider not opted in) |
+| `unscorable` | failure class `task_invalid`, `oracle_validation_failed`, or `verification_flake` |
+
+- **Pass rate** = `resolved / (resolved + failed)`. The other classes are
+  reported as counts next to it and never enter the denominator.
+- A run is **unreliable** when `provider_error + infra_error` exceeds 10% of
+  attempts (every outcome except `skipped`). Unreliable runs are not compared.
+- Cost-per-solve (once #282 lands) divides spend on *all* attempts, including
+  `provider_error`, by the resolved count.
+
+`summary.json` carries `outcomes` (counts per class), `pass_rate` (`null`
+when nothing was scored), `unreliable`, and a per-task `outcome`;
+`summary.md` prints the same. Provider and harness failures are never
+refined into M16 repair classes.
+
+### Reproducibility metadata (`repro`)
+
+```text
+repro.git                      # { sha, dirty } of the evaluating checkout
+repro.task                     # { id, schema_version, content_version, content_hash }
+repro.provider                 # { profile, model, base_url_host } (host only; never key or URL)
+repro.tool_policy              # { allowed_tools, builtin_tools }
+repro.security                 # { side_effects, approvals, agent_sandbox }
+repro.isolation                # { backend, network, cpu_limit, memory_limit, container_image }
+repro.runtime                  # { max_turns, timeout_secs, mode, attempts, repair_* }
+repro.prompt                   # { template_version, variant, hash }
+repro.repetition, repro.seed
+repro.host                     # { os, arch, cpus, memory_bytes }
+repro.crom_version
+repro.pricing_source_version   # null until pricing (#282) lands
+```
+
+- `content_hash` is `sha256:<hex>` over every file in the task directory
+  (relative path + bytes, sorted), so any manifest, fixture, hidden-test, or
+  oracle change produces a new hash. `content_version` is the manifest's
+  v3 `task_version`.
+- `prompt.hash` is `sha256:<hex>` of the initial prompt (after variant
+  selection). `template_version` is `eval-prompt-v1`.
+- `seed` comes from `crom eval run --seed <n>` (default `0`); repetition `n`
+  uses `seed + n`.
+- `cost_usd` stays `null` until #282 adds pricing.
+
+### Comparability
+
+`crom_eval::result_schema::comparability_diff(a, b)` returns one line per
+mismatched factor; an empty list means the two results may be compared.
+Compared factors: task id, `content_version`, `content_hash`, `tool_policy`,
+`security`, `isolation.backend`, `runtime`, and the prompt template version
+and hash. Provider, model, seed, git, and host are **not** compared, because
+they are usually the variable under test.
+
+### `run.json` v2
+
+`run.json` declares `schema_version: 2` and records adapter, provider,
+model, `base_url_host`, isolation settings, repetitions, attempts,
+`prompt_variant`, `prompt_template_version`, `seed`, repair policy, `git`,
+`host`, `crom_version`, and `pricing_source_version`.
+
+### Reading v1 results
+
+`crom_eval::result_schema::parse_result` / `load_result` accept v1
+(`schema_version` absent) and v2 results and reject unknown versions. A v1
+result loads with `schema_version = 1` and `repro = null`;
+`EvalResult::outcome()` derives its outcome from status, `resolved`, and
+failure class. Index lines (`index.jsonl`) gained `schema_version` and
+`outcome` with the same defaults, so `history`, `trend`, and `regressions`
+keep reading old entries. v1 index lines carry no status, so a v1 skipped
+task derives as `failed`.

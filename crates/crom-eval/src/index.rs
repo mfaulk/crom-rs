@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::failure::FailureClass;
-use crate::runner::EvalResult;
+use crate::result_schema::{Outcome, LEGACY_RESULT_SCHEMA_VERSION};
+use crate::runner::{EvalResult, EvalStatus};
 
 /// Default index path under `target/`.
 pub const INDEX_PATH: &str = "target/crom-eval/index.jsonl";
@@ -21,6 +22,9 @@ pub const INDEX_PATH: &str = "target/crom-eval/index.jsonl";
 /// One row in the result index. Stable, append-only schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
+    /// Result schema version of the source result (1 when absent).
+    #[serde(default = "legacy_schema_version")]
+    pub schema_version: u32,
     pub run_id: String,
     /// RFC3339 timestamp (filled by the caller).
     pub timestamp: String,
@@ -45,6 +49,13 @@ pub struct IndexEntry {
     pub capabilities: Vec<String>,
     pub repetition: usize,
     pub quarantined: bool,
+    /// M17.4 outcome class (`None` on pre-v2 lines).
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
+}
+
+fn legacy_schema_version() -> u32 {
+    LEGACY_RESULT_SCHEMA_VERSION
 }
 
 impl IndexEntry {
@@ -56,6 +67,7 @@ impl IndexEntry {
         git: &GitContext,
     ) -> Self {
         IndexEntry {
+            schema_version: result.schema_version,
             run_id: run_id.to_string(),
             timestamp: timestamp.to_string(),
             git_sha: git.sha.clone(),
@@ -79,7 +91,21 @@ impl IndexEntry {
             capabilities: result.capabilities.clone(),
             repetition: result.repetition,
             quarantined: result.quarantined,
+            outcome: Some(result.outcome()),
         }
+    }
+
+    /// The recorded outcome, or one derived for pre-v2 lines. v1 lines carry
+    /// no status, so a v1 skipped task is indistinguishable from `failed`.
+    pub fn outcome(&self) -> Outcome {
+        self.outcome.unwrap_or_else(|| {
+            let status = if self.resolved {
+                EvalStatus::Passed
+            } else {
+                EvalStatus::Failed
+            };
+            Outcome::derive(status, self.resolved, self.failure_class)
+        })
     }
 }
 
@@ -369,6 +395,7 @@ mod tests {
 
     fn entry(run: &str, task: &str, resolved: bool, fc: Option<FailureClass>) -> IndexEntry {
         IndexEntry {
+            schema_version: crate::result_schema::RESULT_SCHEMA_VERSION,
             run_id: run.into(),
             timestamp: "2026-06-03T00:00:00Z".into(),
             git_sha: Some("abc123".into()),
@@ -392,6 +419,7 @@ mod tests {
             capabilities: vec![],
             repetition: 0,
             quarantined: false,
+            outcome: None,
         }
     }
 
@@ -407,6 +435,30 @@ mod tests {
         .unwrap();
         let loaded = load_entries(&path).unwrap();
         assert_eq!(loaded.len(), 2);
+    }
+
+    /// A pre-v2 index line (no schema_version/outcome) still loads beside a v2 line, so history/trend keep old runs.
+    #[test]
+    fn v1_index_lines_still_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("index.jsonl");
+        let mut v1 = serde_json::to_value(entry("r0", "t1", false, None)).unwrap();
+        let obj = v1.as_object_mut().unwrap();
+        obj.remove("schema_version");
+        obj.remove("outcome");
+        obj.insert("failure_class".into(), "provider_error".into());
+        std::fs::write(&path, format!("{v1}\n")).unwrap();
+        append_entries(&path, &[entry("r1", "t1", true, None)]).unwrap();
+
+        let loaded = load_entries(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].schema_version, 1);
+        assert_eq!(
+            loaded[0].outcome(),
+            crate::result_schema::Outcome::ProviderError
+        );
+        assert_eq!(loaded[1].schema_version, 2);
+        assert_eq!(loaded[1].outcome(), crate::result_schema::Outcome::Resolved);
     }
 
     #[test]

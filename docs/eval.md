@@ -51,6 +51,7 @@ $ crom eval run <task-id> --adapter internal
 $ crom eval run <path> --adapter directory
 $ crom eval run --suite <suite> --isolation local --network false
 $ crom eval run --suite <suite> --repetitions 5
+$ crom eval run --suite <suite> --repetitions 5 --seed 42
 $ crom eval run --suite <suite> --prompt-variant concise
 $ crom eval run <path> --adapter aider --attempts 2
 $ crom eval validate-task <id-or-path>
@@ -320,7 +321,7 @@ Every run writes a self-contained bundle:
 target/crom-eval/
   index.jsonl              # regression index, one entry per task result
   runs/<run-id>/
-    run.json               # run metadata (provider, adapter, isolation, flags)
+    run.json               # run metadata, schema v2 (provider, model, flags, seed, git, host, crom version)
     summary.json
     summary.md
     behavior-summary.json  # behavior metrics aggregated over the run
@@ -346,7 +347,7 @@ target/crom-eval/
       verification.json    # per-check public/hidden verification results
       behavior.json        # behavior metrics for the task
       score.json
-      result.json          # the full task result (status, resolved, failure class, usage, model_round_trips, …)
+      result.json          # the full task result, schema v2 (status, outcome, failure class, usage, repro metadata, …)
       index-entry.json     # the row appended to index.jsonl
       report.md
       triage.md
@@ -357,6 +358,11 @@ target/crom-eval/
 
 With `--repetitions k` (k > 1) each repetition writes its own
 `<run-id>/rep-<n>/tasks/<task-id>/` tree.
+
+`result.json`, `run.json`, and `summary.json` follow result schema v2
+(outcome classes, pass-rate denominators, reproducibility metadata,
+comparability rule, v1 back-compat); see
+[Result schema v2](eval-schema.md#result-schema-v2-m174).
 
 Each task runs in its own git-initialised workspace; the final patch is the diff
 against the baseline commit.

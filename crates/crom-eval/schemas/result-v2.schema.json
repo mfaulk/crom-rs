@@ -1,0 +1,664 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "crom eval task result (schema v2)",
+  "description": "Per-task result.json written by crom-eval. See docs/eval-schema.md#result-schema-v2-m174.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "task_id",
+    "title",
+    "status",
+    "score",
+    "patch",
+    "transcript_path",
+    "events_path",
+    "report_path",
+    "workspace_path",
+    "provider",
+    "model",
+    "suites",
+    "tags",
+    "checks_passed",
+    "checks_total",
+    "tool_calls",
+    "turns_used",
+    "duration_ms",
+    "skipped_reason",
+    "resolved",
+    "failure_class",
+    "secondary_failures",
+    "public_passed",
+    "hidden_present",
+    "hidden_passed",
+    "behavior",
+    "behavior_warnings",
+    "category",
+    "difficulty",
+    "capabilities",
+    "adapter",
+    "isolation",
+    "quarantined",
+    "patch_lines_added",
+    "patch_lines_removed",
+    "repetition",
+    "seed",
+    "attempts_used",
+    "cost_usd",
+    "repair",
+    "usage",
+    "model_round_trips",
+    "outcome",
+    "repro"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "partial",
+        "failed",
+        "timed_out",
+        "errored",
+        "skipped"
+      ]
+    },
+    "score": {
+      "$ref": "#/$defs/score"
+    },
+    "patch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "transcript_path": {
+      "type": "string"
+    },
+    "events_path": {
+      "type": "string"
+    },
+    "report_path": {
+      "type": "string"
+    },
+    "workspace_path": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "suites": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "checks_passed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "checks_total": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "tool_calls": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "turns_used": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "skipped_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resolved": {
+      "type": "boolean"
+    },
+    "failure_class": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/failure_class"
+        }
+      ]
+    },
+    "secondary_failures": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/failure_class"
+      }
+    },
+    "public_passed": {
+      "type": "boolean"
+    },
+    "hidden_present": {
+      "type": "boolean"
+    },
+    "hidden_passed": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "behavior": {
+      "type": "object"
+    },
+    "behavior_warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "category": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "difficulty": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "adapter": {
+      "type": "string"
+    },
+    "isolation": {
+      "type": "string"
+    },
+    "quarantined": {
+      "type": "boolean"
+    },
+    "patch_lines_added": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "patch_lines_removed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "repetition": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "seed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "attempts_used": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "cost_usd": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "repair": {
+      "type": "object"
+    },
+    "usage": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/token_usage"
+        }
+      ]
+    },
+    "model_round_trips": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "outcome": {
+      "$ref": "#/$defs/outcome"
+    },
+    "repro": {
+      "$ref": "#/$defs/repro"
+    }
+  },
+  "$defs": {
+    "failure_class": {
+      "type": "string",
+      "enum": [
+        "did_not_attempt",
+        "wrong_file",
+        "compile_error",
+        "public_test_failure",
+        "hidden_test_failure",
+        "overfit_public_tests",
+        "excessive_patch",
+        "unsafe_command",
+        "tool_loop",
+        "context_failure",
+        "planning_failure",
+        "timeout",
+        "provider_error",
+        "harness_error",
+        "forbidden_path_changed",
+        "required_path_missing",
+        "verification_flake",
+        "isolation_error",
+        "adapter_error",
+        "oracle_validation_failed",
+        "task_invalid",
+        "unrecovered_compile_error",
+        "unrecovered_test_failure",
+        "repeated_same_failure",
+        "unvalidated_completion",
+        "repair_attempt_limit_exceeded",
+        "diagnostic_parse_failure"
+      ]
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "resolved",
+        "failed",
+        "infra_error",
+        "provider_error",
+        "skipped",
+        "unscorable"
+      ]
+    },
+    "token_usage": {
+      "type": "object",
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "reasoning_tokens"
+      ],
+      "properties": {
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cache_creation_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cache_read_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "reasoning_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "score": {
+      "type": "object",
+      "required": [
+        "total",
+        "correctness",
+        "patch_quality",
+        "process_quality",
+        "efficiency",
+        "notes"
+      ],
+      "properties": {
+        "total": {
+          "type": "number"
+        },
+        "correctness": {
+          "type": "number"
+        },
+        "patch_quality": {
+          "type": "number"
+        },
+        "process_quality": {
+          "type": "number"
+        },
+        "efficiency": {
+          "type": "number"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "repro": {
+      "type": "object",
+      "required": [
+        "git",
+        "task",
+        "provider",
+        "tool_policy",
+        "security",
+        "isolation",
+        "runtime",
+        "prompt",
+        "repetition",
+        "seed",
+        "host",
+        "crom_version",
+        "pricing_source_version"
+      ],
+      "properties": {
+        "git": {
+          "type": "object",
+          "required": [
+            "sha",
+            "dirty"
+          ],
+          "properties": {
+            "sha": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dirty": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "task": {
+          "type": "object",
+          "required": [
+            "id",
+            "schema_version",
+            "content_version",
+            "content_hash"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "schema_version": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "content_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "content_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "provider": {
+          "type": "object",
+          "required": [
+            "profile",
+            "model",
+            "base_url_host"
+          ],
+          "properties": {
+            "profile": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "base_url_host": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "tool_policy": {
+          "type": "object",
+          "required": [
+            "allowed_tools",
+            "builtin_tools"
+          ],
+          "properties": {
+            "allowed_tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "builtin_tools": {
+              "type": "object"
+            }
+          },
+          "additionalProperties": false
+        },
+        "security": {
+          "type": "object",
+          "required": [
+            "side_effects",
+            "approvals",
+            "agent_sandbox"
+          ],
+          "properties": {
+            "side_effects": {
+              "type": "object"
+            },
+            "approvals": {
+              "type": "string"
+            },
+            "agent_sandbox": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "isolation": {
+          "type": "object",
+          "required": [
+            "backend",
+            "network",
+            "cpu_limit",
+            "memory_limit",
+            "container_image"
+          ],
+          "properties": {
+            "backend": {
+              "type": "string"
+            },
+            "network": {
+              "type": "boolean"
+            },
+            "cpu_limit": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "memory_limit": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "container_image": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "runtime": {
+          "type": "object",
+          "required": [
+            "max_turns",
+            "timeout_secs",
+            "mode",
+            "attempts",
+            "repair_enabled",
+            "repair_max_attempts",
+            "repair_require_validation_after_mutation"
+          ],
+          "properties": {
+            "max_turns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "timeout_secs": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string"
+            },
+            "attempts": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "repair_enabled": {
+              "type": "boolean"
+            },
+            "repair_max_attempts": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "repair_require_validation_after_mutation": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "prompt": {
+          "type": "object",
+          "required": [
+            "template_version",
+            "variant",
+            "hash"
+          ],
+          "properties": {
+            "template_version": {
+              "type": "string"
+            },
+            "variant": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hash": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "repetition": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "host": {
+          "type": "object",
+          "required": [
+            "os",
+            "arch",
+            "cpus",
+            "memory_bytes"
+          ],
+          "properties": {
+            "os": {
+              "type": "string"
+            },
+            "arch": {
+              "type": "string"
+            },
+            "cpus": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "memory_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "crom_version": {
+          "type": "string"
+        },
+        "pricing_source_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

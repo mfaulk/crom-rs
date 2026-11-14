@@ -22,6 +22,8 @@
 //! - [`score`] — weighted structured scoring.
 //! - [`artifacts`] — per-run / per-task artifact bundle.
 //! - [`report`] — human-readable reports and run summaries.
+//! - [`result_schema`] — result schema v2: outcome classes, reproducibility
+//!   metadata, comparability, and v1 back-compat reading.
 
 pub mod adapter;
 pub mod artifacts;
@@ -36,6 +38,7 @@ pub mod oracle;
 pub mod providers;
 pub mod repair;
 pub mod report;
+pub mod result_schema;
 pub mod runner;
 pub mod schema;
 pub mod score;
@@ -52,6 +55,7 @@ pub use providers::{ProviderMode, ProviderSetup, ProviderUnavailable};
 pub use repair::{
     FinalValidationStatus, RepairMetrics, RepairSession, RepairTrace, ValidationAttempt,
 };
+pub use result_schema::{Outcome, OutcomeCounts, ReproMetadata};
 pub use runner::{EvalResult, EvalStatus, RunConfig};
 pub use schema::{
     BehaviorRules, Capabilities, HiddenSpec, PromptVariants, Quarantine, Visibility,
