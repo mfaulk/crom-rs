@@ -1109,13 +1109,28 @@ fn build_child_options(
     context: Option<&Value>,
     hook_added_context: &str,
 ) -> AgentOptions {
+    // A definition (possibly repo-supplied) can never run looser than the
+    // parent's mode. `inherit_permissions` controls only whether the parent's
+    // mode is the child's default and whether parent disallow rules carry over.
+    let inherit = runtime_options.context_policy.inherit_permissions;
+    let requested_mode = def.permission_mode.unwrap_or(if inherit {
+        parent.permission_mode
+    } else {
+        PermissionMode::Default
+    });
+    let child_mode = requested_mode.capped_at(parent.permission_mode);
+    let mut child_disallow_rules = Vec::new();
+    if inherit {
+        child_disallow_rules.extend(parent.disallowed_tool_rules.iter().cloned());
+    }
+    child_disallow_rules.extend(def.disallowed_tools.iter().cloned());
     let mut opts = AgentOptions {
         cwd: cwd.clone(),
         model: def.model.clone().unwrap_or_else(|| parent.model.clone()),
         allowed_tools: Vec::new(),
         allowed_tool_rules: def.tools.clone().unwrap_or_default(),
-        disallowed_tool_rules: def.disallowed_tools.clone(),
-        permission_mode: def.permission_mode.unwrap_or(parent.permission_mode),
+        disallowed_tool_rules: child_disallow_rules,
+        permission_mode: child_mode,
         // The invocation may *lower* max_turns but cannot *raise* it past
         // the definition's cap (or the hard limit). The parent LLM cannot
         // bypass an admin-set cost ceiling by passing a higher value via
@@ -1651,5 +1666,139 @@ mod classify_status_tests {
             ),
             SubagentStatus::Failed
         );
+    }
+}
+
+#[cfg(test)]
+mod child_permission_tests {
+    use super::*;
+    use crate::agents::runtime::AgentRuntimeOptions;
+
+    fn child(
+        parent: &AgentOptions,
+        runtime: &AgentRuntimeOptions,
+        def: &AgentDefinition,
+    ) -> AgentOptions {
+        build_child_options(
+            parent,
+            runtime,
+            def,
+            None,
+            SessionId::new(),
+            parent.cwd.clone(),
+            "task",
+            None,
+            "",
+        )
+    }
+
+    fn has_exact(rules: &[ToolRule], name: &str) -> bool {
+        rules
+            .iter()
+            .any(|r| matches!(r, ToolRule::ExactTool(n) if n == name))
+    }
+
+    fn parent(mode: PermissionMode) -> AgentOptions {
+        AgentOptions {
+            permission_mode: mode,
+            disallowed_tool_rules: vec![ToolRule::ExactTool("Bash".into())],
+            ..AgentOptions::default()
+        }
+    }
+
+    fn def(mode: Option<PermissionMode>) -> AgentDefinition {
+        AgentDefinition {
+            name: "repo-agent".into(),
+            permission_mode: mode,
+            ..AgentDefinition::default()
+        }
+    }
+
+    #[test]
+    // A definition asking for acceptEdits under a Default parent is clamped to Default.
+    fn definition_cannot_raise_mode_above_parent() {
+        let rt = AgentRuntimeOptions::default();
+        let c = child(
+            &parent(PermissionMode::Default),
+            &rt,
+            &def(Some(PermissionMode::AcceptEdits)),
+        );
+        assert_eq!(c.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
+    // A Plan-mode parent forces every subagent into Plan mode.
+    fn plan_parent_forces_plan_child() {
+        let rt = AgentRuntimeOptions::default();
+        for m in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::DontAsk,
+        ] {
+            let c = child(&parent(PermissionMode::Plan), &rt, &def(Some(m)));
+            assert_eq!(c.permission_mode, PermissionMode::Plan, "requested {m:?}");
+        }
+    }
+
+    #[test]
+    // A dontAsk parent (never prompts) cannot spawn a child that prompts or auto-accepts edits.
+    fn dont_ask_parent_clamps_child() {
+        let rt = AgentRuntimeOptions::default();
+        for m in [PermissionMode::Default, PermissionMode::AcceptEdits] {
+            let c = child(&parent(PermissionMode::DontAsk), &rt, &def(Some(m)));
+            assert_eq!(
+                c.permission_mode,
+                PermissionMode::DontAsk,
+                "requested {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    // A definition may lower its mode below the parent's.
+    fn definition_may_lower_mode() {
+        let rt = AgentRuntimeOptions::default();
+        let c = child(
+            &parent(PermissionMode::AcceptEdits),
+            &rt,
+            &def(Some(PermissionMode::DontAsk)),
+        );
+        assert_eq!(c.permission_mode, PermissionMode::DontAsk);
+        let c = child(
+            &parent(PermissionMode::AcceptEdits),
+            &rt,
+            &def(Some(PermissionMode::Plan)),
+        );
+        assert_eq!(c.permission_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    // With inherit_permissions (default), the child keeps the parent's disallow rules and mode.
+    fn inherit_permissions_carries_parent_disallow_rules() {
+        let rt = AgentRuntimeOptions::default();
+        assert!(rt.context_policy.inherit_permissions);
+        let mut d = def(None);
+        d.disallowed_tools = vec![ToolRule::ExactTool("Write".into())];
+        let c = child(&parent(PermissionMode::AcceptEdits), &rt, &d);
+        assert!(has_exact(&c.disallowed_tool_rules, "Bash"));
+        assert!(has_exact(&c.disallowed_tool_rules, "Write"));
+        assert_eq!(c.permission_mode, PermissionMode::AcceptEdits);
+    }
+
+    #[test]
+    // With inherit_permissions off, the child starts from Default mode and its own disallow rules,
+    // but still cannot exceed the parent's mode.
+    fn no_inherit_permissions_starts_clean_but_stays_capped() {
+        let mut rt = AgentRuntimeOptions::default();
+        rt.context_policy.inherit_permissions = false;
+        let c = child(&parent(PermissionMode::AcceptEdits), &rt, &def(None));
+        assert_eq!(c.permission_mode, PermissionMode::Default);
+        assert!(!has_exact(&c.disallowed_tool_rules, "Bash"));
+        let c = child(
+            &parent(PermissionMode::Default),
+            &rt,
+            &def(Some(PermissionMode::AcceptEdits)),
+        );
+        assert_eq!(c.permission_mode, PermissionMode::Default);
     }
 }

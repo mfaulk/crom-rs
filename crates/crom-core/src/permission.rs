@@ -20,6 +20,29 @@ impl PermissionMode {
             _ => None,
         }
     }
+
+    /// Rank by how much the mode lets run without a prompt:
+    /// `Plan` (nothing) < `DontAsk` (allow rules only, never prompts) <
+    /// `Default` (allow rules, read-only, or a prompt) < `AcceptEdits`
+    /// (additionally auto-allows mutating tools).
+    fn permissiveness(self) -> u8 {
+        match self {
+            Self::Plan => 0,
+            Self::DontAsk => 1,
+            Self::Default => 2,
+            Self::AcceptEdits => 3,
+        }
+    }
+
+    /// The less permissive of `self` and `ceiling`. Used to stop a subagent
+    /// from running in a mode looser than its parent's.
+    pub fn capped_at(self, ceiling: Self) -> Self {
+        if self.permissiveness() <= ceiling.permissiveness() {
+            self
+        } else {
+            ceiling
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
