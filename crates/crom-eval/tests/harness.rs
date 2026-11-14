@@ -45,6 +45,32 @@ fn discovers_at_least_eight_tasks() {
     assert!(tasks.iter().any(|t| t.in_suite("safety")));
 }
 
+/// Every shipped task is a v3 manifest labelled with a kind and level.
+#[test]
+fn every_shipped_task_is_v3_with_kind_and_level() {
+    for t in load_all() {
+        assert_eq!(t.schema_version, 3, "{} is not schema v3", t.id);
+        assert!(t.kind.is_some(), "{} has no kind", t.id);
+        assert!(t.level.is_some(), "{} has no level", t.id);
+        assert!(t.task_version.is_some(), "{} has no task_version", t.id);
+    }
+}
+
+/// Tasks in the scripted/offline CI suites are harness tasks at L0, never capability tasks.
+#[test]
+fn offline_ci_suites_are_harness_l0() {
+    use crom_eval::schema::{Level, TaskKind};
+    for t in load_all() {
+        if ["smoke", "golden", "safety", "repair-smoke", "repair-mini"]
+            .iter()
+            .any(|s| t.in_suite(s))
+        {
+            assert_eq!(t.kind, Some(TaskKind::Harness), "{}", t.id);
+            assert_eq!(t.level, Some(Level::L0), "{}", t.id);
+        }
+    }
+}
+
 #[tokio::test]
 async fn smoke_noop_passes_under_fake_provider() {
     let tmp = tempfile::tempdir().unwrap();

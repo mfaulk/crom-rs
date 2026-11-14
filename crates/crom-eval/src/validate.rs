@@ -5,7 +5,10 @@
 //! pristine base (which should fail the hidden check for a real task), applies
 //! the oracle patch if present (which should pass), and runs a battery of
 //! structural and canary checks (e.g. hidden test names leaking into the
-//! prompt). Repeated validation classifies a task's flakiness.
+//! prompt). `kind = capability` tasks (schema v3) must additionally have
+//! hidden verification and a passing reference, and their unmodified fixture
+//! must fail (or, for `no_change`, pass) verification; these are errors.
+//! Repeated validation classifies a task's flakiness.
 
 use std::path::Path;
 
@@ -14,7 +17,7 @@ use serde::Serialize;
 use crate::fixture::{copy_dir_recursive, prepare_workspace};
 use crate::isolation::{CommandLimits, LocalBackend};
 use crate::oracle::{self, OracleReport};
-use crate::schema::SUPPORTED_SCHEMA_VERSIONS;
+use crate::schema::{Level, ReferenceKind, TaskKind, SUPPORTED_SCHEMA_VERSIONS};
 use crate::task::EvalTask;
 
 /// Severity of a validation finding.
@@ -264,6 +267,7 @@ pub async fn validate_task(task: &EvalTask) -> ValidationReport {
 
     // Hidden verification: must be runnable and must FAIL on the base fixture
     // (unless this is a negative/no-op task).
+    let mut base_hidden_passed: Option<bool> = None;
     if let Some(hidden) = &task.hidden {
         if hidden.has_checks() {
             // Overlay hidden fixture if any.
@@ -282,7 +286,8 @@ pub async fn validate_task(task: &EvalTask) -> ValidationReport {
                     base_hidden.checks_total()
                 ),
             ));
-            if base_hidden.all_passed() && !task.capabilities.negative_noop {
+            base_hidden_passed = Some(base_hidden.all_passed());
+            if base_hidden.all_passed() && !task.expects_no_change() {
                 checks.push(Check::warn(
                     "base_fails_hidden",
                     "base fixture already passes the hidden check (expected to fail)",
@@ -360,9 +365,86 @@ pub async fn validate_task(task: &EvalTask) -> ValidationReport {
         ));
     }
 
+    if task.kind == Some(TaskKind::Capability) {
+        capability_checks(task, public.all_passed(), base_hidden_passed, &mut checks);
+    }
+
     ValidationReport {
         task_id: task.id.clone(),
         checks,
+    }
+}
+
+/// Rules every `kind = capability` task must satisfy (M17.2): hidden
+/// verification, a declared reference that passes public + hidden, and an
+/// unmodified fixture that fails (or, for `no_change`, passes) verification.
+/// The reference patch itself is exercised by the `oracle_patch_*` checks.
+fn capability_checks(
+    task: &EvalTask,
+    base_public_passed: bool,
+    base_hidden_passed: Option<bool>,
+    checks: &mut Vec<Check>,
+) {
+    if task.level.is_none_or(|l| l == Level::L0) {
+        checks.push(Check::error(
+            "capability_level",
+            "capability tasks need a level in L1..L5",
+        ));
+    }
+
+    let has_hidden = task.hidden.as_ref().is_some_and(|h| h.has_checks());
+    if has_hidden {
+        checks.push(Check::ok(
+            "capability_hidden",
+            "hidden verification present",
+        ));
+    } else {
+        checks.push(Check::error(
+            "capability_hidden",
+            "capability task has no hidden verification",
+        ));
+    }
+
+    let no_change = task.expects_no_change();
+    match task.reference {
+        None => checks.push(Check::error(
+            "capability_reference",
+            "capability task declares no reference (oracle_patch | validated_oracle)",
+        )),
+        Some(ReferenceKind::OraclePatch) if task.oracle_patch.is_none() => {
+            checks.push(Check::error(
+                "capability_reference",
+                "reference = oracle_patch but no oracle_patch path",
+            ))
+        }
+        Some(ReferenceKind::ValidatedOracle) if !no_change => checks.push(Check::error(
+            "capability_reference",
+            "reference = validated_oracle requires expected_outcome = no_change",
+        )),
+        Some(kind) => checks.push(Check::ok("capability_reference", format!("{kind:?}"))),
+    }
+
+    let Some(base_hidden_passed) = base_hidden_passed else {
+        return;
+    };
+    let base_passed = base_public_passed && base_hidden_passed;
+    match (no_change, base_passed) {
+        (false, false) => checks.push(Check::ok(
+            "capability_base_outcome",
+            "unmodified fixture fails verification",
+        )),
+        (false, true) => checks.push(Check::error(
+            "capability_base_outcome",
+            "unmodified fixture already passes public + hidden (expected to fail)",
+        )),
+        (true, true) => checks.push(Check::ok(
+            "capability_base_outcome",
+            "unmodified fixture passes verification (no_change)",
+        )),
+        (true, false) => checks.push(Check::error(
+            "capability_base_outcome",
+            "no_change task: unmodified fixture must pass public + hidden",
+        )),
     }
 }
 
@@ -519,7 +601,9 @@ pub async fn flake_detect(task: &EvalTask, repeat: usize) -> FlakeVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{command_oracle, HiddenSpec};
+    use crate::schema::{
+        command_oracle, ExpectedOutcome, HiddenSpec, Level, ReferenceKind, TaskKind,
+    };
     use crate::task::OracleSpec;
 
     fn task_in(dir: &Path, oracle: OracleSpec) -> EvalTask {
@@ -560,6 +644,141 @@ mod tests {
             .checks
             .iter()
             .any(|c| c.name == "base_fails_hidden" && !c.passed));
+    }
+
+    const FIX_PATCH: &str = "--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-bad\n+good\n";
+
+    /// Build a capability task whose fixture holds `value.txt = bad` and whose hidden check wants `good`.
+    fn capability_task(dir: &Path, with_hidden: bool, patch: Option<&str>) -> EvalTask {
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        std::fs::write(dir.join("repo/value.txt"), "bad\n").unwrap();
+        let mut task = task_in(dir, command_oracle(vec!["test -f value.txt".into()]));
+        task.schema_version = 3;
+        task.kind = Some(TaskKind::Capability);
+        task.level = Some(Level::L1);
+        if with_hidden {
+            task.hidden = Some(HiddenSpec {
+                fixture: None,
+                oracle: command_oracle(vec!["grep -qx good value.txt".into()]),
+            });
+        }
+        if let Some(p) = patch {
+            std::fs::write(dir.join("oracle.patch"), p).unwrap();
+            task.oracle_patch = Some("oracle.patch".to_string());
+            task.reference = Some(ReferenceKind::OraclePatch);
+        }
+        task
+    }
+
+    fn failed(report: &ValidationReport, name: &str) -> bool {
+        report
+            .checks
+            .iter()
+            .any(|c| c.name == name && !c.passed && c.severity == Severity::Error)
+    }
+
+    /// A capability task with hidden checks and a patch that turns base-fail into pass validates cleanly.
+    #[tokio::test]
+    async fn capability_task_with_hidden_and_reference_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task = capability_task(tmp.path(), true, Some(FIX_PATCH));
+        let report = validate_task(&task).await;
+        assert!(report.ok(), "{}", report.to_markdown());
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.name == "capability_base_outcome" && c.passed));
+    }
+
+    /// A capability task without hidden verification is a validation error.
+    #[tokio::test]
+    async fn capability_task_without_hidden_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task = capability_task(tmp.path(), false, Some(FIX_PATCH));
+        let report = validate_task(&task).await;
+        assert!(
+            failed(&report, "capability_hidden"),
+            "{}",
+            report.to_markdown()
+        );
+        assert!(!report.ok());
+    }
+
+    /// A capability task without a declared reference is a validation error.
+    #[tokio::test]
+    async fn capability_task_without_reference_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task = capability_task(tmp.path(), true, None);
+        let report = validate_task(&task).await;
+        assert!(
+            failed(&report, "capability_reference"),
+            "{}",
+            report.to_markdown()
+        );
+    }
+
+    /// A capability `change` task whose unmodified fixture already passes is a validation error.
+    #[tokio::test]
+    async fn capability_change_task_base_must_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task = capability_task(tmp.path(), true, Some(FIX_PATCH));
+        std::fs::write(tmp.path().join("repo/value.txt"), "good\n").unwrap();
+        let report = validate_task(&task).await;
+        assert!(
+            failed(&report, "capability_base_outcome"),
+            "{}",
+            report.to_markdown()
+        );
+    }
+
+    /// A reference patch that does not make hidden verification pass is a validation error.
+    #[tokio::test]
+    async fn capability_reference_must_pass_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrong = "--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-bad\n+meh\n";
+        let task = capability_task(tmp.path(), true, Some(wrong));
+        let report = validate_task(&task).await;
+        assert!(
+            failed(&report, "oracle_patch_passes_hidden"),
+            "{}",
+            report.to_markdown()
+        );
+    }
+
+    /// A capability `no_change` task with a validated oracle passes when the unmodified fixture passes.
+    #[tokio::test]
+    async fn capability_no_change_task_base_must_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = capability_task(tmp.path(), true, None);
+        task.reference = Some(ReferenceKind::ValidatedOracle);
+        task.expected_outcome = ExpectedOutcome::NoChange;
+        std::fs::write(tmp.path().join("repo/value.txt"), "good\n").unwrap();
+        let report = validate_task(&task).await;
+        assert!(report.ok(), "{}", report.to_markdown());
+
+        // The same task with a failing fixture is rejected.
+        std::fs::write(tmp.path().join("repo/value.txt"), "bad\n").unwrap();
+        let report = validate_task(&task).await;
+        assert!(
+            failed(&report, "capability_base_outcome"),
+            "{}",
+            report.to_markdown()
+        );
+    }
+
+    /// Harness tasks are exempt from the capability rules.
+    #[tokio::test]
+    async fn harness_task_skips_capability_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = capability_task(tmp.path(), false, None);
+        task.kind = Some(TaskKind::Harness);
+        task.level = Some(Level::L0);
+        let report = validate_task(&task).await;
+        assert!(report.ok(), "{}", report.to_markdown());
+        assert!(!report
+            .checks
+            .iter()
+            .any(|c| c.name.starts_with("capability_")));
     }
 
     #[tokio::test]

@@ -359,15 +359,37 @@ Rules (enforced by `validate-task`, #285):
 - **No grader material in the agent's reach.** Covered by #286, plus the
   sandbox (#253).
 
-### Existing-task audit (initial, to be finalized in #285)
+### Existing-task audit (#285)
 
-| Task | Proposed kind/level |
-|---|---|
-| smoke-noop, noop-already-correct, prompt-variants-demo, private-canary-demo | harness / L0 |
-| policy-denied-bash, dangerous-command-denial | harness / L0 (security harness) |
-| golden-edit-recover, golden-rust-recover, repair-grep-recover, repair-grep-trap | harness / L0 |
-| rust-failing-unit-test, rust-compiler-error, rust-clippy-cleanup, rust-hidden-sum-bug, rust-serde-edge-case, rust-add-regression-test, rust-refactor-preserve | capability / L1 candidates (need hidden tests + reference) |
-| rust-cli-arg-order, plan-act-small-feature | capability / L1–L2 candidates |
+All 19 shipped tasks are schema v3 with `task_version = "1.0.0"` and
+provenance. "Validates" is `crom eval validate-task <id>` with 0 errors.
+
+| Task | kind | level | network | expected_outcome | Validates | Notes |
+|---|---|---|---|---|---|---|
+| smoke-noop | harness | L0 | none | no_change | yes | `smoke` |
+| noop-already-correct | harness | L0 | none | no_change | yes | `smoke` |
+| prompt-variants-demo | harness | L0 | none | no_change | yes | `smoke` |
+| private-canary-demo | harness | L0 | none | no_change | yes | `private` |
+| policy-denied-bash | harness | L0 | none | change | yes | security harness (`smoke`, `safety`) |
+| dangerous-command-denial | harness | L0 | none | change | yes | security harness (`smoke`, `safety`) |
+| golden-edit-recover | harness | L0 | none | change | yes | scripted `golden` |
+| golden-rust-recover | harness | L0 | none | change | yes | scripted `golden` |
+| repair-grep-recover | harness | L0 | none | change | yes | scripted `repair-smoke` |
+| repair-grep-trap | harness | L0 | none | change | yes | scripted negative (`repair-smoke`) |
+| rust-hidden-sum-bug | capability | L1 | none | change | yes | hidden test + `oracle_patch` reference |
+| rust-failing-unit-test | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
+| rust-compiler-error | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
+| rust-clippy-cleanup | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
+| rust-serde-edge-case | capability | L1 | registry | change | no | needs hidden tests + reference (#287) |
+| rust-add-regression-test | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
+| rust-refactor-preserve | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
+| rust-cli-arg-order | capability | L2 | none | change | no | 3-file fixture; needs hidden tests + reference (#287/#288) |
+| plan-act-small-feature | capability | L2 | none | change | no | plan-then-act; needs hidden tests + reference (#287/#288) |
+
+The eight capability tasks marked "no" fail `capability_hidden` and
+`capability_reference`, so `validate-suite rust-small` / `rust-mini` exit
+non-zero until they are upgraded. CI validates `smoke`, `golden`, `safety`,
+`repair-smoke`, and `rust-hidden-sum-bug`.
 
 ## 10. Provider support and cost strategy
 

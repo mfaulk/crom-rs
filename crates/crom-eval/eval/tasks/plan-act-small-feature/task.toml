@@ -1,4 +1,8 @@
-schema_version = 2
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
 id = "plan-act-small-feature"
 title = "Add a small feature using explicit plan-then-act"
 category = "feature"
@@ -34,3 +38,9 @@ text = "is_palindrome"
 
 [[oracle.behavior]]
 kind = "must_emit_plan"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"
