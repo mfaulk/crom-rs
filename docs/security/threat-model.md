@@ -91,7 +91,7 @@ Verified against `5bc1fb2`.
 | Control | Location | What it does | Limit |
 |---|---|---|---|
 | Pre-execution policy gate | `crom-core/src/agent.rs:1418-1506` (unknown tool → `ToolCallDenied`; `policy.evaluate_tool` at `:1454`; deny path `:1488-1506`; `execute` only at `:1673`) | No tool runs without an `Allow` decision | Decides on tool name + input, not on effects |
-| Policy pipeline | `crom-core/src/policy.rs:302-542` (hooks `:308-350`, disallow rules `:353`, plan mode `:371`, permission mode `:380`, approval memory `:485`, default deny `:536-540`) | Ordered allow/deny; default deny | Hook `Allow` returns before disallow rules (`:325-344`) — #290 |
+| Policy pipeline | `crom-core/src/policy.rs:302-542` (hooks `:308-350`, disallow rules `:353`, plan mode `:371`, permission mode `:380`, approval memory `:485`, default deny `:536-540`) | Ordered allow/deny; default deny. A hook `Allow` is honoured only after disallow rules, deny memory and plan mode (#290) | — |
 | Path checks for file tools | `crom-tools/src/path_sandbox.rs:44-124`, used by Read/Write/Edit; Glob/Grep canonicalize the root | Rejects `..` and symlink escapes; absolute paths are re-rooted (`:58-60`) | Path-based, TOCTOU (`:16-43`); does not apply to Bash |
 | Bash timeout | `crom-tools/src/bash.rs:89-94` caps caller timeout at the configured max; `:134` | Bounds wall time | — |
 | Bash process group | `bash.rs:107-114` (`process_group(0)`), SIGKILL to the group on timeout only (`:144-160`); `kill_on_drop` (`:104`) kills bash only | Kills same-group descendants on timeout | `setsid` escapes; not killed on normal exit or cancel |
@@ -113,8 +113,8 @@ Verified against `5bc1fb2`.
 | G3 | No fail-closed mode; no backend exists | P7 | #253 |
 | G4 | Hidden material on the agent-reachable FS; overlay into the same workspace | P8 | #286 |
 | G5 | Repo `.agent/settings.json` / `.agent/mcp.json` loosen policy and spawn processes without a trust decision; MCP `${VAR}` interpolation | P9 | #290 |
-| G6 | Hook `Allow` short-circuits disallow rules; subagents inherit/raise `permission_mode` (`agents/tool.rs:1118`) | S0 | #290 |
-| G7 | Slash `` !`cmd` `` expansion and SDK in-memory workspace while tools act on host cwd (`sdk/src/runtime/run.rs:1160-1175`) | S1 | #290 |
+| G6 | ~~Hook `Allow` short-circuits disallow rules; subagents raise `permission_mode`~~ Fixed: disallow rules run before hook `Allow`; child mode is capped at the parent's and inherits parent disallow rules (`agents.inherit_permissions`) | S0 | #290 |
+| G7 | ~~Slash `` !`cmd` `` expansion skips the policy gate; SDK tools act on host cwd~~ Fixed: slash `!`/`@` expansions go through `PolicyEngine::evaluate_tool`; SDK `ReturnOnly`/`RejectMutations` run tools in a scratch copy, rootless apply runs get no built-in file/shell tools | S1 | #290 |
 | G8 | `PolicyDecision`/`ToolCallDenied` lack target, run id, enforcement layer; redaction hooks are no-ops | Audit | #291 |
 | G9 | Sessions and checkpoints live under `<cwd>/.agent/`, inside the future sandbox's writable set | B6 | #253 (exclude `.agent/` from rw set) |
 | G10 | Host-side helpers run untrusted repo code outside any sandbox: `git status` in checkpoints (`crom-checkpoint/src/lib.rs:91-94`, honours `core.fsmonitor`), validation commands (`checkpoint/src/validation.rs:38-48`, `sdk/src/runtime/validation.rs:20`), eval `LocalBackend` | P1–P6, P9 | #253 (validation), #290 (git config) |
