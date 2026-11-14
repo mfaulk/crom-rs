@@ -39,18 +39,22 @@ The runtime gates operations on capabilities and on the configured
 ## Built-in tool I/O and the `Workspace` trait
 
 The built-in tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`) work
-against a filesystem `cwd`. The SDK sets `cwd` to the workspace's
-`filesystem_root()` when available. Consequences:
+against a filesystem `cwd`. The SDK never lets them fall back to the host
+process's working directory. Where they are bound depends on the request's
+`PatchPolicy`:
 
-- `FilesystemWorkspace`, `ReadOnlyWorkspace`/`PatchOnlyWorkspace`/
-  `OverlayWorkspace` wrapping a filesystem base — built-in tools read and
-  write under the workspace root as expected.
-- `InMemoryWorkspace` or pure `Custom` workspaces — built-in tools fall
-  back to the process's current working directory. For headless services,
-  configure `ToolPolicy::enable_builtin_tools` to disable Bash/Edit/Write
-  (the default already does this), or only register custom tools that
-  route through the SDK `Workspace` trait.
+| Patch policy | Workspace with a filesystem root | Rootless (`InMemoryWorkspace`, pure `Custom`) |
+| --- | --- | --- |
+| `ReturnOnly` (default) | Private scratch copy of the workspace's files | Private scratch copy of the workspace's files |
+| `RejectMutations` | Read-only scratch copy; `Write`/`Edit`/`Bash` not registered | Same |
+| `ApplyToWorkspace` / `ApplyAndReturn` | The real root | No built-in file/shell tools are registered |
 
-In other words, the SDK `Workspace` trait is the contract for *patches*
-and *diffs*; the built-in tools are the contract for *agent I/O*. They
-overlap fully on filesystem workspaces and partially elsewhere.
+The scratch copy is a temp dir populated from a snapshot of the
+workspace's `list_files()` set (for a `FilesystemWorkspace` that set
+honours `.gitignore` and skips hidden paths, so `.git/` and build outputs
+are not copied). The returned patch is the diff of the scratch copy
+against that snapshot; the temp dir is removed when the run ends.
+Validation commands under these policies run in the scratch copy.
+
+Custom tools are always registered and are responsible for routing their
+own I/O through the SDK `Workspace` trait.

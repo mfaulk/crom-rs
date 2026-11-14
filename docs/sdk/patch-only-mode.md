@@ -9,19 +9,19 @@ what to do.
 
 | Workspace type | Behavior |
 | -------------- | -------- |
-| `InMemoryWorkspace` / overlay / custom | SDK wraps in `PatchOnlyWorkspace`. Writes route to a pending map. `take_patch()` consumes the patch. |
-| `FilesystemWorkspace`                  | SDK snapshots the workspace **before** the run, lets the agent mutate disk through the built-in tools, then computes the diff and **rolls back** every file to the snapshot. The host gets a `PatchSet`; disk is unchanged. |
+| Any workspace | SDK snapshots the workspace's `list_files()` set **before** the run and writes it into a private temp dir. Built-in tools (including `Bash`) run with that temp dir as `cwd`. The `PatchSet` is the diff of the temp dir against the snapshot; the caller's workspace is never handed to the tools. |
 
-The rollback is best-effort: it only restores files that were present in
-the snapshot and removes files that were created during the run. If your
-host needs guaranteed isolation, run on a copy or a container-mounted
-overlay directory.
+Files outside the snapshot (for a `FilesystemWorkspace`: gitignored and
+hidden paths such as `.git/` or `target/`) are not present in the scratch
+copy. This is policy-level isolation, not an OS sandbox: a `Bash` command
+that writes to an absolute path outside the scratch dir is not contained
+(see [`docs/security/threat-model.md`](../security/threat-model.md)).
 
 ## `PatchPolicy` semantics
 
 | Policy                 | Behavior                                                                 |
 | ---------------------- | ------------------------------------------------------------------------ |
-| `ReturnOnly`           | Compute patch, do not mutate (rollback for filesystem).                  |
+| `ReturnOnly`           | Compute patch against a scratch copy; never mutate the workspace.        |
 | `ApplyToWorkspace`     | Apply the patch directly to the workspace. Do not return it.             |
 | `ApplyAndReturn`       | Apply AND return the patch.                                              |
 | `RejectMutations`      | Refuse to compute mutations entirely; raises an invalid-request error    |
