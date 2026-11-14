@@ -1,0 +1,120 @@
+diff --git a/src/cli.rs b/src/cli.rs
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -9,6 +9,7 @@
+ pub enum Command {
+     Add(String),
+     List,
++    Done(u32),
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -43,6 +44,13 @@
+             Command::Add(tail.join(" "))
+         }
+         "list" => Command::List,
++        "done" => match tail {
++            [id] => Command::Done(
++                id.parse()
++                    .map_err(|_| Failure::usage("usage: todo done <id>"))?,
++            ),
++            _ => return Err(Failure::usage("usage: todo done <id>")),
++        },
+         other => return Err(Failure::usage(format!("unknown subcommand '{other}'"))),
+     };
+     Ok(Invocation { file, command })
+@@ -53,6 +61,7 @@
+     let result = parse(args).and_then(|inv| match inv.command {
+         Command::Add(text) => commands::add(&inv.file, &text, out),
+         Command::List => commands::list(&inv.file, out),
++        Command::Done(id) => commands::done(&inv.file, id, out),
+     });
+     match result {
+         Ok(()) => 0,
+diff --git a/src/commands.rs b/src/commands.rs
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -54,3 +54,21 @@
+     }
+     Ok(())
+ }
++
++/// `done`: marks item `id` done and prints `completed <id>: <text>`, or
++/// `already completed <id>: <text>` if it was already done.
++pub fn done(path: &Path, id: u32, out: &mut dyn Write) -> Result<(), Failure> {
++    let mut list = load(path)?;
++    let item = list
++        .get_mut(id)
++        .ok_or_else(|| Failure::runtime(format!("no item with id {id}")))?;
++    let prefix = if item.done {
++        "already completed"
++    } else {
++        "completed"
++    };
++    item.done = true;
++    let line = format!("{prefix} {id}: {}", item.text);
++    save(&list, path)?;
++    writeln!(out, "{line}").map_err(|e| Failure::runtime(e.to_string()))
++}
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,6 +3,7 @@
+ //! ```text
+ //! todo [--file <path>] add <text...>
+ //! todo [--file <path>] list
++//! todo [--file <path>] done <id>
+ //! ```
+ //!
+ //! Exit codes: 0 success, 1 runtime error, 2 usage error. Errors are printed
+diff --git a/tests/cli_done.rs b/tests/cli_done.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/cli_done.rs
+@@ -0,0 +1,46 @@
++use std::path::PathBuf;
++use std::process::{Command, Output};
++
++fn scratch(name: &str) -> PathBuf {
++    let p = std::env::temp_dir().join(format!("todo-done-{}-{name}.txt", std::process::id()));
++    let _ = std::fs::remove_file(&p);
++    p
++}
++
++fn todo(file: &PathBuf, args: &[&str]) -> Output {
++    Command::new(env!("CARGO_BIN_EXE_todo"))
++        .arg("--file")
++        .arg(file)
++        .args(args)
++        .output()
++        .expect("spawn todo")
++}
++
++#[test]
++fn done_marks_item_complete() {
++    let f = scratch("marks");
++    todo(&f, &["add", "write report"]);
++    let out = todo(&f, &["done", "1"]);
++    assert!(out.status.success());
++    assert_eq!(
++        String::from_utf8_lossy(&out.stdout),
++        "completed 1: write report\n"
++    );
++    let list = todo(&f, &["list"]);
++    assert_eq!(
++        String::from_utf8_lossy(&list.stdout),
++        "[x] 1 write report\n"
++    );
++    let _ = std::fs::remove_file(&f);
++}
++
++#[test]
++fn done_rejects_unknown_id() {
++    let f = scratch("unknown");
++    let out = todo(&f, &["done", "3"]);
++    assert_eq!(out.status.code(), Some(1));
++    assert_eq!(
++        String::from_utf8_lossy(&out.stderr),
++        "error: no item with id 3\n"
++    );
++}

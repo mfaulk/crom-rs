@@ -1,0 +1,59 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+expected_outcome = "change"
+id = "l2-expr-test-cascade"
+title = "Fix root causes behind a cascade of failing calculator tests"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "multi-file", "hidden-tests", "bugfix", "test-cascade"]
+suites = ["l2"]
+
+prompt = """
+`cargo test` fails in the `calc` crate (lexer -> parser -> evaluator), and the
+failures spread across several modules. Find the root causes and fix them so
+that every expression documented by the grammar in src/parser.rs evaluates
+correctly. Do not change the public API, and do not weaken or delete any
+existing test.
+"""
+
+max_turns = 30
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml", "tests/calculate.rs"]
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden_calc"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

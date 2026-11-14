@@ -1,0 +1,64 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+expected_outcome = "change"
+id = "l2-library-borrow-repair"
+title = "Repair borrow-checker errors after a by-reference API change"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "multi-file", "hidden-tests", "borrow-checker", "api-migration"]
+suites = ["l2"]
+
+prompt = """
+The `library` crate no longer compiles. `Store` in src/store.rs was changed so
+that `get` returns `Option<&Book>` instead of a cloned book, `get_mut` was
+added, and `put` was removed; `Book` is intentionally no longer `Clone`.
+
+Migrate the rest of the crate to the new `Store` API so it compiles and
+`cargo test` passes. `most_borrowed` must now return `Option<&Book>`. Keep the
+documented behavior of every function (including the exact activity-log
+messages). Do not modify src/store.rs or src/model.rs, and do not reintroduce
+cloning of `Book`.
+"""
+
+max_turns = 30
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml", "src/store.rs", "src/model.rs"]
+required_paths = ["src/loans.rs", "src/report.rs"]
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden_library"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

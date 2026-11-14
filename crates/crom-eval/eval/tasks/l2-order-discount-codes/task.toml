@@ -1,0 +1,75 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+expected_outcome = "change"
+id = "l2-order-discount-codes"
+title = "Add discount codes across order, pricing, and receipt modules"
+category = "feature"
+difficulty = "medium"
+tags = ["rust", "multi-file", "hidden-tests", "feature", "cross-module"]
+suites = ["l2"]
+
+prompt = """
+Add discount codes to the `orders` crate.
+
+- `Order::apply_discount(&mut self, code: &str) -> Result<(), PricingError>`
+  applies a code. Codes are case-insensitive. A later valid code replaces the
+  current one; an unknown code returns `PricingError::UnknownCode(code)` (the
+  code exactly as passed in) and leaves the current discount unchanged.
+- `Order::discount_code(&self) -> Option<&str>` returns the applied code in
+  upper case.
+- Supported codes: `SAVE10` is 10% off the subtotal (rounded half up to the
+  cent, like tax); `FLAT5` is $5.00 off. A discount never exceeds the subtotal.
+- `discount_cents(&Order) -> i64` returns the discount as a positive amount
+  (0 when no code is applied).
+- Tax is charged on the discounted subtotal; the total is
+  subtotal - discount + tax.
+- When a code is applied, the receipt gets a line directly after `Subtotal:`
+  of the form `Discount (SAVE10): -$1.85`. Without a code the receipt is
+  unchanged.
+
+Export `PricingError` and `discount_cents` from the crate root. Keep the
+existing public API working and `cargo test` green.
+"""
+
+max_turns = 30
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/order.rs", "src/pricing.rs", "src/receipt.rs"]
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden_discounts"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

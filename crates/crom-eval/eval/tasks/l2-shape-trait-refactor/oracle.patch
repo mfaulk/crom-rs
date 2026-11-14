@@ -1,0 +1,146 @@
+diff --git a/src/circle.rs b/src/circle.rs
+--- a/src/circle.rs
++++ b/src/circle.rs
+@@ -17,7 +17,11 @@
+         std::f64::consts::PI * self.radius * self.radius
+     }
+ 
+-    fn name(&self) -> String {
+-        "circle".to_string()
++    fn name(&self) -> &'static str {
++        "circle"
++    }
++
++    fn perimeter(&self) -> f64 {
++        2.0 * std::f64::consts::PI * self.radius
+     }
+ }
+diff --git a/src/rect.rs b/src/rect.rs
+--- a/src/rect.rs
++++ b/src/rect.rs
+@@ -18,8 +18,12 @@
+         self.width * self.height
+     }
+ 
+-    fn name(&self) -> String {
+-        "rect".to_string()
++    fn name(&self) -> &'static str {
++        "rect"
++    }
++
++    fn perimeter(&self) -> f64 {
++        2.0 * (self.width + self.height)
+     }
+ }
+ 
+@@ -42,7 +46,11 @@
+         self.0.area()
+     }
+ 
+-    fn name(&self) -> String {
+-        "square".to_string()
++    fn name(&self) -> &'static str {
++        "square"
++    }
++
++    fn perimeter(&self) -> f64 {
++        self.0.perimeter()
+     }
+ }
+diff --git a/src/scene.rs b/src/scene.rs
+--- a/src/scene.rs
++++ b/src/scene.rs
+@@ -27,8 +27,12 @@
+         self.shapes.iter().map(|s| s.area()).sum()
+     }
+ 
++    pub fn total_perimeter(&self) -> f64 {
++        self.shapes.iter().map(|s| s.perimeter()).sum()
++    }
++
+     /// Name of the shape with the largest area (first one wins ties).
+-    pub fn largest(&self) -> Option<String> {
++    pub fn largest(&self) -> Option<&'static str> {
+         let mut best: Option<&dyn Shape> = None;
+         for s in &self.shapes {
+             if best.is_none_or(|b| s.area() > b.area()) {
+@@ -38,11 +42,11 @@
+         best.map(|s| s.name())
+     }
+ 
+-    /// One line per shape: `<name>: area=<area>` with two decimals.
++    /// One line per shape, as produced by [`Shape::describe`].
+     pub fn describe(&self) -> String {
+         self.shapes
+             .iter()
+-            .map(|s| format!("{}: area={:.2}\n", s.name(), s.area()))
++            .map(|s| format!("{}\n", s.describe()))
+             .collect()
+     }
+ }
+diff --git a/src/shape.rs b/src/shape.rs
+--- a/src/shape.rs
++++ b/src/shape.rs
+@@ -4,5 +4,18 @@
+     fn area(&self) -> f64;
+ 
+     /// Lower-case kind name, e.g. `"circle"`.
+-    fn name(&self) -> String;
++    fn name(&self) -> &'static str;
++
++    /// Length of the boundary.
++    fn perimeter(&self) -> f64;
++
++    /// `<name>: area=<area> perimeter=<perimeter>` with two decimals.
++    fn describe(&self) -> String {
++        format!(
++            "{}: area={:.2} perimeter={:.2}",
++            self.name(),
++            self.area(),
++            self.perimeter()
++        )
++    }
+ }
+diff --git a/src/triangle.rs b/src/triangle.rs
+--- a/src/triangle.rs
++++ b/src/triangle.rs
+@@ -23,7 +23,11 @@
+         (s * (s - self.a) * (s - self.b) * (s - self.c)).sqrt()
+     }
+ 
+-    fn name(&self) -> String {
+-        "triangle".to_string()
++    fn name(&self) -> &'static str {
++        "triangle"
++    }
++
++    fn perimeter(&self) -> f64 {
++        self.a + self.b + self.c
+     }
+ }
+diff --git a/tests/scene.rs b/tests/scene.rs
+--- a/tests/scene.rs
++++ b/tests/scene.rs
+@@ -24,13 +24,13 @@
+ 
+ #[test]
+ fn largest_prefers_first_on_tie() {
+-    assert_eq!(scene().largest(), Some("rect".to_string()));
++    assert_eq!(scene().largest(), Some("rect"));
+     assert_eq!(Scene::new().largest(), None);
+ }
+ 
+ #[test]
+ fn names() {
+-    let names: Vec<String> = vec![
++    let names: Vec<&str> = vec![
+         Circle::new(1.0).name(),
+         Rect::new(1.0, 1.0).name(),
+         Square::new(1.0).name(),
+@@ -42,5 +42,5 @@
+ fn describe_lists_every_shape() {
+     let text = scene().describe();
+     assert_eq!(text.lines().count(), 4);
+-    assert!(text.starts_with("rect: area=6.00"));
++    assert!(text.starts_with("rect: area=6.00 perimeter=10.00"));
+ }

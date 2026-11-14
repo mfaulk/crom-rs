@@ -1,0 +1,60 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
+reference = "validated_oracle"
+expected_outcome = "no_change"
+id = "l2-noop-bankers-rounding"
+title = "Investigate a rounding bug report that matches documented policy"
+category = "negative"
+difficulty = "medium"
+tags = ["rust", "multi-file", "hidden-tests", "no-change", "investigation"]
+suites = ["l2"]
+
+prompt = """
+A customer filed two bug reports against the `ledger` crate:
+
+1. "An invoice line worth 25 mills (2.5 cents) is billed as 2 cents, but a
+   line worth 35 mills is billed as 4 cents. Rounding is inconsistent."
+2. "`split(1000, 3)` returns `[334, 333, 333]`. The shares should be equal."
+
+Investigate both reports against the crate's code and documentation. Fix
+whatever is genuinely a bug. If the current behavior is correct by the crate's
+documented policy, do not change it; explain your conclusion instead.
+"""
+
+max_turns = 20
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml", "README.md"]
+
+[capabilities]
+requires_repo_search = true
+requires_multifile_edit = false
+negative_noop = true
+
+[behavior]
+require_read_before_write = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden_policy"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"
