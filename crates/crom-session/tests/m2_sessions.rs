@@ -286,10 +286,9 @@ async fn session_summary_sums_cost_across_runs() {
             run_id: Some(RunId::new()),
             num_turns: 1,
             usage: Some(TokenUsage {
-                input_tokens: 100,
-                output_tokens: 50,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                ..Default::default()
             }),
             total_cost_usd: Some(cost),
         };

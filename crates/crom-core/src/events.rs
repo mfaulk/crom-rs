@@ -198,6 +198,8 @@ pub enum AgentEvent {
     /// M11: a plan was archived.
     PlanArchived(PlanArchivedEvent),
     Result(AgentResult),
+    /// One model round trip finished (stream ended or errored).
+    ModelTurnCompleted(ModelTurnCompleted),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,6 +586,20 @@ pub struct UserToolResult {
     pub tool_name: String,
     pub content: String,
     pub is_error: bool,
+}
+
+/// Per-round-trip usage. `usage` is `None` when the provider reported none
+/// for this turn (including a stream that errored or was interrupted before
+/// its final `MessageStop`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelTurnCompleted {
+    /// 1-based turn index within the run.
+    pub turn: u32,
+    pub model: String,
+    pub usage: Option<TokenUsage>,
+    pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

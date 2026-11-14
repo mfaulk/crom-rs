@@ -751,7 +751,7 @@ pub async fn summarize_session(
                             }
                             // No run id to bucket by — accumulate directly,
                             // mirroring `uncounted_sum`.
-                            None => uncounted_usage.add(u),
+                            None => uncounted_usage.add_known(u),
                         }
                     }
                     if let Some(c) = res.total_cost_usd {
@@ -783,12 +783,13 @@ pub async fn summarize_session(
     }
     // Sum the per-run usage buckets plus the run-less accumulator. The summary
     // only tracks input/output totals (no cache fields), so collapse to those.
+    // Best-effort display: unreported quantities contribute nothing here.
     let mut total_usage = uncounted_usage;
     for u in last_usage_per_run.values() {
-        total_usage.add(u);
+        total_usage.add_known(u);
     }
-    s.total_input_tokens = total_usage.input_tokens;
-    s.total_output_tokens = total_usage.output_tokens;
+    s.total_input_tokens = total_usage.input_tokens.unwrap_or(0);
+    s.total_output_tokens = total_usage.output_tokens.unwrap_or(0);
     Ok(s)
 }
 
@@ -1307,10 +1308,9 @@ mod tests {
             run_id: run_id.map(|s| RunId(s.to_string())),
             num_turns: 1,
             usage: Some(crom_core::TokenUsage {
-                input_tokens,
-                output_tokens,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                ..Default::default()
             }),
             total_cost_usd: None,
         };

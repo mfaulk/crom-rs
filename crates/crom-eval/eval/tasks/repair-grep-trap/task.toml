@@ -1,4 +1,8 @@
-schema_version = 2
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
 id = "repair-grep-trap"
 title = "Repair: repeated identical failure is detected and stopped"
 category = "repair"
@@ -28,3 +32,9 @@ path = "repo"
 [oracle]
 kind = "command"
 commands = ["grep -q 'value=42' data.txt"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-09"

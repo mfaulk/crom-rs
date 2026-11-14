@@ -4,8 +4,8 @@ use crom_core::events::AgentEvent;
 
 use crate::callback::SecretRedactor;
 use crate::event::{
-    AssistantMessageEvent, AssistantTextDelta, DiagnosticEvent, InternalEvent, SdkEvent,
-    ToolCallCompletedEvent, ToolCallStartedEvent,
+    AssistantMessageEvent, AssistantTextDelta, DiagnosticEvent, InternalEvent,
+    ModelTurnCompletedEvent, SdkEvent, ToolCallCompletedEvent, ToolCallStartedEvent,
 };
 use crate::RunId;
 
@@ -14,11 +14,22 @@ use crate::RunId;
 pub struct SdkEventMapper {
     run_id: RunId,
     verbosity: crate::event::EventVerbosity,
+    provider: Option<crom_auth::ProviderId>,
 }
 
 impl SdkEventMapper {
     pub fn new(run_id: RunId, verbosity: crate::event::EventVerbosity) -> Self {
-        Self { run_id, verbosity }
+        Self {
+            run_id,
+            verbosity,
+            provider: None,
+        }
+    }
+
+    /// Tag `ModelTurnCompleted` events with the provider serving the run.
+    pub fn with_provider(mut self, provider: crom_auth::ProviderId) -> Self {
+        self.provider = Some(provider);
+        self
     }
 
     pub fn map(&self, ev: &AgentEvent) -> Option<SdkEvent> {
@@ -59,6 +70,16 @@ impl SdkEventMapper {
                     tool_use_id: c.tool_use_id.clone(),
                     is_error: c.is_error,
                     duration_ms: c.duration_ms,
+                })
+            }),
+            AgentEvent::ModelTurnCompleted(t) => standard.then(|| {
+                SdkEvent::ModelTurnCompleted(ModelTurnCompletedEvent {
+                    run_id: self.run_id.clone(),
+                    turn: t.turn,
+                    provider: self.provider.clone(),
+                    model: t.model.clone(),
+                    usage: t.usage.clone(),
+                    latency_ms: t.latency_ms,
                 })
             }),
             AgentEvent::ToolCallDenied(d) => Some(SdkEvent::Diagnostic(DiagnosticEvent {
@@ -272,6 +293,32 @@ mod tests {
                 }
                 other => panic!("unexpected: {other:?}"),
             }
+        }
+    }
+
+    /// ModelTurnCompleted maps under Standard+ with the mapper's provider and an unknown usage kept as None.
+    #[test]
+    fn model_turn_completed_is_standard_plus_and_keeps_unknown_usage() {
+        let ev = AgentEvent::ModelTurnCompleted(crom_core::events::ModelTurnCompleted {
+            turn: 3,
+            model: "m".into(),
+            usage: None,
+            latency_ms: 12,
+            stop_reason: None,
+        });
+        assert!(mapper(EventVerbosity::Minimal).map(&ev).is_none());
+        let out = mapper(EventVerbosity::Standard)
+            .with_provider(crom_auth::ProviderId::OpenAi)
+            .map(&ev)
+            .expect("standard maps model turns");
+        match out {
+            SdkEvent::ModelTurnCompleted(e) => {
+                assert_eq!(e.turn, 3);
+                assert_eq!(e.provider, Some(crom_auth::ProviderId::OpenAi));
+                assert_eq!(e.usage, None);
+                assert_eq!(e.latency_ms, 12);
+            }
+            other => panic!("unexpected: {other:?}"),
         }
     }
 

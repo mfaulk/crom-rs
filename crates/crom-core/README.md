@@ -18,6 +18,10 @@ provider, terminal, or storage backend — those are supplied by other crates.
   the shared `provider_retry` policy (`RetryPolicy`, `retry_provider_call`,
   `with_retry_observer`) used by all three providers. See
   [`docs/providers.md`](../../docs/providers.md).
+- **Usage accounting** — `TokenUsage` fields are `Option<u64>` (`None` =
+  unreported, never zero); `UsageTotals` sums round trips strictly (`None` if
+  any turn is unknown). The loop emits `AgentEvent::ModelTurnCompleted` per
+  round trip. Semantics: [`docs/sdk/events.md`](../../docs/sdk/events.md#token-usage).
 - **Tools** — the `Tool` trait, `ToolRegistry`, and `ToolCatalog` for
   exposing local and MCP tools, including tool-search filtering.
 - **Subagents** — `AgentRegistry`, `AgentDefinition`, and the `SubagentRuntime`

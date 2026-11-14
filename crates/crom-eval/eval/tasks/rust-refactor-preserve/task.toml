@@ -1,4 +1,8 @@
-schema_version = 2
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "none"
 id = "rust-refactor-preserve"
 title = "Refactor duplicated code without changing behavior"
 category = "refactor"
@@ -34,3 +38,9 @@ commands = ["cargo test --all-targets"]
 [[oracle.behavior]]
 kind = "must_use_tool"
 tool = "Read"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"

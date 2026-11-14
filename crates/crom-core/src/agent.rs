@@ -17,10 +17,11 @@ use crate::conversation::{
 };
 use crate::errors::{AgentError, ToolError};
 use crate::events::{
-    AgentEvent, AgentResult, HookEvaluated, HookOutcomeKind, InterruptedEvent, PolicyDecisionEvent,
-    ResultSubtype, ToolCallCompleted, ToolCallDenied, ToolCallStarted, ToolCatalogBuilt,
-    ToolContextBudgetUpdated, ToolDeferred, ToolDisabled, ToolLoaded, ToolLoadingModeResolved,
-    ToolSearchCompleted, ToolSearchFailed, ToolSearchStarted, UserToolResult,
+    AgentEvent, AgentResult, HookEvaluated, HookOutcomeKind, InterruptedEvent, ModelTurnCompleted,
+    PolicyDecisionEvent, ResultSubtype, ToolCallCompleted, ToolCallDenied, ToolCallStarted,
+    ToolCatalogBuilt, ToolContextBudgetUpdated, ToolDeferred, ToolDisabled, ToolLoaded,
+    ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed, ToolSearchStarted,
+    UserToolResult,
 };
 use crate::hooks::{aggregate, HookAggregateDecision, HookEventName, HookInput, Hooks, StopReason};
 use crate::mcp::{
@@ -40,11 +41,24 @@ use crate::tool_catalog::{
     ToolCatalogBuilder, ToolLoadPolicy, ToolLoadReason, ToolSearchMatch, ToolSearchMatchSummary,
     ToolSearchProviderConfig, ToolSearchRuntime, ToolSourceFilter, SEARCH_TOOLS_NAME,
 };
-use crate::usage::TokenUsage;
+use crate::usage::{TokenUsage, UsageTotals};
 
 /// Convert an elapsed duration to milliseconds, saturating at u64::MAX.
 /// Intentional saturation handles the extremely unlikely case of timing
 /// durations exceeding u64::MAX milliseconds (~584 million years).
+fn estimate_cost(pricing: Option<&ModelPricing>, usage: Option<&TokenUsage>) -> Option<f64> {
+    pricing?.estimate(usage?)
+}
+
+async fn emit_model_turn_completed(
+    tx: &mpsc::Sender<AgentEvent>,
+    sink: &Option<Arc<dyn SessionSink>>,
+    sid: &SessionId,
+    turn: ModelTurnCompleted,
+) {
+    emit(tx, sink, sid, AgentEvent::ModelTurnCompleted(turn)).await;
+}
+
 fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -852,7 +866,7 @@ pub(crate) async fn run_loop(
     // whose calls would push this past `max_tool_calls` is refused before any of
     // its `ToolCallStarted` events fire, so exactly `max_tool_calls` ever start.
     let mut tool_calls_started: u32 = 0;
-    let mut total_usage = TokenUsage::default();
+    let mut usage_totals = UsageTotals::new();
     let mut last_result_text: Option<String> = None;
 
     loop {
@@ -865,7 +879,7 @@ pub(crate) async fn run_loop(
                 &cfg.run_id,
                 turns,
                 last_result_text.clone(),
-                total_usage.clone(),
+                usage_totals.total(),
                 pricing.as_ref(),
                 &hooks,
                 &options.cwd,
@@ -875,14 +889,14 @@ pub(crate) async fn run_loop(
         }
 
         if turns >= max_turns {
-            let cost = pricing.as_ref().map(|p| p.estimate(&total_usage));
+            let cost = estimate_cost(pricing.as_ref(), usage_totals.total().as_ref());
             let result = AgentResult {
                 subtype: ResultSubtype::ErrorMaxTurns,
                 result: last_result_text.clone(),
                 session_id: session_id.clone(),
                 run_id: Some(cfg.run_id.clone()),
                 num_turns: turns,
-                usage: Some(total_usage.clone()),
+                usage: usage_totals.total(),
                 total_cost_usd: cost,
             };
             emit(&tx, &session_sink, &session_id, AgentEvent::Result(result)).await;
@@ -968,7 +982,7 @@ pub(crate) async fn run_loop(
                 &cfg.run_id,
                 turns,
                 last_result_text.clone(),
-                total_usage.clone(),
+                usage_totals.total(),
                 pricing.as_ref(),
                 &hooks,
                 &options.cwd,
@@ -987,7 +1001,7 @@ pub(crate) async fn run_loop(
                     &cfg.run_id,
                     turns,
                     last_result_text.clone(),
-                    total_usage.clone(),
+                    usage_totals.total(),
                     pricing.as_ref(),
                     &hooks,
                     &options.cwd,
@@ -1014,14 +1028,14 @@ pub(crate) async fn run_loop(
                     },
                 )
                 .await;
-                let cost = pricing.as_ref().map(|p| p.estimate(&total_usage));
+                let cost = estimate_cost(pricing.as_ref(), usage_totals.total().as_ref());
                 let result = AgentResult {
                     subtype: ResultSubtype::ErrorDuringExecution,
                     result: Some(format!("provider error: {e}")),
                     session_id: session_id.clone(),
                     run_id: Some(cfg.run_id.clone()),
                     num_turns: turns,
-                    usage: Some(total_usage.clone()),
+                    usage: usage_totals.total(),
                     total_cost_usd: cost,
                 };
                 emit(&tx, &session_sink, &session_id, AgentEvent::Result(result)).await;
@@ -1043,7 +1057,7 @@ pub(crate) async fn run_loop(
         let mut text_buf = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut stop_reason: Option<String> = None;
-        let mut turn_usage = TokenUsage::default();
+        let mut turn_stops: Vec<Option<TokenUsage>> = Vec::new();
 
         loop {
             // Re-register the notify waiter before every poll so the
@@ -1094,12 +1108,25 @@ pub(crate) async fn run_loop(
                     usage,
                 }) => {
                     stop_reason = sr;
-                    if let Some(u) = usage {
-                        total_usage.add(&u);
-                        turn_usage.add(&u);
-                    }
+                    turn_stops.push(usage);
                 }
                 Err(e) => {
+                    // A turn that errored mid-stream may still have been
+                    // billed, so its usage is unknown rather than zero.
+                    usage_totals.record(None);
+                    emit_model_turn_completed(
+                        &tx,
+                        &session_sink,
+                        &session_id,
+                        ModelTurnCompleted {
+                            turn: turns,
+                            model: options.model.clone(),
+                            usage: None,
+                            latency_ms: elapsed_ms(model_started),
+                            stop_reason: None,
+                        },
+                    )
+                    .await;
                     emit_telemetry(
                         &telemetry_sink,
                         AgentTelemetryEvent::ModelRequestCompleted {
@@ -1108,21 +1135,21 @@ pub(crate) async fn run_loop(
                             turn_index: turns,
                             model: options.model.clone(),
                             duration_ms: elapsed_ms(model_started),
-                            usage: Some(total_usage.clone()),
-                            cost_usd: pricing.as_ref().map(|p| p.estimate(&total_usage)),
+                            usage: None,
+                            cost_usd: None,
                             outcome: TelemetryOutcome::Error,
                             error_category: Some("stream".into()),
                         },
                     )
                     .await;
-                    let cost = pricing.as_ref().map(|p| p.estimate(&total_usage));
+                    let cost = estimate_cost(pricing.as_ref(), usage_totals.total().as_ref());
                     let result = AgentResult {
                         subtype: ResultSubtype::ErrorDuringExecution,
                         result: Some(format!("provider error: {e}")),
                         session_id: session_id.clone(),
                         run_id: Some(cfg.run_id.clone()),
                         num_turns: turns,
-                        usage: Some(total_usage.clone()),
+                        usage: usage_totals.total(),
                         total_cost_usd: cost,
                     };
                     emit(&tx, &session_sink, &session_id, AgentEvent::Result(result)).await;
@@ -1143,6 +1170,28 @@ pub(crate) async fn run_loop(
             }
         }
 
+        // A turn with no `MessageStop` (interrupted / truncated stream), or
+        // any stop without usage, has unknown usage.
+        let turn_usage = turn_stops
+            .iter()
+            .map(Option::as_ref)
+            .collect::<UsageTotals>()
+            .total();
+        usage_totals.record(turn_usage.as_ref());
+        let latency_ms = elapsed_ms(model_started);
+        emit_model_turn_completed(
+            &tx,
+            &session_sink,
+            &session_id,
+            ModelTurnCompleted {
+                turn: turns,
+                model: options.model.clone(),
+                usage: turn_usage.clone(),
+                latency_ms,
+                stop_reason: stop_reason.clone(),
+            },
+        )
+        .await;
         emit_telemetry(
             &telemetry_sink,
             AgentTelemetryEvent::ModelRequestCompleted {
@@ -1150,9 +1199,9 @@ pub(crate) async fn run_loop(
                 run_id: cfg.run_id.clone(),
                 turn_index: turns,
                 model: options.model.clone(),
-                duration_ms: elapsed_ms(model_started),
-                usage: Some(turn_usage.clone()),
-                cost_usd: pricing.as_ref().map(|p| p.estimate(&turn_usage)),
+                duration_ms: latency_ms,
+                usage: turn_usage.clone(),
+                cost_usd: estimate_cost(pricing.as_ref(), turn_usage.as_ref()),
                 outcome: TelemetryOutcome::Ok,
                 error_category: None,
             },
@@ -1168,7 +1217,7 @@ pub(crate) async fn run_loop(
                 &cfg.run_id,
                 turns,
                 last_result_text.clone(),
-                total_usage.clone(),
+                usage_totals.total(),
                 pricing.as_ref(),
                 &hooks,
                 &options.cwd,
@@ -1208,14 +1257,14 @@ pub(crate) async fn run_loop(
 
         // Plan mode: never execute tools. Treat first turn output as the final result.
         if matches!(options.permission_mode, PermissionMode::Plan) {
-            let cost = pricing.as_ref().map(|p| p.estimate(&total_usage));
+            let cost = estimate_cost(pricing.as_ref(), usage_totals.total().as_ref());
             let result = AgentResult {
                 subtype: ResultSubtype::Success,
                 result: last_result_text.clone().or(Some(String::new())),
                 session_id: session_id.clone(),
                 run_id: Some(cfg.run_id.clone()),
                 num_turns: turns,
-                usage: Some(total_usage.clone()),
+                usage: usage_totals.total(),
                 total_cost_usd: cost,
             };
             emit(&tx, &session_sink, &session_id, AgentEvent::Result(result)).await;
@@ -1236,14 +1285,14 @@ pub(crate) async fn run_loop(
 
         if tool_calls.is_empty() {
             // Final answer.
-            let cost = pricing.as_ref().map(|p| p.estimate(&total_usage));
+            let cost = estimate_cost(pricing.as_ref(), usage_totals.total().as_ref());
             let result = AgentResult {
                 subtype: ResultSubtype::Success,
                 result: last_result_text.clone(),
                 session_id: session_id.clone(),
                 run_id: Some(cfg.run_id.clone()),
                 num_turns: turns,
-                usage: Some(total_usage.clone()),
+                usage: usage_totals.total(),
                 total_cost_usd: cost,
             };
             emit(&tx, &session_sink, &session_id, AgentEvent::Result(result)).await;
@@ -1279,7 +1328,7 @@ pub(crate) async fn run_loop(
                 &cfg.run_id,
                 turns,
                 last_result_text.clone(),
-                total_usage.clone(),
+                usage_totals.total(),
                 pricing.as_ref(),
                 &hooks,
                 &options.cwd,
@@ -1298,14 +1347,14 @@ pub(crate) async fn run_loop(
         // the cap never starts (#29).
         if let Some(max) = max_tool_calls {
             if tool_calls_started + (tool_calls.len() as u32) > max {
-                let cost = pricing.as_ref().map(|p| p.estimate(&total_usage));
+                let cost = estimate_cost(pricing.as_ref(), usage_totals.total().as_ref());
                 let result = AgentResult {
                     subtype: ResultSubtype::ErrorMaxToolCalls,
                     result: last_result_text.clone(),
                     session_id: session_id.clone(),
                     run_id: Some(cfg.run_id.clone()),
                     num_turns: turns,
-                    usage: Some(total_usage.clone()),
+                    usage: usage_totals.total(),
                     total_cost_usd: cost,
                 };
                 emit(&tx, &session_sink, &session_id, AgentEvent::Result(result)).await;
@@ -1374,7 +1423,7 @@ pub(crate) async fn run_loop(
                     &cfg.run_id,
                     turns,
                     last_result_text.clone(),
-                    total_usage.clone(),
+                    usage_totals.total(),
                     pricing.as_ref(),
                     &hooks,
                     &options.cwd,
@@ -1991,7 +2040,7 @@ async fn handle_interrupt(
     run_id: &RunId,
     turns: u32,
     last_result_text: Option<String>,
-    usage: TokenUsage,
+    usage: Option<TokenUsage>,
     pricing: Option<&ModelPricing>,
     hooks: &Hooks,
     cwd: &std::path::Path,
@@ -2016,7 +2065,7 @@ async fn handle_interrupt(
         },
     )
     .await;
-    let cost = pricing.map(|p| p.estimate(&usage));
+    let cost = estimate_cost(pricing, usage.as_ref());
     emit(
         tx,
         sink,
@@ -2027,7 +2076,7 @@ async fn handle_interrupt(
             session_id: sid.clone(),
             run_id: Some(run_id.clone()),
             num_turns: turns,
-            usage: Some(usage),
+            usage,
             total_cost_usd: cost,
         }),
     )

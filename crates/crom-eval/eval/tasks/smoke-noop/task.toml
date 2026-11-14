@@ -1,4 +1,9 @@
-schema_version = 2
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
+expected_outcome = "no_change"
 id = "smoke-noop"
 title = "Smoke: harness plumbing on a pristine fixture"
 category = "negative"
@@ -33,3 +38,9 @@ kind = "none"
 kind = "file_contains"
 path = "README.md"
 text = "smoke fixture"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"

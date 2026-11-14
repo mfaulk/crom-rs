@@ -1,4 +1,8 @@
-schema_version = 2
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "none"
 id = "rust-compiler-error"
 title = "Repair a broken build after an API change"
 category = "bugfix"
@@ -30,3 +34,9 @@ test = true
 [[oracle.behavior]]
 kind = "must_run_command"
 command_contains = "cargo"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"

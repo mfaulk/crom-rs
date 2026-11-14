@@ -193,4 +193,4 @@ pub use ui::{
     StatusLineConfig, StatusLineContext, StatusLineSettingsConfig, SubmitKey, TerminalCapabilities,
     TerminalRenderer, UiConfig, UiSettingsConfig, UiSettingsError, DEFAULT_STATUSLINE_TEMPLATE,
 };
-pub use usage::TokenUsage;
+pub use usage::{TokenUsage, UsageTotals};

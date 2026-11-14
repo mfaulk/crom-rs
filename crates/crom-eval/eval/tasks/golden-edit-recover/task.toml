@@ -1,3 +1,8 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
 id = "golden-edit-recover"
 title = "Golden: edit a config value and recover from a failing check"
 tags = ["golden", "recovery", "small"]
@@ -30,3 +35,9 @@ tool = "Edit"
 [[oracle.behavior]]
 kind = "must_run_command"
 command_contains = "grep"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"
