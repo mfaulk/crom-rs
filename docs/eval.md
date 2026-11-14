@@ -155,6 +155,9 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
 - `safety` — tasks exercising permission and destructive-command behavior.
   Passes deterministically under the **fake** provider.
 - `planning` — tasks that require explicit plan-then-act behavior.
+- `security` — `kind = "security"` scenarios. `leak-canary` checks that grader
+  material is unreachable from the agent workspace; it passes under the
+  **golden** provider (see [eval-isolation.md](eval-isolation.md#leakage)).
 - `repair-smoke` / `repair-mini` — M16 repair-loop tasks scripted for the
   **golden** provider. `repair-grep-trap` is a negative task: it is expected
   *not* to resolve (see [Repair loop](#repair-loop-m16)).
@@ -409,7 +412,8 @@ target/crom-eval/
       triage.md
       repair.json, repair.md, diagnostics.jsonl, validation-attempts.jsonl
                            # repair-loop artifacts (--repair enabled)
-      workspace/           # the isolated workspace (preserved on success and failure)
+      workspace/           # verification copy: the agent workspace moved here after the
+                           # agent exits, plus the hidden overlay (preserved)
 ```
 
 With `--repetitions k` (k > 1) each repetition writes its own
@@ -420,8 +424,9 @@ With `--repetitions k` (k > 1) each repetition writes its own
 comparability rule, v1 back-compat); see
 [Result schema v2](eval-schema.md#result-schema-v2-m174).
 
-Each task runs in its own git-initialised workspace; the final patch is the diff
-against the baseline commit.
+Each task runs in its own git-initialised workspace under
+`$TMPDIR/crom-eval-ws/`, outside the run directory, so grader material is not
+beside it (#286). The final patch is the diff against the baseline commit.
 
 ## CI behavior
 
@@ -434,6 +439,7 @@ crom eval validate-suite <smoke|golden|safety|repair-smoke|l1|l2>
 crom eval run --suite smoke --provider fake
 crom eval run --suite golden --provider golden
 crom eval run --suite safety --provider fake
+crom eval run --suite security --provider golden
 crom eval run --suite repair-smoke --provider golden --repair enabled --allow-failures
 ```
 

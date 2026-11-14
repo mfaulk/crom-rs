@@ -18,6 +18,7 @@
 //! - [`fixture`] — isolated workspace setup, git baseline, patch generation.
 //! - [`providers`] — fake / golden / live provider execution modes.
 //! - [`runner`] — runs one task or a suite end-to-end.
+//! - [`workspace`] — agent workspaces outside the grader-reachable tree.
 //! - [`oracle`] — command / rust / file-assertion / behavior oracles.
 //! - [`score`] — weighted structured scoring.
 //! - [`artifacts`] — per-run / per-task artifact bundle.
@@ -45,6 +46,7 @@ pub mod score;
 pub mod task;
 pub mod triage;
 pub mod validate;
+pub mod workspace;
 
 pub use adapter::{AdapterRegistry, EvalAdapter};
 pub use behavior::BehaviorMetrics;

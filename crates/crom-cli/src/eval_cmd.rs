@@ -466,6 +466,7 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
         repair,
         provider_profiles,
         environment: Some(crom_eval::result_schema::RunEnvironment::gather()),
+        workspace_root: None,
     };
 
     let results = run_tasks_repeated(&selected, &run, &config, repetitions).await;
