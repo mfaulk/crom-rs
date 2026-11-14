@@ -1,4 +1,8 @@
-schema_version = 2
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
 id = "rust-cli-arg-order"
 title = "Fix a CLI arg-parsing edge case spanning multiple files"
 category = "bugfix"
@@ -36,3 +40,9 @@ tool = "Read"
 [[oracle.behavior]]
 kind = "must_run_command"
 command_contains = "cargo test"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"

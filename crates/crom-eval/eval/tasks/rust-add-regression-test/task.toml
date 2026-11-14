@@ -1,4 +1,8 @@
-schema_version = 2
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "none"
 id = "rust-add-regression-test"
 title = "Fix a bug and add a regression test"
 category = "test_writing"
@@ -34,3 +38,9 @@ text = "collapses_repeated_separators"
 [[oracle.behavior]]
 kind = "must_run_command"
 command_contains = "cargo test"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-06-03"
