@@ -155,7 +155,7 @@ max_cost_usd = 0.50             # declared; not yet enforced by the runner
 |---|---|
 | `harness` | Validates the runtime, scripted (`golden`) or `fake` providers, and policy plumbing. Succeeds by construction offline; never a capability signal. Always `L0`. |
 | `capability` | Measures coding capability at `L1`..`L5`. Must satisfy the rules below. |
-| `security` | Adversarial/policy tasks (M17.3). No extra validation rules yet. |
+| `security` | Adversarial/policy tasks (M17.3), e.g. `leak-canary` in the `security` suite. No extra validation rules yet. |
 
 Levels follow the capability ladder in
 [MILESTONE_17.md](milestones/MILESTONE_17.md#5-capability-ladder): `L0`
@@ -198,9 +198,46 @@ label) also suppresses the `base_fails_hidden` warning.
 ## Hidden verification
 
 `[hidden]` holds checks that run **only after the agent completes**. If
-`[hidden].fixture` is set, that directory is overlaid into the workspace just
-before the hidden oracle runs — so hidden test files are never present while the
-agent works, and the agent cannot overfit to them.
+`[hidden].fixture` is set, that directory is overlaid into the verification
+copy of the workspace just before the hidden oracle runs — so hidden test files
+are never present while the agent works, and the agent cannot overfit to them.
+
+### Where grader material lives (M17.2, #286)
+
+Every task directory has this layout. Only the public fixture is ever copied
+into the agent workspace:
+
+```text
+eval/tasks/<task-id>/
+  task.toml          # grader material (contains [hidden] commands)
+  repo/              # public fixture: the ONLY thing the agent sees
+  hidden/            # hidden fixture: overlaid after the agent exits
+  oracle.patch       # reference solution (grader material)
+```
+
+Rules for task authors (L1/L2/L3 corpora included):
+
+- Put hidden tests, hidden check scripts (e.g. `hidden/hidden_checks/*.sh`),
+  and the reference patch **beside** `task.toml`, never under the public
+  fixture dir. Hidden files may assume they are overlaid at the workspace
+  root: `hidden/tests/hidden.rs` lands at `tests/hidden.rs` in the
+  verification copy.
+- `[fixture].path` must be a strict subdirectory of the task dir
+  (`canary_fixture_root`); `"."`, `".."`, or absolute paths are errors because
+  they would copy `task.toml`/`hidden/` into the workspace.
+- `[hidden].fixture` and `oracle_patch` must not be inside the public fixture
+  (`canary_hidden_visible`, `canary_oracle_visible`).
+- Do not name hidden files in the prompt (`canary_hidden_names`).
+
+At run time the agent works in a fresh `$TMPDIR/crom-eval-ws/ws-<random>/`
+holding only the public fixture plus its git baseline. The runner writes
+`task.toml`, `prompt.md`, `normalized-task.json`, and results under
+`runs/<run-id>/tasks/<task-id>/`, which is not under or beside the agent
+workspace. After the agent exits, the workspace is moved to
+`runs/<run-id>/tasks/<task-id>/workspace/` (the verification copy) and the
+hidden fixture is overlaid there. The runner refuses (harness error) a
+workspace root that overlaps the runs dir or the tasks dir. See
+[eval-isolation.md](eval-isolation.md#leakage) for what is and is not enforced.
 
 A task is **resolved** when:
 

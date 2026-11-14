@@ -32,6 +32,7 @@ use crate::result_schema::{
 };
 use crate::score::{self, EvalScore, ScoreInputs};
 use crate::task::{EvalTask, TaskMode};
+use crate::workspace::AgentWorkspace;
 
 /// Outcome status for a single evaluated task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +199,9 @@ pub struct RunConfig {
     /// Run-level git/host/build context recorded in each result's `repro`.
     /// Gathered once per `run_tasks` call when `None`.
     pub environment: Option<RunEnvironment>,
+    /// Parent dir for agent workspaces (`None` => `$TMPDIR/crom-eval-ws`).
+    /// Must be disjoint from the runs dir and the task source (M17.2).
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl Default for RunConfig {
@@ -218,6 +222,7 @@ impl Default for RunConfig {
             repair: crom_core::repair::RepairPolicy::disabled(),
             provider_profiles: Default::default(),
             environment: None,
+            workspace_root: None,
         }
     }
 }
@@ -528,6 +533,7 @@ fn provider_model(config: &RunConfig) -> String {
         ProviderMode::Fake => "fake-echo".to_string(),
         ProviderMode::Golden => "golden".to_string(),
         ProviderMode::Fault(_) => "fault".to_string(),
+        ProviderMode::Scripted(_) => "scripted".to_string(),
         ProviderMode::Live(name) => {
             providers::resolve_live_profile(name, &config.provider_profiles)
                 .ok()
@@ -700,7 +706,9 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     let _ = artifacts.write_string("prompt.md", &prompt);
     write_metadata_artifacts(&artifacts, task, config);
 
-    let workspace_dir = artifacts.workspace_dir();
+    // Grader material (above) lives in the artifact dir; the agent works in a
+    // separate temp workspace that is moved here only after it exits (#286).
+    let verification_dir = artifacts.workspace_dir();
 
     // Provider availability is checked first so skips are clean and cheap.
     if let Err(unavailable) = providers::build(&config.provider, task, &config.provider_profiles) {
@@ -738,19 +746,32 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         &EnvMetadata::gather(backend.as_ref(), limits.network),
     );
 
-    if let Err(e) = prepare_workspace(task, &workspace_dir) {
-        let _ = artifacts.write_string(
-            "final_summary.md",
-            &format!("# {}\n\nworkspace setup failed: {e}\n", task.id),
-        );
-        let mut r = default_result(task, config, EvalStatus::Errored, &dir);
-        r.score = EvalScore::zero(format!("errored: workspace setup: {e}"));
-        r.failure_class = Some(FailureClass::HarnessError);
-        r.duration_ms = started.elapsed().as_millis() as u64;
-        stamp_v2(&mut r, task, config, &prompt);
-        let _ = artifacts.write_json("result.json", &r);
-        return r;
-    }
+    let ws_root = config
+        .workspace_root
+        .clone()
+        .unwrap_or_else(crate::workspace::default_root);
+    let runs_root = run_dir.root.parent().unwrap_or(&run_dir.root);
+    let tasks_root = task.dir.parent().unwrap_or(&task.dir);
+    let agent_ws = AgentWorkspace::create(&ws_root, &[runs_root, tasks_root])
+        .map_err(|e| crate::fixture::FixtureError::Io(e.to_string()));
+    let prepared = agent_ws.and_then(|ws| prepare_workspace(task, ws.path()).map(|()| ws));
+    let agent_ws = match prepared {
+        Ok(ws) => ws,
+        Err(e) => {
+            let _ = artifacts.write_string(
+                "final_summary.md",
+                &format!("# {}\n\nworkspace setup failed: {e}\n", task.id),
+            );
+            let mut r = default_result(task, config, EvalStatus::Errored, &dir);
+            r.score = EvalScore::zero(format!("errored: workspace setup: {e}"));
+            r.failure_class = Some(FailureClass::HarnessError);
+            r.duration_ms = started.elapsed().as_millis() as u64;
+            stamp_v2(&mut r, task, config, &prompt);
+            let _ = artifacts.write_json("result.json", &r);
+            return r;
+        }
+    };
+    let workspace_dir = agent_ws.path().to_path_buf();
 
     // Drive the agent, optionally retrying with test feedback (Aider-style).
     let mut events: Vec<SdkEvent> = Vec::new();
@@ -853,6 +874,18 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
             harness_errored = true;
             summary = format!("{summary}; patch generation failed: {e}");
             PatchInfo::default()
+        }
+    };
+
+    // The agent has exited: move its workspace into the artifact bundle as the
+    // verification copy. Hidden material is overlaid only onto this copy.
+    let workspace_dir = match agent_ws.into_verification_copy(&verification_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            errored = true;
+            harness_errored = true;
+            summary = format!("{summary}; moving workspace to verification copy failed: {e}");
+            verification_dir
         }
     };
 

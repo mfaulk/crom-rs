@@ -465,6 +465,33 @@ fn canary_checks(task: &EvalTask, checks: &mut Vec<Check>) {
         ));
     }
 
+    // The public fixture must be a strict subdirectory of the task dir, or
+    // task.toml / hidden/ / the reference patch would be copied into the agent
+    // workspace (#286).
+    if task.fixture.kind == crate::task::FixtureKind::CopyDir {
+        use std::path::Component;
+        let rel = task.fixture.path.as_deref().unwrap_or("repo");
+        let comps: Vec<Component> = Path::new(rel).components().collect();
+        let strict_child = comps.iter().any(|c| matches!(c, Component::Normal(_)))
+            && comps
+                .iter()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+        if strict_child {
+            checks.push(Check::ok(
+                "canary_fixture_root",
+                format!("fixture '{rel}' is a subdirectory of the task dir"),
+            ));
+        } else {
+            checks.push(Check::error(
+                "canary_fixture_root",
+                format!(
+                    "fixture path '{rel}' must be a subdirectory of the task dir \
+                     (it would expose task.toml/hidden/ to the agent)"
+                ),
+            ));
+        }
+    }
+
     // Hidden test filenames leaking into the prompt.
     if let Some(hidden) = &task.hidden {
         let mut leaked = Vec::new();
@@ -822,6 +849,30 @@ mod tests {
                 .any(|c| c.name == "canary_oracle_visible" && !c.passed),
             "child 'repo/...' must be flagged as inside the public fixture"
         );
+    }
+
+    /// A copy_dir fixture rooted at (or above) the task dir is an error, because it would copy task.toml, hidden/, and the reference patch into the agent workspace; a `repo` subdirectory passes.
+    #[test]
+    fn canary_rejects_fixture_rooted_at_task_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        for bad in [".", "", "./", "..", "../other", "/abs/repo", "repo/../.."] {
+            let mut t = task_in(tmp.path(), command_oracle(vec!["true".into()]));
+            t.fixture.path = Some(bad.to_string());
+            let mut checks = Vec::new();
+            canary_checks(&t, &mut checks);
+            assert!(
+                checks
+                    .iter()
+                    .any(|c| c.name == "canary_fixture_root" && !c.passed),
+                "fixture path {bad:?} must be rejected"
+            );
+        }
+        let good = task_in(tmp.path(), command_oracle(vec!["true".into()]));
+        let mut checks = Vec::new();
+        canary_checks(&good, &mut checks);
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "canary_fixture_root" && c.passed));
     }
 
     #[tokio::test]
