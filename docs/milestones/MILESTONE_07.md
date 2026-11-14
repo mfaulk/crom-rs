@@ -126,15 +126,15 @@ Matching telemetry variants are emitted to the normal event stream.
 ## CLI surface
 
 ```sh
-code-agent skills list --cwd .
-code-agent skills show release-pr --cwd .
-code-agent skills validate --cwd .
-code-agent skills inspect release-pr --cwd .
-code-agent skills init my-skill --cwd .
+crom skills list --cwd .
+crom skills show release-pr --cwd .
+crom skills validate --cwd .
+crom skills inspect release-pr --cwd .
+crom skills init my-skill --cwd .
 
-code-agent commands list --cwd .
-code-agent commands show release-pr --cwd .
-code-agent commands validate --cwd .
+crom commands list --cwd .
+crom commands show release-pr --cwd .
+crom commands validate --cwd .
 ```
 
 New flags on `run` / `chat`: `--skills`, `--commands`, `--no-skills`,

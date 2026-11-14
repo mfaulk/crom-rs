@@ -17,7 +17,7 @@ downgraded).
 ## Flags
 
 ```console
-$ code-agent eval run <suite> \
+$ crom eval run <suite> \
     --isolation docker \
     --network false \
     --container-image rust:latest \
@@ -39,8 +39,8 @@ Container backends are gated behind environment variables, mirroring the
 live-provider lane:
 
 ```console
-$ CODE_AGENT_EVAL_DOCKER=1 code-agent eval run <suite> --isolation docker
-$ CODE_AGENT_EVAL_PODMAN=1 code-agent eval run <suite> --isolation podman
+$ CROM_EVAL_DOCKER=1 crom eval run <suite> --isolation docker
+$ CROM_EVAL_PODMAN=1 crom eval run <suite> --isolation podman
 ```
 
 Without the opt-in variable (or without the engine on `PATH`), the backend is

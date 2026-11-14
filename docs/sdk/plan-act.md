@@ -12,8 +12,8 @@ test/integration flows), then acts.
 ## Plan-only
 
 ```rust,no_run
-use code_agent_sdk::{AgentRuntime, ProviderConfig, SdkPlanRequest};
-use code_agent_sdk::fake_provider::EchoFakeProvider;
+use crom_sdk::{AgentRuntime, ProviderConfig, SdkPlanRequest};
+use crom_sdk::fake_provider::EchoFakeProvider;
 use std::sync::Arc;
 
 # async fn run() -> anyhow::Result<()> {

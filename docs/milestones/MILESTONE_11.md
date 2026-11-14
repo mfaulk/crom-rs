@@ -10,7 +10,7 @@ checkpoint rules.
 ## What's new
 
 Core planning subsystem lives at
-`crates/code-agent-core/src/plan/`:
+`crates/crom-core/src/plan/`:
 
 | Module | Purpose |
 |--------|---------|
@@ -22,7 +22,7 @@ Core planning subsystem lives at
 | `scope.rs` | `PlanExecutionContext` summary used by the act driver. |
 | `driver.rs` | `generate_plan` (planning loop) and `act_plan` (execute approved plan) helpers; `PlanScopeCallback` wraps the user's permission callback to detect and route deviations through a `PlanDeviationCallback`. |
 
-`code-agent-core` re-exports the public surface and adds 16 new
+`crom-core` re-exports the public surface and adds 16 new
 `AgentEvent` variants:
 
 ```
@@ -46,7 +46,7 @@ The CLI renders each one in plain and JSON modes.
 
 Listing rebuilds the directory from disk and skips files it can't
 parse, so a single corrupted plan never hides healthy ones. Versioned
-snapshots back `code-agent plans diff --from-version N --to-version M`.
+snapshots back `crom plans diff --from-version N --to-version M`.
 
 ## Planning options (`.agent/settings.json`)
 
@@ -88,34 +88,34 @@ planning-mode system prompt that bounds the model.
 New top-level commands:
 
 ```
-code-agent plan <PROMPT> [--mode no-tools|read-only|read-only-external]
+crom plan <PROMPT> [--mode no-tools|read-only|read-only-external]
                          [--max-steps N] [--provider X] [--model Y]
-code-agent act <PLAN_ID|latest> [--permission-mode MODE]
+crom act <PLAN_ID|latest> [--permission-mode MODE]
                                 [--strict-plan] [--no-enforce-plan-scope]
-code-agent replan [PLAN_ID|latest] [INSTRUCTIONS]
-code-agent plans list   [--status all|draft|pending|approved|...]
-code-agent plans show   <PLAN_ID> [--format pretty|json|markdown]
-code-agent plans approve <PLAN_ID> [--notes ...]
-code-agent plans reject  <PLAN_ID> [--reason ...]
-code-agent plans revise  <PLAN_ID> <INSTRUCTIONS>
-code-agent plans edit    <PLAN_ID>          # $EDITOR or --print-path
-code-agent plans diff    <PLAN_ID> [--from-version N --to-version M]
-code-agent plans archive <PLAN_ID>
-code-agent plans export  <PLAN_ID> [--format json|markdown --output PATH]
+crom replan [PLAN_ID|latest] [INSTRUCTIONS]
+crom plans list   [--status all|draft|pending|approved|...]
+crom plans show   <PLAN_ID> [--format pretty|json|markdown]
+crom plans approve <PLAN_ID> [--notes ...]
+crom plans reject  <PLAN_ID> [--reason ...]
+crom plans revise  <PLAN_ID> <INSTRUCTIONS>
+crom plans edit    <PLAN_ID>          # $EDITOR or --print-path
+crom plans diff    <PLAN_ID> [--from-version N --to-version M]
+crom plans archive <PLAN_ID>
+crom plans export  <PLAN_ID> [--format json|markdown --output PATH]
 ```
 
-`code-agent run --require-plan` refuses to run unless an approved
+`crom run --require-plan` refuses to run unless an approved
 plan already exists in the plan store. Useful for automation that
 wants planning to be mandatory.
 
-The CLI plan handlers (`crates/code-agent-cli/src/plan_cmd.rs`) reuse
+The CLI plan handlers (`crates/crom-cli/src/plan_cmd.rs`) reuse
 `resolve_common` so plan/act runs pick up the same provider, MCP
 configuration, tool registry, and validation settings as `run`.
 
 ## Slash commands
 
 Nine new built-in commands live in
-`crates/code-agent-core/src/slash/commands.rs`:
+`crates/crom-core/src/slash/commands.rs`:
 
 ```
 /plan <prompt>
@@ -130,7 +130,7 @@ Nine new built-in commands live in
 ```
 
 These resolve via the existing `SlashCommandRegistry` and run inside
-both `code-agent run` and `code-agent chat`. Per the registry's
+both `crom run` and `crom chat`. Per the registry's
 ordering (custom commands → built-ins → skills), plugin slash commands
 cannot shadow `/plan`, `/act`, or `/replan` unless they're installed
 as project-level custom commands.
@@ -194,13 +194,13 @@ Plan approval **never** bypasses:
 
 ## Doctor / status / status line
 
-`code-agent doctor` gains three new checks under "Planning":
+`crom doctor` gains three new checks under "Planning":
 
 - `planning.store_writable`
 - `planning.malformed` (counts plan files that fail to parse)
 - `planning.stale_executing` (plans stuck in `Executing`)
 
-`code-agent status` shows the latest plan id, version, status, and
+`crom status` shows the latest plan id, version, status, and
 the active enforcement mode + deviation policy.
 
 The status-line template registers four new variables:
@@ -208,7 +208,7 @@ The status-line template registers four new variables:
 example:
 
 ```
-code-agent · my-crate · plan_01J approved · step 3/5 · ctx 42%
+crom · my-crate · plan_01J approved · step 3/5 · ctx 42%
 ```
 
 These read the most recently updated plan file under `.agent/plans/`
@@ -216,7 +216,7 @@ synchronously (no nested tokio runtime), so they work from any context.
 
 ## TUI
 
-`crates/code-agent-tui/src/plan_view.rs` adds four deterministic
+`crates/crom-tui/src/plan_view.rs` adds four deterministic
 renderers used by both Plain and Fullscreen renderers:
 
 - `format_plan_panel` — title/status/steps/validation/risks.
@@ -237,10 +237,10 @@ act → re-plan loop offline.
 
 ```bash
 cd examples/planning-demo
-code-agent plan "Fix the failing subtract test"
-code-agent plans show latest
-code-agent plans approve latest
-code-agent act latest
+crom plan "Fix the failing subtract test"
+crom plans show latest
+crom plans approve latest
+crom act latest
 ```
 
 Settings enable planning, checkpointing, and `cargo test` as the
@@ -250,7 +250,7 @@ ships the planted bug and the offline tests as the proof surface.
 ## Tests
 
 20 unit tests inside the plan module and 11 integration tests in
-`crates/code-agent-core/tests/planning.rs` cover:
+`crates/crom-core/tests/planning.rs` cover:
 
 - plan id format + path-traversal rejection,
 - plan round-trip (serde, version increment, approval invalidation

@@ -3,9 +3,9 @@
 # End-to-end demo of Milestone 1 (Headless Rust Coding Agent Alpha).
 #
 # Exercises every M1 surface in one run:
-#   * `code-agent run`     — Read, Edit, Bash under the `dontAsk` permission mode
-#   * `code-agent sessions list`
-#   * `code-agent resume`  — Write, Glob, Grep on a recovered session
+#   * `crom run`     — Read, Edit, Bash under the `dontAsk` permission mode
+#   * `crom sessions list`
+#   * `crom resume`  — Write, Glob, Grep on a recovered session
 #   * AGENTS.md project memory (per-task scope for the agent)
 #   * JSONL session persistence under .agent/sessions/
 #
@@ -51,13 +51,13 @@ TARGET_DIR="$(
         || true
 )"
 TARGET_DIR="${TARGET_DIR:-$REPO_ROOT/target}"
-BIN="$TARGET_DIR/debug/code-agent"
+BIN="$TARGET_DIR/debug/crom"
 
 # ---------------------------------------------------------------------------
-section "Step 0 — Build the code-agent CLI"
+section "Step 0 — Build the crom CLI"
 # Debug build: this demo is API-bound, so the cold-start savings outweigh any
 # release-mode gains.
-cargo build -p code-agent-cli --manifest-path "$REPO_ROOT/Cargo.toml"
+cargo build -p crom-cli --manifest-path "$REPO_ROOT/Cargo.toml"
 gray "binary: $BIN"
 if [[ ! -x "$BIN" ]]; then
     echo "error: expected binary at $BIN was not produced" >&2
@@ -99,7 +99,7 @@ gray "(cargo test exited non-zero, as expected)"
 section "Step 2 — Run the agent: fix the bug (Read + Edit + Bash)"
 
 cyan "Command:"
-gray "  code-agent run \"Run the tests, find the bug, fix it, and re-run the tests.\" \\"
+gray "  crom run \"Run the tests, find the bug, fix it, and re-run the tests.\" \\"
 gray "      --cwd . --allowed-tools Read,Glob,Grep,Edit,Bash \\"
 gray "      --permission-mode dontAsk --max-turns 8"
 
@@ -133,10 +133,10 @@ cyan "cargo test:"
 cargo test --quiet 2>&1 | tail -n 10
 
 # ---------------------------------------------------------------------------
-section "Step 4 — \`code-agent sessions list\`"
+section "Step 4 — \`crom sessions list\`"
 
 cyan "Command:"
-gray "  code-agent sessions list --cwd ."
+gray "  crom sessions list --cwd ."
 "$BIN" sessions list --cwd "$DEMO_DIR"
 
 cyan "JSONL on disk for this session (first few records):"
@@ -152,10 +152,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "Step 5 — \`code-agent resume\`: follow-up that uses Write + Glob + Grep"
+section "Step 5 — \`crom resume\`: follow-up that uses Write + Glob + Grep"
 
 cyan "Command:"
-gray "  code-agent resume $SESSION_ID 'Write a SUMMARY.md as described in AGENTS.md.' \\"
+gray "  crom resume $SESSION_ID 'Write a SUMMARY.md as described in AGENTS.md.' \\"
 gray "      --cwd . --allowed-tools Read,Glob,Grep,Write \\"
 gray "      --permission-mode dontAsk --max-turns 6"
 
@@ -184,7 +184,7 @@ section "Done"
 cat <<EOF
 Demo complete. Summary of what just happened:
 
-  * Built the code-agent CLI (debug profile).
+  * Built the crom CLI (debug profile).
   * Reset examples/bugfix-demo to its buggy state and confirmed cargo test failed.
   * Ran the agent with dontAsk and the Read/Glob/Grep/Edit/Bash tool set;
     it found the bug, edited src/lib.rs, and re-ran the tests.

@@ -1,0 +1,31 @@
+[package]
+name = "crom-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal UI for crom: renderers, status line, composer, approvals, diffs, and the M13 live event-loop app shell."
+
+[dependencies]
+crom-core = { workspace = true }
+crom-sdk = { workspace = true }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+unicode-width = "0.2"
+textwrap = "0.16"
+similar = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+crom-sdk = { workspace = true, features = ["fake-provider"] }
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }

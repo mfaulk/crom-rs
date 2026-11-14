@@ -29,7 +29,7 @@ Decisions merge with priority `Deny > Ask > Allow > AddContext > Continue`.
 `PreToolUse` `Ask` forces the callback even under `acceptEdits` / read-only
 auto-allow paths.
 
-Built-in hooks (in `code_agent_core::builtin_hooks`):
+Built-in hooks (in `crom_core::builtin_hooks`):
 
 - `BlockEnvFileWritesHook`
 - `BlockDangerousBashHook`
@@ -52,7 +52,7 @@ Typed `ToolRule`: `ExactTool`, `ToolGlob`, `BashCommandRegex`, `FilePathGlob`.
 ## Settings
 
 Project (`<cwd>/.agent/settings.json`) and user
-(`~/.config/code-agent/settings.json`) layers. Project overrides user on
+(`~/.config/crom/settings.json`) layers. Project overrides user on
 scalars; list-typed fields concatenate.
 
 CLI flags include `--settings`, `--config`, `--yes-to`, `--deny`,

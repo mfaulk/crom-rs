@@ -2,17 +2,17 @@
 
 **Theme:** Layer content-addressed local checkpoints onto the M2 runtime.
 Each top-level user request snapshots the workspace before any `Write` /
-`Edit` mutation; `code-agent rewind <id>` restores files (conversation
+`Edit` mutation; `crom rewind <id>` restores files (conversation
 history is left intact). M1 and M2 surfaces work unchanged with
 checkpointing turned off.
 
-## New crate: `code-agent-checkpoint`
+## New crate: `crom-checkpoint`
 
 - `LocalCheckpointStore` — SHA-256 blob deduplication, JSONL index,
   per-session storage caps, per-session async mutex serializing index
   updates, lazy-cached blob byte total.
 - `AgentCheckpointHandle` + `RotatingCheckpointHandle` — implement the new
-  `code_agent_core::CheckpointHandle` trait. `session_id` and `run_id` flow
+  `crom_core::CheckpointHandle` trait. `session_id` and `run_id` flow
   through every call so a misconfigured handle cannot bleed snapshots into a
   forked session's lineage.
 - `LocalCheckpointApi` — backs `AgentClient::create_checkpoint`,
@@ -33,7 +33,7 @@ checkpointing turned off.
 
 - New `AgentEvent::CheckpointEvent(CheckpointEventPayload)` envelope so core
   stays decoupled from the checkpoint crate.
-- `CheckpointHandle` / `CheckpointApi` traits in `code_agent_core`.
+- `CheckpointHandle` / `CheckpointApi` traits in `crom_core`.
 - Snapshots are captured **after** policy approval and **before** mutation.
 - The agent loop reads Bash command from `effective_input` (the policy- and
   hook-rewritten input that will actually execute), not raw `call.input`.
@@ -59,7 +59,7 @@ decides what to do:
 ## Validation gates
 
 ```sh
-code-agent run "Refactor the parser" \
+crom run "Refactor the parser" \
     --checkpointing on \
     --validate "cargo test" \
     --rewind-on-validation-failure
@@ -71,10 +71,10 @@ checkpoint. Conversation history is **not** rewound.
 
 ## CLI surface
 
-- `code-agent run --checkpointing on --validate "cargo test" --rewind-on-validation-failure`
-- `code-agent checkpoint create [DESC]`
-- `code-agent checkpoints list / show / diff`
-- `code-agent rewind <ID> [--yes] [--dry-run] [--force-cwd]`
+- `crom run --checkpointing on --validate "cargo test" --rewind-on-validation-failure`
+- `crom checkpoint create [DESC]`
+- `crom checkpoints list / show / diff`
+- `crom rewind <ID> [--yes] [--dry-run] [--force-cwd]`
 - `chat` rotates checkpoints per user prompt via `RotatingCheckpointHandle`.
 - Validation failure now affects the CLI exit code.
 - Rewind appends a session note to the checkpoint's owner session, not

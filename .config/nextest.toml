@@ -13,13 +13,13 @@ mcp-subprocess = { max-threads = 1 }
 
 [[profile.default.overrides]]
 # Match the test binaries that spawn the fake-mcp-server subprocess:
-#   - code-agent-mcp   :: tests/stdio_lifecycle.rs
-#   - code-agent-cli   :: tests/mcp_cli.rs
-#   - code-agent-core  :: tests/mcp_integration.rs
+#   - crom-mcp   :: tests/stdio_lifecycle.rs
+#   - crom-cli   :: tests/mcp_cli.rs
+#   - crom-core  :: tests/mcp_integration.rs
 # `binary_id` is "<package>::<binary>" for integration test binaries.
 filter = """
-    binary_id(=code-agent-mcp::stdio_lifecycle)
-    | binary_id(=code-agent-cli::mcp_cli)
-    | binary_id(=code-agent-core::mcp_integration)
+    binary_id(=crom-mcp::stdio_lifecycle)
+    | binary_id(=crom-cli::mcp_cli)
+    | binary_id(=crom-core::mcp_integration)
 """
 test-group = 'mcp-subprocess'

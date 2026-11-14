@@ -8,7 +8,7 @@ filesystem settings.
 
 ## What's new
 
-A new top-level crate, `crates/code-agent-sdk`, exposes the agent as a
+A new top-level crate, `crates/crom-sdk`, exposes the agent as a
 typed, async, headless library. The SDK is built on top of the existing
 M1–M11 core; it adds public types, safety-first defaults, and an
 embeddable runtime, but does not duplicate the agent loop.
@@ -77,12 +77,12 @@ The CLI grows one new subcommand whose entire implementation runs through
 `AgentRuntime`:
 
 ```
-code-agent headless-run "<prompt>" [--cwd .] [--provider anthropic|fake]
+crom headless-run "<prompt>" [--cwd .] [--provider anthropic|fake]
     [--api-key …] [--model …] [--max-turns N] [--deadline-secs N]
     [--apply-patch] [--allow-bash] [--auto-approve] [--plan-only]
 ```
 
-`crates/code-agent-cli/src/sdk_cmd.rs` builds a `ProviderConfig` from CLI
+`crates/crom-cli/src/sdk_cmd.rs` builds a `ProviderConfig` from CLI
 flags, configures the runtime with conservative defaults, calls
 `runtime.run_once`, and prints a summary plus any patch / diagnostics /
 validations. Existing CLI subcommands (`run`, `chat`, `resume`,
@@ -92,15 +92,15 @@ validations. Existing CLI subcommands (`run`, `chat`, `resume`,
 
 ```toml
 default = ["filesystem-workspace", "in-memory-workspace", "anthropic", "planning"]
-anthropic            = ["dep:code-agent-anthropic"]
-openai               = ["dep:code-agent-provider-openai"]
-gemini               = ["dep:code-agent-provider-gemini"]
+anthropic            = ["dep:crom-anthropic"]
+openai               = ["dep:crom-provider-openai"]
+gemini               = ["dep:crom-provider-gemini"]
 fake-provider        = []
 mcp                  = []
 plugins              = []
 skills               = []
 subagents            = []
-checkpointing        = ["dep:code-agent-checkpoint"]
+checkpointing        = ["dep:crom-checkpoint"]
 planning             = []
 filesystem-workspace = []
 in-memory-workspace  = []
@@ -108,14 +108,14 @@ cli                  = []   # placeholders: SDK never depends on CLI/TUI
 tui                  = []
 ```
 
-`cargo tree -p code-agent-sdk` confirms the SDK has no dependency on
-`code-agent-cli` or `code-agent-tui` under any feature combination.
+`cargo tree -p crom-sdk` confirms the SDK has no dependency on
+`crom-cli` or `crom-tui` under any feature combination.
 
 ## Examples and documentation
 
-Reference examples live under `crates/code-agent-sdk/examples/` and run
+Reference examples live under `crates/crom-sdk/examples/` and run
 with `cargo run --example <name> --features fake-provider -p
-code-agent-sdk`:
+crom-sdk`:
 
 - `simple_patch.rs`
 - `in_memory_workspace.rs`
@@ -151,9 +151,9 @@ Hand-written docs are under `docs/sdk/`:
 
 | Test target | What it covers |
 |-------------|----------------|
-| `crates/code-agent-sdk/src/**` (`cargo test -p code-agent-sdk --lib`) | 48 unit tests: workspace path safety, in-memory workspace CRUD, read-only/patch-only/overlay wrappers, filesystem path guards, patch diff/summary, diagnostics, errors, storage round-trip, side-effect policy, request validation, fake provider behavior, redactor. |
-| `crates/code-agent-sdk/tests/headless_run.rs` | 17 integration tests across run/run_once/plan/act: `RunStarted`/`RunCompleted` emission, cancellation, deadlines, budgets, `PatchPolicy::ReturnOnly` snapshot + rollback, approval callback wiring, in-memory storage recording, plan-only output, validation success and side-effect-policy denial, concurrent runs isolation. |
-| `crates/code-agent-cli/src/sdk_cmd.rs` tests | 2 unit tests verify the CLI delegate to the SDK runtime and reject missing API keys. |
+| `crates/crom-sdk/src/**` (`cargo test -p crom-sdk --lib`) | 48 unit tests: workspace path safety, in-memory workspace CRUD, read-only/patch-only/overlay wrappers, filesystem path guards, patch diff/summary, diagnostics, errors, storage round-trip, side-effect policy, request validation, fake provider behavior, redactor. |
+| `crates/crom-sdk/tests/headless_run.rs` | 17 integration tests across run/run_once/plan/act: `RunStarted`/`RunCompleted` emission, cancellation, deadlines, budgets, `PatchPolicy::ReturnOnly` snapshot + rollback, approval callback wiring, in-memory storage recording, plan-only output, validation success and side-effect-policy denial, concurrent runs isolation. |
+| `crates/crom-cli/src/sdk_cmd.rs` tests | 2 unit tests verify the CLI delegate to the SDK runtime and reject missing API keys. |
 
 Total: 911 workspace tests with default features, 913 with
 `--features fake-provider`, all green. Baseline before M12 was 844.

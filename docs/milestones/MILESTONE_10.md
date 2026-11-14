@@ -14,11 +14,11 @@ out of scope.
 
 | Crate | Purpose |
 |-------|---------|
-| `code-agent-auth` | Auth types, providers, OAuth (PKCE + device-code), credential store, model registry, CI policy. |
-| `code-agent-provider-openai` | OpenAI Chat Completions adapter. Accepts a `ResolvedCredential` at call time; transport is pluggable (test mock or `reqwest`). |
-| `code-agent-provider-gemini` | Google AI Studio `generateContent` adapter with the same call-time-credential pattern. |
+| `crom-auth` | Auth types, providers, OAuth (PKCE + device-code), credential store, model registry, CI policy. |
+| `crom-provider-openai` | OpenAI Chat Completions adapter. Accepts a `ResolvedCredential` at call time; transport is pluggable (test mock or `reqwest`). |
+| `crom-provider-gemini` | Google AI Studio `generateContent` adapter with the same call-time-credential pattern. |
 
-`code-agent-auth` is dependency-light on purpose: only the workspace's
+`crom-auth` is dependency-light on purpose: only the workspace's
 standard async + serde stack plus `sha2`/`hex` (for PKCE and the
 redacted account-id hash). No HTTP client is bundled — providers and
 the OAuth flows accept an `oauth::HttpTransport` so the host crate can
@@ -26,7 +26,7 @@ back it with `reqwest`, a fake transport, or anything else.
 
 ## Auth surface
 
-Core types (in `code-agent-auth`):
+Core types (in `crom-auth`):
 
 - `ProviderId` — `Anthropic | OpenAi | Codex | Gemini | VertexAi |
   Bedrock | Foundry | Fake | Custom(String)`. Serializes as a plain
@@ -114,7 +114,7 @@ client IDs are embedded.
 
 ## Model registry
 
-`code_agent_auth::starter_registry()` ships one representative model per
+`crom_auth::starter_registry()` ships one representative model per
 provider with `BillingMode` annotated:
 
 | Provider/Model | Billing | Availability |
@@ -143,7 +143,7 @@ let provider = OpenAiProvider::new(
 );
 ```
 
-Both providers map `code_agent_core::ModelRequest` to the upstream
+Both providers map `crom_core::ModelRequest` to the upstream
 schema, normalize streaming/tool-call output back into `ModelEvent`s,
 and reject missing credentials via `ProviderError::Auth` before
 touching the transport.
@@ -151,26 +151,26 @@ touching the transport.
 ## CLI surface
 
 ```sh
-code-agent login                                # provider selector
-code-agent login fake --api-key=demo            # explicit value
-code-agent login anthropic --api-key            # prompts on TTY
-code-agent login openai  --api-key-stdin        # script-friendly
-code-agent login codex   --device               # OAuth device-code (when enabled)
+crom login                                # provider selector
+crom login fake --api-key=demo            # explicit value
+crom login anthropic --api-key            # prompts on TTY
+crom login openai  --api-key-stdin        # script-friendly
+crom login codex   --device               # OAuth device-code (when enabled)
 
-code-agent auth status        [--allow-file-store] [--json]
-code-agent auth list          [--allow-file-store] [--json]
-code-agent auth use   <PROVIDER> [ACCOUNT]
-code-agent auth logout [PROVIDER]
-code-agent auth refresh [PROVIDER]
-code-agent auth doctor
+crom auth status        [--allow-file-store] [--json]
+crom auth list          [--allow-file-store] [--json]
+crom auth use   <PROVIDER> [ACCOUNT]
+crom auth logout [PROVIDER]
+crom auth refresh [PROVIDER]
+crom auth doctor
 
-code-agent provider list
-code-agent provider use <PROVIDER>
-code-agent model list
-code-agent model use <PROVIDER>/<MODEL>
-code-agent model status
+crom provider list
+crom provider use <PROVIDER>
+crom model list
+crom model use <PROVIDER>/<MODEL>
+crom model status
 
-code-agent logout                               # alias for `auth logout`
+crom logout                               # alias for `auth logout`
 ```
 
 `--api-key` accepts an inline value (`--api-key=sk-...`) or, when bare,
@@ -186,7 +186,7 @@ account under env-first precedence`).
 ## Slash commands
 
 `BuiltInSlashCommand` gains `Login`, `Logout`, `Auth`, `Provider`,
-`Model`. The TUI and `code-agent chat` dispatch each to the same
+`Model`. The TUI and `crom chat` dispatch each to the same
 handlers as the CLI subcommands. `/login` with no provider renders the
 provider selector; `/login fake --api-key=demo` runs the offline path.
 
@@ -200,7 +200,7 @@ the data.
 
 ## Doctor
 
-`code-agent doctor` gains an **Auth** section that reports:
+`crom doctor` gains an **Auth** section that reports:
 
 - Credential-store backend in use.
 - CI detection (and a warning when subscription auth is selected).
@@ -304,7 +304,7 @@ Existing M1–M9 demos continue to work unchanged.
 ## Runtime provider selection
 
 `build_provider` honors `--provider <name>` (CLI), then
-`.agent/active-provider.json` (written by `code-agent provider use`),
+`.agent/active-provider.json` (written by `crom provider use`),
 then `auth.active_provider` from settings, then the built-in default
 `anthropic`. The OpenAI/Gemini providers are wired to a `reqwest`-backed
 transport and resolve credentials through the same auth precedence

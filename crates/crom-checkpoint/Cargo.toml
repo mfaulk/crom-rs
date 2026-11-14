@@ -1,0 +1,29 @@
+[package]
+name = "crom-checkpoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Workspace checkpointing and rewind for crom (M3)"
+
+[dependencies]
+crom-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["parsing"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+similar = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+futures = { workspace = true }
+crom-session = { workspace = true }

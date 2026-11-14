@@ -37,7 +37,7 @@ only; no traversal or symlink escape.
 
 | Scope | Layout |
 |-------|--------|
-| `user` | `~/.config/code-agent/plugins/<name>/<version>/` |
+| `user` | `~/.config/crom/plugins/<name>/<version>/` |
 | `project` | `<cwd>/.agent/plugins/<name>/<version>/` |
 | `local` | `<cwd>/.agent/plugins.local/<name>/<version>/` |
 
@@ -63,8 +63,8 @@ unset and skipped.
 
 Inside plugin manifests / configs:
 
-- `${CODE_AGENT_PLUGIN_ROOT}` — resolves to the plugin's installed root.
-- `${CODE_AGENT_PLUGIN_DATA}` — resolves to the plugin's persistent data
+- `${CROM_PLUGIN_ROOT}` — resolves to the plugin's installed root.
+- `${CROM_PLUGIN_DATA}` — resolves to the plugin's persistent data
   directory.
 - `${ENV_VAR}` — environment variable lookup.
 - `${user_config.<key>}` — user-supplied configuration value.
@@ -108,20 +108,20 @@ New plugin events emitted to the event stream and session JSONL:
 ## CLI surface
 
 ```sh
-code-agent plugin install <PATH-OR-MARKETPLACE-TOKEN> [--scope project|user|local] [--enable] [--dry-run] [--force]
-code-agent plugin uninstall <NAME> [--scope ...] [--keep-data] [--yes]
-code-agent plugin enable  <NAME> [--scope ...]
-code-agent plugin disable <NAME> [--scope ...]
-code-agent plugin list    [--all] [--json]
-code-agent plugin show    <NAME> [--json]
-code-agent plugin validate <PATH>
-code-agent plugin reload
-code-agent plugin init <NAME>
-code-agent plugin prune
+crom plugin install <PATH-OR-MARKETPLACE-TOKEN> [--scope project|user|local] [--enable] [--dry-run] [--force]
+crom plugin uninstall <NAME> [--scope ...] [--keep-data] [--yes]
+crom plugin enable  <NAME> [--scope ...]
+crom plugin disable <NAME> [--scope ...]
+crom plugin list    [--all] [--json]
+crom plugin show    <NAME> [--json]
+crom plugin validate <PATH>
+crom plugin reload
+crom plugin init <NAME>
+crom plugin prune
 
-code-agent plugin marketplace add <PATH>
-code-agent plugin marketplace list
-code-agent plugin marketplace show <NAME>
+crom plugin marketplace add <PATH>
+crom plugin marketplace list
+crom plugin marketplace show <NAME>
 ```
 
 New flags on existing commands: `--plugin-dir`, `--no-plugins`.

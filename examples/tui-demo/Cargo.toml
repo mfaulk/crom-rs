@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
-code-agent-sdk = { path = "../../crates/code-agent-sdk", features = ["fake-provider"] }
-code-agent-core = { path = "../../crates/code-agent-core" }
-code-agent-tui = { path = "../../crates/code-agent-tui" }
+crom-sdk = { path = "../../crates/crom-sdk", features = ["fake-provider"] }
+crom-core = { path = "../../crates/crom-core" }
+crom-tui = { path = "../../crates/crom-tui" }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

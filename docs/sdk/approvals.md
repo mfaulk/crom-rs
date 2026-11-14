@@ -26,7 +26,7 @@ approval routes through the host-supplied `ApprovalCallback`.
 
 ```rust,no_run
 use async_trait::async_trait;
-use code_agent_sdk::{
+use crom_sdk::{
     AgentSdkError, ApprovalCallback, ApprovalDecision, ApprovalRequest,
 };
 

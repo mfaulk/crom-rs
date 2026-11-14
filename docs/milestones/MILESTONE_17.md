@@ -47,7 +47,7 @@ isolation, and audit. M17 makes both halves measurable:
 
 It also preserves three product principles:
 
-- **Rust-native SDK first.** Eval drives runs through `code-agent-sdk`, and
+- **Rust-native SDK first.** Eval drives runs through `crom-sdk`, and
   the provider work moves transports out of the CLI binary.
 - **Low cost.** DeepSeek and OpenAI-compatible endpoints become first-class.
   Paid runs are opt-in and spend-capped.
@@ -63,7 +63,7 @@ earlier docs, several of which are stale (§3.6).
 
 | Item | State |
 |---|---|
-| CI on `main` (weekly schedule) | **Failing since 2026-09.** Stable: clippy `double_must_use`. Beta: `code-agent-cli/tests/m9_commands.rs::completions_bash_emits_output` can't locate the binary under nextest. MSRV and macOS pass. |
+| CI on `main` (weekly schedule) | **Failing since 2026-09.** Stable: clippy `double_must_use`. Beta: `crom-cli/tests/m9_commands.rs::completions_bash_emits_output` can't locate the binary under nextest. MSRV and macOS pass. |
 | `cargo-deny` | **Failing.** RUSTSEC-2026-0190, -0204, -0285, -0346, -0348, -0349, -0381, -0382, -0386 (rustls/webpki TLS, tokio `AsyncFd`, anyhow, crossbeam), plus yanked `chacha20`. Dependabot #270 is open. |
 | Rename PR #271 | Mergeable, 412 files. Its checks are a month old, and it has no fallback for the old config dir or env vars. |
 | Tests | 1,529 nextest tests in the workspace; 104 in the eval crate. |
@@ -105,7 +105,7 @@ earlier docs, several of which are stale (§3.6).
 | Level | State |
 |---|---|
 | S0 semantics | Mostly correct. 26 policy tests. Exceptions: hook `Allow` returns before disallow rules are checked (`policy.rs:325-353`); subagents can raise their own `permission_mode` (`agents/tool.rs:1117-1118`). |
-| S1 pre-execution blocking | Holds for the model tool-call path (`agent.rs:1418-1506`). Bypassed by: repo `.agent/settings.json` loosening permissions; repo `.agent/mcp.json` auto-spawning servers with host `${VAR}` interpolation (`code-agent-mcp/src/config.rs:290-312`); slash `` !`cmd` `` expansion (hooks only); SDK in-memory workspace while tools act on the host cwd (`sdk/src/runtime/run.rs:1166-1174`). |
+| S1 pre-execution blocking | Holds for the model tool-call path (`agent.rs:1418-1506`). Bypassed by: repo `.agent/settings.json` loosening permissions; repo `.agent/mcp.json` auto-spawning servers with host `${VAR}` interpolation (`crom-mcp/src/config.rs:290-312`); slash `` !`cmd` `` expansion (hooks only); SDK in-memory workspace while tools act on the host cwd (`sdk/src/runtime/run.rs:1166-1174`). |
 | S2 OS enforcement | **Absent.** Path checks exist only in Read/Write/Edit (`tools/src/path_sandbox.rs`; absolute paths are re-rooted; TOCTOU per #15). Bash: full environment inherited (no `env_clear` in the repo), cwd only, no network control, no rlimits, process group killed only on timeout. No landlock/seccomp/namespaces anywhere. |
 | S3 adversarial | Untested. Repo instruction files go into the system prompt with no provenance marking; tool and MCP output are not framed as untrusted. |
 | Audit | `PolicyDecision` and `ToolCallDenied` events lack target, run id, and enforcement layer. `SecretRedactionHook` and `McpSecretRedactionHook` are **no-ops** (`builtin_hooks.rs:430-441`). |

@@ -37,7 +37,7 @@ namespaces, bind-mount allowlist, `--clearenv`, `--die-with-parent`,
 **(c) rootless podman / docker per task or per tool call.** `run --rm
 --network none --pids-limit --memory -v ws:ws`, toolchain bind-mounted
 read-only or baked into the image. Already used for eval *verification*
-(`crates/eval/src/isolation.rs:244-291`).
+(`crates/crom-eval/src/isolation.rs:244-291`).
 
 ## 3. Measured evidence
 
