@@ -19,7 +19,27 @@ payload, makes the call, and normalizes the response into `ModelEvent`s.
 Credentials are passed in at call time as a `ResolvedCredential` (from
 `crom-auth`).
 
+## `http` feature (default)
+
+The default-on `http` feature adds `ReqwestGeminiTransport`, a `reqwest`-backed transport,
+and a one-call constructor:
+
+```rust,ignore
+let provider = GeminiProvider::from_config(GeminiConfig::default(), resolved_credential)?;
+```
+
+`GeminiConfig` defaults: `connect_timeout` 30s, `request_timeout` 120s.
+Gemini does not retry: 429/5xx and network errors surface immediately
+as `ProviderError::Http`.
+
+Build with `default-features = false` to drop the reqwest transport and
+supply your own `GeminiTransport` via `GeminiProvider::new`.
+
 ## Usage
 
-Enabled in `crom-sdk` via the `gemini` feature and selectable from the
-`crom` CLI.
+Enabled in `crom-sdk` via the `gemini` feature (on by default) as
+`ProviderConfig::gemini_api_key`, and selectable from the `crom` CLI; both
+go through `from_config`.
+
+HTTP-level tests (`tests/http_transport.rs`) run the reqwest transport
+against a `wiremock` server: success, 429, 5xx, and timeout.

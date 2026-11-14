@@ -5,12 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "OpenAI Platform model-provider implementation for crom (M10)."
 
+[features]
+# reqwest-backed transport plus `from_config` constructors. Disable to
+# supply your own transport via `new` without pulling in reqwest.
+default = ["http"]
+http = ["dep:reqwest"]
+
 [dependencies]
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
@@ -23,3 +29,4 @@ crom-auth = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 insta = { workspace = true }
 proptest = { workspace = true }
+wiremock = { workspace = true }

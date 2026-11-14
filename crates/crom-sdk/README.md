@@ -37,9 +37,12 @@ println!("summary = {}", result.summary);
 
 ## Features
 
-Providers and checkpointing are opt-in via Cargo features: `anthropic`,
-`openai`, `gemini`, `checkpointing`, and `fake-provider` (for tests and
-examples). See `examples/` for runnable usage:
+Provider integrations are Cargo features: `anthropic`, `openai`, and
+`gemini` are on by default, so `ProviderConfig::anthropic_api_key`,
+`openai_api_key`, and `gemini_api_key` build HTTP-backed providers directly.
+`checkpointing` and `fake-provider` (for tests and examples) are opt-in.
+Disabling a provider feature makes its config fail with
+`provider.feature_disabled`. See `examples/` for runnable usage:
 
 ```sh
 cargo run --example <name> --features fake-provider -p crom-sdk

@@ -66,6 +66,7 @@ sha2 = "0.11"
 hex = "0.4"
 rand = { version = "0.10", features = ["sys_rng"] }
 insta = { version = "1", features = ["json"] }
+wiremock = "0.6"
 proptest = "1"
 
 crom-core = { path = "crates/crom-core", version = "0.1.0" }
