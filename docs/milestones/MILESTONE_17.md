@@ -392,6 +392,9 @@ Rules (enforced by `validate-task`, #285):
 The full model lives in #276 (`docs/security/threat-model.md`). M17 requires
 these trust boundaries:
 
+Full model: [`docs/security/threat-model.md`](../security/threat-model.md);
+backend decision: [`docs/security/decisions/0001-sandbox-backend.md`](../security/decisions/0001-sandbox-backend.md).
+
 ```
 ┌──────────── trusted host process ─────────────┐
 │ provider client · policy engine · credential  │

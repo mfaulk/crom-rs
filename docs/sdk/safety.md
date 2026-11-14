@@ -17,6 +17,10 @@ should never make a destructive choice on the host's behalf.
 | `NoopStorage`                                   | `.storage(Arc::new(...))`                               |
 | No external network beyond the model            | Model provider call only                                |
 
+Threat model, trust boundaries, and required OS-enforcement properties:
+[`docs/security/threat-model.md`](../security/threat-model.md). The SDK
+controls below are policy-level; they are not an OS sandbox.
+
 ## Defense in depth
 
 Every layer enforces:
