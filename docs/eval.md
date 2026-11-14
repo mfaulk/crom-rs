@@ -170,6 +170,9 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
 - `l2` — the M17 L2 capability corpus (multi-step coding and repair). Every
   task is `kind = "capability"`, `level = "L2"`, with hidden tests and a
   reference. Intended for a live provider; see [L2 corpus](#l2-corpus-m172).
+- `l3` — M17.2 L3 capability corpus (real-repository engineering): ten
+  multi-crate Rust workspaces with hidden behavioral tests and oracle-patch
+  references. Intended for a live provider; see [L3 corpus](#l3-corpus-m172).
 
 ### L1 capability corpus
 
@@ -219,6 +222,55 @@ crom eval run --suite l2 --provider <profile> --repair disabled
 ```
 
 Each run needs a cargo toolchain; no task needs the network.
+
+### L3 corpus (M17.2)
+
+Each `l3-*` task is a `kind = "capability"`, `level = "L3"` task whose
+fixture is a realistic three-crate Cargo workspace with an existing, passing
+test suite. The agent must locate the root cause or extension point across
+crates; grading is behavioral.
+
+| Task | Category | Crates | What the reference changes |
+|---|---|---|---|
+| `l3-ledger-split` | bugfix | `money`, `ledger`, `report` | Exact remainder allocation in `Money::allocate` |
+| `l3-semver-prerelease` | bugfix | `versions`, `registry`, `resolver` | Pre-release precedence + Cargo pre-release matching |
+| `l3-logstore-reopen` | bugfix | `wire`, `logstore`, `kvtool` | LEB128 varint decoding (data loss on reopen) |
+| `l3-http-header-case` | bugfix | `http-types`, `middleware`, `server` | Case-insensitive header names and content codings |
+| `l3-cron-ranges-steps` | feature | `calendar`, `cronexpr`, `scheduler` | `A-B`, `*/S`, `A-B/S` cron field syntax |
+| `l3-buildplan-cycles` | bugfix | `manifest`, `depgraph`, `planner` | Cycle detection/reporting instead of a panic |
+| `l3-csv-quoting` | bugfix | `csvread`, `schema`, `colstats` | RFC 4180 quoting, CRLF, embedded newlines |
+| `l3-mdtoc-anchors` | bugfix | `mdscan`, `slugger`, `toc` | GitHub slugs, duplicate suffixes, fenced code |
+| `l3-throttle-refill` | bugfix | `clock`, `bucket`, `gateway` | Token-bucket refill drift and exact `Retry-After` |
+| `l3-layercfg-merge` | bugfix | `confval`, `layers`, `appconfig` | Deep merge of layers and `APP_A__B` env overrides |
+
+Verification:
+
+- Public oracle: `cargo test --workspace --offline` (passes on the
+  unmodified fixture; guards against regressions).
+- Hidden oracle: `acceptance_*.rs` integration tests overlaid from
+  `hidden/crates/<crate>/tests/` after the agent finishes, run with
+  `cargo test --offline -p <crate> --test <name>`.
+- `crom eval validate-suite l3` proves, offline, that every reference patch
+  passes public + hidden verification and every unmodified fixture fails it.
+  CI runs it on every push/PR; `crates/crom-eval/tests/l3_corpus.rs` checks
+  structure (kind/level, offline commands, hidden dir outside `repo/`,
+  path-only dependencies, provenance, size budget).
+
+Provenance and storage: the fixtures are original, synthetic workspaces
+(`provenance.source = "original"`, `Apache-2.0 OR MIT`), not snapshots of
+upstream repositories. They depend only on `std` and on each other through
+path dependencies, so no `cargo vendor` tarball or registry cache is needed
+and verification works with `network = "none"`. The corpus adds ~190 KB of
+plain files to the repository (~4.1k lines of fixture Rust, 10–25 KB per
+task); `l3_corpus.rs` caps each task at 96 KB. Larger pinned upstream
+snapshots (the 2k–30k LoC target in #289) need a separate storage decision
+(git bundle plus vendored-deps tarball, or a fixtures repository) and are
+not part of this corpus.
+
+Leakage: `task.toml`, `hidden/`, and `oracle.patch` sit beside `repo/` in
+the task directory, as for every other task. Until #286 lands they remain
+reachable from the agent workspace by relative or absolute path; #286 must
+move or withhold them for `l3-*` tasks along with the rest of the corpus.
 
 ## Adding a new task
 
@@ -435,7 +487,7 @@ offline lane on every push/PR:
 
 ```console
 cargo test -p crom-eval
-crom eval validate-suite <smoke|golden|safety|repair-smoke|l1|l2>
+crom eval validate-suite <smoke|golden|safety|repair-smoke|l1|l2|l3>
 crom eval run --suite smoke --provider fake
 crom eval run --suite golden --provider golden
 crom eval run --suite safety --provider fake

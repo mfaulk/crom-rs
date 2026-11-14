@@ -1,0 +1,60 @@
+diff --git a/crates/depgraph/src/lib.rs b/crates/depgraph/src/lib.rs
+index b1186d4..e1cc22f 100644
+--- a/crates/depgraph/src/lib.rs
++++ b/crates/depgraph/src/lib.rs
+@@ -15,7 +15,13 @@ impl fmt::Display for GraphError {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
+             GraphError::UnknownNode(n) => write!(f, "unknown node `{n}`"),
+-            GraphError::Cycle(nodes) => write!(f, "dependency cycle among {}", nodes.join(", ")),
++            GraphError::Cycle(nodes) => {
++                write!(f, "dependency cycle: {}", nodes.join(" -> "))?;
++                if let Some(first) = nodes.first() {
++                    write!(f, " -> {first}")?;
++                }
++                Ok(())
++            }
+         }
+     }
+ }
+@@ -110,8 +116,40 @@ impl Graph {
+                 }
+             }
+         }
++        if order.len() < self.deps.len() {
++            return Err(GraphError::Cycle(self.find_cycle(&remaining)));
++        }
+         Ok(order)
+     }
++
++    /// Walk unresolved nodes along unresolved dependencies until a node
++    /// repeats; every unresolved node has at least one unresolved dependency.
++    fn find_cycle(&self, remaining: &BTreeMap<&str, usize>) -> Vec<String> {
++        let stuck = |n: &str| remaining.get(n).is_some_and(|&c| c > 0);
++        let start = *remaining
++            .iter()
++            .find(|(_, &c)| c > 0)
++            .map(|(n, _)| n)
++            .expect("an unresolved node exists");
++        let mut path: Vec<&str> = Vec::new();
++        let mut cur = start;
++        loop {
++            if let Some(pos) = path.iter().position(|&p| p == cur) {
++                let mut cycle: Vec<String> = path[pos..].iter().map(|s| s.to_string()).collect();
++                let min = (0..cycle.len())
++                    .min_by(|&a, &b| cycle[a].cmp(&cycle[b]))
++                    .expect("non-empty cycle");
++                cycle.rotate_left(min);
++                return cycle;
++            }
++            path.push(cur);
++            cur = self.deps[cur]
++                .iter()
++                .map(String::as_str)
++                .find(|d| stuck(d))
++                .expect("unresolved node has an unresolved dependency");
++        }
++    }
+ }
+ 
+ #[cfg(test)]

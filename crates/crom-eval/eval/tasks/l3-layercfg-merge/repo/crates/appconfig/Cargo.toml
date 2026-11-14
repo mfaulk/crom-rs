@@ -1,0 +1,9 @@
+[package]
+name = "appconfig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+confval = { path = "../confval" }
+layers = { path = "../layers" }

@@ -1,0 +1,77 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-buildplan-cycles"
+title = "Report dependency cycles instead of panicking in the build planner"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "algorithms", "l3"]
+suites = ["l3"]
+
+prompt = """
+In the `buildplan` workspace (`manifest`, `depgraph`, `planner`), a manifest
+that contains a dependency cycle makes `planner::plan` panic, and
+`depgraph::Graph::topo_order` silently returns a partial order that omits the
+nodes involved.
+
+Fix it:
+
+1. `Graph::topo_order` must return `Err(GraphError::Cycle(nodes))` when the
+   graph has a cycle. `nodes` lists one cycle exactly once each: it starts at
+   the alphabetically smallest node of that cycle and then follows "depends
+   on" edges around the cycle (for `a: b`, `b: c`, `c: a` it is
+   `["a", "b", "c"]`; a target that depends on itself gives `[that target]`).
+   Acyclic graphs keep their current ordering.
+2. `GraphError::Cycle` displays as `dependency cycle: a -> b -> c -> a`.
+3. `planner::plan` / `plan_source` return
+   `PlanError::Graph(GraphError::Cycle(..))` for a goal whose dependencies
+   contain a cycle, and still succeed for goals that do not reach the cycle.
+
+Keep the existing public API and `cargo test --workspace` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --workspace --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+  "cargo test --offline -p depgraph --test acceptance_cycles",
+  "cargo test --offline -p planner --test acceptance_plan_cycles",
+]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

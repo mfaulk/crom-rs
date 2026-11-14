@@ -163,6 +163,10 @@ jobs:
       # no_change task must pass as-is). Fixtures are dependency-free crates.
       - name: Validate L2 capability suite
         run: cargo run --locked -p crom-cli -- eval validate-suite l2
+      # L3 corpus (#289): std-only multi-crate workspaces, so the reference
+      # patch must pass and the unmodified fixture must fail fully offline.
+      - name: Validate L3 capability suite
+        run: cargo run --locked -p crom-cli -- eval validate-suite l3
       - name: Eval smoke suite (fake provider)
         run: cargo run --locked -p crom-cli -- eval run --suite smoke --provider fake
       - name: Eval golden suite (golden provider)

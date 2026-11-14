@@ -1,0 +1,81 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-cron-ranges-steps"
+title = "Add range and step syntax to the cronlite expression parser"
+category = "feature"
+difficulty = "medium"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "feature", "parsing", "l3"]
+suites = ["l3"]
+
+prompt = """
+The `cronlite` workspace (`calendar`, `cronexpr`, `scheduler`) only accepts
+`*`, single numbers, and comma lists in cron fields. Users need the standard
+range and step forms. Implement them so that each comma-separated item of a
+field may be any of:
+
+- `*` — every value in the field's bounds
+- `N` — a single value
+- `A-B` — every value from A to B inclusive
+- `*/S` — every S-th value starting at the field's lower bound
+- `A-B/S` — every S-th value from A up to at most B
+
+Examples: `*/15` in the minute field is {0, 15, 30, 45}; `9-17/2` in the hour
+field is {9, 11, 13, 15, 17}; `5-10,30` is {5, 6, 7, 8, 9, 10, 30}.
+
+Errors: a value outside the field's bounds (including a range endpoint) is
+`CronError::OutOfRange { field, value }`; a step of 0, a range whose start is
+greater than its end, or any other malformed item is
+`CronError::Invalid { field, token }`. Day-of-month/day-of-week "star"
+semantics should stay exactly as they are for a field written as `*`.
+
+`scheduler::next_run` / `upcoming` must work with the new syntax. Update the
+workspace README's syntax note, keep the public API unchanged, and keep
+`cargo test --workspace` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --workspace --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+  "cargo test --offline -p cronexpr --test acceptance_syntax",
+  "cargo test --offline -p scheduler --test acceptance_upcoming",
+]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/clock", "crates/bucket", "crates/gateway"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
