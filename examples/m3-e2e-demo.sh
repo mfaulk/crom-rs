@@ -124,6 +124,10 @@ section "Step 1 — Reset checkpoint-demo to a clean, buggy starting state"
 
 cd "$DEMO_DIR"
 
+# The demo relies on its .agent/settings.json allow rules, which only apply
+# in a trusted workspace (#290). Undo with: crom untrust "$DEMO_DIR"
+"$BIN" trust "$DEMO_DIR"
+
 # `checkpoint-demo` is excluded from the workspace; its tracked files are
 # managed by git directly. Restore every tracked file under this crate
 # from HEAD so the agent can't leak edits (to e.g. Cargo.toml or

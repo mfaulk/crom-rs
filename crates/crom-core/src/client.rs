@@ -289,9 +289,16 @@ impl AgentClientBuilder {
             options.mcp = mcp;
         }
         if let Some(path) = self.mcp_config_file {
-            options.mcp =
-                crom_mcp::load_mcp_options(&options.cwd, None, Some(&path), Some(true), None, None)
-                    .map_err(|e| AgentError::InvalidConfig(e.to_string()))?;
+            options.mcp = crom_mcp::load_mcp_options(
+                &options.cwd,
+                None,
+                Some(&path),
+                Some(true),
+                None,
+                None,
+                false,
+            )
+            .map_err(|e| AgentError::InvalidConfig(e.to_string()))?;
         }
         if let Some(tool_search) = self.tool_search_options {
             options.tool_search = tool_search;

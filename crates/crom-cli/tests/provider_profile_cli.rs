@@ -79,11 +79,12 @@ async fn deepseek_profile_completes_tool_turn() {
     let dir = TempDir::new().unwrap();
     let work = dir.path().join("work");
     let home = dir.path().join("home");
-    std::fs::create_dir_all(work.join(".agent")).unwrap();
-    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(home.join("crom")).unwrap();
     std::fs::write(work.join("hello.txt"), "hello-from-fixture\n").unwrap();
+    // User settings: an untrusted repo may not redirect provider endpoints (#290).
     std::fs::write(
-        work.join(".agent").join("settings.json"),
+        home.join("crom").join("settings.json"),
         serde_json::json!({
             "providers": { "deepseek": { "base_url": server.uri() } },
             "allowed_tools": ["Read"]

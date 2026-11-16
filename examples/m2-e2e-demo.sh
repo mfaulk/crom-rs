@@ -81,6 +81,10 @@ section "Step 1 — Reset policy-demo to a clean, buggy starting state"
 
 cd "$DEMO_DIR"
 
+# The demo relies on its .agent/settings.json allow rules, which only apply
+# in a trusted workspace (#290). Undo with: crom untrust "$DEMO_DIR"
+"$BIN" trust "$DEMO_DIR"
+
 # `policy-demo` is excluded from the workspace, so its tracked files are
 # managed by git directly. Restore src/lib.rs in case a previous run patched
 # it.

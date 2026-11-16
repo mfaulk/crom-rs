@@ -89,12 +89,22 @@ fn write_mcp_config(dir: &Path) {
         .to_string(),
     )
     .unwrap();
+    // Repo `.agent/` config only loads in a trusted workspace (#290).
+    let trust = Command::new(bin())
+        .args(["trust", "."])
+        .current_dir(dir)
+        .env("CROM_CONFIG_HOME", dir.join(".test-config"))
+        .output()
+        .unwrap();
+    assert!(trust.status.success());
 }
 
 fn run(args: &[&str], cwd: &Path) -> std::process::Output {
     Command::new(bin())
         .args(args)
         .current_dir(cwd)
+        // Isolated user config holding this workspace's trust decision.
+        .env("CROM_CONFIG_HOME", cwd.join(".test-config"))
         .env_remove("ANTHROPIC_API_KEY")
         .output()
         .expect("failed to spawn crom")

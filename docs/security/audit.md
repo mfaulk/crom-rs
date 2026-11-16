@@ -16,7 +16,7 @@ consumers as `SdkEvent::SecurityDecision` under **every** verbosity.
 | `tool_use_id`, `tool_name` | The model's tool call |
 | `action_class` | `PermissionKind` (`ReadOnly`, `Mutating`, `Execution`, `External`, `Orchestration`); absent for unregistered tools |
 | `resource` | Normalized target: workspace-relative (or normalized absolute) path, Bash command head (leading `NAME=value` assignments skipped), URL `host[:port]` without userinfo, `mcp:<server>`, `agent:<name>` |
-| `policy_source` | `PolicyDecisionSource` stage that decided (`hook`, `disallow_rule`, `permission_mode`, `allow_rule`, `approval_callback`, `approval_memory`, `external_effect_policy`, `default_deny`); absent when the call never reached the policy engine or was refused below it |
+| `policy_source` | `PolicyDecisionSource` stage that decided (`hook`, `disallow_rule`, `permission_mode`, `allow_rule`, `approval_callback`, `approval_memory`, `external_effect_policy`, `default_deny`, `workspace_trust`); absent when the call never reached the policy engine or was refused below it |
 | `rule` | Matching rule as `<list>[<index>]: <rule json>`, e.g. `disallowed_tools[0]: "Write"` |
 | `decision` | `allow` / `deny` / `ask` |
 | `enforcement` | `policy` (policy engine, tool allowlist, tool-catalog loading gate), `hook` (`PreToolUse` hook), `checkpoint` (checkpoint safety gate), `sandbox` (tool-level `PermissionDenied`: the Read/Write/Edit path sandbox, and a Bash call refused because the [OS sandbox](sandbox.md) is `required` but cannot be enforced) |
@@ -37,6 +37,17 @@ CLI slash-command `` !`cmd` `` / `@file` expansions (#290) that the policy
 engine denies record a blocked decision with `tool_use_id`
 `slash-expansion-<run id>`. They are printed as JSON lines under
 `--log-format json`; text mode shows only the expansion error.
+
+Repo-local configuration ignored because the workspace is untrusted (#290,
+see [threat model](threat-model.md) P9) records one blocked decision per
+ignored key at CLI startup: `tool_name` `workspace_config`, `tool_use_id`
+`workspace-trust-<run id>-<n>`, `resource` `<file>#<key>` (e.g.
+`.agent/settings.json#allowed_tools`, `.agent/mcp.json#mcpServers.evil`),
+`policy_source` `workspace_trust`, `decision` `deny`, `enforcement` `policy`,
+`outcome` `blocked`. These are printed as JSON lines under
+`--log-format json`; text mode prints a `[trust] ignored …` line on stderr.
+They are emitted before the session starts, so `session_id` is a fresh
+id (not the run's session) and they are not written to the session file.
 
 Text-mode CLI output does not print `SecurityDecision` (the `[policy]` and
 `[denied]` lines cover it); the TUI shows a card for blocked decisions only.

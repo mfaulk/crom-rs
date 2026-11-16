@@ -669,7 +669,18 @@ pub fn format_effective_config(settings: &Settings) -> Vec<String> {
     out.push("Effective configuration".to_string());
     out.push(format!("  source:          {:?}", settings.source));
     if let Some(p) = &settings.project_path {
-        out.push(format!("  project file:    {}", p.display()));
+        out.push(format!(
+            "  project file:    {} ({})",
+            p.display(),
+            if settings.workspace_trust.is_trusted() {
+                "trusted"
+            } else {
+                "untrusted: may only tighten"
+            }
+        ));
+        for d in &settings.untrusted_denials {
+            out.push(format!("    ignored:       {} ({})", d.key, d.reason));
+        }
     }
     if let Some(p) = &settings.user_path {
         out.push(format!("  user file:       {}", p.display()));

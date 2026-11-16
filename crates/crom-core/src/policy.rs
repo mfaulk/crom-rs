@@ -52,6 +52,8 @@ pub enum PolicyDecisionSource {
     DefaultDeny,
     ApprovalMemory,
     ExternalEffectPolicy,
+    /// Repo-local configuration ignored because the workspace is untrusted.
+    WorkspaceTrust,
 }
 
 /// A single policy decision with metadata.
