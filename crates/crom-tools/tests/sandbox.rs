@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crom_core::{SandboxConfig, SandboxMode, SessionId, Tool, ToolContext, ToolError, ToolResult};
+use crom_core::{SandboxConfig, SessionId, Tool, ToolContext, ToolError, ToolResult};
 use crom_tools::{BashTool, ToolLimits};
 use serde_json::json;
 use tempfile::TempDir;
@@ -51,6 +51,7 @@ async fn run_with_timeout(
     .await
 }
 
+#[cfg(target_os = "linux")]
 fn text(r: &ToolResult) -> String {
     r.content
         .iter()
@@ -107,6 +108,7 @@ async fn off_mode_runs_and_records_unsandboxed() {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use crom_core::SandboxMode;
 
     /// True when the sandbox is enforceable here; otherwise prints an explicit
     /// skip line (or panics when CI requires the sandbox tests to run).
