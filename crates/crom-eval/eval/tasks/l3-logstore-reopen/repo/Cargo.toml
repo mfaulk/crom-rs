@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/wire", "crates/logstore", "crates/kvtool"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"

@@ -1,0 +1,13 @@
+diff --git a/crates/wire/src/varint.rs b/crates/wire/src/varint.rs
+index 3a9966b..84c0d75 100644
+--- a/crates/wire/src/varint.rs
++++ b/crates/wire/src/varint.rs
+@@ -22,7 +22,7 @@ pub fn read(buf: &[u8]) -> Result<(u64, usize), WireError> {
+         if i >= 10 {
+             return Err(WireError::VarintOverflow);
+         }
+-        value |= ((byte & 0x7f) as u64) << (8 * i);
++        value |= ((byte & 0x7f) as u64) << (7 * i);
+         if byte & 0x80 == 0 {
+             return Ok((value, i + 1));
+         }

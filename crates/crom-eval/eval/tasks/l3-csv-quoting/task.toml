@@ -1,0 +1,79 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-csv-quoting"
+title = "Implement RFC 4180 quoting in the tabular CSV reader"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "parsing", "l3"]
+suites = ["l3"]
+
+prompt = """
+The `tabular` workspace (`csvread`, `schema`, `colstats`) mangles real-world
+CSV exports. Column summaries come out wrong or `schema::load` reports ragged
+rows as soon as a file contains quoted fields with commas, escaped quotes,
+line breaks inside quotes, or Windows (CRLF) line endings.
+
+Rewrite `csvread::parse` to follow RFC 4180:
+
+- Fields are separated by `,`; records end at `\\n` or `\\r\\n`.
+- A field that starts with `"` is quoted: it may contain `,`, `\\r`, `\\n`,
+  and `""` (an escaped `"`), and ends at the next lone `"`. The surrounding
+  quotes are not part of the value. Unquoted fields are taken verbatim (no
+  trimming).
+- Completely empty lines between records are skipped, as today.
+- A quoted field still open at end of input is
+  `CsvError::UnterminatedQuote { line }`, where `line` is the 1-based physical
+  line on which that field started. Any character after a closing quote other
+  than `,` or a record end is `CsvError::UnexpectedChar { line, ch }`, with
+  `line` the physical line of that character.
+
+`csvread::write` output must parse back to the same records. Keep the public
+API unchanged and `cargo test --workspace` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --workspace --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+  "cargo test --offline -p csvread --test acceptance_rfc4180",
+  "cargo test --offline -p colstats --test acceptance_exports",
+]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

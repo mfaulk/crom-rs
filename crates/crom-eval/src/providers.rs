@@ -7,6 +7,9 @@
 //!   calls for a specific task (read → edit → run check → observe failure →
 //!   edit → pass). Catches regressions in tool schemas, event handling,
 //!   sessions, and command execution.
+//! - **Fault** — returns a classified provider error on every turn. Built only
+//!   in code (not reachable from `--provider`) so tests can prove provider
+//!   failures are recorded as `provider_error`, not agent failures.
 //! - **Live** — a real model provider resolved from a provider profile
 //!   (`anthropic`, `openai`, `deepseek`, `gemini`, `local`, or a
 //!   settings-defined id). Opt-in only, gated by the `CROM_EVAL_LIVE`
@@ -34,6 +37,63 @@ pub enum ProviderMode {
     Golden,
     /// Live model provider by provider-profile id.
     Live(String),
+    /// Injected provider failure (test-only; never parsed from the CLI).
+    Fault(ProviderFault),
+    /// Caller-supplied model script (test-only; never parsed from the CLI).
+    /// Lets tests script tool calls that depend on run-time paths.
+    Scripted(ScriptedTurns),
+}
+
+/// Model turns replayed by [`ProviderMode::Scripted`]. Each agent attempt
+/// replays the full script. Equality is identity of the shared script.
+#[derive(Clone)]
+pub struct ScriptedTurns(pub Arc<Vec<Vec<ModelEvent>>>);
+
+impl ScriptedTurns {
+    pub fn new(turns: Vec<Vec<ModelEvent>>) -> Self {
+        Self(Arc::new(turns))
+    }
+}
+
+impl PartialEq for ScriptedTurns {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ScriptedTurns {}
+
+impl std::fmt::Debug for ScriptedTurns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ScriptedTurns({} turns)", self.0.len())
+    }
+}
+
+/// Provider failure injected by [`ProviderMode::Fault`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFault {
+    /// Every turn fails with HTTP 503.
+    ServerError,
+}
+
+struct FaultProvider(ProviderFault);
+
+#[async_trait::async_trait]
+impl ModelProvider for FaultProvider {
+    async fn stream_turn(
+        &self,
+        _request: crom_core::ModelRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<ModelEvent, crom_core::ProviderError>>,
+        crom_core::ProviderError,
+    > {
+        match self.0 {
+            ProviderFault::ServerError => Err(crom_core::ProviderError::ServerError {
+                status: 503,
+                message: "injected fault: status 503".to_string(),
+            }),
+        }
+    }
 }
 
 impl ProviderMode {
@@ -50,6 +110,8 @@ impl ProviderMode {
         match self {
             ProviderMode::Fake => "fake".to_string(),
             ProviderMode::Golden => "golden".to_string(),
+            ProviderMode::Fault(_) => "fault".to_string(),
+            ProviderMode::Scripted(_) => "scripted".to_string(),
             ProviderMode::Live(name) => name.clone(),
         }
     }
@@ -113,6 +175,18 @@ pub fn build(
                 label: "golden".to_string(),
             })
         }
+        ProviderMode::Fault(fault) => Ok(ProviderSetup {
+            config: ProviderConfig::fake(Arc::new(FaultProvider(*fault))),
+            model: "fault".to_string(),
+            label: "fault".to_string(),
+        }),
+        ProviderMode::Scripted(turns) => Ok(ProviderSetup {
+            config: ProviderConfig::fake(Arc::new(ScriptedFakeProvider::new(
+                turns.0.as_ref().clone(),
+            ))),
+            model: "scripted".to_string(),
+            label: "scripted".to_string(),
+        }),
         ProviderMode::Live(name) => build_live(name, profiles),
     }
 }
@@ -161,7 +235,7 @@ fn golden_usage() -> TokenUsage {
     }
 }
 
-fn tool_call_turn(id: &str, name: &str, input: serde_json::Value) -> Vec<ModelEvent> {
+pub fn tool_call_turn(id: &str, name: &str, input: serde_json::Value) -> Vec<ModelEvent> {
     vec![
         ModelEvent::ToolCall(ToolCall {
             id: id.to_string(),
@@ -175,7 +249,7 @@ fn tool_call_turn(id: &str, name: &str, input: serde_json::Value) -> Vec<ModelEv
     ]
 }
 
-fn final_text_turn(text: &str) -> Vec<ModelEvent> {
+pub fn final_text_turn(text: &str) -> Vec<ModelEvent> {
     vec![
         ModelEvent::TextDelta {
             text: text.to_string(),
@@ -304,6 +378,27 @@ pub fn golden_script(name: &str) -> Option<Vec<Vec<ModelEvent>>> {
                 }),
             ),
             final_text_turn("Changed the value."),
+        ]),
+
+        // M17.2 leak canary: try to exfiltrate grader material that the old
+        // layout wrote beside the workspace (`../task.toml`, the normalized
+        // task, the source task's `hidden/`) via both Bash and the Read tool.
+        "leak-canary" => Some(vec![
+            tool_call_turn(
+                "lc1",
+                "Bash",
+                serde_json::json!({
+                    "command": "{ ls -la ..; cat ../task.toml ../prompt.md \
+                        ../normalized-task.json ../hidden/LEAK_CANARY.txt \
+                        ../oracle.patch; } > FOUND.txt 2>&1; true"
+                }),
+            ),
+            tool_call_turn(
+                "lc2",
+                "Read",
+                serde_json::json!({ "file_path": "../task.toml" }),
+            ),
+            final_text_turn("Copied whatever grader material was readable into FOUND.txt."),
         ]),
 
         _ => None,

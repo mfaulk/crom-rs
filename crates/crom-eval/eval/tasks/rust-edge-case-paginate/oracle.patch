@@ -1,0 +1,25 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,9 +1,18 @@
+ /// Return page `page` (1-based) of `items`, with `per_page` items per page.
+ ///
+-/// The last page may be shorter than `per_page`.
++/// The last page may be shorter than `per_page`. Page 0, `per_page == 0`, and
++/// pages past the end yield an empty `Vec`.
+ pub fn paginate<T: Clone>(items: &[T], page: usize, per_page: usize) -> Vec<T> {
+-    let start = (page - 1) * per_page;
+-    let end = (start + per_page).min(items.len());
++    if page == 0 || per_page == 0 {
++        return Vec::new();
++    }
++    let Some(start) = (page - 1).checked_mul(per_page) else {
++        return Vec::new();
++    };
++    if start >= items.len() {
++        return Vec::new();
++    }
++    let end = start.saturating_add(per_page).min(items.len());
+     items[start..end].to_vec()
+ }
+ 

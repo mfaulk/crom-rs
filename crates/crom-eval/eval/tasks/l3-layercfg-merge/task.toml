@@ -1,0 +1,81 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-layercfg-merge"
+title = "Deep-merge config layers and fix environment overrides in layercfg"
+category = "bugfix"
+difficulty = "hard"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "config", "l3"]
+suites = ["l3"]
+
+prompt = """
+The `layercfg` workspace (`confval`, `layers`, `appconfig`) loads the
+service configuration from defaults, an optional file, and environment
+variables. Two classes of bug keep biting deployments:
+
+1. A config file that overrides a single key in a section, e.g. only
+   `[server]` / `port = 9000`, makes `AppConfig::load` fail with a missing
+   `server.host`: the file's section replaces the whole default section.
+2. Environment overrides don't work: `APP_SERVER__PORT=9001` is rejected or
+   ignored, `APP_SERVER__READ_TIMEOUT=5` doesn't reach `server.read_timeout`,
+   and `APP_FEATURES__METRICS=false` is not treated as a boolean.
+
+Fix it so that:
+
+- Merging layers is a deep merge: when both sides hold a table at the same
+  key, their entries are merged recursively; otherwise the later layer's
+  value replaces the earlier one.
+- For variables starting with `APP_`, the rest of the name is split on `__`
+  into path segments, each lowercased (a single `_` stays part of the key),
+  so `APP_DB__POOL__MAX` sets `db.pool.max`. Values are interpreted the same
+  way as scalar values in config files.
+- Precedence stays defaults < file < environment.
+
+Keep public signatures unchanged and `cargo test --workspace` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --workspace --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+  "cargo test --offline -p layers --test acceptance_merge",
+  "cargo test --offline -p appconfig --test acceptance_load",
+]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

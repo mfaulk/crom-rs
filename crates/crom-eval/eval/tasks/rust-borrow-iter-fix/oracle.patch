@@ -1,0 +1,20 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,14 +10,14 @@
+     people
+         .iter()
+         .filter(|p| p.age >= 18)
+-        .map(|p| p.name)
++        .map(|p| p.name.as_str())
+         .collect()
+ }
+ 
+ /// Uppercase every tag in place; return how many tags actually changed.
+ pub fn shout_all(tags: &mut Vec<String>) -> usize {
+     let mut changed = 0;
+-    for tag in tags.iter() {
++    for tag in tags.iter_mut() {
+         let upper = tag.to_uppercase();
+         if upper != *tag {
+             *tag = upper;

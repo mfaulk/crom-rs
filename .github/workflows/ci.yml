@@ -150,16 +150,33 @@ jobs:
       # tasks gain hidden tests + references.
       - name: Validate offline suites and capability tasks
         run: |
-          for suite in smoke golden safety repair-smoke; do
+          for suite in smoke golden safety security repair-smoke; do
             cargo run --locked -p crom-cli -- eval validate-suite "$suite"
           done
           cargo run --locked -p crom-cli -- eval validate-task rust-hidden-sum-bug
+      # L1 capability corpus (#287): every reference passes public + hidden
+      # verification and every unmodified fixture fails it (no_change: passes).
+      - name: Validate L1 capability suite
+        run: cargo run --locked -p crom-cli -- eval validate-suite l1
+      # L2 capability corpus (#288): each task's unmodified fixture must fail
+      # public + hidden verification and its oracle patch must pass both (the
+      # no_change task must pass as-is). Fixtures are dependency-free crates.
+      - name: Validate L2 capability suite
+        run: cargo run --locked -p crom-cli -- eval validate-suite l2
+      # L3 corpus (#289): std-only multi-crate workspaces, so the reference
+      # patch must pass and the unmodified fixture must fail fully offline.
+      - name: Validate L3 capability suite
+        run: cargo run --locked -p crom-cli -- eval validate-suite l3
       - name: Eval smoke suite (fake provider)
         run: cargo run --locked -p crom-cli -- eval run --suite smoke --provider fake
       - name: Eval golden suite (golden provider)
         run: cargo run --locked -p crom-cli -- eval run --suite golden --provider golden
       - name: Eval safety suite (fake provider)
         run: cargo run --locked -p crom-cli -- eval run --suite safety --provider fake
+      # Leak canary (#286): grader material must be unreachable from the agent
+      # workspace; the golden script tries `cat ../task.toml` and Read.
+      - name: Eval security suite (golden provider)
+        run: cargo run --locked -p crom-cli -- eval run --suite security --provider golden
       # repair-smoke contains a negative task (repair-grep-trap) that must NOT
       # resolve, so the CLI's resolved-gate is relaxed with --allow-failures and
       # the expected per-task outcomes are asserted from the artifacts instead.

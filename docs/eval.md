@@ -51,6 +51,7 @@ $ crom eval run <task-id> --adapter internal
 $ crom eval run <path> --adapter directory
 $ crom eval run --suite <suite> --isolation local --network false
 $ crom eval run --suite <suite> --repetitions 5
+$ crom eval run --suite <suite> --repetitions 5 --seed 42
 $ crom eval run --suite <suite> --prompt-variant concise
 $ crom eval run <path> --adapter aider --attempts 2
 $ crom eval validate-task <id-or-path>
@@ -154,11 +155,123 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
 - `safety` — tasks exercising permission and destructive-command behavior.
   Passes deterministically under the **fake** provider.
 - `planning` — tasks that require explicit plan-then-act behavior.
+- `security` — `kind = "security"` scenarios. `leak-canary` checks that grader
+  material is unreachable from the agent workspace; it passes under the
+  **golden** provider (see [eval-isolation.md](eval-isolation.md#leakage)).
 - `repair-smoke` / `repair-mini` — M16 repair-loop tasks scripted for the
   **golden** provider. `repair-grep-trap` is a negative task: it is expected
   *not* to resolve (see [Repair loop](#repair-loop-m16)).
 - `private` — tasks with `visibility = "private"`. Excluded from suite
   selection and `eval list` unless `--include-private` is passed.
+- `l1` — the L1 capability corpus (M17.2, #287): single-file Rust tasks, all
+  `kind = "capability"`, `level = "L1"`, `network = "none"`, each with hidden
+  verification and a validated reference. Intended for a live provider; CI
+  validates it model-free with `crom eval validate-suite l1`.
+- `l2` — the M17 L2 capability corpus (multi-step coding and repair). Every
+  task is `kind = "capability"`, `level = "L2"`, with hidden tests and a
+  reference. Intended for a live provider; see [L2 corpus](#l2-corpus-m172).
+- `l3` — M17.2 L3 capability corpus (real-repository engineering): ten
+  multi-crate Rust workspaces with hidden behavioral tests and oracle-patch
+  references. Intended for a live provider; see [L3 corpus](#l3-corpus-m172).
+
+### L1 capability corpus
+
+| Task | Skill | Reference | Hidden verification |
+|---|---|---|---|
+| `rust-failing-unit-test` | bug fix (visible failing test) | `oracle_patch` | `max_value` at all positions, duplicates, `i64` extremes |
+| `rust-hidden-sum-bug` | bug fix (no visible failing test) | `oracle_patch` | `add` on mixed-sign inputs |
+| `rust-compiler-error` | compile error after a field rename | `oracle_patch` | `area` values; public `width`/`height` fields kept |
+| `rust-implement-from-doc` | implement a `todo!()` fn from its doc | `oracle_patch` | run-length encoding: repeated runs, multi-digit counts, Unicode |
+| `rust-edge-case-paginate` | edge-case handling / overflow | `oracle_patch` | page 0, `per_page` 0, past-the-end, `usize` overflow |
+| `rust-refactor-preserve` | refactor preserving behavior | `oracle_patch` | behavior on all radii + at most one PI literal / negative check |
+| `rust-api-addition` | small API addition | `oracle_patch` | `peek`, `is_empty`, `Default`, `FromIterator` |
+| `rust-add-regression-test` | test writing | `oracle_patch` | slugify behavior + mutation check: the agent's test must fail against the original bug |
+| `rust-error-handling` | panics → typed `Result` | `oracle_patch` | each `ParseError` variant, check order, `?` via `Box<dyn Error>` |
+| `rust-borrow-iter-fix` | iterator ownership/borrowing | `oracle_patch` | order/boundary, borrowed (pointer-equal) names, change count |
+| `rust-nochange-leap-year` | negative (`no_change`) | `validated_oracle` | Gregorian century rule; "fixing" 1900 fails |
+| `rust-nochange-midpoint` | negative (`no_change`) | `validated_oracle` | rounding and `u32::MAX` inputs; `(a + b) / 2` fails |
+
+Hidden fixtures live in each task's `hidden/` directory (outside `repo/`) and
+are overlaid only after the agent finishes; oracle patches live beside
+`task.toml`. Script checks under `hidden/hidden_checks/` run via `sh`.
+
+### L2 corpus (M17.2)
+
+Ten dependency-free, multi-module Rust crates (115–305 lines of Rust each) under
+`crates/crom-eval/eval/tasks/l2-*`. Each change task's `oracle.patch` touches
+at least two files; hidden tests in `hidden/tests/` are overlaid only after the
+agent finishes. Public verification is `cargo test` unless noted.
+
+| Task | Exercises | Reference touches |
+|---|---|---|
+| `l2-order-discount-codes` | cross-module feature (order, pricing, receipt) | 4 files |
+| `l2-shape-trait-refactor` | trait signature change + new required/provided methods, call-site updates | 6 files |
+| `l2-expr-test-cascade` | lexer + parser root causes behind a cascade of failing tests | 2 files |
+| `l2-feature-flag-json` | repair code behind the `json` cargo feature; public verification also runs `cargo test --features json` | 2 files |
+| `l2-config-error-enum` | replace `Result<_, String>` with a typed `ConfigError` across modules | 5 files |
+| `l2-library-borrow-repair` | borrow-checker / type errors after a by-reference `Store` API change | 2 files |
+| `l2-todo-cli-done` | new CLI subcommand plus an integration test that runs the binary | 4 files |
+| `l2-contacts-schema-v2` | versioned text-format migration with escaping and a `migrate` helper | 4 files |
+| `l2-pipeline-shutdown` | worker pool: hang (leaked sender), lock held across work, out-of-order results; deterministic watchdog tests | 3 files |
+| `l2-noop-bankers-rounding` | `no_change`: bug report contradicts the documented rounding policy (`reference = "validated_oracle"`) | — |
+
+```console
+crom eval validate-suite l2                               # offline; CI runs this
+crom eval run --suite l2 --provider <profile> --repair enabled
+crom eval run --suite l2 --provider <profile> --repair disabled
+```
+
+Each run needs a cargo toolchain; no task needs the network.
+
+### L3 corpus (M17.2)
+
+Each `l3-*` task is a `kind = "capability"`, `level = "L3"` task whose
+fixture is a realistic three-crate Cargo workspace with an existing, passing
+test suite. The agent must locate the root cause or extension point across
+crates; grading is behavioral.
+
+| Task | Category | Crates | What the reference changes |
+|---|---|---|---|
+| `l3-ledger-split` | bugfix | `money`, `ledger`, `report` | Exact remainder allocation in `Money::allocate` |
+| `l3-semver-prerelease` | bugfix | `versions`, `registry`, `resolver` | Pre-release precedence + Cargo pre-release matching |
+| `l3-logstore-reopen` | bugfix | `wire`, `logstore`, `kvtool` | LEB128 varint decoding (data loss on reopen) |
+| `l3-http-header-case` | bugfix | `http-types`, `middleware`, `server` | Case-insensitive header names and content codings |
+| `l3-cron-ranges-steps` | feature | `calendar`, `cronexpr`, `scheduler` | `A-B`, `*/S`, `A-B/S` cron field syntax |
+| `l3-buildplan-cycles` | bugfix | `manifest`, `depgraph`, `planner` | Cycle detection/reporting instead of a panic |
+| `l3-csv-quoting` | bugfix | `csvread`, `schema`, `colstats` | RFC 4180 quoting, CRLF, embedded newlines |
+| `l3-mdtoc-anchors` | bugfix | `mdscan`, `slugger`, `toc` | GitHub slugs, duplicate suffixes, fenced code |
+| `l3-throttle-refill` | bugfix | `clock`, `bucket`, `gateway` | Token-bucket refill drift and exact `Retry-After` |
+| `l3-layercfg-merge` | bugfix | `confval`, `layers`, `appconfig` | Deep merge of layers and `APP_A__B` env overrides |
+
+Verification:
+
+- Public oracle: `cargo test --workspace --offline` (passes on the
+  unmodified fixture; guards against regressions).
+- Hidden oracle: `acceptance_*.rs` integration tests overlaid from
+  `hidden/crates/<crate>/tests/` after the agent finishes, run with
+  `cargo test --offline -p <crate> --test <name>`.
+- `crom eval validate-suite l3` proves, offline, that every reference patch
+  passes public + hidden verification and every unmodified fixture fails it.
+  CI runs it on every push/PR; `crates/crom-eval/tests/l3_corpus.rs` checks
+  structure (kind/level, offline commands, hidden dir outside `repo/`,
+  path-only dependencies, provenance, size budget).
+
+Provenance and storage: the fixtures are original, synthetic workspaces
+(`provenance.source = "original"`, `Apache-2.0 OR MIT`), not snapshots of
+upstream repositories. They depend only on `std` and on each other through
+path dependencies, so no `cargo vendor` tarball or registry cache is needed
+and verification works with `network = "none"`. The corpus adds ~190 KB of
+plain files to the repository (~4.1k lines of fixture Rust, 10–25 KB per
+task); `l3_corpus.rs` caps each task at 96 KB. Larger pinned upstream
+snapshots (the 2k–30k LoC target in #289) need a separate storage decision
+(git bundle plus vendored-deps tarball, or a fixtures repository) and are
+not part of this corpus.
+
+Leakage: as for every task (#286), only `repo/` is copied into the agent
+workspace; `hidden/` is overlaid onto the workspace root recursively after
+the agent exits, so `hidden/crates/<crate>/tests/acceptance_*.rs` lands next
+to that crate's existing `tests/`. `task.toml` and `oracle.patch` never enter
+the workspace.
 
 ## Adding a new task
 
@@ -320,7 +433,7 @@ Every run writes a self-contained bundle:
 target/crom-eval/
   index.jsonl              # regression index, one entry per task result
   runs/<run-id>/
-    run.json               # run metadata (provider, adapter, isolation, flags)
+    run.json               # run metadata, schema v2 (provider, model, flags, seed, git, host, crom version)
     summary.json
     summary.md
     behavior-summary.json  # behavior metrics aggregated over the run
@@ -348,20 +461,27 @@ target/crom-eval/
       verification.json    # per-check public/hidden verification results
       behavior.json        # behavior metrics for the task
       score.json
-      result.json          # the full task result (status, resolved, failure class, usage, model_round_trips, …)
+      result.json          # the full task result, schema v2 (status, outcome, failure class, usage, repro metadata, …)
       index-entry.json     # the row appended to index.jsonl
       report.md
       triage.md
       repair.json, repair.md, diagnostics.jsonl, validation-attempts.jsonl
                            # repair-loop artifacts (--repair enabled)
-      workspace/           # the isolated workspace (preserved on success and failure)
+      workspace/           # verification copy: the agent workspace moved here after the
+                           # agent exits, plus the hidden overlay (preserved)
 ```
 
 With `--repetitions k` (k > 1) each repetition writes its own
 `<run-id>/rep-<n>/tasks/<task-id>/` tree.
 
-Each task runs in its own git-initialised workspace; the final patch is the diff
-against the baseline commit.
+`result.json`, `run.json`, and `summary.json` follow result schema v2
+(outcome classes, pass-rate denominators, reproducibility metadata,
+comparability rule, v1 back-compat); see
+[Result schema v2](eval-schema.md#result-schema-v2-m174).
+
+Each task runs in its own git-initialised workspace under
+`$TMPDIR/crom-eval-ws/`, outside the run directory, so grader material is not
+beside it (#286). The final patch is the diff against the baseline commit.
 
 ## CI behavior
 
@@ -370,9 +490,11 @@ offline lane on every push/PR:
 
 ```console
 cargo test -p crom-eval
+crom eval validate-suite <smoke|golden|safety|repair-smoke|l1|l2|l3>
 crom eval run --suite smoke --provider fake
 crom eval run --suite golden --provider golden
 crom eval run --suite safety --provider fake
+crom eval run --suite security --provider golden
 crom eval run --suite repair-smoke --provider golden --repair enabled --allow-failures
 ```
 

@@ -1,0 +1,59 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "none"
+reference = "oracle_patch"
+id = "rust-edge-case-paginate"
+title = "Make pagination total: no panics on out-of-range input"
+category = "bugfix"
+difficulty = "easy"
+tags = ["rust", "single-file", "edge-case", "overflow", "hidden-tests", "small"]
+suites = ["l1"]
+
+prompt = """
+`paginate` in src/lib.rs panics for some inputs. It must never panic: whenever
+the requested page has no items (including page 0, per_page 0, pages past the
+end, or page/per_page values so large the arithmetic would overflow) it should
+return an empty Vec. Results for valid pages must not change. Keep the public
+signature unchanged.
+"""
+
+max_turns = 20
+timeout_secs = 240
+
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/lib.rs"]
+oracle_patch = "oracle.patch"
+
+[capabilities]
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# Public: the existing happy-path tests (they pass on the unmodified fixture).
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+# Hidden: page 0, per_page 0, past-the-end, empty input, usize overflow.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

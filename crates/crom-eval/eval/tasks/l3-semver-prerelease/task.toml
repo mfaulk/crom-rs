@@ -1,0 +1,78 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-semver-prerelease"
+title = "Fix pre-release precedence and matching in a package resolver workspace"
+category = "bugfix"
+difficulty = "hard"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "l3"]
+suites = ["l3"]
+
+prompt = """
+This workspace is a small package resolver (`versions`, `registry`,
+`resolver`). Since a maintainer published `2.0.0-rc.1` of a package, the
+resolver has started choosing release candidates: with `2.0.0-rc.1` and
+`2.0.0` both published it picks the RC, and a plain requirement such as
+`>=1.0.0` or `*` happily selects pre-releases.
+
+Fix the workspace to follow semver.org precedence and Cargo's pre-release
+rule:
+
+1. A normal release has higher precedence than any pre-release of the same
+   `major.minor.patch` (`1.0.0-rc.1 < 1.0.0`). All other ordering stays as is.
+2. A pre-release version only satisfies a `VersionReq` if at least one of the
+   requirement's comparators itself has a pre-release with the same
+   `major.minor.patch` (so `^1.3.0-beta.1` accepts `1.3.0-beta.2`, but
+   `>=1.0.0` and `*` never accept a pre-release, and `^1.3.0-beta.1` does not
+   accept `1.4.0-alpha`). Non-pre-release versions are matched as before.
+
+Keep the public API of every crate unchanged and keep
+`cargo test --workspace` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --workspace --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+  "cargo test --offline -p versions --test acceptance_prerelease",
+  "cargo test --offline -p resolver --test acceptance_resolve_pre",
+]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

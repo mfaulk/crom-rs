@@ -1,27 +1,39 @@
 schema_version = 3
-task_version = "1.0.0"
+task_version = "1.1.0"
 kind = "capability"
 level = "L1"
 network = "none"
+reference = "oracle_patch"
 id = "rust-compiler-error"
-title = "Repair a broken build after an API change"
+title = "Repair a broken build after a field rename"
 category = "bugfix"
-difficulty = "medium"
-tags = ["rust", "compile", "small", "multi-file"]
-suites = ["rust-small", "rust-mini"]
+difficulty = "easy"
+tags = ["rust", "single-file", "compile", "hidden-tests", "small"]
+suites = ["rust-small", "rust-mini", "l1"]
 
 prompt = """
 This crate does not compile: a struct field was renamed but a caller was not
-updated. Make it build and pass tests without changing the test expectations.
+updated. Make it build and make `cargo test` pass without changing the test
+expectations or the struct's public fields.
 """
 
 max_turns = 20
 timeout_secs = 240
 
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/lib.rs"]
+oracle_patch = "oracle.patch"
+
 [capabilities]
 requires_repo_search = true
 requires_test_feedback = true
-requires_multifile_edit = true
+requires_public_api_preservation = true
+
+# Advisory (not enforced): validate with cargo after editing.
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
 
 [fixture]
 kind = "copy_dir"
@@ -31,9 +43,13 @@ path = "repo"
 kind = "rust"
 test = true
 
-[[oracle.behavior]]
-kind = "must_run_command"
-command_contains = "cargo"
+# Hidden: area for several shapes, and the renamed public fields still exist.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]
 
 [provenance]
 author = "crom maintainers"

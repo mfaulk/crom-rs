@@ -1,0 +1,73 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+expected_outcome = "change"
+id = "l2-config-error-enum"
+title = "Replace stringly-typed errors with a ConfigError enum"
+category = "refactor"
+difficulty = "medium"
+tags = ["rust", "multi-file", "hidden-tests", "refactor", "error-handling"]
+suites = ["l2"]
+
+prompt = """
+Every fallible function in the `iniconf` crate returns `Result<_, String>`.
+Redesign the error handling around a typed error:
+
+- Add `pub enum ConfigError` in a new module `src/error.rs`, re-exported from
+  the crate root, deriving `Debug, Clone, PartialEq, Eq`, with exactly these
+  variants:
+  - `Syntax { line: usize, msg: String }` for parse errors (1-based line; `msg`
+    is the existing message text without the `line N: ` prefix),
+  - `Missing { key: String }`,
+  - `Invalid { key: String, value: String, expected: &'static str }` where
+    `expected` is the target type name (`"u16"` or `"bool"`).
+- Implement `Display` so `to_string()` yields exactly the messages the crate
+  produces today, and implement `std::error::Error`.
+- Change `parse`, `Config::require`, `Config::get_u16`, `Config::get_bool`,
+  `Config::get_u16_or`, `ServerSettings::from_config`, and
+  `ServerSettings::load` to return `Result<_, ConfigError>`.
+
+`cargo test` must keep passing.
+"""
+
+max_turns = 30
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/error.rs", "src/parse.rs", "src/typed.rs", "src/settings.rs"]
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden_errors"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

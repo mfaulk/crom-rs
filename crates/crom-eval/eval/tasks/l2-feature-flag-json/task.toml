@@ -1,0 +1,72 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L2"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+expected_outcome = "change"
+id = "l2-feature-flag-json"
+title = "Repair and complete feature-gated JSON export"
+category = "feature"
+difficulty = "medium"
+tags = ["rust", "multi-file", "hidden-tests", "feature-flags", "cfg"]
+suites = ["l2"]
+
+prompt = """
+The `metrics` crate has an optional cargo feature `json`. The default build
+works, but `cargo test --features json` does not compile. Fix it and finish the
+JSON exporter in src/export.rs:
+
+- `events_to_json(&[Event]) -> String` emits a compact JSON array of objects
+  `{"name":"...","duration_ms":N,"tags":["...",...]}` (keys in that order, no
+  whitespace).
+- Add `to_json(&Summary) -> String` emitting
+  `{"count":N,"total_ms":N,"max_ms":N,"mean_ms":N}` (mean as in
+  `Summary::mean_ms`).
+- All strings must be valid JSON strings: escape `"`, `\\`, `\\n`, `\\r`, `\\t`,
+  and any other control character below U+0020 as `\\u00XX` (lower-case hex).
+- Re-export `event_to_json`, `events_to_json`, and `to_json` from the crate
+  root, only when the `json` feature is enabled.
+
+Both `cargo test` and `cargo test --features json` must pass. Do not add
+dependencies.
+"""
+
+max_turns = 30
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/export.rs", "src/lib.rs"]
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_feature_flags = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test", "cargo test --features json"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo build", "cargo test --features json --test hidden_json"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

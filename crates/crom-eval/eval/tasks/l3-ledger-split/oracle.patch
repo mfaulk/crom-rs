@@ -1,0 +1,38 @@
+diff --git a/crates/money/src/lib.rs b/crates/money/src/lib.rs
+index fec817f..ceec3aa 100644
+--- a/crates/money/src/lib.rs
++++ b/crates/money/src/lib.rs
+@@ -160,11 +160,28 @@ impl Money {
+         if total == 0 {
+             return Err(MoneyError::ZeroRatios);
+         }
+-        let parts = ratios
+-            .iter()
+-            .map(|&r| Money::from_minor(self.minor * r as i64 / total, self.currency))
+-            .collect();
+-        Ok(parts)
++        let mut minors: Vec<i64> = Vec::with_capacity(ratios.len());
++        for &r in ratios {
++            let share = (self.minor as i128 * r as i128 / total as i128) as i64;
++            minors.push(share);
++        }
++        let step = if self.minor < 0 { -1 } else { 1 };
++        let mut remainder = self.minor - minors.iter().sum::<i64>();
++        while remainder != 0 {
++            for (m, &r) in minors.iter_mut().zip(ratios) {
++                if remainder == 0 {
++                    break;
++                }
++                if r > 0 {
++                    *m += step;
++                    remainder -= step;
++                }
++            }
++        }
++        Ok(minors
++            .into_iter()
++            .map(|m| Money::from_minor(m, self.currency))
++            .collect())
+     }
+ 
+     /// Split evenly into `n` parts.

@@ -20,7 +20,8 @@
 //!     command-output/001-cargo-test.stdout ...
 //!     score.json
 //!     report.md
-//!     workspace/        (preserved on success and failure)
+//!     workspace/        (verification copy: agent workspace moved here after
+//!                        the agent exits, plus the hidden overlay)
 //! ```
 //!
 //! Everything except `workspace/` is written through [`write_redacted`].

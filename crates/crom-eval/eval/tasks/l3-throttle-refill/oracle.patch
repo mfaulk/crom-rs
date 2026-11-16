@@ -1,0 +1,35 @@
+diff --git a/crates/bucket/src/lib.rs b/crates/bucket/src/lib.rs
+index d728313..e374490 100644
+--- a/crates/bucket/src/lib.rs
++++ b/crates/bucket/src/lib.rs
+@@ -36,12 +36,17 @@ impl TokenBucket {
+         self.interval_ms
+     }
+ 
++    /// Credit whole intervals since the last refill, keeping the partial
++    /// interval; once the bucket is full, progress stops accumulating.
+     fn refill(&mut self, now_ms: u64) {
+         let elapsed = now_ms.saturating_sub(self.last_refill_ms);
+         let new_tokens = elapsed / self.interval_ms;
+-        if new_tokens > 0 {
+-            self.tokens = (self.tokens as u64 + new_tokens).min(self.capacity as u64) as u32;
++        if self.tokens as u64 + new_tokens >= self.capacity as u64 {
++            self.tokens = self.capacity;
+             self.last_refill_ms = now_ms;
++        } else {
++            self.tokens += new_tokens as u32;
++            self.last_refill_ms += new_tokens * self.interval_ms;
+         }
+     }
+ 
+@@ -59,8 +64,9 @@ impl TokenBucket {
+                 remaining: self.tokens,
+             }
+         } else {
++            let elapsed = now_ms.saturating_sub(self.last_refill_ms);
+             Take::Denied {
+-                retry_after_ms: self.interval_ms,
++                retry_after_ms: self.interval_ms - elapsed,
+             }
+         }
+     }

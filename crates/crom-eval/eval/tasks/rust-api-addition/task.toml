@@ -1,0 +1,63 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L1"
+network = "none"
+reference = "oracle_patch"
+id = "rust-api-addition"
+title = "Extend a small Stack API"
+category = "feature"
+difficulty = "easy"
+tags = ["rust", "single-file", "api", "traits", "hidden-tests", "small"]
+suites = ["l1"]
+
+prompt = """
+Extend `Stack<T>` in src/lib.rs with:
+
+- `peek(&self) -> Option<&T>`: the top item without removing it.
+- `is_empty(&self) -> bool`.
+- `Default`, equivalent to `Stack::new()`.
+- `FromIterator<T>`, pushing items in iteration order (so the last item yielded
+  ends up on top).
+
+Do not change the existing methods. Add unit test coverage for the new API.
+"""
+
+max_turns = 20
+timeout_secs = 240
+
+forbidden_paths = ["Cargo.toml"]
+required_paths = ["src/lib.rs"]
+oracle_patch = "oracle.patch"
+
+[capabilities]
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test"]
+
+# Hidden: exercises peek / is_empty / Default / collect() against the public
+# API; it does not compile against the unmodified fixture.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

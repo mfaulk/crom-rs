@@ -1,0 +1,77 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-throttle-refill"
+title = "Fix token-bucket refill drift and Retry-After hints in the throttle gateway"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "time", "l3"]
+suites = ["l3"]
+
+prompt = """
+Operators of the `throttle` gateway (`clock`, `bucket`, `gateway`) report two
+problems:
+
+1. Clients that poll steadily get far fewer requests through than the
+   configured rate. With a 100 ms interval and a capacity of 2, a client
+   polling every 60 ms only gets a request through every 120 ms instead of
+   every 100 ms on average.
+2. When a client is limited, the `Retry-After` hint is always the full
+   interval, even when the next token is only a few milliseconds away.
+
+Fix the workspace so that a bucket gains one token per `interval_ms` of
+elapsed time measured continuously: partial progress toward the next token
+is never lost between calls, a bucket never holds more than `capacity`
+tokens, and time spent while the bucket is full does not bank extra
+progress. A denied request reports `retry_after_ms` as the exact number of
+milliseconds until the next token becomes available. The gateway's
+decisions must reflect this.
+
+Keep public signatures unchanged and `cargo test --workspace` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --workspace --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+  "cargo test --offline -p bucket --test acceptance_refill",
+  "cargo test --offline -p gateway --test acceptance_rate",
+]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

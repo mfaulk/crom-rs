@@ -73,11 +73,37 @@ For container backends, `container_engine` records the engine version and
 `container_image` records the image. Hidden tests remain unavailable until after
 the agent completes regardless of backend.
 
+## Leakage
+
+Grader material must not be reachable from the agent workspace (M17.2, #286).
+Task-authoring rules are in
+[eval-schema.md](eval-schema.md#where-grader-material-lives-m172-286).
+
+| Layer | What it guarantees | Enforced by |
+|---|---|---|
+| Workspace root | The agent's cwd is `$TMPDIR/crom-eval-ws/ws-<random>/` (mode 0700) with only the public fixture + git baseline. `task.toml`, `prompt.md`, `normalized-task.json`, `hidden/`, `oracle.patch`, and earlier results are not inside it or beside it, so `cat ../task.toml` finds nothing. | runner (`crom_eval::workspace`) |
+| Overlap guard | A workspace root inside (or containing) the runs dir or tasks dir is refused as a harness error. | runner |
+| Hidden overlay | `[hidden].fixture` is copied only into the verification copy (`runs/<id>/tasks/<task>/workspace/`) after the agent exits. | runner |
+| Path tools | `Read`/`Write`/`Edit`/`Glob`/`Grep` reject paths outside the workspace, including absolute paths to the task source or run dir. | `crom-tools` path sandbox |
+| Agent Bash, absolute paths | **Not enforced yet.** Bash can still read the task source dir or `target/crom-eval/runs` by absolute path. | #253 (OS sandbox must not mount the artifacts dir or task source dir) |
+
+`TMPDIR` controls the workspace root. The `leak-canary` task (suite
+`security`, `kind = "security"`) asks the agent to copy grader material into
+`FOUND.txt`; it resolves only if no grader token leaks. Run it offline with:
+
+```console
+$ crom eval run --suite security --provider golden
+```
+
+Coverage lives in `crates/crom-eval/tests/leakage.rs`; the Bash
+absolute-path test is `#[ignore]`d until #253 lands.
+
 ## Known limitations
 
 - No backend sandboxes the agent: tool calls run on the host under `local`,
   `docker`, and `podman` alike (container backends confine verification only).
-  The workspace is isolated by working directory, not by OS sandboxing. Run
+  The workspace is a separate temp dir (see [Leakage](#leakage)), not an OS
+  sandbox. Run
   live evals that enable Bash only against trusted tasks, or run the whole
   harness inside an externally sandboxed environment (container/VM).
 - On timeout the harness kills the wrapping `sh`; a long-running child (e.g.

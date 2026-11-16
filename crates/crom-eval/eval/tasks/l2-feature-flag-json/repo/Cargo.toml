@@ -1,0 +1,12 @@
+# Empty [workspace] table keeps the parent workspace from absorbing this fixture.
+[workspace]
+
+[package]
+name = "metrics"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# Hand-written JSON export (no external dependencies).
+json = []

@@ -1,0 +1,72 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-ledger-split"
+title = "Make shared-expense splits exact across the money/ledger workspace"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is a small bookkeeping workspace (`money`, `ledger`, `report`). Users
+report that splitting an expense sometimes fails with an "unbalanced" error:
+for example, `Ledger::split_expense` for $100.00 shared by three people is
+rejected, and calling `Money::split(3)` on $100.00 returns parts that only add
+up to $99.99.
+
+Fix it so that allocations are exact: the parts returned by `Money::allocate`
+(and therefore `Money::split` and `Ledger::split_expense`) must always sum to
+the original amount, including for negative amounts. Each part should get its
+proportional share rounded toward zero, and any leftover minor units are then
+handed out one at a time to the earliest parts in the list
+($100.00 / 3 -> 33.34, 33.33, 33.33). A part whose ratio is zero always
+gets zero. Keep the public API unchanged and make
+sure `cargo test --workspace` still passes.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --workspace --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+  "cargo test --offline -p money --test acceptance_allocate",
+  "cargo test --offline -p ledger --test acceptance_split",
+]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-14"

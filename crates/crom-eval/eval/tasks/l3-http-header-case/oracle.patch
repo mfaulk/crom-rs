@@ -1,0 +1,44 @@
+diff --git a/crates/http-types/src/headers.rs b/crates/http-types/src/headers.rs
+index 747a63d..ed0c2f8 100644
+--- a/crates/http-types/src/headers.rs
++++ b/crates/http-types/src/headers.rs
+@@ -14,7 +14,7 @@ impl Headers {
+     pub fn get(&self, name: &str) -> Option<&str> {
+         self.entries
+             .iter()
+-            .find(|(n, _)| n == name)
++            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+             .map(|(_, v)| v.as_str())
+     }
+ 
+@@ -22,7 +22,7 @@ impl Headers {
+     pub fn get_all(&self, name: &str) -> Vec<&str> {
+         self.entries
+             .iter()
+-            .filter(|(n, _)| n == name)
++            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+             .map(|(_, v)| v.as_str())
+             .collect()
+     }
+@@ -45,7 +45,7 @@ impl Headers {
+     /// Remove every value for `name`; returns how many were removed.
+     pub fn remove(&mut self, name: &str) -> usize {
+         let before = self.entries.len();
+-        self.entries.retain(|(n, _)| n != name);
++        self.entries.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+         before - self.entries.len()
+     }
+ 
+diff --git a/crates/middleware/src/lib.rs b/crates/middleware/src/lib.rs
+index a38d17b..e83f5e4 100644
+--- a/crates/middleware/src/lib.rs
++++ b/crates/middleware/src/lib.rs
+@@ -29,7 +29,7 @@ impl Compression {
+                 .find_map(|p| p.trim().strip_prefix("q="))
+                 .and_then(|q| q.parse::<f32>().ok())
+                 .unwrap_or(1.0);
+-            let name = match coding {
++            let name = match coding.to_ascii_lowercase().as_str() {
+                 "br" => "br",
+                 "gzip" => "gzip",
+                 _ => continue,

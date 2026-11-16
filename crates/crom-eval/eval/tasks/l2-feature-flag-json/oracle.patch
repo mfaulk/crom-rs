@@ -1,0 +1,66 @@
+diff --git a/src/export.rs b/src/export.rs
+--- a/src/export.rs
++++ b/src/export.rs
+@@ -4,13 +4,33 @@
+ use crate::model::Event;
+ use crate::summary::Summary;
+ 
+-fn escape(s: &str) -> String {
+-    s.replace('"', "\\\"")
++fn string(s: &str) -> String {
++    let mut out = String::with_capacity(s.len() + 2);
++    out.push('"');
++    for c in s.chars() {
++        match c {
++            '"' => out.push_str("\\\""),
++            '\\' => out.push_str("\\\\"),
++            '\n' => out.push_str("\\n"),
++            '\r' => out.push_str("\\r"),
++            '\t' => out.push_str("\\t"),
++            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
++            c => out.push(c),
++        }
++    }
++    out.push('"');
++    out
+ }
+ 
+-/// `{"name":"...","value":N}`
++/// `{"name":"...","duration_ms":N,"tags":[...]}`
+ pub fn event_to_json(e: &Event) -> String {
+-    format!("{{\"name\":\"{}\",\"value\":{}}}", escape(&e.name), e.value)
++    let tags: Vec<String> = e.tags.iter().map(|t| string(t)).collect();
++    format!(
++        "{{\"name\":{},\"duration_ms\":{},\"tags\":[{}]}}",
++        string(&e.name),
++        e.duration_ms,
++        tags.join(",")
++    )
+ }
+ 
+ /// A JSON array of [`event_to_json`] objects.
+@@ -19,4 +39,13 @@
+     format!("[{}]", parts.join(","))
+ }
+ 
+-// TODO: summary export.
++/// `{"count":N,"total_ms":N,"max_ms":N,"mean_ms":N}`
++pub fn to_json(s: &Summary) -> String {
++    format!(
++        "{{\"count\":{},\"total_ms\":{},\"max_ms\":{},\"mean_ms\":{}}}",
++        s.count,
++        s.total_ms,
++        s.max_ms,
++        s.mean_ms()
++    )
++}
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,3 +12,6 @@
+ pub use model::Event;
+ pub use summary::Summary;
+ pub use text::render_text;
++
++#[cfg(feature = "json")]
++pub use export::{event_to_json, events_to_json, to_json};

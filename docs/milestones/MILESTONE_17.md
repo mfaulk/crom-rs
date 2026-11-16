@@ -377,19 +377,21 @@ provenance. "Validates" is `crom eval validate-task <id>` with 0 errors.
 | repair-grep-recover | harness | L0 | none | change | yes | scripted `repair-smoke` |
 | repair-grep-trap | harness | L0 | none | change | yes | scripted negative (`repair-smoke`) |
 | rust-hidden-sum-bug | capability | L1 | none | change | yes | hidden test + `oracle_patch` reference |
-| rust-failing-unit-test | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
-| rust-compiler-error | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
+| rust-failing-unit-test | capability | L1 | none | change | yes | hidden tests + `oracle_patch`; `l1` suite (#287) |
+| rust-compiler-error | capability | L1 | none | change | yes | hidden tests + `oracle_patch`; `l1` suite (#287) |
 | rust-clippy-cleanup | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
 | rust-serde-edge-case | capability | L1 | registry | change | no | needs hidden tests + reference (#287) |
-| rust-add-regression-test | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
-| rust-refactor-preserve | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
+| rust-add-regression-test | capability | L1 | none | change | yes | hidden tests + `oracle_patch`; `l1` suite (#287) |
+| rust-refactor-preserve | capability | L1 | none | change | yes | hidden tests + `oracle_patch`; `l1` suite (#287) |
 | rust-cli-arg-order | capability | L2 | none | change | no | 3-file fixture; needs hidden tests + reference (#287/#288) |
 | plan-act-small-feature | capability | L2 | none | change | no | plan-then-act; needs hidden tests + reference (#287/#288) |
 
-The eight capability tasks marked "no" fail `capability_hidden` and
+The capability tasks marked "no" fail `capability_hidden` and
 `capability_reference`, so `validate-suite rust-small` / `rust-mini` exit
 non-zero until they are upgraded. CI validates `smoke`, `golden`, `safety`,
-`repair-smoke`, and `rust-hidden-sum-bug`.
+`repair-smoke`, `rust-hidden-sum-bug`, and the `l1` suite (#287: the L1 tasks
+marked "yes" above plus seven new single-file tasks, two of them `no_change`;
+see the task table in [eval.md](../eval.md#l1-capability-corpus)).
 
 ## 10. Provider support and cost strategy
 
