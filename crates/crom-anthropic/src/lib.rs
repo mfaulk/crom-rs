@@ -501,6 +501,7 @@ where
         // `None` until the stream reports a usage block, so a stream with no
         // usage yields `MessageStop { usage: None }` rather than zeros.
         let mut usage_accum: Option<TokenUsage> = None;
+        let mut stop_reason: Option<String> = None;
         let mut started = false;
 
         tokio::pin!(stream);
@@ -623,6 +624,7 @@ where
                     if let Some(u) = usage {
                         merge_usage(&mut usage_accum, &u);
                     }
+                    stop_reason.clone_from(&delta.stop_reason);
                     send_or_stop!(Ok(ModelEvent::MessageStop {
                         stop_reason: delta.stop_reason,
                         usage: usage_accum.clone(),
@@ -651,7 +653,14 @@ where
         // — preferred over best-effort parsing of `partial_json`
         // because the upstream input may be syntactically incomplete
         // (mid-object, mid-string, mid-escape).
-        if !pending.is_empty() {
+        //
+        // Exception: a turn that ended at the output token limit already
+        // reported that via `MessageStop`; the agent loop drops the
+        // incomplete call and asks the model to continue (#284).
+        let hit_token_limit = stop_reason
+            .as_deref()
+            .is_some_and(crom_core::provider::is_output_truncated);
+        if !pending.is_empty() && !hit_token_limit {
             let names: Vec<String> = pending.values().map(|p| p.name.clone()).collect();
             let _ = tx
                 .send(Err(ProviderError::Stream(format!(
@@ -1012,6 +1021,44 @@ mod tests {
             !saw_tool_call,
             "no ToolCall should be emitted from a truncated stream"
         );
+    }
+
+    /// A tool_use cut off by `max_tokens` ends the turn with a truncation stop, not an error (#284).
+    #[tokio::test]
+    async fn max_tokens_mid_tool_use_is_a_truncation_not_an_error() {
+        use futures::stream::StreamExt;
+
+        let events = vec![
+            sse_event(
+                r#"{"type":"message_start","message":{"id":"m1","model":"x","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
+            sse_event(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Write","input":{}}}"#,
+            ),
+            sse_event(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"numbers.txt\",\"content\":\"1\\n2\\n"}}"#,
+            ),
+            sse_event(
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"input_tokens":0,"output_tokens":4096}}"#,
+            ),
+            sse_event(r#"{"type":"message_stop"}"#),
+        ];
+        let mut out = parse_sse(futures::stream::iter(events)).boxed();
+
+        let mut stop = None;
+        while let Some(item) = out.next().await {
+            match item {
+                Ok(ModelEvent::MessageStop { stop_reason, usage }) => {
+                    stop = Some((stop_reason, usage))
+                }
+                Ok(ModelEvent::ToolCall(tc)) => panic!("incomplete tool call emitted: {tc:?}"),
+                Err(e) => panic!("truncation surfaced as an error: {e:?}"),
+                _ => {}
+            }
+        }
+        let (reason, usage) = stop.expect("MessageStop");
+        assert_eq!(reason.as_deref(), Some("max_tokens"));
+        assert_eq!(usage.and_then(|u| u.output_tokens), Some(4096));
     }
 
     // A clean stream that reaches `content_block_stop` for the
