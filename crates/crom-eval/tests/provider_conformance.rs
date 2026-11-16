@@ -447,12 +447,17 @@ fn anthropic_body(reply: &Reply, model: &str) -> String {
             "max_tokens"
         }
     };
+    // Live Anthropic cuts a tool_use at `max_tokens` without a
+    // `content_block_stop` (observed in the M17 live conformance run).
+    let truncated = matches!(reply, Reply::Truncated { .. });
     for (idx, (id, name, partial)) in (index..).zip(tool_blocks) {
         events.push(json!({"type": "content_block_start", "index": idx,
             "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}));
         events.push(json!({"type": "content_block_delta", "index": idx,
             "delta": {"type": "input_json_delta", "partial_json": partial}}));
-        events.push(json!({"type": "content_block_stop", "index": idx}));
+        if !truncated {
+            events.push(json!({"type": "content_block_stop", "index": idx}));
+        }
     }
     events.push(
         json!({"type": "message_delta", "delta": {"stop_reason": stop},

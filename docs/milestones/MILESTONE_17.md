@@ -768,7 +768,25 @@ filled by an opt-in `Eval (live smoke)` dispatch (`eval-live.yml`) with
 
 | Profile | Model | Offline (synthetic transcripts) | Live | Live failures (capability / provider / Crom) |
 |---|---|---|---|---|
-| `anthropic` | `claude-sonnet-4-6` | 6/6 resolved | _pending_ | — |
-| `openai` | `gpt-4.1` | 6/6 resolved | _pending_ | — |
-| `deepseek` | `deepseek-chat` | 6/6 resolved | _pending_ | — |
+| `anthropic` | `claude-sonnet-4-6` | 6/6 resolved | 2/6 resolved, 1 errored, 3 skipped ([run 43956910916](https://github.com/mfaulk/crom-rs/actions/runs/43956910916), $0.062); re-run after #336 _pending_ | `conf-long-output`: **Crom** (see below); 3 skipped as a consequence |
+| `openai` | `gpt-4.1` | 6/6 resolved | 6/6 resolved ([run 43957425729](https://github.com/mfaulk/crom-rs/actions/runs/43957425729), $0.058) | — |
+| `deepseek` | `deepseek-flash` | 6/6 resolved | 6/6 resolved ([run 43956919752](https://github.com/mfaulk/crom-rs/actions/runs/43956919752), $0.004) | — |
 | `gemini` | `gemini-2.5-pro` | 6/6 resolved | _pending_ (not required by #284) | — |
+
+Live runs on 2026-11-16, `max_run_cost_usd = 2` each. DeepSeek ran
+`deepseek-flash` because the profile default `deepseek-chat` has no entry in
+`crates/crom-core/pricing/prices.toml` (unpriced models are skipped).
+
+- **Anthropic `conf-long-output` — Crom bug, fixed in #336.** The model wrote
+  all 3000 lines in a single `Write` and hit `max_tokens` mid-`tool_use`. Live
+  Anthropic sends no `content_block_stop` for the cut block, and the adapter
+  turned the pending block into `ProviderError::Stream("tool_use truncated
+  mid-stream")` even though `message_delta` already reported
+  `stop_reason = max_tokens`. The agent loop's truncation continuation (drop
+  the incomplete call, ask the model to continue) never ran. The synthetic
+  transcript sent `content_block_stop`, so offline CI missed it; it now
+  matches the live stream.
+- **Cascade (open finding for M18).** The errored turn's usage was recorded as
+  unknown, so `--max-run-cost-usd` could no longer be enforced and the
+  remaining three tasks were skipped (fail-closed, as designed). Usage that
+  `message_delta` did report is lost when a turn ends in an error.
