@@ -1,63 +1,85 @@
-name: Eval (live provider)
+name: Eval (live smoke)
 
-# Manual-only. Live-provider evals are informative, not a deterministic CI
-# gate, and cost real model tokens — so they never run on push/PR. Trigger this
-# workflow by hand from the Actions tab. It requires the API-key secret for
-# the chosen provider profile (ANTHROPIC_API_KEY, OPENAI_API_KEY,
-# DEEPSEEK_API_KEY, or GEMINI_API_KEY); without it every task skips, the CLI
-# exits 3, and this job reports a warning instead of failing.
+# Lane 3 (#295). Manual only: never runs on push/PR. Spends real model tokens,
+# so it refuses to start without a spend cap no larger than LIVE_SMOKE_CEILING_USD.
+# Secrets come from the `eval-live` environment; give it required reviewers so
+# every run needs maintainer approval. Without the provider's key every task
+# skips, the CLI exits 3, and the job warns instead of failing.
 on:
   workflow_dispatch:
     inputs:
+      max_run_cost_usd:
+        description: 'Required. Run-wide nominal spend cap in USD (<= 5)'
+        required: true
+        type: string
       suite:
-        description: 'Suite to run (e.g. rust-small, provider-conformance)'
+        description: 'Suite to run'
         required: false
-        default: 'rust-small'
+        default: 'provider-conformance'
       provider:
         description: 'Live provider profile id (anthropic, openai, deepseek, gemini)'
         required: false
-        default: 'anthropic'
+        default: 'deepseek'
       model:
-        description: 'Model override (blank = the profile default_model)'
+        description: 'Model override (blank = profile default_model; must be priced)'
         required: false
-        default: ''
+        default: 'deepseek-flash'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-live
+  cancel-in-progress: false
 
 jobs:
   eval-live:
-    name: eval / live
+    name: eval / live smoke
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    environment: eval-live
     env:
       CARGO_TERM_COLOR: always
-      # The runtime opt-in switch. Without this the harness reports live tasks
-      # as skipped rather than failing.
-      CROM_EVAL_LIVE: '1'
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      LIVE_SMOKE_CEILING_USD: '5'
+      # Inputs reach the shell only through env, never inline interpolation.
       SUITE: ${{ inputs.suite }}
       PROVIDER: ${{ inputs.provider }}
       MODEL: ${{ inputs.model }}
+      MAX_RUN_COST_USD: ${{ inputs.max_run_cost_usd }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check spend cap
+        run: .github/scripts/check-spend-cap.sh "$MAX_RUN_COST_USD" "$LIVE_SMOKE_CEILING_USD"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: eval-live
       - name: Run live eval suite
+        env:
+          CROM_EVAL_LIVE: '1'
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          args=(--suite "$SUITE" --provider "$PROVIDER" --allow-failures)
+          args=(--suite "$SUITE" --provider "$PROVIDER" --allow-failures
+                --max-run-cost-usd "$MAX_RUN_COST_USD")
           if [ -n "$MODEL" ]; then args+=(--model "$MODEL"); fi
           set +e
           cargo run --locked -p crom-cli -- eval run "${args[@]}"
           rc=$?
           set -e
           if [ "$rc" -eq 3 ]; then
-            echo "::warning::all tasks skipped (missing CROM_EVAL_LIVE or the $PROVIDER API-key secret)"
+            echo "::warning::all tasks skipped (missing the $PROVIDER API-key secret, unpriced model, or spend cap reached)"
             exit 0
           fi
           exit "$rc"
+      - name: Scoreboard
+        if: always()
+        run: |
+          cargo run --locked -p crom-cli -- eval scoreboard --format md >> "$GITHUB_STEP_SUMMARY" || true
       - name: Upload eval artifacts
         if: always()
         uses: actions/upload-artifact@v7

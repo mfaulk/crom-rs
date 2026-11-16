@@ -255,7 +255,14 @@ the agent against a real model.
 `security / OS sandbox (linux)` job runs `scripts/sandbox-tests.sh` on
 `ubuntu-24.04` with `CROM_REQUIRE_SANDBOX_TESTS=1` and the golden/security
 eval suites with `--sandbox required`, plus the adversarial security suite
-(scripted attacks scored on host effects, sandbox required and off).
+(scripted attacks scored on host effects, sandbox required and off). The
+`lint / workflows` job runs `actionlint` and dry-runs the live-lane spend-cap
+gate.
+
+Live-provider evals never run on push or PR. `eval-live.yml` (live smoke) and
+`eval-benchmark.yml` (provider/model matrix) are manual dispatches that
+require a `max_run_cost_usd` input and read API keys from the `eval-live`
+environment. See [CI lanes and spend controls](docs/eval.md#ci-lanes-and-spend-controls-295).
 
 ## Roadmap
 

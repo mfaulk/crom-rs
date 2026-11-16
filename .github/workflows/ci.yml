@@ -332,3 +332,19 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans sources licenses
+
+  workflows:
+    name: lint / workflows + spend-cap gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Live eval lanes (#295) must fail closed without a valid spend cap.
+      - name: Spend-cap gate dry run
+        run: .github/scripts/test-check-spend-cap.sh
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
