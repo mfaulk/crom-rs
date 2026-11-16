@@ -956,3 +956,45 @@ async fn provider_retry_is_emitted_as_sdk_event() {
     let result = handle.final_result().await.unwrap();
     assert!(matches!(result.status, AgentRunStatus::Completed));
 }
+
+/// `ToolPolicy::sandbox` reaches the built-in Bash tool: a `required` sandbox
+/// that cannot be enforced refuses the command instead of running it.
+#[tokio::test]
+async fn tool_policy_sandbox_reaches_bash() {
+    let dir = TempDir::new().unwrap();
+    let provider = ScriptedFakeProvider::one_shot_tool_call(
+        "Bash",
+        serde_json::json!({"command": "touch marker"}),
+    );
+    let runtime = AgentRuntime::builder()
+        .provider(ProviderConfig::fake(Arc::new(provider)))
+        .tool_policy(ToolPolicy {
+            enable_builtin_tools: BuiltinToolSet::cli_defaults(),
+            side_effect_policy: SideEffectPolicy::full(),
+            sandbox: crom_core::SandboxConfig {
+                // No kernel offers this ABI, so the sandbox can never enforce.
+                min_landlock_abi: u32::MAX,
+                ..crom_core::SandboxConfig::required()
+            },
+            ..Default::default()
+        })
+        .approval_callback(Arc::new(AllowAllApprovals))
+        .interactivity(InteractivityMode::Interactive)
+        .build()
+        .await
+        .unwrap();
+    runtime
+        .run_once(
+            AgentRequest::new("touch")
+                .workspace(WorkspaceSource::filesystem(dir.path()))
+                .mode(AgentMode::ModifyWorkspace)
+                .approval_policy(ApprovalPolicy::CallbackRequired)
+                .max_turns(3),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !dir.path().join("marker").exists(),
+        "Bash ran despite an unenforceable required sandbox"
+    );
+}

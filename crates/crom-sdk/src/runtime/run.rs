@@ -1235,7 +1235,10 @@ fn build_tool_registry(
 ) -> ToolRegistry {
     use crom_tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, ToolLimits, WriteTool};
     let mut registry = ToolRegistry::new();
-    let limits = Arc::new(ToolLimits::default());
+    let limits = Arc::new(ToolLimits {
+        sandbox: policy.sandbox.clone(),
+        ..ToolLimits::default()
+    });
     let builtins = policy.enable_builtin_tools;
     let has_root = workspace.filesystem_root().is_some();
     let writable = has_root && workspace.capabilities().can_write;

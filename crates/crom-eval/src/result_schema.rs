@@ -192,8 +192,11 @@ pub struct ToolPolicyMeta {
 pub struct SecurityMeta {
     pub side_effects: serde_json::Value,
     pub approvals: String,
-    /// OS-level sandbox for agent tools (`none` until #253).
+    /// OS sandbox backend for agent tools: `landlock` or `off` (#253).
     pub agent_sandbox: String,
+    /// Mean per-call sandbox overhead measured for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_sandbox_overhead_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -361,7 +364,12 @@ impl ReproMetadata {
             security: SecurityMeta {
                 side_effects: i.side_effects,
                 approvals: i.approvals.to_string(),
-                agent_sandbox: "none".to_string(),
+                agent_sandbox: match config.sandbox {
+                    crom_core::SandboxMode::Required => "landlock",
+                    crom_core::SandboxMode::Off => "off",
+                }
+                .to_string(),
+                agent_sandbox_overhead_ms: config.sandbox_overhead_ms,
             },
             isolation: IsolationMeta {
                 backend: config.isolation.id().to_string(),

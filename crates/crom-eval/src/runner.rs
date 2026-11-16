@@ -202,6 +202,11 @@ pub struct RunConfig {
     /// Parent dir for agent workspaces (`None` => `$TMPDIR/crom-eval-ws`).
     /// Must be disjoint from the runs dir and the task source (M17.2).
     pub workspace_root: Option<PathBuf>,
+    /// OS sandbox for agent tool processes (M17.3, #253). The CLI defaults
+    /// it to `required` for live providers.
+    pub sandbox: crom_core::SandboxMode,
+    /// Measured mean per-call sandbox overhead, recorded in results.
+    pub sandbox_overhead_ms: Option<f64>,
 }
 
 impl Default for RunConfig {
@@ -223,6 +228,8 @@ impl Default for RunConfig {
             provider_profiles: Default::default(),
             environment: None,
             workspace_root: None,
+            sandbox: crom_core::SandboxMode::Off,
+            sandbox_overhead_ms: None,
         }
     }
 }
@@ -277,8 +284,18 @@ fn classify_sdk_error(err: &crom_sdk::AgentSdkError) -> (bool, bool) {
     (false, harness)
 }
 
+/// Agent-tool sandbox for a task: network follows `--network` or the task's
+/// `requires_network`, all-or-nothing.
+pub fn sandbox_config_for(task: &EvalTask, config: &RunConfig) -> crom_core::SandboxConfig {
+    crom_core::SandboxConfig {
+        mode: config.sandbox,
+        network: config.network || task.requires_network,
+        ..crom_core::SandboxConfig::default()
+    }
+}
+
 /// Build the tool policy for a task from its `allowed_tools` list.
-fn tool_policy_for(task: &EvalTask) -> ToolPolicy {
+fn tool_policy_for(task: &EvalTask, config: &RunConfig) -> ToolPolicy {
     let mut builtins = BuiltinToolSet::cli_defaults();
     if !task.allowed_tools.is_empty() {
         let allowed = |name: &str| task.allowed_tools.iter().any(|t| t == name);
@@ -293,6 +310,7 @@ fn tool_policy_for(task: &EvalTask) -> ToolPolicy {
     ToolPolicy {
         enable_builtin_tools: builtins,
         side_effect_policy: SideEffectPolicy::full(),
+        sandbox: sandbox_config_for(task, config),
         ..Default::default()
     }
 }
@@ -318,7 +336,7 @@ async fn drive_agent(
         .provider(setup.config)
         .model(setup.model)
         .workspace(WorkspaceSource::filesystem(workspace_dir.to_path_buf()))
-        .tool_policy(tool_policy_for(task))
+        .tool_policy(tool_policy_for(task, config))
         .interactivity(InteractivityMode::Headless)
         .approval_callback(Arc::new(AllowAllApprovals))
         .event_sink(sink)
@@ -512,7 +530,7 @@ fn stamp_v2(r: &mut EvalResult, task: &EvalTask, config: &RunConfig, prompt: &st
         .environment
         .clone()
         .unwrap_or_else(RunEnvironment::gather);
-    let policy = tool_policy_for(task);
+    let policy = tool_policy_for(task, config);
     r.schema_version = RESULT_SCHEMA_VERSION;
     r.outcome = Some(Outcome::derive(r.status, r.resolved, r.failure_class));
     r.repro = Some(ReproMetadata::build(ReproInputs {
@@ -585,6 +603,10 @@ pub fn run_metadata(config: &RunConfig, repetitions: usize) -> serde_json::Value
         "host": env.host,
         "crom_version": env.crom_version,
         "pricing_source_version": serde_json::Value::Null,
+        "agent_sandbox": {
+            "mode": config.sandbox.as_str(),
+            "overhead_ms": config.sandbox_overhead_ms,
+        },
     })
 }
 
@@ -1527,5 +1549,101 @@ mod provider_metadata_tests {
         assert_eq!(meta["endpoint_host"], "ds.example:8443");
         let text = meta.to_string();
         assert!(!text.contains("pw") && !text.contains("/proxy"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod sandbox_policy_tests {
+    use super::*;
+    use crom_core::SandboxMode;
+
+    fn task(requires_network: bool) -> EvalTask {
+        let mut t = EvalTask::minimal(
+            "t",
+            "t",
+            "p",
+            crate::task::OracleSpec::default(),
+            PathBuf::from("."),
+        );
+        t.requires_network = requires_network;
+        t
+    }
+
+    fn repro(config: &RunConfig) -> ReproMetadata {
+        ReproMetadata::build(ReproInputs {
+            task: &task(false),
+            config,
+            env: &RunEnvironment::gather(),
+            prompt: "p",
+            model: "m".into(),
+            base_url_host: None,
+            builtin_tools: serde_json::Value::Null,
+            side_effects: serde_json::Value::Null,
+            approvals: "allow_all",
+        })
+    }
+
+    // The run's sandbox mode reaches the agent tool policy; network stays off unless granted.
+    #[test]
+    fn tool_policy_carries_required_sandbox() {
+        let config = RunConfig {
+            sandbox: SandboxMode::Required,
+            ..RunConfig::default()
+        };
+        let policy = tool_policy_for(&task(false), &config);
+        assert_eq!(policy.sandbox.mode, SandboxMode::Required);
+        assert!(!policy.sandbox.network);
+    }
+
+    // A task that requires network, or a run with --network, grants sandbox networking.
+    #[test]
+    fn tool_policy_sandbox_network_follows_task_and_run() {
+        let config = RunConfig {
+            sandbox: SandboxMode::Required,
+            ..RunConfig::default()
+        };
+        assert!(tool_policy_for(&task(true), &config).sandbox.network);
+        let networked = RunConfig {
+            network: true,
+            ..config
+        };
+        assert!(tool_policy_for(&task(false), &networked).sandbox.network);
+    }
+
+    // The default run config leaves agent tools unsandboxed (offline providers).
+    #[test]
+    fn tool_policy_sandbox_defaults_off() {
+        let policy = tool_policy_for(&task(false), &RunConfig::default());
+        assert_eq!(policy.sandbox.mode, SandboxMode::Off);
+    }
+
+    // Results record the agent sandbox backend and the measured per-call overhead.
+    #[test]
+    fn repro_records_sandbox_and_overhead() {
+        let config = RunConfig {
+            sandbox: SandboxMode::Required,
+            sandbox_overhead_ms: Some(2.5),
+            ..RunConfig::default()
+        };
+        let r = repro(&config);
+        assert_eq!(r.security.agent_sandbox, "landlock");
+        assert_eq!(r.security.agent_sandbox_overhead_ms, Some(2.5));
+        let off = repro(&RunConfig::default());
+        assert_eq!(off.security.agent_sandbox, "off");
+        assert_eq!(off.security.agent_sandbox_overhead_ms, None);
+    }
+
+    // run.json records the agent sandbox mode and overhead.
+    #[test]
+    fn run_metadata_records_sandbox() {
+        let config = RunConfig {
+            sandbox: SandboxMode::Required,
+            sandbox_overhead_ms: Some(1.25),
+            environment: Some(RunEnvironment::gather()),
+            ..RunConfig::default()
+        };
+        let meta = run_metadata(&config, 1);
+        assert_eq!(meta["agent_sandbox"]["mode"], "required");
+        assert_eq!(meta["agent_sandbox"]["overhead_ms"], 1.25);
     }
 }

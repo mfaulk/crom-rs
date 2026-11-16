@@ -100,6 +100,11 @@ pub struct EvalRunArgs {
     /// Allow network access during verification.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub network: bool,
+    /// OS sandbox for agent tool processes: `required` or `off`. Defaults to
+    /// `required` for live providers and `off` for fake/golden. `required`
+    /// fails closed when the host cannot enforce the sandbox.
+    #[arg(long)]
+    pub sandbox: Option<crom_core::SandboxMode>,
     /// Container image (container backends only).
     #[arg(long)]
     pub container_image: Option<String>,
@@ -449,6 +454,8 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
     );
 
     let repair = build_repair_policy(&args)?;
+    let sandbox = resolve_eval_sandbox(args.sandbox, &provider);
+    let sandbox_overhead_ms = prepare_eval_sandbox(sandbox, args.network).await?;
 
     let config = RunConfig {
         provider: provider.clone(),
@@ -467,6 +474,8 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
         provider_profiles,
         environment: Some(crom_eval::result_schema::RunEnvironment::gather()),
         workspace_root: None,
+        sandbox,
+        sandbox_overhead_ms,
     };
 
     let results = run_tasks_repeated(&selected, &run, &config, repetitions).await;
@@ -631,6 +640,47 @@ fn write_behavior_summary(run_root: &Path, results: &[EvalResult]) {
 /// Run-level eval files go through the same secret redaction as task artifacts.
 fn write_artifact(path: std::path::PathBuf, content: String) -> std::io::Result<()> {
     crom_eval::artifacts::write_redacted(&path, &content)
+}
+
+/// Agent-tool sandbox mode for a run: the explicit flag, else `required`
+/// for live providers and `off` for the offline fake/golden providers.
+fn resolve_eval_sandbox(
+    flag: Option<crom_core::SandboxMode>,
+    provider: &ProviderMode,
+) -> crom_core::SandboxMode {
+    flag.unwrap_or(if provider.is_live() {
+        crom_core::SandboxMode::Required
+    } else {
+        crom_core::SandboxMode::Off
+    })
+}
+
+/// Fail closed before any task runs when `required` cannot be enforced, then
+/// measure the mean per-call overhead recorded in results.
+async fn prepare_eval_sandbox(mode: crom_core::SandboxMode, network: bool) -> Result<Option<f64>> {
+    if mode == crom_core::SandboxMode::Off {
+        println!("agent sandbox: off (agent tools run unsandboxed)");
+        return Ok(None);
+    }
+    let cfg = crom_core::SandboxConfig {
+        network,
+        ..crom_core::SandboxConfig::required()
+    };
+    let info = crom_tools::sandbox::probe(&cfg).map_err(|reason| {
+        anyhow!(
+            "agent sandbox is required but cannot be enforced on this host: {reason}; \
+             pass --sandbox off to run agent tools unsandboxed"
+        )
+    })?;
+    let scratch = tempfile::TempDir::new().context("sandbox overhead scratch dir")?;
+    let overhead = crom_tools::sandbox::measure_overhead_ms(&cfg, scratch.path(), 20)
+        .await
+        .map_err(|e| anyhow!("measuring sandbox overhead: {e}"))?;
+    println!(
+        "agent sandbox: required ({} ABI {}), overhead {overhead:.2} ms/call",
+        info.backend, info.landlock_abi
+    );
+    Ok(Some(overhead))
 }
 
 async fn cmd_validate_task(args: ValidateTaskArgs) -> Result<()> {
@@ -879,4 +929,51 @@ fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod sandbox_flag_tests {
+    use super::*;
+    use crom_core::SandboxMode;
+    use crom_eval::providers::ProviderMode;
+
+    // Live providers default to a required agent sandbox; offline providers default to off.
+    #[test]
+    fn sandbox_defaults_follow_provider() {
+        assert_eq!(
+            resolve_eval_sandbox(None, &ProviderMode::Live("anthropic".into())),
+            SandboxMode::Required
+        );
+        assert_eq!(
+            resolve_eval_sandbox(None, &ProviderMode::Fake),
+            SandboxMode::Off
+        );
+        assert_eq!(
+            resolve_eval_sandbox(None, &ProviderMode::Golden),
+            SandboxMode::Off
+        );
+    }
+
+    // An explicit --sandbox flag wins over the provider default in both directions.
+    #[test]
+    fn sandbox_flag_overrides_default() {
+        assert_eq!(
+            resolve_eval_sandbox(Some(SandboxMode::Off), &ProviderMode::Live("x".into())),
+            SandboxMode::Off
+        );
+        assert_eq!(
+            resolve_eval_sandbox(Some(SandboxMode::Required), &ProviderMode::Fake),
+            SandboxMode::Required
+        );
+    }
+
+    // `crom eval run --sandbox` parses required|off and rejects anything else.
+    #[test]
+    fn sandbox_flag_parses() {
+        let args = EvalRunArgs::try_parse_from(["run", "--sandbox", "required"]).unwrap();
+        assert_eq!(args.sandbox, Some(SandboxMode::Required));
+        let args = EvalRunArgs::try_parse_from(["run"]).unwrap();
+        assert_eq!(args.sandbox, None);
+        assert!(EvalRunArgs::try_parse_from(["run", "--sandbox", "maybe"]).is_err());
+    }
 }
