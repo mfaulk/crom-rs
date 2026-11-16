@@ -1152,7 +1152,7 @@ fn cmd_regressions(args: RegressionsArgs) -> Result<()> {
         .map_err(|e| anyhow!("reading index: {e}"))?;
     if let Some(reference) = &args.since {
         use crom_eval::compare::{latest_run_except, resolve_baseline_run};
-        let sha = std::process::Command::new("git")
+        let sha = crom_core::git::host_git(std::path::Path::new("."))
             .args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
             .output()
             .ok()

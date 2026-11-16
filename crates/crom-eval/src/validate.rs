@@ -144,9 +144,8 @@ async fn run_oracle_in(
 }
 
 fn git_apply_check(workspace: &Path, patch: &Path) -> Result<(), String> {
-    let out = std::process::Command::new("git")
+    let out = crom_core::git::host_git(workspace)
         .args(["-c", "safe.directory=*"])
-        .current_dir(workspace)
         .args(["apply", "--check", &patch.display().to_string()])
         .output()
         .map_err(|e| format!("spawn git apply: {e}"))?;
@@ -158,9 +157,8 @@ fn git_apply_check(workspace: &Path, patch: &Path) -> Result<(), String> {
 }
 
 fn git_apply(workspace: &Path, patch: &Path) -> Result<(), String> {
-    let out = std::process::Command::new("git")
+    let out = crom_core::git::host_git(workspace)
         .args(["-c", "safe.directory=*"])
-        .current_dir(workspace)
         .args(["apply", &patch.display().to_string()])
         .output()
         .map_err(|e| format!("spawn git apply: {e}"))?;

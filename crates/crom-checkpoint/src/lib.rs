@@ -45,11 +45,12 @@ pub fn to_payload<T: serde::Serialize>(name: &str, value: &T) -> crom_core::Chec
 }
 
 /// Optional Git workspace probe. Best-effort: returns `None` if `git` is
-/// not on the PATH or the directory is not a repo.
+/// not on the PATH or the directory is not a repo. Repo-controlled exec
+/// config is neutralised (#334).
 pub async fn probe_git_state(cwd: &std::path::Path) -> Option<types::GitWorkspaceState> {
-    let out = tokio::process::Command::new("git")
+    let out = crom_core::git::host_git_async(cwd)
+        .await
         .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -59,9 +60,9 @@ pub async fn probe_git_state(cwd: &std::path::Path) -> Option<types::GitWorkspac
     if !out.status.success() {
         return None;
     }
-    let branch = tokio::process::Command::new("git")
+    let branch = crom_core::git::host_git_async(cwd)
+        .await
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(cwd)
         .output()
         .await
         .ok()
@@ -72,9 +73,9 @@ pub async fn probe_git_state(cwd: &std::path::Path) -> Option<types::GitWorkspac
                 None
             }
         });
-    let head = tokio::process::Command::new("git")
+    let head = crom_core::git::host_git_async(cwd)
+        .await
         .args(["rev-parse", "HEAD"])
-        .current_dir(cwd)
         .output()
         .await
         .ok()
@@ -85,9 +86,9 @@ pub async fn probe_git_state(cwd: &std::path::Path) -> Option<types::GitWorkspac
                 None
             }
         });
-    let dirty = tokio::process::Command::new("git")
+    let dirty = crom_core::git::host_git_async(cwd)
+        .await
         .args(["status", "--porcelain"])
-        .current_dir(cwd)
         .output()
         .await
         .ok()

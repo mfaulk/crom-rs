@@ -561,7 +561,9 @@ fn collect_results(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Full SHAs of `rev` and every commit reachable from `HEAD` but not `rev`.
 pub fn commits_since(rev: &str) -> anyhow::Result<BTreeSet<String>> {
     let run = |args: &[&str]| -> anyhow::Result<String> {
-        let out = std::process::Command::new("git").args(args).output()?;
+        let out = crom_core::git::host_git(std::path::Path::new("."))
+            .args(args)
+            .output()?;
         anyhow::ensure!(
             out.status.success(),
             "git {}: {}",
