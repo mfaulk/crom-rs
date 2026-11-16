@@ -14,6 +14,7 @@ pub mod glob;
 pub mod grep;
 pub mod limits;
 pub mod path_sandbox;
+pub mod sandbox;
 pub mod read;
 pub mod todo;
 pub mod write;

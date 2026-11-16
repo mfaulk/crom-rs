@@ -10,9 +10,10 @@ use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 
-use crom_core::{PermissionKind, Tool, ToolContext, ToolError, ToolResult};
+use crom_core::{PermissionKind, SandboxMode, Tool, ToolContext, ToolError, ToolResult};
 
 use crate::limits::ToolLimits;
+use crate::sandbox;
 use crate::truncate_with_marker;
 
 /// Names of environment variables we never expose in returned metadata.
@@ -28,6 +29,40 @@ const DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 /// Marker appended to the captured stream when the drain task had to be
 /// aborted because a descendant kept the pipe open past `DRAIN_DEADLINE`.
 const DRAIN_ABORTED_MARKER: &str = "\n[bash: drain aborted after kill]";
+
+/// How long a sandbox supervisor gets to kill and reap the tool's process
+/// tree after SIGTERM before it is SIGKILLed itself.
+const SUPERVISOR_GRACE: Duration = Duration::from_secs(5);
+
+/// Sends SIGTERM to the sandbox supervisor if the call ends without the
+/// supervisor having been reaped (timeout, cancel, or a dropped future), so
+/// it kills the whole tool process tree.
+struct SupervisorGuard {
+    pid: Option<u32>,
+}
+
+impl SupervisorGuard {
+    fn terminate(&self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            // SAFETY: plain kill(2) on the supervisor we spawned and have not
+            // reaped yet, so the pid cannot have been reused.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for SupervisorGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct Input {
@@ -53,7 +88,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command from the workspace root. Output is capped, stdin is closed, and the command is killed after the configured timeout."
+        "Run a shell command from the workspace root. Output is capped, stdin is closed, and the command is killed after the configured timeout. When the OS sandbox is enabled, only the workspace and a private $TMPDIR are writable, paths outside the workspace and the toolchain are unreadable, there is no network, and background processes are killed when the command returns."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -94,6 +129,10 @@ impl Tool for BashTool {
             .unwrap_or(max_dur);
         let cap = self.limits.max_output_bytes;
 
+        let sandbox_cfg = &self.limits.sandbox;
+        let sandboxed = sandbox_cfg.mode == SandboxMode::Required;
+        let setup_started = std::time::Instant::now();
+
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
             .arg(&parsed.command)
@@ -101,7 +140,9 @@ impl Tool for BashTool {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            // In sandbox mode the child is the supervisor, which must get
+            // SIGTERM (not SIGKILL) so it can kill the tree; the guard does that.
+            .kill_on_drop(!sandboxed);
 
         // Place the child in its own process group so that timeouts kill any
         // grandchild processes (e.g., builds, servers) the script started,
@@ -113,11 +154,35 @@ impl Tool for BashTool {
             cmd.process_group(0);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError::ExecutionFailed(format!("spawn bash: {e}")))?;
+        // Fail closed: under `required`, any probe or setup failure refuses
+        // the call before anything is spawned.
+        let prepared = if sandboxed {
+            Some(
+                sandbox::prepare(sandbox_cfg, &ctx.cwd, &mut cmd).map_err(|e| {
+                    ToolError::PermissionDenied(format!(
+                        "sandbox required but cannot be enforced: {e}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let mut child = cmd.spawn().map_err(|e| {
+            if sandboxed {
+                ToolError::PermissionDenied(format!(
+                    "sandbox required but cannot be enforced: sandbox setup failed: {e}"
+                ))
+            } else {
+                ToolError::ExecutionFailed(format!("spawn bash: {e}"))
+            }
+        })?;
+        let setup_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
         #[cfg(unix)]
         let child_pid: Option<u32> = child.id();
+        let mut guard = SupervisorGuard {
+            pid: if sandboxed { child.id() } else { None },
+        };
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -140,6 +205,17 @@ impl Tool for BashTool {
             }
             Ok(Err(e)) => {
                 return Err(ToolError::ExecutionFailed(format!("wait: {e}")));
+            }
+            Err(_) if sandboxed => {
+                // The supervisor kills the whole tree (including setsid'd
+                // descendants) on SIGTERM, then exits.
+                guard.terminate();
+                if timeout(SUPERVISOR_GRACE, child.wait()).await.is_err() {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+                timed_out = true;
+                None
             }
             Err(_) => {
                 // Kill the entire process group so any grandchildren the
@@ -166,6 +242,8 @@ impl Tool for BashTool {
                 None
             }
         };
+        // The supervisor has been reaped; its pid may be reused from here on.
+        guard.disarm();
 
         // Bound the drain join with a hard deadline. Belt-and-suspenders for
         // descendants that inherited the pipes: on Unix the SIGKILL to the
@@ -223,10 +301,23 @@ impl Tool for BashTool {
         // when we couldn't run the command to a clean exit: timeouts, or a
         // signal-killed child where no exit code is available.
         let is_error = timed_out || exit_code.is_none();
+        let sandbox_meta = match &prepared {
+            Some(p) => json!({
+                "mode": "required",
+                "enforced": true,
+                "backend": p.info.backend,
+                "landlock_abi": p.info.landlock_abi,
+                "network": sandbox_cfg.network,
+                "setup_ms": setup_ms,
+            }),
+            None => json!({"mode": "off", "enforced": false}),
+        };
+        drop(prepared);
         let metadata = json!({
             "exit_code": exit_code,
             "timed_out": timed_out,
             "command_redacted": redact(&parsed.command),
+            "sandbox": sandbox_meta,
         });
         Ok(ToolResult {
             content: vec![crom_core::ToolContent::Text(text)],

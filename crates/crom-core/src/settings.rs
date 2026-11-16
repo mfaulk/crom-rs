@@ -133,6 +133,9 @@ pub struct SettingsFile {
     /// M16: validation-before-final-answer policy.
     #[serde(default)]
     pub completion: Option<CompletionConfig>,
+    /// M17.3: OS sandbox for tool processes. Project files may only tighten.
+    #[serde(default)]
+    pub sandbox: Option<crate::sandbox::SandboxSettingsConfig>,
 }
 
 /// On-disk planning settings (M11). All fields optional; merge into
@@ -646,6 +649,9 @@ pub struct Settings {
     pub diagnostics: DiagnosticsConfig,
     /// M16: effective completion (validation-before-final) configuration.
     pub completion: CompletionConfig,
+    /// M17.3: merged sandbox settings; resolve with
+    /// [`crate::sandbox::SandboxSettingsConfig::resolve`].
+    pub sandbox: crate::sandbox::SandboxSettingsConfig,
     pub source: SettingSource,
     pub project_path: Option<PathBuf>,
     pub user_path: Option<PathBuf>,
@@ -743,8 +749,14 @@ pub fn load(cwd: &Path, source: SettingSource) -> Result<Settings, SettingsError
     if let Some(u) = user_settings {
         merge_settings_file_into(&mut effective, u)?;
     }
-    if let Some(p) = project_settings {
+    if let Some(mut p) = project_settings {
+        // Repository settings are untrusted: they may tighten the sandbox
+        // but never loosen it (threat model P9).
+        let project_sandbox = p.sandbox.take();
         merge_settings_file_into(&mut effective, p)?;
+        if let Some(sb) = project_sandbox {
+            effective.sandbox.tighten_from_untrusted(sb);
+        }
     }
 
     Ok(effective)
@@ -1013,6 +1025,9 @@ pub fn merge_settings_file_into(
     }
     if let Some(planning) = src.planning {
         merge_planning_settings(&mut dst.planning, planning)?;
+    }
+    if let Some(sb) = src.sandbox {
+        dst.sandbox.merge(sb);
     }
     Ok(())
 }
@@ -1476,6 +1491,37 @@ mod tests {
 
         assert_eq!(s.model.as_deref(), Some("project-model"));
         assert_eq!(s.allowed_tools.len(), 2);
+    }
+
+    #[test]
+    // A project settings file cannot turn off or loosen a sandbox the user settings require.
+    fn project_settings_cannot_loosen_user_sandbox() {
+        let user_home = TempDir::new().unwrap();
+        let user_cfg_dir = user_home.path().join("crom");
+        fs::create_dir_all(&user_cfg_dir).unwrap();
+        let user_cfg = serde_json::json!({"sandbox": {"mode": "required"}});
+        fs::write(user_cfg_dir.join("settings.json"), user_cfg.to_string()).unwrap();
+
+        let project = TempDir::new().unwrap();
+        let agent_dir = project.path().join(".agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let proj_cfg = serde_json::json!({
+            "sandbox": {"mode": "off", "network": true, "env_allow": ["OPENAI_API_KEY"]}
+        });
+        fs::write(agent_dir.join("settings.json"), proj_cfg.to_string()).unwrap();
+
+        let s = temp_env::with_vars(
+            [
+                ("CROM_CONFIG_HOME", Some(user_cfg_dir.to_str().unwrap())),
+                ("XDG_CONFIG_HOME", None),
+            ],
+            || load(project.path(), SettingSource::UserAndProject).unwrap(),
+        );
+
+        let r = s.sandbox.resolve();
+        assert_eq!(r.mode, crate::sandbox::SandboxMode::Required);
+        assert!(!r.network);
+        assert!(r.env_allow.is_empty());
     }
 
     #[test]
