@@ -51,6 +51,7 @@ pub fn load_instruction_task(dir: &Path, adapter: &str) -> Result<EvalTask> {
     task.fixture = FixtureSpec {
         kind: FixtureKind::CopyDir,
         path: Some(".".to_string()),
+        ..Default::default()
     };
     task.tags = vec![adapter.to_string(), "external".to_string()];
     Ok(task)
@@ -123,6 +124,7 @@ impl SweBenchAdapter {
         task.fixture = FixtureSpec {
             kind: FixtureKind::CopyDir,
             path: Some(fixture_sub),
+            ..Default::default()
         };
         task.hidden = Some(HiddenSpec {
             fixture: None,
@@ -190,6 +192,7 @@ impl AiderAdapter {
         task.fixture = FixtureSpec {
             kind: FixtureKind::CopyDir,
             path: Some(fixture_path.to_string()),
+            ..Default::default()
         };
         task.category = Some("feature".to_string());
         task.tags = vec![
@@ -256,6 +259,7 @@ impl TerminalAdapter {
         task.fixture = FixtureSpec {
             kind: FixtureKind::CopyDir,
             path: Some(".".to_string()),
+            ..Default::default()
         };
         task.category = Some("cli".to_string());
         // image.txt / Dockerfile presence is recorded but local mode is used.

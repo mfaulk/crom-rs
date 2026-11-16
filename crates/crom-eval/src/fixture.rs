@@ -49,6 +49,15 @@ pub enum FixtureError {
 /// Copies the fixture (when `kind = copy_dir`), then initialises a fresh git
 /// repository with a baseline commit. The directory is created if missing.
 pub fn prepare_workspace(task: &EvalTask, workspace_dir: &Path) -> Result<(), FixtureError> {
+    prepare_workspace_with_cache(task, workspace_dir, &fixture_cache_dir())
+}
+
+/// [`prepare_workspace`] with an explicit cache root for `git` fixtures.
+pub fn prepare_workspace_with_cache(
+    task: &EvalTask,
+    workspace_dir: &Path,
+    cache_root: &Path,
+) -> Result<(), FixtureError> {
     std::fs::create_dir_all(workspace_dir)
         .map_err(|e| FixtureError::Io(format!("create {}: {e}", workspace_dir.display())))?;
 
@@ -61,11 +70,116 @@ pub fn prepare_workspace(task: &EvalTask, workspace_dir: &Path) -> Result<(), Fi
             }
             copy_dir_recursive(&src, workspace_dir)?;
         }
+        FixtureKind::Git => {
+            let checkout = fetch_git_fixture(&task.fixture, cache_root)?;
+            let rel = task.fixture.path.as_deref().unwrap_or(".");
+            let src = checkout.join(rel);
+            if !src.is_dir() {
+                return Err(FixtureError::FixtureNotFound(format!(
+                    "{rel} at {}",
+                    task.fixture.rev.as_deref().unwrap_or("?")
+                )));
+            }
+            copy_dir_recursive(&src, workspace_dir)?;
+        }
         FixtureKind::Empty => {}
     }
 
     git_init_baseline(workspace_dir)?;
     Ok(())
+}
+
+/// Root of the `git` fixture cache: `$CROM_EVAL_FIXTURE_CACHE`, else
+/// `$XDG_CACHE_HOME/crom/eval-fixtures`, else `~/.cache/crom/eval-fixtures`.
+pub fn fixture_cache_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os("CROM_EVAL_FIXTURE_CACHE") {
+        return PathBuf::from(p);
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("crom").join("eval-fixtures")
+}
+
+/// Whether `rev` is a full 40-hex commit SHA (the only pin a git fixture accepts).
+pub fn is_full_sha(rev: &str) -> bool {
+    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Checkout of a `git` fixture at its pinned commit, fetched into
+/// `cache_root/<rev>` on first use. The cache entry is only published after
+/// `HEAD` is verified to equal `rev`, so a cached entry is always complete and
+/// later runs need no network.
+pub fn fetch_git_fixture(
+    spec: &crate::task::FixtureSpec,
+    cache_root: &Path,
+) -> Result<PathBuf, FixtureError> {
+    let repo = spec
+        .repo
+        .as_deref()
+        .ok_or_else(|| FixtureError::Git("git fixture missing `repo`".into()))?;
+    let rev = spec
+        .rev
+        .as_deref()
+        .ok_or_else(|| FixtureError::Git("git fixture missing `rev`".into()))?;
+    if !is_full_sha(rev) {
+        return Err(FixtureError::Git(format!(
+            "git fixture `rev` must be a full 40-hex commit SHA, got {rev:?}"
+        )));
+    }
+    let rev = rev.to_ascii_lowercase();
+    let dest = cache_root.join(&rev);
+    if dest.join(".git").is_dir() {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(cache_root)
+        .map_err(|e| FixtureError::Io(format!("create {}: {e}", cache_root.display())))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".fetch-")
+        .tempdir_in(cache_root)
+        .map_err(|e| FixtureError::Io(format!("staging dir: {e}")))?;
+    let dir = staging.path();
+    let git = |args: &[&str]| -> Result<String, FixtureError> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(|e| FixtureError::Git(format!("spawn git: {e}")))?;
+        if !out.status.success() {
+            return Err(FixtureError::Git(format!(
+                "git {} failed for {repo}@{rev}: {}",
+                args.first().copied().unwrap_or_default(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    git(&["init", "-q"])?;
+    git(&["fetch", "-q", "--depth", "1", repo, &rev])?;
+    git(&[
+        "-c",
+        "advice.detachedHead=false",
+        "checkout",
+        "-q",
+        "FETCH_HEAD",
+    ])?;
+    let head = git(&["rev-parse", "HEAD"])?;
+    if head != rev {
+        return Err(FixtureError::Git(format!(
+            "fetched {head} but the fixture is pinned to {rev}"
+        )));
+    }
+    let staged = staging.keep();
+    if let Err(e) = std::fs::rename(&staged, &dest) {
+        let _ = std::fs::remove_dir_all(&staged);
+        // A concurrent fetch may have published the same commit first.
+        if !dest.join(".git").is_dir() {
+            return Err(FixtureError::Io(format!("publish {}: {e}", dest.display())));
+        }
+    }
+    Ok(dest)
 }
 
 /// Recursively copy the contents of `src` into `dst`. Skips `.git`, `target`,
@@ -334,5 +448,120 @@ mod tests {
         let patch = generate_patch(&ws).unwrap();
         assert!(patch.deleted_files.iter().any(|f| f == "tests/it.rs"));
         assert!(looks_like_test_path("tests/it.rs"));
+    }
+}
+
+#[cfg(test)]
+mod git_fixture_tests {
+    use super::*;
+    use crate::task::{FixtureSpec, OracleSpec};
+    use std::fs;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A local fixtures repo holding `l3-demo/src/lib.rs`; returns (dir, url, sha).
+    fn fixtures_repo() -> (tempfile::TempDir, String, String) {
+        let d = tempfile::tempdir().unwrap();
+        git(d.path(), &["init", "-q"]);
+        git(
+            d.path(),
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+        fs::create_dir_all(d.path().join("l3-demo/src")).unwrap();
+        fs::write(
+            d.path().join("l3-demo/src/lib.rs"),
+            "pub fn v() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        fs::write(d.path().join("other.txt"), "not part of the task\n").unwrap();
+        git(d.path(), &["add", "-A"]);
+        git(d.path(), &["commit", "-q", "-m", "snapshot"]);
+        let sha = git(d.path(), &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", d.path().display());
+        (d, url, sha)
+    }
+
+    fn task(url: &str, rev: &str) -> EvalTask {
+        let mut t = EvalTask::minimal("t", "t", "p", OracleSpec::default(), PathBuf::from("."));
+        t.fixture = FixtureSpec {
+            kind: FixtureKind::Git,
+            path: Some("l3-demo".into()),
+            repo: Some(url.into()),
+            rev: Some(rev.into()),
+        };
+        t
+    }
+
+    // A git fixture at a pinned commit materializes only its sub-path into the workspace.
+    #[test]
+    fn git_fixture_copies_pinned_subdir() {
+        let (_repo, url, sha) = fixtures_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        prepare_workspace_with_cache(&task(&url, &sha), ws.path(), cache.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(ws.path().join("src/lib.rs")).unwrap(),
+            "pub fn v() -> u8 { 1 }\n"
+        );
+        assert!(!ws.path().join("other.txt").exists());
+        assert!(!ws.path().join("l3-demo").exists());
+    }
+
+    // Once cached, a git fixture materializes without reaching the source repo (offline).
+    #[test]
+    fn git_fixture_cache_works_offline() {
+        let (repo, url, sha) = fixtures_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let ws1 = tempfile::tempdir().unwrap();
+        prepare_workspace_with_cache(&task(&url, &sha), ws1.path(), cache.path()).unwrap();
+        drop(repo);
+        let ws2 = tempfile::tempdir().unwrap();
+        prepare_workspace_with_cache(&task(&url, &sha), ws2.path(), cache.path()).unwrap();
+        assert!(ws2.path().join("src/lib.rs").exists());
+    }
+
+    // A rev that is not in the repo fails with a clear error and leaves no cache entry.
+    #[test]
+    fn git_fixture_unknown_rev_fails() {
+        let (_repo, url, _sha) = fixtures_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let bogus = "0123456789abcdef0123456789abcdef01234567";
+        let err =
+            prepare_workspace_with_cache(&task(&url, bogus), ws.path(), cache.path()).unwrap_err();
+        assert!(err.to_string().contains(bogus), "{err}");
+        assert!(!cache.path().join(bogus).exists());
+    }
+
+    // A git fixture whose sub-path is missing at the pinned commit is reported as not found.
+    #[test]
+    fn git_fixture_missing_path_fails() {
+        let (_repo, url, sha) = fixtures_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let mut t = task(&url, &sha);
+        t.fixture.path = Some("l3-nope".into());
+        let err = prepare_workspace_with_cache(&t, ws.path(), cache.path()).unwrap_err();
+        assert!(matches!(err, FixtureError::FixtureNotFound(_)), "{err}");
     }
 }

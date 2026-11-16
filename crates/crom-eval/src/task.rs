@@ -202,6 +202,9 @@ pub enum FixtureKind {
     CopyDir,
     /// Start from an empty workspace.
     Empty,
+    /// Copy `path` from a git repository pinned at `rev` (fetched once into
+    /// the fixture cache; see `crom_eval::fixture`).
+    Git,
 }
 
 /// Where a task's fixture comes from.
@@ -209,9 +212,16 @@ pub enum FixtureKind {
 pub struct FixtureSpec {
     #[serde(default)]
     pub kind: FixtureKind,
-    /// Path to the fixture directory, relative to the task directory.
+    /// Path to the fixture directory, relative to the task directory
+    /// (`copy_dir`) or to the repository root (`git`).
     #[serde(default)]
     pub path: Option<String>,
+    /// `git` only: repository URL (`https://` or `file://`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// `git` only: full 40-hex commit SHA the fixture is pinned to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
 }
 
 impl Default for FixtureSpec {
@@ -219,6 +229,8 @@ impl Default for FixtureSpec {
         Self {
             kind: FixtureKind::CopyDir,
             path: Some("repo".to_string()),
+            repo: None,
+            rev: None,
         }
     }
 }

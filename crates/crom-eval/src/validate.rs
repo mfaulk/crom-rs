@@ -492,6 +492,52 @@ fn canary_checks(task: &EvalTask, checks: &mut Vec<Check>) {
         }
     }
 
+    // A git fixture must be pinned to an exact commit on an https (or local
+    // file) repo, and its sub-path must stay inside that checkout (#289).
+    if task.fixture.kind == crate::task::FixtureKind::Git {
+        use std::path::Component;
+        let f = &task.fixture;
+        let mut problems = Vec::new();
+        match f.repo.as_deref() {
+            Some(r) if r.starts_with("https://") || r.starts_with("file://") => {}
+            Some(r) => problems.push(format!("repo {r:?} must be an https:// or file:// URL")),
+            None => problems.push("missing `repo`".to_string()),
+        }
+        match f.rev.as_deref() {
+            Some(r) if crate::fixture::is_full_sha(r) => {}
+            Some(r) => problems.push(format!("rev {r:?} must be a full 40-hex commit SHA")),
+            None => problems.push("missing `rev`".to_string()),
+        }
+        match f.path.as_deref() {
+            Some(p) => {
+                let comps: Vec<Component> = Path::new(p).components().collect();
+                let relative = comps.iter().any(|c| matches!(c, Component::Normal(_)))
+                    && comps
+                        .iter()
+                        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+                if !relative {
+                    problems.push(format!("path {p:?} must be a relative sub-directory"));
+                }
+            }
+            None => problems.push("missing `path`".to_string()),
+        }
+        if problems.is_empty() {
+            checks.push(Check::ok(
+                "git_fixture_pin",
+                format!(
+                    "fixture pinned to {}@{}",
+                    f.repo.as_deref().unwrap_or_default(),
+                    f.rev.as_deref().unwrap_or_default()
+                ),
+            ));
+        } else {
+            checks.push(Check::error(
+                "git_fixture_pin",
+                format!("git fixture: {}", problems.join("; ")),
+            ));
+        }
+    }
+
     // Hidden test filenames leaking into the prompt.
     if let Some(hidden) = &task.hidden {
         let mut leaked = Vec::new();
@@ -638,6 +684,7 @@ mod tests {
         t.fixture = crate::task::FixtureSpec {
             kind: crate::task::FixtureKind::CopyDir,
             path: Some("repo".to_string()),
+            ..Default::default()
         };
         t
     }
@@ -896,5 +943,73 @@ mod tests {
             ),
             "unexpected verdict {verdict:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod git_fixture_validation_tests {
+    use super::*;
+    use crate::task::{FixtureKind, FixtureSpec};
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn git_task(repo: Option<&str>, rev: Option<&str>, path: Option<&str>) -> EvalTask {
+        let mut t = EvalTask::minimal(
+            "t",
+            "t",
+            "p",
+            crate::task::OracleSpec::default(),
+            std::path::PathBuf::from("."),
+        );
+        t.fixture = FixtureSpec {
+            kind: FixtureKind::Git,
+            path: path.map(str::to_string),
+            repo: repo.map(str::to_string),
+            rev: rev.map(str::to_string),
+        };
+        t
+    }
+
+    fn pin_check(t: &EvalTask) -> Option<bool> {
+        let mut checks = Vec::new();
+        canary_checks(t, &mut checks);
+        checks
+            .iter()
+            .find(|c| c.name == "git_fixture_pin")
+            .map(|c| c.passed)
+    }
+
+    // A git fixture pinned to a full SHA on an https repo with a relative sub-path passes.
+    #[test]
+    fn git_fixture_pin_accepts_full_sha() {
+        let t = git_task(
+            Some("https://github.com/mfaulk/crom-eval-fixtures"),
+            Some(SHA),
+            Some("l3-x"),
+        );
+        assert_eq!(pin_check(&t), Some(true));
+    }
+
+    // Branch names, short SHAs, missing fields, non-https repos, and escaping paths are rejected.
+    #[test]
+    fn git_fixture_pin_rejects_unpinned_or_unsafe() {
+        let repo = Some("https://github.com/mfaulk/crom-eval-fixtures");
+        for (r, rev, path) in [
+            (repo, Some("main"), Some("l3-x")),
+            (repo, Some("0123456"), Some("l3-x")),
+            (repo, None, Some("l3-x")),
+            (None, Some(SHA), Some("l3-x")),
+            (Some("http://example.com/r"), Some(SHA), Some("l3-x")),
+            (Some("ssh://git@example.com/r"), Some(SHA), Some("l3-x")),
+            (repo, Some(SHA), Some("../x")),
+            (repo, Some(SHA), Some("/abs")),
+            (repo, Some(SHA), None),
+        ] {
+            assert_eq!(
+                pin_check(&git_task(r, rev, path)),
+                Some(false),
+                "{r:?} {rev:?} {path:?} must be rejected"
+            );
+        }
     }
 }
