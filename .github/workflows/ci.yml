@@ -163,10 +163,10 @@ jobs:
       # no_change task must pass as-is). Fixtures are dependency-free crates.
       - name: Validate L2 capability suite
         run: cargo run --locked -p crom-cli -- eval validate-suite l2
-      # L3 corpus (#289): std-only multi-crate workspaces, so the reference
+      # L3-mini corpus: std-only multi-crate workspaces, so the reference
       # patch must pass and the unmodified fixture must fail fully offline.
-      - name: Validate L3 capability suite
-        run: cargo run --locked -p crom-cli -- eval validate-suite l3
+      - name: Validate L3-mini capability suite
+        run: cargo run --locked -p crom-cli -- eval validate-suite l3-mini
       - name: Eval smoke suite (fake provider)
         run: cargo run --locked -p crom-cli -- eval run --suite smoke --provider fake
       - name: Eval golden suite (golden provider)
@@ -200,6 +200,32 @@ jobs:
             target/crom-eval/runs
             target/crom-eval/repair-smoke
           if-no-files-found: ignore
+
+  eval-l3:
+    name: eval / L3 upstream fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: eval-l3
+      # L3 corpus (#289): upstream repos pinned in mfaulk/crom-eval-fixtures.
+      # The fixture commit is fetched once (cached by the rev in the task
+      # manifests); verification itself builds with dependencies vendored
+      # and --offline.
+      - name: Fixture cache key
+        id: rev
+        run: echo "rev=$(grep -h '^rev = ' crates/crom-eval/eval/tasks/l3-*/task.toml | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/crom/eval-fixtures
+          key: eval-fixtures-${{ steps.rev.outputs.rev }}
+      - name: Validate L3 capability suite
+        env:
+          CARGO_BUILD_JOBS: "4"
+        run: cargo run --locked -p crom-cli -- eval validate-suite l3
 
   coverage:
     name: coverage (cargo-llvm-cov)
