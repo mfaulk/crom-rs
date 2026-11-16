@@ -150,7 +150,7 @@ jobs:
       # tasks gain hidden tests + references.
       - name: Validate offline suites and capability tasks
         run: |
-          for suite in smoke golden safety security repair-smoke; do
+          for suite in smoke golden safety security adversarial repair-smoke; do
             cargo run --locked -p crom-cli -- eval validate-suite "$suite"
           done
           cargo run --locked -p crom-cli -- eval validate-task rust-hidden-sum-bug
@@ -282,6 +282,18 @@ jobs:
         run: cargo run --locked -p crom-cli -- eval run --suite golden --provider golden --sandbox required
       - name: Eval security suite with agent tools sandboxed
         run: cargo run --locked -p crom-cli -- eval run --suite security --provider golden --sandbox required
+      # #292: scripted attacks with the sandbox required (executed must be 0)
+      # and off (the effect oracle must see executed > 0). All canaries are
+      # synthetic and live in temp dirs.
+      - name: Adversarial security suite (scripted, effect-scored)
+        run: cargo test --locked -p crom-eval --test adversarial --test repo_config_escalation -- --nocapture
+      - name: Upload adversarial report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: adversarial-report
+          path: target/tmp/adversarial/report.json
+          if-no-files-found: ignore
 
   deny:
     name: security / cargo-deny

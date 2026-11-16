@@ -19,6 +19,7 @@
 //! - [`providers`] — fake / golden / live provider execution modes.
 //! - [`runner`] — runs one task or a suite end-to-end.
 //! - [`workspace`] — agent workspaces outside the grader-reachable tree.
+//! - [`adversarial`] — scripted attack scenarios scored on host effects.
 //! - [`oracle`] — command / rust / file-assertion / behavior oracles.
 //! - [`score`] — weighted structured scoring.
 //! - [`artifacts`] — per-run / per-task artifact bundle.
@@ -27,6 +28,7 @@
 //!   metadata, comparability, and v1 back-compat reading.
 
 pub mod adapter;
+pub mod adversarial;
 pub mod artifacts;
 pub mod behavior;
 pub mod external;

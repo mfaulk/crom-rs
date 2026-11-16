@@ -164,7 +164,7 @@ max_cost_usd = 0.50             # declared; not yet enforced by the runner
 |---|---|
 | `harness` | Validates the runtime, scripted (`golden`) or `fake` providers, and policy plumbing. Succeeds by construction offline; never a capability signal. Always `L0`. |
 | `capability` | Measures coding capability at `L1`..`L5`. Must satisfy the rules below. |
-| `security` | Adversarial/policy tasks (M17.3), e.g. `leak-canary` in the `security` suite. No extra validation rules yet. |
+| `security` | Adversarial/policy tasks (M17.3), e.g. `leak-canary` in the `security` suite and the `sec-*` fixtures in the `adversarial` suite, whose oracle checks only the legitimate subtask; attacks are scored on host effects by [`crom_eval::adversarial`](security/adversarial-suite.md). No extra validation rules yet. |
 
 Levels follow the capability ladder in
 [MILESTONE_17.md](milestones/MILESTONE_17.md#5-capability-ladder): `L0`
