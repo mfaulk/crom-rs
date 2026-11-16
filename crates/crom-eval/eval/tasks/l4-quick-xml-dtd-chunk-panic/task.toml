@@ -1,0 +1,102 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L4"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l4-quick-xml-dtd-chunk-panic"
+title = "Stop DtdParser panicking on chunked input with long unknown markup"
+category = "bugfix"
+difficulty = "hard"
+tags = ["rust", "hidden-tests", "bugfix", "upstream", "real-issue", "l4", "parsing", "untrusted-input", "panic"]
+suites = ["l4"]
+
+prompt = """
+This repository is the `quick-xml` project (https://github.com/tafia/quick-xml). Resolve the GitHub issue below. The issue text is reproduced as filed.
+
+Keep the existing public API working, keep the existing test suite green, and do not edit `Cargo.toml`, `Cargo.lock`, `.cargo/`, or `vendor/`. There is no network access; build and test with `--offline`.
+
+---
+
+Issue #960: DtdParser panics on chunked input with long unknown markup after `<`
+
+Sibling of #957. The fix in #958 prevents the iterative growth of `skipped` inside `DtdParser::feed`'s `UndecidedMarkup` arm, but the same panic is still reachable via the *initial* assignment one arm earlier:
+
+https://github.com/tafia/quick-xml/blob/master/src/parser/dtd.rs#L139
+
+```rust
+*self = Self::UndecidedMarkup(cur.len() - i - 1);
+```
+
+If a chunk delivers `<` followed by 9+ bytes of unknown markup (so `switch()` returns `None` on a window long enough to definitively rule out all keywords), `skipped` is set to that long value in one shot. On the next iteration, the very first line of the `UndecidedMarkup` arm panics:
+
+```rust
+bytes[..skipped].copy_from_slice(&buf[buf.len() - skipped..]);
+// thread '...' panicked: range end index 24 out of range for slice of length 9
+```
+
+## Reproduction
+
+```rust
+use quick_xml::reader::Reader;
+use std::io::BufReader;
+
+let reader = BufReader::with_capacity(24, "<!DOCTYPE r[<aaaaaaaaaaaaaaaaaaaaaaaaaaaaa>]>".as_bytes());
+let mut reader = Reader::from_reader(reader);
+let mut buf = Vec::new();
+let _ = reader.read_event_into(&mut buf); // panics
+```
+
+Surfaced by CIFuzz on #959 .
+
+## Suggested fix
+
+Mirror the bail-out already present in the `UndecidedMarkup` arm: when `cur.len() - i - 1 >= 9`, the markup is definitively unknown, so transition to `InElementDecl` (skip until `>`) instead of staging more bytes than the 9-byte work buffer can hold.
+
+I'll send a PR with this fix and a regression test
+"""
+
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock", ".cargo/", "vendor/"]
+
+[limits]
+wall_secs = 1800
+max_turns = 60
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "d506fca9fda166ac6b5fdaa47c8e283d93a965fc"
+path = "l4-quick-xml-dtd-chunk-panic"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --offline -- --test-threads 8"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline --test issues"]
+
+[provenance]
+author = "quick-xml contributors"
+source = "https://github.com/tafia/quick-xml/issues/960"
+license = "MIT"
+created = "2026-11-15"
+upstream = "https://github.com/tafia/quick-xml"
+base_commit = "42cbb86ccf15a49eebcc61a83fe1125c7a0ddc9a"
+fix_commit = "8128038a58feb3d10a4280897777ceec88d47853"

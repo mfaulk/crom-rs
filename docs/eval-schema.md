@@ -85,7 +85,7 @@ customer_request = "..."
 kind = "copy_dir"                   # or "empty", or "git" (below)
 path = "repo"                       # relative to the task directory
 
-# kind = "git": a snapshot pinned in a fixtures repository (L3)
+# kind = "git": a snapshot pinned in a fixtures repository (L3, L4)
 # repo = "https://github.com/mfaulk/crom-eval-fixtures"   # https:// or file://
 # rev  = "<40-hex commit sha>"      # branch names / short SHAs are rejected
 # path = "<task-id>"                # relative to the repository root
@@ -141,10 +141,10 @@ expected_outcome = "change"     # change (default) | no_change
 
 [provenance]                    # optional; unknown keys rejected
 author = "crom maintainers"
-source = "original"             # or an upstream URL / benchmark name
+source = "original"             # or an upstream URL / benchmark name (L4: the issue URL)
 license = "Apache-2.0 OR MIT"   # SPDX expression
 created = "2026-11-14"          # YYYY-MM-DD
-# Upstream-derived fixtures (L3) also record:
+# Upstream-derived fixtures (L3, L4) also record:
 # upstream = "https://github.com/<org>/<repo>"
 # base_commit = "<sha>"         # snapshot = parent of the fix
 # fix_commit = "<sha>"          # its tests are the hidden oracle

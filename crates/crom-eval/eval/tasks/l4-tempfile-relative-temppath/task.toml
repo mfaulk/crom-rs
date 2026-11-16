@@ -1,0 +1,100 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L4"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l4-tempfile-relative-temppath"
+title = "Make TempPath::from_path cleanup independent of later cwd changes"
+category = "bugfix"
+difficulty = "hard"
+tags = ["rust", "hidden-tests", "bugfix", "upstream", "real-issue", "l4", "security", "filesystem"]
+suites = ["l4"]
+
+prompt = """
+This repository is the `tempfile` project (https://github.com/Stebalien/tempfile). Resolve the GitHub issue below. The issue text is reproduced as filed.
+
+Keep the existing public API working, keep the existing test suite green, and do not edit `Cargo.toml`, `Cargo.lock`, `.cargo/`, or `vendor/`. There is no network access; build and test with `--offline`.
+
+---
+
+Issue #395: `TempPath::from_path` stores relative paths verbatim, so cleanup can delete the wrong file after `chdir`
+
+`TempPath::from_path` currently stores a relative path verbatim. Later, `Drop`
+and `close()` delete via that stored path.
+
+Because the path is re-resolved against the process current working directory,
+this can delete a different file than the caller intended:
+
+    std::env::set_current_dir(&a)?;
+    File::create("victim")?;
+    let tp = tempfile::TempPath::from_path("victim");
+
+    std::env::set_current_dir(&b)?;
+    File::create("victim")?;
+    drop(tp);
+
+Expected:
+- `a/victim` is removed.
+
+Actual:
+- `b/victim` is removed.
+- `a/victim` remains.
+
+This seems inconsistent with `util::create_helper`, which already normalizes to
+absolute paths specifically to avoid cwd-sensitive cleanup, and with the earlier
+absolute-path fixes in #80 and #323. `TempPath::from_path` appears to have
+missed the same normalization when it was added in #159.
+
+Possible fixes:
+1. Normalize relative inputs to absolute paths at construction time.
+2. If a fallible conversion is preferred, add `try_from_path(...) -> io::Result<TempPath>`
+   and deprecate/document the current API accordingly.
+3. If raw relative-path semantics are needed, expose that under an explicit
+   `*_unchecked` or directory-relative API rather than the default constructor.
+"""
+
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock", ".cargo/", "vendor/"]
+
+[limits]
+wall_secs = 1800
+max_turns = 60
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "d506fca9fda166ac6b5fdaa47c8e283d93a965fc"
+path = "l4-tempfile-relative-temppath"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --offline -- --test-threads 8"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline --test temp_path_relative"]
+
+[provenance]
+author = "tempfile contributors"
+source = "https://github.com/Stebalien/tempfile/issues/395"
+license = "MIT OR Apache-2.0"
+created = "2026-11-15"
+upstream = "https://github.com/Stebalien/tempfile"
+base_commit = "929a1127bde5046733d535281203bf8ec1bf2c9e"
+fix_commit = "e34e5748d66a48073ec8e1e6ba37338eecca4548"

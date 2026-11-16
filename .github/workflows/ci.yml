@@ -233,6 +233,32 @@ jobs:
           CARGO_BUILD_JOBS: "4"
         run: env -u RUSTFLAGS cargo run --locked -p crom-cli -- eval validate-suite l3
 
+  eval-l4:
+    name: eval / L4 real-world issues
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: eval-l4
+      # L4 corpus (#296): real upstream issues pinned in
+      # mfaulk/crom-eval-fixtures; see docs/eval/real-world-tasks.md.
+      - name: Fixture cache key
+        id: rev
+        run: echo "rev=$(grep -h '^rev = ' crates/crom-eval/eval/tasks/l4-*/task.toml | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/crom/eval-fixtures
+          key: eval-fixtures-l4-${{ steps.rev.outputs.rev }}
+      # Upstream snapshots are not warning-clean; keep `-D warnings` away
+      # from their builds (see the L3 job).
+      - name: Validate L4 capability suite
+        env:
+          CARGO_BUILD_JOBS: "4"
+        run: env -u RUSTFLAGS cargo run --locked -p crom-cli -- eval validate-suite l4
+
   coverage:
     name: coverage (cargo-llvm-cov)
     runs-on: ubuntu-latest

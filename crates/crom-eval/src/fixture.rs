@@ -184,7 +184,19 @@ pub fn fetch_git_fixture(
 
 /// Recursively copy the contents of `src` into `dst`. Skips `.git`, `target`,
 /// and other build artifacts so fixtures stay small and reproducible.
+///
+/// Below the root, a `target` directory is skipped only when it is a Cargo
+/// build dir: vendored crates such as `cc` ship source modules under
+/// `src/target/`, and dropping them breaks offline builds.
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), FixtureError> {
+    copy_dir_inner(src, dst, true)
+}
+
+fn is_cargo_build_dir(dir: &Path) -> bool {
+    dir.join("CACHEDIR.TAG").is_file() || dir.join(".rustc_info.json").is_file()
+}
+
+fn copy_dir_inner(src: &Path, dst: &Path, at_root: bool) -> Result<(), FixtureError> {
     std::fs::create_dir_all(dst)
         .map_err(|e| FixtureError::Io(format!("create {}: {e}", dst.display())))?;
     let entries = std::fs::read_dir(src)
@@ -193,16 +205,21 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), FixtureError> {
         let entry = entry.map_err(|e| FixtureError::Io(e.to_string()))?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if matches!(name_str.as_ref(), ".git" | "target" | "node_modules") {
+        let from = entry.path();
+        let skip = match name_str.as_ref() {
+            ".git" | "node_modules" => true,
+            "target" => at_root || is_cargo_build_dir(&from),
+            _ => false,
+        };
+        if skip {
             continue;
         }
-        let from = entry.path();
         let to = dst.join(&name);
         let file_type = entry
             .file_type()
             .map_err(|e| FixtureError::Io(e.to_string()))?;
         if file_type.is_dir() {
-            copy_dir_recursive(&from, &to)?;
+            copy_dir_inner(&from, &to, false)?;
         } else {
             std::fs::copy(&from, &to)
                 .map_err(|e| FixtureError::Io(format!("copy {}: {e}", from.display())))?;
@@ -385,6 +402,25 @@ mod tests {
         );
         assert!(!dst.join(".git").exists());
         assert!(!dst.join("target").exists());
+    }
+
+    // A nested source directory named `target` (e.g. vendored `cc/src/target/`) is copied; a nested Cargo build dir is not.
+    #[test]
+    fn copy_dir_keeps_nested_source_dir_named_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        write(&src.join("vendor/cc/src/target/mod.rs"), "pub mod x;");
+        write(&src.join("member/target/CACHEDIR.TAG"), "Signature");
+        write(&src.join("member/target/debug/junk"), "should be skipped");
+
+        let dst = tmp.path().join("dst");
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dst.join("vendor/cc/src/target/mod.rs")).unwrap(),
+            "pub mod x;"
+        );
+        assert!(!dst.join("member/target").exists());
     }
 
     #[test]

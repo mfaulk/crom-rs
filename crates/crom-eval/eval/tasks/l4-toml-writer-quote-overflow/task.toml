@@ -1,0 +1,107 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L4"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l4-toml-writer-quote-overflow"
+title = "Fix add-with-overflow in toml_writer for 256+ consecutive quotes"
+category = "bugfix"
+difficulty = "hard"
+tags = ["rust", "hidden-tests", "bugfix", "upstream", "real-issue", "l4", "serialization", "panic", "workspace"]
+suites = ["l4"]
+
+prompt = """
+This repository is the `toml_writer` project (https://github.com/toml-rs/toml). Resolve the GitHub issue below. The issue text is reproduced as filed.
+
+Keep the existing public API working, keep the existing test suite green, and do not edit `Cargo.toml`, `Cargo.lock`, `.cargo/`, or `vendor/`. There is no network access; build and test with `--offline`.
+
+---
+
+Issue #1188: toml_writer: "attempt to add with overflow" serializing a string with 256+ consecutive quotes
+
+`toml_writer`'s `ValueMetrics::calculate` (`src/string.rs`) tracks the longest run of consecutive quotes with `u8` counters:
+
+```rust
+let mut prev_single_quotes = 0;
+let mut prev_double_quotes = 0;
+for byte in s.as_bytes() {
+    if *byte == b'\\'' {
+        prev_single_quotes += 1;   // overflows on the 256th consecutive quote
+        ...
+```
+
+Serializing a string value containing a run of 256+ consecutive `"` (or `'`) characters overflows the counter. In builds with overflow checks enabled (debug builds, and fuzz/test profiles with `debug-assertions`) this panics:
+
+```text
+thread 'main' panicked at toml_writer-1.1.1+spec-1.1.0/src/string.rs:352:17:
+attempt to add with overflow
+```
+
+## Reproduction
+
+```rust
+fn main() {
+    let mut table = toml::Table::new();
+    table.insert("key".into(), toml::Value::String("\\"".repeat(256)));
+    let _ = toml::to_string(&table); // panics in a debug build
+}
+```
+
+Tested with `toml` 1.1.2 / `toml_writer` 1.1.1+spec-1.1.0 (latest at time of writing). `"'".repeat(256)` panics the same way on the `prev_single_quotes` counter a few lines earlier.
+
+## Impact
+
+Panic only in overflow-checked builds. In release builds the wrap appears harmless: `max_seq_*_quotes` has already latched at ≥3 via `.max()` by the time the running counter wraps, and the delimiter decisions only compare against 0 and 2, so the serialized output is still correct.
+
+Found by cargo-fuzz (which builds with `-Cdebug-assertions`) while round-trip fuzzing a config loader that uses `toml::to_string`.
+
+## Suggested fix
+
+`saturating_add(1)` on both running counters (or clamp them at 3, since no consumer distinguishes runs longer than that).
+"""
+
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock", ".cargo/", "vendor/", "crates/toml_writer/Cargo.toml"]
+
+[limits]
+wall_secs = 1800
+max_turns = 60
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "d506fca9fda166ac6b5fdaa47c8e283d93a965fc"
+path = "l4-toml-writer-quote-overflow"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --offline -p toml_writer -- --test-threads 8"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline -p toml_writer --test string"]
+
+[provenance]
+author = "toml-rs contributors"
+source = "https://github.com/toml-rs/toml/issues/1188"
+license = "MIT OR Apache-2.0"
+created = "2026-11-15"
+upstream = "https://github.com/toml-rs/toml"
+base_commit = "771a975840ff876825c2973a79634ffe79a3bf5a"
+fix_commit = "3adbbb7860810b146dbdedba1f315c90813083f2"
