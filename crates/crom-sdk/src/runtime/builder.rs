@@ -37,6 +37,7 @@ pub struct AgentRuntimeBuilder {
     interactivity: Option<InteractivityMode>,
     verbosity: Option<EventVerbosity>,
     budgets: Option<RunBudgets>,
+    pricing: Option<crom_core::ModelPricing>,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -77,6 +78,7 @@ impl AgentRuntimeBuilder {
             interactivity: None,
             verbosity: None,
             budgets: None,
+            pricing: None,
         }
     }
 
@@ -164,6 +166,14 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Nominal prices for the runtime's model, e.g. from
+    /// `crom_core::PricingTable::lookup(..).model_pricing()`. Enables
+    /// `total_cost_usd` and `RunBudgets::max_cost_usd` enforcement.
+    pub fn pricing(mut self, pricing: crom_core::ModelPricing) -> Self {
+        self.pricing = Some(pricing);
+        self
+    }
+
     /// Apply a host bundle: pulls approval, credential, event sink, redactor,
     /// and tool host out of an `AgentHost` implementation.
     pub fn host(mut self, host: Arc<dyn AgentHost>) -> Self {
@@ -237,6 +247,7 @@ impl AgentRuntimeBuilder {
             interactivity,
             verbosity,
             default_budgets: self.budgets.unwrap_or_default(),
+            pricing: self.pricing,
         });
         Ok(AgentRuntime { inner })
     }

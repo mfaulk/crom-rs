@@ -149,6 +149,72 @@ Manual live check (opt-in, costs tokens):
 DEEPSEEK_API_KEY=... crom run --provider deepseek "List the files in src/"
 CROM_EVAL_LIVE=1 DEEPSEEK_API_KEY=... crom eval run --suite smoke --provider deepseek
 ```
+
+## Cost semantics
+
+crom reports **nominal** cost: published standard-tier list price times the
+token usage the provider reported. It is not the billed amount. It ignores
+discounts, credits, batch/flex/off-peak rates, regional or data-residency
+surcharges, long-context tiers, cache storage fees, and 1-hour cache-write
+rates. Use it to compare runs, not to reconcile invoices.
+
+- **Source of prices.** `crates/crom-core/pricing/prices.toml`, compiled
+  in and parsed at runtime (`crom_core::PricingTable`). There are no prices
+  in Rust source and no network fetches. Every entry has `source_url` and
+  `retrieved_at`. The table `version` (the retrieval date) is recorded as
+  `repro.pricing_source_version` in eval results and in `run.json`.
+- **Matching.** `provider` is the provider profile id and `model` (or an
+  entry in `aliases`) must equal the request model id exactly. A model
+  without an entry has unknown cost (`no_pricing_entry`).
+- **Fields.** USD per 1M tokens for `input` (uncached), `output` (including
+  reasoning), and optionally `cache_write` and `cache_read`, matching
+  `TokenUsage` normalization (see [events](sdk/events.md#token-usage)).
+- **Unknown is never zero.** Cost is `null` if usage was not reported for
+  any round trip, if input or output is unknown, or if an entry prices a
+  cache quantity the provider did not report. Eval results give the reason
+  in `cost_unknown_reason`: `no_pricing_entry`, `usage_unknown`,
+  `input_tokens_unknown`, `output_tokens_unknown`, or
+  `cache_tokens_unknown`.
+- **Not priced on purpose.** Models whose price depends on prompt size
+  (e.g. `gemini-2.5-pro` above 200k tokens) are left out, since a flat
+  rate would misprice them. DeepSeek prices are peak-hour rates (off-peak
+  is cheaper), so DeepSeek nominal cost is an upper bound. The DeepSeek
+  pricing page no longer lists `deepseek-chat`/`deepseek-reasoner`, so the
+  `deepseek` profile's default model is unpriced.
+- **Overrides.** `CROM_PRICING_FILE=<path>` (read by
+  `PricingTable::load_default`, which `crom eval run` uses) and
+  `crom eval run --pricing-file <path>` merge a file in the same format
+  over the built-in table. An override entry replaces any built-in entry
+  for the same provider that shares a model name or alias. The recorded
+  version becomes `<override version>+<built-in version>`.
+
+### Budgets
+
+`crom eval run --max-cost-usd <usd>` caps each task across all of its
+attempts. A task's `limits.max_cost_usd` also applies, and the tighter cap
+wins. `--max-run-cost-usd <usd>` caps the whole run, across repetitions.
+Both are checked between model turns, so a task can overshoot its cap by at
+most one turn. Caps fail closed: with a cap set, an unpriced model or
+unreported usage stops the agent (`budget.usage_unknown`) or keeps further
+tasks from starting. Remaining tasks are recorded as `skipped` with a
+`budget:` reason. SDK hosts set `RunBudgets::max_cost_usd`,
+`max_input_tokens`, and `max_output_tokens` and pass prices with
+`AgentRuntimeBuilder::pricing` (see [SDK safety](sdk/safety.md)).
+
+### Updating the pricing table
+
+1. Open each `source_url` in `crates/crom-core/pricing/prices.toml` and
+   read the standard (non-batch) per-1M-token prices.
+2. Edit the prices. Set `retrieved_at` to today's date on every entry you
+   checked. Add new models with their own `source_url`. Leave out any
+   model whose price you cannot verify or that is tiered by prompt size.
+3. Set the top-level `version` to the retrieval date (`YYYY-MM-DD`).
+4. Run `cargo test -p crom-core pricing`. The tests check that the table
+   parses, is in USD, has https sources, ISO dates, non-negative prices,
+   and no duplicate names.
+5. Commit as `chore(pricing): refresh prices (<date>)`. Results priced
+   with different table versions are not comparable on cost.
+
 ## Errors, retries, timeouts
 
 Applies to `crom-anthropic`, `crom-provider-openai`, and `crom-provider-gemini`.

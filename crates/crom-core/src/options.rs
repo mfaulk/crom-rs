@@ -103,6 +103,9 @@ pub struct AgentOptions {
     /// finishes naturally is not affected — the cap only blocks the call
     /// that would exceed it.
     pub max_tool_calls: Option<u32>,
+    /// Token and nominal-cost caps checked after every model turn; see
+    /// [`crate::usage_budget`]. Unlimited by default.
+    pub usage_budget: crate::usage_budget::UsageBudget,
     pub session_id: Option<SessionId>,
     pub permission_callback: Option<Arc<dyn PermissionCallback>>,
     pub system_prompt: Option<String>,
@@ -153,6 +156,7 @@ impl Default for AgentOptions {
             permission_mode: PermissionMode::Default,
             max_turns: Some(8),
             max_tool_calls: None,
+            usage_budget: Default::default(),
             session_id: None,
             permission_callback: None,
             system_prompt: None,
@@ -182,6 +186,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("permission_mode", &self.permission_mode)
             .field("max_turns", &self.max_turns)
             .field("max_tool_calls", &self.max_tool_calls)
+            .field("usage_budget", &self.usage_budget)
             .field("session_id", &self.session_id)
             .field("max_tokens", &self.max_tokens)
             .field("approval_memory", &self.approval_memory)

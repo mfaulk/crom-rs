@@ -37,6 +37,33 @@ impl RunBudgets {
         self
     }
 
+    /// Cap cumulative prompt tokens (input plus reported cache tokens).
+    pub fn with_max_input_tokens(mut self, n: u64) -> Self {
+        self.max_input_tokens = Some(n);
+        self
+    }
+
+    pub fn with_max_output_tokens(mut self, n: u64) -> Self {
+        self.max_output_tokens = Some(n);
+        self
+    }
+
+    /// Cap nominal list-price cost. Requires runtime pricing
+    /// (`AgentRuntimeBuilder::pricing`); without it the run fails closed.
+    pub fn with_max_cost_usd(mut self, usd: f64) -> Self {
+        self.max_cost_usd = Some(usd);
+        self
+    }
+
+    /// The token/cost caps the core agent loop checks between turns.
+    pub fn usage_budget(&self) -> crom_core::UsageBudget {
+        crom_core::UsageBudget {
+            max_input_tokens: self.max_input_tokens,
+            max_output_tokens: self.max_output_tokens,
+            max_cost_usd: self.max_cost_usd,
+        }
+    }
+
     pub fn with_max_duration(mut self, d: Duration) -> Self {
         self.max_duration = Some(d);
         self

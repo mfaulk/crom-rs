@@ -587,16 +587,58 @@ impl ModelPricing {
     /// unknown, or when a configured cache rate applies to an unknown cache
     /// quantity — an unknown is never priced as zero.
     pub fn estimate(&self, u: &TokenUsage) -> Option<f64> {
-        let input = u.input_tokens? as f64;
-        let output = u.output_tokens? as f64;
+        self.estimate_explained(u).ok()
+    }
+
+    /// [`Self::estimate`] with the reason the cost is unknown.
+    pub fn estimate_explained(&self, u: &TokenUsage) -> Result<f64, CostUnknownReason> {
+        let input = u
+            .input_tokens
+            .ok_or(CostUnknownReason::InputTokensUnknown)? as f64;
+        let output = u
+            .output_tokens
+            .ok_or(CostUnknownReason::OutputTokensUnknown)? as f64;
         let mut cost = (input * self.input_per_million + output * self.output_per_million) / 1.0e6;
         if let Some(rate) = self.cache_creation_per_million {
-            cost += (u.cache_creation_input_tokens? as f64 * rate) / 1.0e6;
+            let n = u
+                .cache_creation_input_tokens
+                .ok_or(CostUnknownReason::CacheTokensUnknown)?;
+            cost += (n as f64 * rate) / 1.0e6;
         }
         if let Some(rate) = self.cache_read_per_million {
-            cost += (u.cache_read_input_tokens? as f64 * rate) / 1.0e6;
+            let n = u
+                .cache_read_input_tokens
+                .ok_or(CostUnknownReason::CacheTokensUnknown)?;
+            cost += (n as f64 * rate) / 1.0e6;
         }
-        Some(cost)
+        Ok(cost)
+    }
+}
+
+/// Why a nominal cost could not be computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostUnknownReason {
+    /// No pricing entry matches the provider/model.
+    NoPricingEntry,
+    /// No round trip was recorded, or one reported no usage at all.
+    UsageUnknown,
+    InputTokensUnknown,
+    OutputTokensUnknown,
+    /// A priced cache quantity was not reported.
+    CacheTokensUnknown,
+}
+
+impl CostUnknownReason {
+    /// Stable string key (matches the serde representation).
+    pub fn key(&self) -> &'static str {
+        match self {
+            CostUnknownReason::NoPricingEntry => "no_pricing_entry",
+            CostUnknownReason::UsageUnknown => "usage_unknown",
+            CostUnknownReason::InputTokensUnknown => "input_tokens_unknown",
+            CostUnknownReason::OutputTokensUnknown => "output_tokens_unknown",
+            CostUnknownReason::CacheTokensUnknown => "cache_tokens_unknown",
+        }
     }
 }
 
@@ -628,5 +670,28 @@ mod tests {
         };
         assert_eq!(pricing(None).estimate(&partial), None);
         assert_eq!(pricing(Some(0.1)).estimate(&known), None);
+    }
+
+    // Each unknown quantity maps to its own reason.
+    #[test]
+    fn estimate_explained_names_the_unknown_quantity() {
+        let known = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(10),
+            ..Default::default()
+        };
+        let no_input = TokenUsage {
+            input_tokens: None,
+            ..known.clone()
+        };
+        assert_eq!(
+            pricing(None).estimate_explained(&no_input),
+            Err(CostUnknownReason::InputTokensUnknown)
+        );
+        assert_eq!(
+            pricing(Some(0.1)).estimate_explained(&known),
+            Err(CostUnknownReason::CacheTokensUnknown)
+        );
+        assert_eq!(CostUnknownReason::NoPricingEntry.key(), "no_pricing_entry");
     }
 }

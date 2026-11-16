@@ -236,6 +236,16 @@ pub struct RunSummary {
     /// Provider + infra errors exceed 10% of attempts; do not compare.
     #[serde(default)]
     pub unreliable: bool,
+    /// Nominal spend over every non-skipped result. `None` when any of them
+    /// has an unknown cost: a partial sum is never reported. `0.0` when none ran.
+    #[serde(default)]
+    pub total_cost_usd: Option<f64>,
+    /// Non-skipped results whose cost is unknown.
+    #[serde(default)]
+    pub cost_unknown: usize,
+    /// Tasks skipped because a spend cap was reached or unenforceable.
+    #[serde(default)]
+    pub budget_skipped: usize,
 }
 
 /// Aggregate resolved-rate by a key extractor (possibly multi-valued).
@@ -354,6 +364,9 @@ impl RunSummary {
             outcomes: Default::default(),
             pass_rate: None,
             unreliable: false,
+            total_cost_usd: None,
+            cost_unknown: 0,
+            budget_skipped: 0,
         };
         let mut score_sum = 0.0;
         for r in results {
@@ -421,6 +434,22 @@ impl RunSummary {
             crate::result_schema::OutcomeCounts::from_outcomes(results.iter().map(|r| r.outcome()));
         summary.pass_rate = summary.outcomes.pass_rate();
         summary.unreliable = summary.outcomes.unreliable();
+        let ran: Vec<&EvalResult> = results
+            .iter()
+            .filter(|r| !matches!(r.status, EvalStatus::Skipped))
+            .collect();
+        summary.cost_unknown = ran.iter().filter(|r| r.cost_usd.is_none()).count();
+        summary.total_cost_usd =
+            (summary.cost_unknown == 0).then(|| ran.iter().filter_map(|r| r.cost_usd).sum());
+        summary.budget_skipped = results
+            .iter()
+            .filter(|r| {
+                matches!(r.status, EvalStatus::Skipped)
+                    && r.skipped_reason
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("budget:"))
+            })
+            .count();
         if !results.is_empty() {
             summary.mean_score = (score_sum / results.len() as f64 * 1000.0).round() / 1000.0;
         }
@@ -475,6 +504,16 @@ impl RunSummary {
         }
         if self.unreliable {
             s.push_str("- **UNRELIABLE**: provider + infra errors exceed 10% of attempts; do not compare\n");
+        }
+        match self.total_cost_usd {
+            Some(c) => s.push_str(&format!("- nominal cost: ${c:.4}\n")),
+            None => s.push_str(&format!(
+                "- nominal cost: unknown ({} result(s) without a cost)\n",
+                self.cost_unknown
+            )),
+        }
+        if self.budget_skipped > 0 {
+            s.push_str(&format!("- skipped (budget): {}\n", self.budget_skipped));
         }
         s.push_str(&format!("- mean score: {:.3}\n\n", self.mean_score));
 

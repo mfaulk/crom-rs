@@ -1,0 +1,126 @@
+# Nominal list prices for cost estimation. Compiled into crom-core via
+# `include_str!` and parsed at runtime; no prices live in Rust source.
+#
+# Costs computed from this table are NOMINAL: published standard-tier list
+# price x reported token usage. They are not billed amounts (no discounts,
+# credits, batch/flex/off-peak rates, regional surcharges, or cache storage
+# fees). See docs/providers.md#cost-semantics.
+#
+# Units: USD per 1,000,000 tokens. Field meanings follow crom's normalized
+# `TokenUsage` (crates/crom-core/src/usage.rs):
+#   input        regular (uncached) input tokens
+#   output       output tokens, including reasoning/thinking tokens
+#   cache_write  cache-creation input tokens (omit if the provider has no
+#                separate write price)
+#   cache_read   cache-hit input tokens (omit if not applicable)
+# When a cache price is set and the provider leaves that token count
+# unreported, the cost is unknown (never zero).
+#
+# Matching: `provider` is the provider profile id (docs/providers.md);
+# `model` and `aliases` match the request model id exactly.
+#
+# Models with prompt-size price tiers (e.g. gemini-2.5-pro above 200k
+# prompt tokens) are deliberately omitted: a flat rate would misprice them,
+# so their cost stays unknown with reason `no_pricing_entry`.
+#
+# Update procedure: docs/providers.md#updating-the-pricing-table. In short:
+# re-read each `source_url`, edit prices, set `retrieved_at` on every
+# changed entry, bump top-level `version` to the retrieval date, and run
+# `cargo test -p crom-core pricing`.
+
+version = "2026-11-15"
+currency = "USD"
+
+# --- Anthropic (5-minute cache-write rate; 1-hour writes cost more) ---
+
+[[models]]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+input = 3.00
+output = 15.00
+cache_write = 3.75
+cache_read = 0.30
+source_url = "https://platform.claude.com/docs/en/about-claude/pricing"
+retrieved_at = "2026-11-15"
+
+[[models]]
+provider = "anthropic"
+model = "claude-opus-5-5"
+input = 4.00
+output = 20.00
+cache_write = 5.00
+cache_read = 0.20
+source_url = "https://platform.claude.com/docs/en/about-claude/pricing"
+retrieved_at = "2026-11-15"
+
+# --- OpenAI (no separate cache-write price) ---
+
+[[models]]
+provider = "openai"
+model = "gpt-4.1"
+input = 2.00
+output = 8.00
+cache_read = 0.50
+source_url = "https://developers.openai.com/api/docs/pricing"
+retrieved_at = "2026-11-15"
+
+[[models]]
+provider = "openai"
+model = "gpt-4.1-mini"
+input = 0.40
+output = 1.60
+cache_read = 0.10
+source_url = "https://developers.openai.com/api/docs/pricing"
+retrieved_at = "2026-11-15"
+
+[[models]]
+provider = "openai"
+model = "gpt-5"
+input = 1.25
+output = 10.00
+cache_read = 0.125
+source_url = "https://developers.openai.com/api/docs/pricing"
+retrieved_at = "2026-11-15"
+
+[[models]]
+provider = "openai"
+model = "gpt-5-mini"
+input = 0.25
+output = 2.00
+cache_read = 0.025
+source_url = "https://developers.openai.com/api/docs/pricing"
+retrieved_at = "2026-11-15"
+
+# --- DeepSeek (peak-hour rates; off-peak is 50%, so nominal is an upper
+# bound). `input` = cache miss, `cache_read` = cache hit. The page no longer
+# lists `deepseek-chat` / `deepseek-reasoner`, so they are not priced. ---
+
+[[models]]
+provider = "deepseek"
+model = "deepseek-flash"
+aliases = ["deepseek-v4-flash"]
+input = 0.30
+output = 1.20
+cache_read = 0.006
+source_url = "https://api-docs.deepseek.com/quick_start/pricing"
+retrieved_at = "2026-11-15"
+
+[[models]]
+provider = "deepseek"
+model = "deepseek-v4-pro"
+input = 1.32
+output = 3.96
+cache_read = 0.044
+source_url = "https://api-docs.deepseek.com/quick_start/pricing"
+retrieved_at = "2026-11-15"
+
+# --- Google Gemini (text input rate; output includes thinking tokens) ---
+
+[[models]]
+provider = "gemini"
+model = "gemini-2.5-flash"
+input = 0.30
+output = 2.50
+cache_read = 0.03
+source_url = "https://ai.google.dev/gemini-api/docs/pricing"
+retrieved_at = "2026-11-15"

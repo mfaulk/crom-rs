@@ -127,6 +127,19 @@ pub struct EvalRunArgs {
     /// Recorded in `run.json` and each result's `repro` block.
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
+    /// Per-task nominal cost cap in USD (all attempts); the tighter of this
+    /// and a task's `limits.max_cost_usd` applies. Breach fails the task as
+    /// `budget_exceeded`.
+    #[arg(long, value_parser = parse_usd)]
+    pub max_cost_usd: Option<f64>,
+    /// Run-level nominal spend cap in USD. Once reached, remaining tasks are
+    /// recorded as skipped with a `budget:` reason.
+    #[arg(long, value_parser = parse_usd)]
+    pub max_run_cost_usd: Option<f64>,
+    /// Pricing override file merged over the built-in table (also read from
+    /// `CROM_PRICING_FILE`). See docs/providers.md#cost-semantics.
+    #[arg(long)]
+    pub pricing_file: Option<PathBuf>,
     /// M16: repair loop — `enabled` or `disabled` (default `disabled`). When
     /// enabled, failed validations are parsed into structured diagnostics and a
     /// targeted repair brief drives bounded retries.
@@ -445,6 +458,27 @@ fn build_repair_policy(args: &EvalRunArgs) -> Result<crom_core::repair::RepairPo
     Ok(policy)
 }
 
+fn parse_usd(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if v.is_finite() && v >= 0.0 {
+        Ok(v)
+    } else {
+        Err("must be a finite amount >= 0".to_string())
+    }
+}
+
+/// Built-in pricing, then `CROM_PRICING_FILE`, then `--pricing-file`.
+fn eval_pricing(args: &EvalRunArgs) -> Result<crom_core::PricingTable> {
+    let table = crom_core::PricingTable::load_default().map_err(|e| anyhow!("{e}"))?;
+    match &args.pricing_file {
+        Some(p) => {
+            Ok(table
+                .with_override(crom_core::PricingTable::load_file(p).map_err(|e| anyhow!("{e}"))?))
+        }
+        None => Ok(table),
+    }
+}
+
 async fn cmd_run(args: EvalRunArgs) -> Result<()> {
     let provider = ProviderMode::parse(&args.provider);
     let provider_profiles = if let ProviderMode::Live(name) = &provider {
@@ -481,6 +515,7 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
     let repair = build_repair_policy(&args)?;
     let sandbox = resolve_eval_sandbox(args.sandbox, &provider);
     let sandbox_overhead_ms = prepare_eval_sandbox(sandbox, args.network).await?;
+    let pricing = eval_pricing(&args)?;
 
     let config = RunConfig {
         provider: provider.clone(),
@@ -501,6 +536,10 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
         workspace_root: None,
         sandbox,
         sandbox_overhead_ms,
+        pricing,
+        max_cost_usd: args.max_cost_usd,
+        max_run_cost_usd: args.max_run_cost_usd,
+        run_cost_remaining: None,
     };
 
     let results = run_tasks_repeated(&selected, &run, &config, repetitions).await;
@@ -598,6 +637,19 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
         println!(
             "({} quarantined task result(s) reported separately)",
             summary.quarantined
+        );
+    }
+    match summary.total_cost_usd {
+        Some(c) => println!("nominal cost: ${c:.4}"),
+        None => println!(
+            "nominal cost: unknown ({} result(s) without a cost)",
+            summary.cost_unknown
+        ),
+    }
+    if summary.budget_skipped > 0 {
+        println!(
+            "spend cap: {} task(s) skipped (budget); see skipped_reason",
+            summary.budget_skipped
         );
     }
     println!("artifacts: {}", run.root.display());

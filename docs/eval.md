@@ -54,6 +54,8 @@ $ crom eval run --suite <suite> --repetitions 5
 $ crom eval run --suite <suite> --repetitions 5 --seed 42
 $ crom eval run --suite <suite> --prompt-variant concise
 $ crom eval run <path> --adapter aider --attempts 2
+$ crom eval run --suite <suite> --provider deepseek --max-cost-usd 0.25 --max-run-cost-usd 5
+$ crom eval run --suite <suite> --pricing-file my-prices.toml
 $ crom eval validate-task <id-or-path>
 $ crom eval validate-suite <suite> --repeat 5
 $ CROM_EVAL_PODMAN=1 crom eval validate-suite <suite> --isolation podman
@@ -140,6 +142,27 @@ The `--provider` flag selects how the agent is driven for the whole run:
 Set `CROM_EVAL_MODEL` to override the live model (default: the profile's
 `default_model`, e.g. `claude-sonnet-4-6` for `anthropic`, `deepseek-chat`
 for `deepseek`).
+
+### Cost and spend caps
+
+Each `result.json` records `cost_usd`: nominal list-price cost from the
+versioned table in `crates/crom-core/pricing/prices.toml`. It is `null`,
+with a `cost_unknown_reason`, when the model has no pricing entry or usage
+was not reported. It is never zero-filled. `summary.json` adds
+`total_cost_usd`. See [cost semantics](providers.md#cost-semantics).
+
+- `--max-cost-usd <usd>`: per-task cap across all attempts (a task's
+  `limits.max_cost_usd` also applies; the tighter wins). A breach stops the
+  agent between turns, and the task fails as `budget_exceeded`.
+- `--max-run-cost-usd <usd>`: cap for the whole run, across repetitions.
+  Once spend reaches it, the remaining tasks are recorded as `skipped` with
+  a `budget:` reason and counted in `summary.json` `budget_skipped`.
+- `--pricing-file <path>` (or `CROM_PRICING_FILE`): merge your own prices
+  over the built-in table.
+
+Caps fail closed. With a cap set, an unpriced model or unreported usage
+stops the run instead of letting it continue unmetered. `plan_then_act`
+tasks are skipped under a cost cap, because plan modes do not meter usage.
 
 ## Suites
 

@@ -183,7 +183,10 @@ async fn result_records_reproducibility_metadata() {
     assert!(repro["runtime"]["max_turns"].as_u64().unwrap() > 0);
     assert!(repro["host"]["cpus"].as_u64().unwrap() > 0);
     assert!(repro["crom_version"].is_string());
-    assert!(repro["pricing_source_version"].is_null());
+    assert_eq!(
+        repro["pricing_source_version"],
+        crom_core::PricingTable::builtin().version.as_str()
+    );
 }
 
 /// A provider 5xx during the run is classified as provider_error (outcome and failure class), not did_not_attempt.

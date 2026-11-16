@@ -118,6 +118,17 @@ pub(crate) async fn execute_request(
         None
     };
 
+    // Token/cost budgets are metered only by the regular run loop. Refuse
+    // them on plan modes rather than running unmetered (#282).
+    if matches!(request.mode, AgentMode::PlanOnly | AgentMode::PlanThenAct)
+        && !request.budgets.usage_budget().is_unlimited()
+    {
+        return Err(AgentSdkError::invalid_request(
+            "budget.unsupported_mode",
+            "max_input_tokens / max_output_tokens / max_cost_usd are not enforced in plan modes",
+        ));
+    }
+
     // Resolve workspace.
     let workspace = resolve_workspace(&runtime, request.workspace).await?;
 
@@ -349,6 +360,7 @@ pub(crate) async fn execute_request(
         // layer that can block the (max+1)-th call *before* it starts while
         // still letting an exactly-`max` run finish naturally (#29).
         max_tool_calls: request.budgets.max_tool_calls,
+        usage_budget: request.budgets.usage_budget(),
         permission_mode: PermissionMode::Default,
         allowed_tools: tools.names(),
         ..Default::default()
@@ -378,13 +390,15 @@ pub(crate) async fn execute_request(
     // Thread the SDK-level cancellation pair (#145, #155) into the core
     // agent loop so external cancel, deadline expiry, and budget
     // breaches actually stop the run instead of being advisory.
-    let agent = AgentBuilder::new()
+    let mut agent_builder = AgentBuilder::new()
         .options(options.clone())
         .provider(provider)
         .tools(tools.clone())
-        .cancellation(cancellation.flag(), cancellation.notify())
-        .build()
-        .map_err(AgentSdkError::from)?;
+        .cancellation(cancellation.flag(), cancellation.notify());
+    if let Some(pricing) = runtime.pricing {
+        agent_builder = agent_builder.pricing(pricing);
+    }
+    let agent = agent_builder.build().map_err(AgentSdkError::from)?;
 
     let prompt = request.task.clone();
     let mut event_stream = agent.run(prompt);
@@ -467,6 +481,21 @@ pub(crate) async fn execute_request(
                             "budget.max_tool_calls_exceeded",
                             "max_tool_calls budget exceeded",
                         ));
+                    }
+                    ResultSubtype::ErrorMaxInputTokens
+                    | ResultSubtype::ErrorMaxOutputTokens
+                    | ResultSubtype::ErrorMaxCost
+                    | ResultSubtype::ErrorBudgetUsageUnknown => {
+                        // The core loop stopped between turns on a usage
+                        // budget (#282). The message follows the `[budget]`
+                        // marker the loop appends to the result text.
+                        status = AgentRunStatus::Failed;
+                        let msg = r
+                            .result
+                            .as_deref()
+                            .and_then(|t| t.rsplit_once("[budget] ").map(|(_, m)| m))
+                            .unwrap_or("usage budget exceeded");
+                        diagnostics.push(Diagnostic::error(usage_budget_code(r.subtype), msg));
                     }
                     ResultSubtype::ErrorDuringExecution => {
                         status = AgentRunStatus::Failed;
@@ -759,6 +788,16 @@ pub(crate) async fn execute_plan(
     execute_plan_with_turns(runtime, request)
         .await
         .map(|(result, _)| result)
+}
+
+/// Diagnostic code for a core usage-budget stop.
+fn usage_budget_code(subtype: ResultSubtype) -> &'static str {
+    match subtype {
+        ResultSubtype::ErrorMaxInputTokens => "budget.max_input_tokens_exceeded",
+        ResultSubtype::ErrorMaxOutputTokens => "budget.max_output_tokens_exceeded",
+        ResultSubtype::ErrorMaxCost => "budget.max_cost_exceeded",
+        _ => "budget.usage_unknown",
+    }
 }
 
 /// [`execute_plan`] plus the planning loop's `ModelTurnCompleted` events, so

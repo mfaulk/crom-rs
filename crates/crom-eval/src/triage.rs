@@ -318,6 +318,7 @@ pub fn triage(run_dir: &Path) -> Result<String> {
         "required_path_missing",
         "planning_failure",
         "timeout",
+        "budget_exceeded",
         "tool_loop",
         "did_not_attempt",
         "provider_error",

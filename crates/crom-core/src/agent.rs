@@ -62,6 +62,52 @@ async fn emit_model_turn_completed(
     emit(tx, sink, sid, AgentEvent::ModelTurnCompleted(turn)).await;
 }
 
+/// Loop state needed to end a run on a usage-budget breach.
+struct BudgetStop<'a> {
+    tx: &'a mpsc::Sender<AgentEvent>,
+    sink: &'a Option<Arc<dyn SessionSink>>,
+    telemetry: &'a Option<Arc<dyn TelemetrySink>>,
+    hooks: &'a Hooks,
+    session_id: &'a SessionId,
+    run_id: &'a RunId,
+    cwd: &'a std::path::Path,
+    turns: u32,
+    last_result_text: Option<String>,
+    usage: Option<TokenUsage>,
+    pricing: Option<&'a ModelPricing>,
+}
+
+/// Emit the terminal result for a budget breach and run the stop hook. The
+/// breach message is appended to `result` so hosts can surface it.
+async fn end_on_budget_breach(breach: crate::usage_budget::BudgetBreach, s: BudgetStop<'_>) {
+    let message = match &s.last_result_text {
+        Some(t) if !t.is_empty() => format!("{t}\n\n[budget] {}", breach.message),
+        _ => format!("[budget] {}", breach.message),
+    };
+    let result = AgentResult {
+        subtype: breach.subtype(),
+        result: Some(message),
+        session_id: s.session_id.clone(),
+        run_id: Some(s.run_id.clone()),
+        num_turns: s.turns,
+        total_cost_usd: estimate_cost(s.pricing, s.usage.as_ref()),
+        usage: s.usage,
+    };
+    emit(s.tx, s.sink, s.session_id, AgentEvent::Result(result)).await;
+    run_stop_hook(
+        s.hooks,
+        s.telemetry,
+        s.tx,
+        s.sink,
+        s.session_id,
+        s.run_id,
+        s.cwd,
+        s.turns,
+        StopReason::Error,
+    )
+    .await;
+}
+
 fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -902,6 +948,31 @@ pub(crate) async fn run_loop(
             return Ok(());
         }
 
+        // Usage budgets (#282): a cost cap without a price can never be
+        // enforced, so refuse to call the provider at all.
+        if turns == 0 {
+            if let Some(breach) = options.usage_budget.preflight(pricing.as_ref()) {
+                end_on_budget_breach(
+                    breach,
+                    BudgetStop {
+                        tx: &tx,
+                        sink: &session_sink,
+                        telemetry: &telemetry_sink,
+                        hooks: &hooks,
+                        session_id: &session_id,
+                        run_id: &cfg.run_id,
+                        cwd: &options.cwd,
+                        turns,
+                        last_result_text: last_result_text.clone(),
+                        usage: usage_totals.total(),
+                        pricing: pricing.as_ref(),
+                    },
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
         if turns >= max_turns {
             let cost = estimate_cost(pricing.as_ref(), usage_totals.total().as_ref());
             let result = AgentResult {
@@ -1271,6 +1342,33 @@ pub(crate) async fn run_loop(
 
         if !text_buf.is_empty() {
             last_result_text = Some(text_buf.clone());
+        }
+
+        // Usage budgets (#282), checked between turns against the strict run
+        // total. A breach ends the run even if this turn was the final
+        // answer: the spend already happened and must be reported as such.
+        if let Some(breach) = options
+            .usage_budget
+            .check(usage_totals.total().as_ref(), pricing.as_ref())
+        {
+            end_on_budget_breach(
+                breach,
+                BudgetStop {
+                    tx: &tx,
+                    sink: &session_sink,
+                    telemetry: &telemetry_sink,
+                    hooks: &hooks,
+                    session_id: &session_id,
+                    run_id: &cfg.run_id,
+                    cwd: &options.cwd,
+                    turns,
+                    last_result_text: last_result_text.clone(),
+                    usage: usage_totals.total(),
+                    pricing: pricing.as_ref(),
+                },
+            )
+            .await;
+            return Ok(());
         }
 
         // Plan mode: never execute tools. Treat first turn output as the final result.

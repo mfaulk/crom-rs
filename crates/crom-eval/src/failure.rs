@@ -66,6 +66,10 @@ pub enum FailureClass {
     RepairAttemptLimitExceeded,
     /// Command output could not be parsed into a structured diagnostic.
     DiagnosticParseFailure,
+    // --- M17.1 ---
+    /// The run hit a token, cost, or tool-call budget (or a cost cap could
+    /// not be enforced because usage or price was unknown).
+    BudgetExceeded,
 }
 
 impl FailureClass {
@@ -100,6 +104,7 @@ impl FailureClass {
             UnvalidatedCompletion => "unvalidated_completion",
             RepairAttemptLimitExceeded => "repair_attempt_limit_exceeded",
             DiagnosticParseFailure => "diagnostic_parse_failure",
+            BudgetExceeded => "budget_exceeded",
         }
     }
 }

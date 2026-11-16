@@ -82,6 +82,9 @@ pub(crate) struct RuntimeInner {
     pub(crate) verbosity: EventVerbosity,
     #[allow(dead_code)]
     pub(crate) default_budgets: crate::budget::RunBudgets,
+    /// Nominal per-model prices used for `total_cost_usd` and to enforce
+    /// `RunBudgets::max_cost_usd`.
+    pub(crate) pricing: Option<crom_core::ModelPricing>,
 }
 
 impl AgentRuntime {

@@ -154,8 +154,8 @@ wall_secs = 300                 # overrides timeout_secs
 max_turns = 16                  # overrides max_turns
 cpu = 2.0                       # declared; not yet enforced by the runner
 memory_mb = 2048                # declared; not yet enforced by the runner
-max_tool_calls = 60             # declared; not yet enforced by the runner
-max_cost_usd = 0.50             # declared; not yet enforced by the runner
+max_tool_calls = 60             # enforced: the call past the cap never starts
+max_cost_usd = 0.50             # enforced: nominal cost cap across all attempts
 ```
 
 ### Kinds and levels
@@ -395,12 +395,17 @@ outcome   # resolved | failed | provider_error | infra_error | skipped | unscora
   reported as counts next to it and never enter the denominator.
 - A run is **unreliable** when `provider_error + infra_error` exceeds 10% of
   attempts (every outcome except `skipped`). Unreliable runs are not compared.
-- Cost-per-solve (once #282 lands) divides spend on *all* attempts, including
-  `provider_error`, by the resolved count.
+- Cost-per-solve divides nominal spend on *all* attempts, including
+  `provider_error`, by the resolved count. It is undefined when any attempt's
+  cost is unknown.
 
 `summary.json` carries `outcomes` (counts per class), `pass_rate` (`null`
-when nothing was scored), `unreliable`, and a per-task `outcome`;
-`summary.md` prints the same. Provider and harness failures are never
+when nothing was scored), `unreliable`, a per-task `outcome`, and cost
+fields: `total_cost_usd` (nominal spend over non-skipped results; `null`
+when any of them has an unknown cost, `0.0` when none ran), `cost_unknown`
+(non-skipped results without a cost), and `budget_skipped` (tasks skipped
+because a spend cap was reached or could not be enforced). `summary.md`
+prints the same. Provider and harness failures are never
 refined into M16 repair classes.
 
 ### Reproducibility metadata (`repro`)
@@ -412,12 +417,12 @@ repro.provider                 # { profile, model, base_url_host } (host only; n
 repro.tool_policy              # { allowed_tools, builtin_tools }
 repro.security                 # { side_effects, approvals, agent_sandbox ("landlock"|"off"), agent_sandbox_overhead_ms? }
 repro.isolation                # { backend, network, cpu_limit, memory_limit, container_image }
-repro.runtime                  # { max_turns, timeout_secs, mode, attempts, repair_* }
+repro.runtime                  # { max_turns, timeout_secs, mode, attempts, repair_*, max_tool_calls, max_cost_usd }
 repro.prompt                   # { template_version, variant, hash }
 repro.repetition, repro.seed
 repro.host                     # { os, arch, cpus, memory_bytes }
 repro.crom_version
-repro.pricing_source_version   # null until pricing (#282) lands
+repro.pricing_source_version   # pricing table version, e.g. "2026-11-15" or "<override>+2026-11-15"
 ```
 
 - `content_hash` is `sha256:<hex>` over every file in the task directory
@@ -428,7 +433,33 @@ repro.pricing_source_version   # null until pricing (#282) lands
   selection). `template_version` is `eval-prompt-v1`.
 - `seed` comes from `crom eval run --seed <n>` (default `0`); repetition `n`
   uses `seed + n`.
-- `cost_usd` stays `null` until #282 adds pricing.
+- `runtime.max_cost_usd` is the static per-task cap (the tighter of
+  `limits.max_cost_usd` and `--max-cost-usd`); the run-level cap is in
+  `run.json`.
+
+### Cost and budget fields
+
+```text
+cost_usd              # nominal USD over all attempts; null when unknown (never 0 for unknown)
+cost_unknown_reason   # null | no_pricing_entry | usage_unknown | input_tokens_unknown
+                      #      | output_tokens_unknown | cache_tokens_unknown
+budget_exceeded       # null | SDK budget code that stopped the agent:
+                      #   budget.max_cost_exceeded, budget.max_tool_calls_exceeded,
+                      #   budget.max_input_tokens_exceeded, budget.max_output_tokens_exceeded,
+                      #   budget.usage_unknown, budget.unsupported_mode
+```
+
+Pricing and the meaning of "nominal" are in
+[providers.md](providers.md#cost-semantics). A task stopped by a budget is
+not resolved. Its primary `failure_class` is `budget_exceeded`, and the
+class derived from the oracle is kept as a secondary label. Its outcome is
+`failed`. A task the run-level cap kept from starting has `status: skipped`,
+outcome `skipped`, and a `skipped_reason` starting with `budget:`. A
+`plan_then_act` task under any cost cap is skipped the same way, because
+plan modes do not meter usage.
+
+These fields, `failure_class: budget_exceeded`, and the two `runtime` caps
+are additive to schema v2 and default to `null` when absent.
 
 ### Comparability
 
@@ -444,8 +475,8 @@ they are usually the variable under test.
 `run.json` declares `schema_version: 2` and records adapter, provider,
 model, `base_url_host`, isolation settings, repetitions, attempts,
 `prompt_variant`, `prompt_template_version`, `seed`, repair policy, `git`,
-`host`, `crom_version`, `pricing_source_version`, and
-`agent_sandbox: { mode, overhead_ms }`.
+`host`, `crom_version`, `pricing_source_version`, `max_cost_usd`,
+`max_run_cost_usd`, and `agent_sandbox: { mode, overhead_ms }`.
 
 ### Reading v1 results
 
