@@ -141,7 +141,8 @@ process" means the process a sandboxed tool spawns and every descendant.
 
 Security metrics (#292, #293): unauthorized effects executed in tested
 scenarios (target 0), per-property pass/fail, isolation overhead in ms per tool
-call, and fail-closed correctness on unsupported platforms.
+call, and fail-closed correctness on unsupported platforms. The adversarial
+suite that measures executed effects is [`adversarial-suite.md`](adversarial-suite.md).
 
 ## 8. Not protected against in M17
 

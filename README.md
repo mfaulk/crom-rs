@@ -254,7 +254,8 @@ the agent against a real model.
 `cargo test --workspace --all-targets` on each push and pull request. The
 `security / OS sandbox (linux)` job runs `scripts/sandbox-tests.sh` on
 `ubuntu-24.04` with `CROM_REQUIRE_SANDBOX_TESTS=1` and the golden/security
-eval suites with `--sandbox required`.
+eval suites with `--sandbox required`, plus the adversarial security suite
+(scripted attacks scored on host effects, sandbox required and off).
 
 ## Roadmap
 
@@ -264,7 +265,9 @@ The security threat model is in [`docs/security/threat-model.md`](docs/security/
 Security audit events (`SecurityDecision`) and secret redaction are described in
 [`docs/security/audit.md`](docs/security/audit.md). The Linux OS sandbox for
 agent `Bash` (`sandbox` settings, `crom eval run --sandbox`) is described in
-[`docs/security/sandbox.md`](docs/security/sandbox.md).
+[`docs/security/sandbox.md`](docs/security/sandbox.md). The adversarial security
+suite (ten effect-scored attack scenarios) is described in
+[`docs/security/adversarial-suite.md`](docs/security/adversarial-suite.md).
 
 ## License
 

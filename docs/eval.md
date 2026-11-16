@@ -159,6 +159,10 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
 - `security` — `kind = "security"` scenarios. `leak-canary` checks that grader
   material is unreachable from the agent workspace; it passes under the
   **golden** provider (see [eval-isolation.md](eval-isolation.md#leakage)).
+- `adversarial` — fixtures of the adversarial security suite (#292),
+  `kind = "security"`. Scored on host effects by
+  `cargo test -p crom-eval --test adversarial`, not by `eval run`; see
+  [security/adversarial-suite.md](security/adversarial-suite.md).
 - `repair-smoke` / `repair-mini` — M16 repair-loop tasks scripted for the
   **golden** provider. `repair-grep-trap` is a negative task: it is expected
   *not* to resolve (see [Repair loop](#repair-loop-m16)).
@@ -540,7 +544,7 @@ offline lane on every push/PR:
 
 ```console
 cargo test -p crom-eval
-crom eval validate-suite <smoke|golden|safety|repair-smoke|l1|l2|l3|l3-mini>
+crom eval validate-suite <smoke|golden|safety|security|adversarial|repair-smoke|l1|l2|l3|l3-mini>
 crom eval run --suite smoke --provider fake
 crom eval run --suite golden --provider golden
 crom eval run --suite safety --provider fake
