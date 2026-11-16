@@ -1,283 +1,152 @@
-# crom-rs
+# Crom
 
-A headless coding agent for Rust. Ships as the `crom` CLI binary and a
-set of embeddable crates (provider adapters, tool registry, MCP client, SDK
-runtime). The library targets approximate architectural parity with the
-public surface of Anthropic's Agent SDK while staying small enough to read
-in one sitting.
+Crom is a Rust-native agent runtime and security framework for building
+autonomous software that operates under explicit, enforceable authority.
+
+Today, an AI agent usually runs with the full privileges of whoever started
+it: their shell, files, network, and credentials. A model's good behaviour is
+the only thing standing between a misleading instruction and a real effect.
+Crom takes a different approach: it separates probabilistic agent reasoning
+from deterministic authorization, execution isolation, and auditing, so the
+limits on what an agent may do are enforced by software rather than by
+prompts, and every attempted action leaves a record.
+
+Crom is both a working agent runtime (an embeddable Rust SDK, a CLI, and a
+terminal UI, focused on coding tasks today) and the foundation for that
+security model. The long-term goal is to let agents work across real systems
+without inheriting unrestricted human privileges. Part of that is in place;
+much of it is still planned (see [Limitations and roadmap](#limitations-and-roadmap)).
+
+## What works today
+
+- **Embeddable Rust SDK** (`crom-sdk`): typed requests, results, and events;
+  approval callbacks; custom tools; run budgets; in-memory and patch-only
+  workspaces. No TypeScript or Python runtime required.
+  Conservative defaults: read-only, no shell, no MCP.
+- **CLI and terminal UI** (`crom`): one-shot runs, chat, sessions,
+  checkpoints and rewind, plan/act, subagents, skills, and plugins.
+- **Multiple model providers:** Anthropic, OpenAI, Gemini, and
+  OpenAI-compatible endpoints such as DeepSeek or a local Ollama/vLLM server,
+  through one provider-profile system. Low-cost models are first-class.
+- **Tools and MCP:** built-in file and shell tools, plus MCP servers over
+  stdio and Streamable HTTP, with search-based loading for large tool
+  catalogs.
+- **Permission policy:** every tool call passes a policy gate before it runs:
+  permission modes, allow/deny rules, hooks, approval callbacks, and a
+  default deny. A cloned repository's `.agent/` settings and MCP config are
+  untrusted until you trust the workspace, and until then may only tighten
+  policy.
+- **Linux sandbox for agent shell commands:** landlock, seccomp, and
+  resource limits. Writes are confined to the workspace and a private temp
+  directory, there is no network by default, the environment is reduced to
+  an allowlist (provider keys never reach the command), and every
+  child process is cleaned up. When the sandbox is required but cannot be
+  enforced, the command is refused.
+- **Audit:** every gated tool call produces a structured `SecurityDecision`
+  record (what was attempted, which layer decided, and the outcome), with
+  secrets redacted.
+- **Measurement:** a reproducible evaluation harness with leveled coding
+  tasks and hidden tests, spend-capped live runs, a scoreboard, and an
+  adversarial security suite. The suite scores attacks on the effects they
+  actually produce, not on whether the model refused.
+
+## Limitations and roadmap
+
+What exists today protects a **coding agent working in a local workspace**.
+Several important pieces are not built yet:
+
+- **Authorization is not yet resource-aware.** Policy decides on tool names
+  and a few arguments (shell command, file path). It cannot express rules
+  like "this customer's records only" or "refunds up to $100".
+- **Delegated, task-scoped authority is planned, not implemented.** This
+  includes trusted principals, grants an application issues to an agent,
+  narrower authority for subagents, keeping downstream credentials away from
+  agents, and enforcement usable from other agent frameworks. It is the goal
+  of **Crom Guard**, planned for milestone M18
+  ([plan](docs/milestones/MILESTONE_18.md),
+  [issues](https://github.com/mfaulk/crom-rs/milestone/2)).
+- **The sandbox is opt-in and Linux-only.** `sandbox.mode` defaults to `off`.
+  It covers agent shell commands, not MCP servers or validation commands.
+  Other platforms refuse sandboxed commands rather than run them unprotected.
+- **No OS keychain yet** ([#205](https://github.com/mfaulk/crom-rs/issues/205)).
+  Use environment variables or the opt-in `0600` file store.
+- **Security results are bounded.** The adversarial suite shows that the
+  tested attacks produce no effects when the sandbox is required. It is not a
+  claim of immunity to prompt injection. See the
+  [threat model](docs/security/threat-model.md) for what is and is not
+  covered.
+- **No published benchmark numbers yet.** The live baseline is in progress
+  ([#297](https://github.com/mfaulk/crom-rs/issues/297)).
+- Not published to crates.io. Install from source.
+
+Plans live in [`docs/milestones/`](docs/milestones/) and the
+[issue tracker](https://github.com/mfaulk/crom-rs/issues).
 
 ## Quickstart
 
-### Install
-
-`crom` is not published to crates.io yet. Install the CLI from this
-repository:
+Requires Rust 1.89 or newer. The first three steps need no API key and no
+network services.
 
 ```sh
 git clone https://github.com/mfaulk/crom-rs.git
 cd crom-rs
-cargo install --path crates/crom-cli
-```
-
-`cargo install` puts the `crom` binary on your `PATH` (usually
-`~/.cargo/bin/crom`).
-
-#### Upgrading from `code-agent`
-
-The project was renamed from `code-agent` to `crom`. User settings now live
-in `${CROM_CONFIG_HOME:-${XDG_CONFIG_HOME:-~/.config}/crom}/settings.json`,
-and every `CODE_AGENT_*` environment variable is now `CROM_*` (for example
-`CROM_CONFIG_HOME`, `CROM_EVAL_LIVE`, `CROM_EVAL_MODEL`).
-
-Until you migrate, `crom` falls back read-only to the old names and prints a
-one-time `warning:` on stderr:
-
-- If `<config>/crom` does not exist but `<config>/code-agent` does, user
-  settings are read from `<config>/code-agent`. Nothing is ever written there;
-  once `<config>/crom` exists it always wins.
-- If a `CROM_*` variable is unset but its `CODE_AGENT_*` spelling is set, the
-  old value is used. The new name always wins when both are set.
-- Plugin manifests using `${CODE_AGENT_PLUGIN_ROOT}` /
-  `${CODE_AGENT_PLUGIN_DATA}` still resolve.
-
-To migrate: `mv ~/.config/code-agent ~/.config/crom` and rename the
-environment variables. The project-level `.agent/` directory is unchanged.
-
-### Authenticate
-
-Log in once and the credential is stored in the OS keychain (or a clearly
-opt-in file backend if no keychain is available). Pick whichever provider
-you want to use:
-
-```sh
-crom login anthropic --api-key=sk-ant-...
-crom login openai    --api-key-stdin < ./openai.key
-crom login gemini    --api-key=AI-...
-
-crom auth status
-```
-
-You can also export `ANTHROPIC_API_KEY` (or the provider equivalent) in your
-shell and skip `crom login` entirely.
-
-OpenAI-compatible endpoints such as DeepSeek and local Ollama/vLLM servers
-are selected by provider profile:
-
-```sh
-DEEPSEEK_API_KEY=sk-... crom run --provider deepseek --model deepseek-chat "..."
-```
-
-Built-in profiles, the `providers` settings key, and capability flags are
-documented in [`docs/providers.md`](docs/providers.md).
-
-### Run the agent
-
-```sh
-# One-shot run.
-crom run "Find the bug in src/lib.rs, fix it, and re-run cargo test" \
-    --allowed-tools Read,Glob,Grep,Edit,Bash \
-    --permission-mode acceptEdits \
-    --max-turns 8
-
-# Interactive chat (multiple prompts in one process).
-crom chat --show-usage
-
-# Full-screen terminal cockpit driven by the SDK runtime (M13 Phase A).
-# `--fake-provider` is offline and deterministic; remove it once an
-# `ANTHROPIC_API_KEY` is in your environment.
-crom tui --fake-provider
-crom tui --renderer plain     # plain-text fallback
-crom tui --snapshot           # single preview frame (CI-friendly)
-
-# Resume the latest session in this directory.
-crom continue "and now add a regression test"
-```
-
-`crom --help` lists every subcommand; `crom <subcommand> --help`
-shows flags for each one.
-
-## Adding an MCP server
-
-`crom` is an MCP client. To expose an MCP server's tools to the agent,
-drop an `mcp.json` file at `.agent/mcp.json` in your project root:
-
-```json
-{
-  "mcpServers": {
-    "github": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": { "GITHUB_TOKEN": "ghp_..." },
-      "startup_timeout_seconds": 10,
-      "request_timeout_seconds": 60
-    }
-  }
-}
-```
-
-HTTP transports are also supported (`"type": "http"` with a `"url"` field).
-
-`.agent/mcp.json` is repository config: it is only loaded after you trust the
-workspace (`crom trust`, see [Workspace trust](#workspace-trust)), and it may
-not use `${VAR}` placeholders. Put servers that need host secrets in user
-settings or pass them with `--mcp-config <file>`; those still interpolate
-`${VAR}` from your environment.
-
-Allow the MCP tools on the run:
-
-```sh
-crom run "Triage the three oldest open issues" \
-    --allowed-tools "Read,Grep,mcp__github__list_issues,mcp__github__get_issue"
-```
-
-Inspect what each server exposes before granting access:
-
-```sh
-crom mcp list          # show configured servers
-crom mcp status        # connect and report each server's health
-crom mcp tools github  # list the tools the github server exposes
-crom mcp call github list_issues --args-json '{}' --yes
-```
-
-MCP tools use `PermissionKind::External`. `acceptEdits` does *not* approve
-them, `dontAsk` denies any unresolved MCP tool, and the default
-external-effect policy requires an explicit allow rule. Live MCP effects are
-not covered by workspace rewind — approve them deliberately.
-
-For larger catalogs, enable search-mode tool loading so MCP schemas are not
-all sent to the model on turn one:
-
-```sh
-crom run "Find the parser bug issue and inspect the likely source" \
-    --tool-loading search \
-    --allowed-tools "Read,Grep,Glob,SearchTools,mcp__github__*"
-```
-
-A fully offline MCP walkthrough lives in `examples/mcp-demo/` (a fake stdio
-server bundled in-tree, no external services required).
-
-## Workspace trust
-
-A cloned repository can ship `.agent/settings.json` and `.agent/mcp.json`.
-Until you trust the workspace, crom treats both as untrusted:
-
-- `.agent/settings.json` may only tighten policy. These keys are ignored:
-  `permission_mode` looser than your user setting (order
-  `plan < dontAsk < default < acceptEdits`), `allowed_tools`, safety hooks set
-  to `false` (`hooks.block_dangerous_bash`, `block_env_file_writes`,
-  `audit_log`, `secret_redaction`), a larger `hooks.max_patch_size_bytes`,
-  `validation.commands`, `checkpointing.enabled: false`, a looser
-  `checkpointing.bash_policy`, `mcp.enabled: true`, `mcp.config_file`,
-  `mcp.servers`, `mcp.external_effect_policy`, `mcp.load_resources`/`load_prompts: true`,
-  `agents.inherit_permissions: false`, `plugins.allow_*: true`,
-  `plugins.marketplaces`, and `providers`. Everything else (model, disallow
-  rules, UI, limits, a tighter sandbox) still applies.
-- `.agent/mcp.json` (or any MCP config file under the workspace that was not
-  passed with `--mcp-config`) is not read, so no repo server starts.
-
-Each ignored key is reported: a `[trust] ignored …` line on stderr, or a
-blocked `security_decision` event (`policy_source: workspace_trust`) under
-`--log-format json`. `crom config` lists them too.
-
-When stdin and stderr are a terminal, agent commands (`run`, `chat`,
-`resume`, `continue`, `fork`, `plan`, `act`, `replan`, `tui`) list the ignored
-keys and ask once whether to trust the workspace; a yes is saved. Headless
-runs (no TTY, `--log-format json`, `headless-run`, eval) never prompt and stay
-restricted.
-
-```sh
-crom trust                # trust the current directory
-crom trust path/to/repo   # trust another workspace
-crom trust --status       # print trusted/untrusted for the current directory
-crom trust --list         # list trusted workspaces
-crom untrust              # revoke
-```
-
-Decisions are stored in
-`${CROM_CONFIG_HOME:-${XDG_CONFIG_HOME:-~/.config}/crom}/trusted-workspaces.json`,
-keyed by canonical path. Trust is exact: trusting a directory does not trust
-its subdirectories. Even in a trusted workspace, repo-sourced MCP config never
-gets `${VAR}` interpolation. The SDK never reads `.agent/settings.json` or
-`.agent/mcp.json`; embedders pass configuration explicitly.
-
-## Examples
-
-The `examples/` directory contains runnable demos for every major feature —
-bugfix loop, policy + hooks, workspace checkpointing, MCP, tool search,
-subagents, skills, plugins, auth, planning, and the headless SDK. See
-[examples/README.md](examples/README.md) for what each one does and how to
-run it.
-
-## Developing
-
-```sh
-# Build everything.
 cargo build --workspace
-
-# Run unit and integration tests for all crates. No API key required.
 cargo test --workspace
-
-# Lint + format.
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all --check
-
-# Run the CLI without installing.
-cargo run -p crom-cli -- run "What files are here?" \
-    --allowed-tools Read,Glob \
-    --permission-mode default
 ```
 
-The `cargo run -p crom-cli -- <args>` form is the easiest way to
-iterate on the CLI while developing — every CLI subcommand documented above
-works after `--`.
-
-The OS sandbox suites include fork-bomb and memory containment tests that are
-`#[ignore]`d by default because a broken sandbox would exhaust the host. Run
-them only through the script, which wraps them in a capped cgroup scope
-(Linux, systemd user session):
+**Try it offline.** The `fake` provider is a deterministic stand-in that
+echoes your prompt. It exercises the real CLI, tool, and session path, but it
+does not reason:
 
 ```sh
-scripts/sandbox-tests.sh
+cargo run -p crom-cli -- run --provider fake "List the files here" --allowed-tools Read,Glob
+
+# Run the offline evaluation smoke suite (expects "resolved 5/5").
+cargo run -p crom-cli -- eval run --suite smoke --provider fake
+
+# Embed the runtime from Rust: the headless SDK demo, also offline.
+cargo run --manifest-path examples/headless-sdk-demo/Cargo.toml -- simple-patch
 ```
 
-See [`docs/security/sandbox.md`](docs/security/sandbox.md).
+**Run a real model.** This needs an API key and spends provider credit:
 
-Live provider tests are kept out of the default suite. `ANTHROPIC_API_KEY`
-(or the equivalent for OpenAI / Gemini) is only needed when actually running
-the agent against a real model.
+```sh
+cargo install --path crates/crom-cli    # puts `crom` on your PATH
 
-## CI
+export ANTHROPIC_API_KEY=sk-ant-...     # or OPENAI_API_KEY / GEMINI_API_KEY
+crom run "Find the bug in src/lib.rs and fix it" \
+    --allowed-tools Read,Glob,Grep,Edit --max-turns 8
 
-`.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy
---workspace --all-targets -- -D warnings`, `cargo build --workspace`, and
-`cargo test --workspace --all-targets` on each push and pull request. The
-`security / OS sandbox (linux)` job runs `scripts/sandbox-tests.sh` on
-`ubuntu-24.04` with `CROM_REQUIRE_SANDBOX_TESTS=1` and the golden/security
-eval suites with `--sandbox required`, plus the adversarial security suite
-(scripted attacks scored on host effects, sandbox required and off). The
-`lint / workflows` job runs `actionlint` and dry-runs the live-lane spend-cap
-gate.
+# A low-cost alternative, using an OpenAI-compatible provider profile:
+export DEEPSEEK_API_KEY=sk-...
+crom run --provider deepseek "Summarize what this crate does" --allowed-tools Read,Glob,Grep
+```
 
-Live-provider evals never run on push or PR. `eval-live.yml` (live smoke) and
-`eval-benchmark.yml` (provider/model matrix) are manual dispatches that
-require a `max_run_cost_usd` input and read API keys from the `eval-live`
-environment. See [CI lanes and spend controls](docs/eval.md#ci-lanes-and-spend-controls-295).
+`crom --help` lists every subcommand. Before letting the agent run shell
+commands on Linux, see the [sandbox guide](docs/security/sandbox.md).
 
-## Roadmap
+## Documentation
 
-Milestone specs live in [`docs/milestones/`](docs/milestones/). The current
-plan is [M17 — Measurable Agent Capability and Secure Execution](docs/milestones/MILESTONE_17.md).
-The next milestone, [M18 — Crom Guard v0: Enforceable Agent Authority](docs/milestones/MILESTONE_18.md),
-is planned (not yet implemented).
-The security threat model is in [`docs/security/threat-model.md`](docs/security/threat-model.md).
-Security audit events (`SecurityDecision`) and secret redaction are described in
-[`docs/security/audit.md`](docs/security/audit.md). The Linux OS sandbox for
-agent `Bash` (`sandbox` settings, `crom eval run --sandbox`) is described in
-[`docs/security/sandbox.md`](docs/security/sandbox.md). The adversarial security
-suite (ten effect-scored attack scenarios) is described in
-[`docs/security/adversarial-suite.md`](docs/security/adversarial-suite.md).
+- [CLI guide](docs/cli.md): install, authentication, MCP servers, workspace
+  trust, development
+- [SDK overview](docs/sdk/overview.md) and [quickstart](docs/sdk/quickstart.md)
+- [Providers and profiles](docs/providers.md)
+- Security: [threat model](docs/security/threat-model.md),
+  [sandbox](docs/security/sandbox.md), [audit events](docs/security/audit.md),
+  [adversarial suite](docs/security/adversarial-suite.md)
+- [Evaluation harness](docs/eval.md)
+- [Examples](examples/README.md)
+- [Milestones](docs/milestones/)
+
+## Contributing
+
+Issues and pull requests are welcome. See the
+[development notes](docs/cli.md#developing) for lint, format, and sandbox
+test commands. Commits follow
+[Conventional Commits](https://www.conventionalcommits.org/).
 
 ## License
 
-Apache-2.0 OR MIT
+Dual-licensed under Apache-2.0 or MIT, at your option, as declared in
+[`Cargo.toml`](Cargo.toml). The licence text files are not yet in the
+repository ([#367](https://github.com/mfaulk/crom-rs/issues/367)).
