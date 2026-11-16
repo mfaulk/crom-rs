@@ -1487,7 +1487,7 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");
-            ExitCode::from(1)
+            ExitCode::from(e.downcast_ref::<eval_cmd::EvalExit>().map_or(1, |x| x.code))
         }
     }
 }

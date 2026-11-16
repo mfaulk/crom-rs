@@ -120,7 +120,11 @@ Run the realistic Rust suite against a live provider (opt-in):
 ```console
 $ CROM_EVAL_LIVE=1 ANTHROPIC_API_KEY=sk-... \
     crom eval run --suite rust-small --provider anthropic
+$ CROM_EVAL_LIVE=1 DEEPSEEK_API_KEY=sk-... \
+    crom eval run --suite rust-small --provider deepseek --model deepseek-chat
 ```
+
+See [Live providers](#live-providers) for every profile and its key.
 
 Report and compare prior runs:
 
@@ -137,11 +141,52 @@ The `--provider` flag selects how the agent is driven for the whole run:
 |-------------|-------------|
 | `fake`      | A trivial echo provider. Proves the harness plumbing (workspace setup, event capture, oracles, scoring, artifacts) without proving model intelligence. Offline and deterministic. |
 | `golden`    | A scripted provider that replays a canned sequence of tool calls for a specific task (read → edit → run check → observe failure → edit → pass). Catches regressions in tool schemas, event handling, sessions, and command execution. |
-| any provider profile id | A real model provider resolved from a provider profile (`anthropic`, `openai`, `deepseek`, `gemini`, `local`, or an id defined under `providers` in user/project settings; see [providers.md](providers.md)). Any other value is rejected with `unknown provider`. **Opt-in only**: requires `CROM_EVAL_LIVE=1` and the profile's API-key env var (e.g. `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`). If the opt-in flag or credentials are missing, affected tasks are reported as **skipped**, never failed. Never runs in ordinary CI. |
+| any provider profile id | A real model provider resolved from a provider profile (`anthropic`, `openai`, `deepseek`, `gemini`, `local`, or an id defined under `providers` in user/project settings; see [providers.md](providers.md)). Any other value is rejected with `unknown provider`. **Opt-in only**; see [Live providers](#live-providers). Never runs in ordinary CI. |
 
-Set `CROM_EVAL_MODEL` to override the live model (default: the profile's
-`default_model`, e.g. `claude-sonnet-4-6` for `anthropic`, `deepseek-chat`
-for `deepseek`).
+### Live providers
+
+Live runs use the same provider-profile resolver as `crom run` and the SDK,
+so a profile id (and any `providers` settings override, such as a
+`base_url`) means the same endpoint everywhere. One invocation runs one
+provider; compare providers with separate runs and `crom eval compare`.
+
+| `--provider` | API-key env var | Default model (`providers.toml`) |
+|---|---|---|
+| `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` |
+| `openai` | `OPENAI_API_KEY` | `gpt-4.1` |
+| `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat` |
+| `gemini` | `GEMINI_API_KEY` | `gemini-2.5-pro` |
+| `local` | `LOCAL_OPENAI_API_KEY` (any placeholder) | none — pass `--model` |
+
+Model precedence: `--model`, then `CROM_EVAL_MODEL`, then the profile's
+`default_model`. The profile file is the only place a default model is
+defined. `--model` is rejected for `fake`/`golden`.
+
+A live task is **skipped**, never failed, when it cannot run. Its
+`skipped_reason` starts with a stable code:
+
+| Code | Cause |
+|---|---|
+| `live_disabled` | `CROM_EVAL_LIVE=1` is not set. |
+| `credentials_unavailable` | The profile's API-key env var is unset or empty. |
+| `model_unavailable` | No `--model`, no `CROM_EVAL_MODEL`, and no profile default. |
+
+The provider profile, model, and endpoint host (never the key or full URL)
+are recorded in `run.json`, `provider.json`, and each result's
+`repro.provider` block.
+
+`crom eval run` exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | Every non-skipped, non-quarantined task resolved (or `--allow-failures`). |
+| `1` | At least one task ran and did not resolve. |
+| `3` | Every task was skipped — nothing ran (e.g. missing credentials). `--allow-failures` does not mask this. |
+
+Offline coverage: `crates/crom-cli/tests/eval_live_cli.rs` points each of
+the `anthropic`, `openai`, `deepseek`, and `gemini` profiles at a wiremock
+server speaking that provider's wire format and runs a task end to end
+through `crom eval run`; it also asserts the skip codes and exit codes.
 
 ### Cost and spend caps
 
@@ -585,9 +630,12 @@ It uploads the artifact bundle when any offline suite regresses. Live-provider
 evals never run here.
 
 Live evals are available manually via the `Eval (live provider)` workflow
-(`.github/workflows/eval-live.yml`), triggered from the Actions tab. It sets
-`CROM_EVAL_LIVE=1` and uses the `ANTHROPIC_API_KEY` repository secret;
-without the secret, live tasks skip cleanly.
+(`.github/workflows/eval-live.yml`), triggered from the Actions tab with
+`suite`, `provider`, and optional `model` inputs. It sets `CROM_EVAL_LIVE=1`
+and passes the `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, and
+`GEMINI_API_KEY` repository secrets; only the chosen provider's secret is
+needed. Without it every task skips, the CLI exits 3, and the workflow
+reports a warning instead of failing.
 
 ## Known limitations
 

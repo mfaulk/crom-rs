@@ -142,12 +142,17 @@ LOCAL_OPENAI_API_KEY=unused crom run --provider local --model llama3.1 "..."
 - `crates/crom-sdk/tests/provider_profile.rs`: SDK profile construction.
 - `provider_route_tests::profile_resolves_identically_in_cli_sdk_and_eval`
   in `crates/crom-cli/src/main.rs`.
+- `crates/crom-cli/tests/eval_live_cli.rs`: `crom eval run --provider
+  <profile> --model <m>` resolves a task against a wiremock endpoint for
+  each of `anthropic`, `openai`, `deepseek`, and `gemini`, and skips with
+  `credentials_unavailable` (exit 3) when the key is missing.
 
 Manual live check (opt-in, costs tokens):
 
 ```sh
 DEEPSEEK_API_KEY=... crom run --provider deepseek "List the files in src/"
-CROM_EVAL_LIVE=1 DEEPSEEK_API_KEY=... crom eval run --suite smoke --provider deepseek
+CROM_EVAL_LIVE=1 DEEPSEEK_API_KEY=... crom eval run --suite rust-small \
+  --provider deepseek --model deepseek-chat
 ```
 
 ## Cost semantics
