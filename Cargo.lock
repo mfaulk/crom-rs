@@ -485,6 +485,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

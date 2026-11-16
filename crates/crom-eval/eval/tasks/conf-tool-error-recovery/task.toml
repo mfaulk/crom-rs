@@ -1,0 +1,37 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
+id = "conf-tool-error-recovery"
+title = "Conformance: recover from a tool error result"
+tags = ["conformance", "tool-error"]
+suites = ["provider-conformance"]
+
+prompt = """
+Read `settings.toml` first. If that file does not exist, the settings live in
+`config/settings.toml` instead. Change `enabled = false` to `enabled = true`
+in the settings file that exists. Do not create any new file.
+"""
+
+max_turns = 10
+timeout_secs = 120
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# The first Read fails (`is_error` tool result; `ERROR:`-prefixed content on
+# OpenAI-compatible wires). The model must recover from it.
+[oracle]
+kind = "command"
+commands = [
+  "grep -qx 'enabled = true' config/settings.toml",
+  "test ! -e settings.toml",
+]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-15"

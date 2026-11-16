@@ -1,0 +1,54 @@
+{
+  "format": "crom-conformance-transcript/v1",
+  "profile": "openai",
+  "task": "conf-read-edit-verify",
+  "model": "gpt-4.1",
+  "source": "synthetic",
+  "path": "/v1/chat/completions",
+  "exchanges": [
+    {
+      "request_contains": [
+        "\"max_completion_tokens\":4096",
+        "\"model\":\"gpt-4.1\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"tool_calls\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": null,\n        \"role\": \"assistant\",\n        \"tool_calls\": [\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"file_path\\\":\\\"data.txt\\\"}\",\n              \"name\": \"Read\"\n            },\n            \"id\": \"call_rev1\",\n            \"type\": \"function\"\n          }\n        ]\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"gpt-4.1\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"max_completion_tokens\":4096",
+        "\"model\":\"gpt-4.1\"",
+        "\"tool_call_id\":\"call_rev1\"",
+        "value=0"
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"tool_calls\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": null,\n        \"role\": \"assistant\",\n        \"tool_calls\": [\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"file_path\\\":\\\"data.txt\\\",\\\"new_string\\\":\\\"value=42\\\",\\\"old_string\\\":\\\"value=0\\\"}\",\n              \"name\": \"Edit\"\n            },\n            \"id\": \"call_rev2\",\n            \"type\": \"function\"\n          }\n        ]\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"gpt-4.1\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"max_completion_tokens\":4096",
+        "\"model\":\"gpt-4.1\"",
+        "\"tool_call_id\":\"call_rev2\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"tool_calls\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": null,\n        \"role\": \"assistant\",\n        \"tool_calls\": [\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"command\\\":\\\"grep -q 'value=42' data.txt\\\"}\",\n              \"name\": \"Bash\"\n            },\n            \"id\": \"call_rev3\",\n            \"type\": \"function\"\n          }\n        ]\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"gpt-4.1\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"max_completion_tokens\":4096",
+        "\"model\":\"gpt-4.1\"",
+        "\"tool_call_id\":\"call_rev3\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"stop\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": \"data.txt now has value=42 and the check passes.\",\n        \"role\": \"assistant\"\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"gpt-4.1\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    }
+  ]
+}

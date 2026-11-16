@@ -1,0 +1,34 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
+id = "conf-parallel-tools"
+title = "Conformance: parallel tool calls in one turn"
+tags = ["conformance", "parallel-tools"]
+suites = ["provider-conformance"]
+
+prompt = """
+Read a.txt, b.txt, and c.txt. The reads are independent, so request all three
+in a single turn if you can. Then write the sum of the three numbers, as a
+bare integer, to sum.txt.
+"""
+
+max_turns = 10
+timeout_secs = 120
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# Parallel calls are an opportunity, not a requirement: the oracle checks only
+# the result, so a model that reads sequentially still resolves.
+[oracle]
+kind = "command"
+commands = ["test \"$(tr -d '[:space:]' < sum.txt)\" = 60"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-15"

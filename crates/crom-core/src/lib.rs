@@ -151,7 +151,9 @@ pub use policy::{
     PolicyDecision, PolicyDecisionSource, PolicyEngine, PolicyOutcome, PolicyToolContext,
 };
 pub use pricing::{CostEstimate, PriceEntry, PricingTable};
-pub use provider::{ModelEvent, ModelProvider, ModelRequest};
+pub use provider::{
+    is_output_truncated, ModelEvent, ModelProvider, ModelRequest, MAX_OUTPUT_CONTINUATIONS,
+};
 pub use provider_profile::{
     MaxTokensField, ProfileError, ProviderCapabilities, ProviderKind, ProviderProfile,
     ProviderProfileConfig,

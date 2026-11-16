@@ -152,7 +152,8 @@ jobs:
       - name: Validate harness and legacy capability suites
         run: |
           for suite in smoke golden safety security adversarial repair-smoke \
-                       repair-mini planning rust-small rust-mini; do
+                       repair-mini planning rust-small rust-mini \
+                       provider-conformance; do
             cargo run --locked -p crom-cli -- eval validate-suite "$suite"
           done
       # L1 capability corpus (#287): every reference passes public + hidden

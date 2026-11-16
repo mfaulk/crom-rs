@@ -637,6 +637,10 @@ pub enum ResultSubtype {
     /// A usage budget is set but the quantity it caps is unknown
     /// (unreported usage or no price), so the run stopped (fail-closed).
     ErrorBudgetUsageUnknown,
+    /// The model's output hit the per-turn token limit (`max_tokens` /
+    /// `length` / `MAX_TOKENS`) more than `MAX_OUTPUT_CONTINUATIONS`
+    /// consecutive times.
+    ErrorOutputTruncated,
     ErrorDuringExecution,
     Cancelled,
 }

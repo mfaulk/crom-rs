@@ -1,0 +1,44 @@
+{
+  "format": "crom-conformance-transcript/v1",
+  "profile": "openai",
+  "task": "conf-parallel-tools",
+  "model": "gpt-4.1",
+  "source": "synthetic",
+  "path": "/v1/chat/completions",
+  "exchanges": [
+    {
+      "request_contains": [
+        "\"max_completion_tokens\":4096",
+        "\"model\":\"gpt-4.1\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"tool_calls\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": null,\n        \"role\": \"assistant\",\n        \"tool_calls\": [\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"file_path\\\":\\\"a.txt\\\"}\",\n              \"name\": \"Read\"\n            },\n            \"id\": \"call_par1\",\n            \"type\": \"function\"\n          },\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"file_path\\\":\\\"b.txt\\\"}\",\n              \"name\": \"Read\"\n            },\n            \"id\": \"call_par2\",\n            \"type\": \"function\"\n          },\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"file_path\\\":\\\"c.txt\\\"}\",\n              \"name\": \"Read\"\n            },\n            \"id\": \"call_par3\",\n            \"type\": \"function\"\n          }\n        ]\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"gpt-4.1\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"max_completion_tokens\":4096",
+        "\"model\":\"gpt-4.1\"",
+        "\"tool_call_id\":\"call_par1\"",
+        "\"tool_call_id\":\"call_par2\"",
+        "\"tool_call_id\":\"call_par3\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"tool_calls\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": null,\n        \"role\": \"assistant\",\n        \"tool_calls\": [\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"content\\\":\\\"60\\\\n\\\",\\\"file_path\\\":\\\"sum.txt\\\"}\",\n              \"name\": \"Write\"\n            },\n            \"id\": \"call_par4\",\n            \"type\": \"function\"\n          }\n        ]\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"gpt-4.1\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"max_completion_tokens\":4096",
+        "\"model\":\"gpt-4.1\"",
+        "\"tool_call_id\":\"call_par4\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"stop\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": \"10 + 20 + 30 = 60, written to sum.txt.\",\n        \"role\": \"assistant\"\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"gpt-4.1\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    }
+  ]
+}

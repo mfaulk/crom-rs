@@ -928,6 +928,8 @@ pub(crate) async fn run_loop(
     let mut tool_calls_started: u32 = 0;
     let mut usage_totals = UsageTotals::new();
     let mut last_result_text: Option<String> = None;
+    // Consecutive turns cut off at the output token limit (#284).
+    let mut consecutive_truncations: u32 = 0;
 
     loop {
         if cfg.cancel.load(Ordering::Acquire) {
@@ -1315,8 +1317,26 @@ pub(crate) async fn run_loop(
             return Ok(());
         }
 
+        // A turn cut off at the output token limit is not a final answer and
+        // its tool calls may carry incomplete arguments: drop them (never
+        // execute them) and ask the model to continue (#284).
+        let truncated_by = stop_reason
+            .as_deref()
+            .filter(|s| crate::provider::is_output_truncated(s))
+            .map(str::to_string);
+        let discarded_tool_calls = if truncated_by.is_some() {
+            std::mem::take(&mut tool_calls).len()
+        } else {
+            0
+        };
+        let assistant_text = if truncated_by.is_some() && text_buf.is_empty() {
+            TRUNCATED_PLACEHOLDER.to_string()
+        } else {
+            text_buf.clone()
+        };
+
         // Build assistant message and append to conversation.
-        let assistant_blocks = build_assistant_blocks(&text_buf, &tool_calls);
+        let assistant_blocks = build_assistant_blocks(&assistant_text, &tool_calls);
         let assistant_msg = AssistantMessage {
             content: assistant_blocks.clone(),
             stop_reason: stop_reason.clone(),
@@ -1370,6 +1390,44 @@ pub(crate) async fn run_loop(
             .await;
             return Ok(());
         }
+        if let Some(reason) = truncated_by {
+            consecutive_truncations += 1;
+            if consecutive_truncations > crate::provider::MAX_OUTPUT_CONTINUATIONS {
+                let cost = estimate_cost(pricing.as_ref(), usage_totals.total().as_ref());
+                let result = AgentResult {
+                    subtype: ResultSubtype::ErrorOutputTruncated,
+                    result: Some(format!(
+                        "model output truncated at the output token limit \
+                         (stop reason `{reason}`) on {consecutive_truncations} consecutive turns"
+                    )),
+                    session_id: session_id.clone(),
+                    run_id: Some(cfg.run_id.clone()),
+                    num_turns: turns,
+                    usage: usage_totals.total(),
+                    total_cost_usd: cost,
+                };
+                emit(&tx, &session_sink, &session_id, AgentEvent::Result(result)).await;
+                run_stop_hook(
+                    &hooks,
+                    &telemetry_sink,
+                    &tx,
+                    &session_sink,
+                    &session_id,
+                    &cfg.run_id,
+                    &options.cwd,
+                    turns,
+                    StopReason::Error,
+                )
+                .await;
+                return Ok(());
+            }
+            conversation.push(Message::user_text(truncation_notice(
+                &reason,
+                discarded_tool_calls,
+            )));
+            continue;
+        }
+        consecutive_truncations = 0;
 
         // Plan mode: never execute tools. Treat first turn output as the final result.
         if matches!(options.permission_mode, PermissionMode::Plan) {
@@ -2748,6 +2806,25 @@ fn hook_decision_reason(d: &HookAggregateDecision) -> Option<String> {
         HookAggregateDecision::Ask { reason } => Some(reason.clone()),
         HookAggregateDecision::Continue => None,
     }
+}
+
+/// Assistant text recorded for a truncated turn that produced no text, so the
+/// conversation never carries an empty assistant message.
+const TRUNCATED_PLACEHOLDER: &str = "[response truncated at the output token limit]";
+
+/// User message sent after a truncated turn.
+fn truncation_notice(stop_reason: &str, discarded_tool_calls: usize) -> String {
+    let discarded = match discarded_tool_calls {
+        0 => String::new(),
+        1 => " 1 incomplete tool call was discarded and not executed.".to_string(),
+        n => format!(" {n} incomplete tool calls were discarded and not executed."),
+    };
+    format!(
+        "[crom] Your previous response was cut off at the output token limit \
+         (stop reason `{stop_reason}`).{discarded} Continue from where you stopped, \
+         keeping each response and tool call smaller (for example, split large file \
+         writes or generate long content with a shell command)."
+    )
 }
 
 /// Assemble the assistant message content for a turn from the accumulated

@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: 'Suite to run'
+        description: 'Suite to run (e.g. rust-small, provider-conformance)'
         required: false
         default: 'rust-small'
       provider:

@@ -1,0 +1,51 @@
+{
+  "format": "crom-conformance-transcript/v1",
+  "profile": "gemini",
+  "task": "conf-tool-error-recovery",
+  "model": "gemini-2.5-pro",
+  "source": "synthetic",
+  "path": "/v1beta/models/gemini-2.5-pro:generateContent",
+  "exchanges": [
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096"
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"args\": {\n                \"file_path\": \"settings.toml\"\n              },\n              \"name\": \"Read\"\n            }\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096",
+        "\"functionResponse\":{\"name\":\"Read\"",
+        "\"isError\":true"
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"args\": {\n                \"file_path\": \"config/settings.toml\"\n              },\n              \"name\": \"Read\"\n            }\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096",
+        "\"functionResponse\":{\"name\":\"Read\"",
+        "enabled = false"
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"args\": {\n                \"file_path\": \"config/settings.toml\",\n                \"new_string\": \"enabled = true\",\n                \"old_string\": \"enabled = false\"\n              },\n              \"name\": \"Edit\"\n            }\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096",
+        "\"functionResponse\":{\"name\":\"Edit\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"text\": \"settings.toml was missing; enabled config/settings.toml instead.\"\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    }
+  ]
+}

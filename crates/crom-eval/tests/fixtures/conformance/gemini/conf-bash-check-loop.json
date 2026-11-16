@@ -1,0 +1,49 @@
+{
+  "format": "crom-conformance-transcript/v1",
+  "profile": "gemini",
+  "task": "conf-bash-check-loop",
+  "model": "gemini-2.5-pro",
+  "source": "synthetic",
+  "path": "/v1beta/models/gemini-2.5-pro:generateContent",
+  "exchanges": [
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096"
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"args\": {\n                \"command\": \"sh check.sh\"\n              },\n              \"name\": \"Bash\"\n            }\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096",
+        "\"functionResponse\":{\"name\":\"Bash\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"args\": {\n                \"content\": \"ready\\n\",\n                \"file_path\": \"status.txt\"\n              },\n              \"name\": \"Write\"\n            }\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096",
+        "\"functionResponse\":{\"name\":\"Write\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"args\": {\n                \"command\": \"sh check.sh\"\n              },\n              \"name\": \"Bash\"\n            }\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096",
+        "\"functionResponse\":{\"name\":\"Bash\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"text\": \"check.sh now exits 0.\"\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    }
+  ]
+}

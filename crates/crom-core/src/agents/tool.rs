@@ -1094,6 +1094,7 @@ fn classify_status(
             | Some(crate::events::ResultSubtype::ErrorMaxOutputTokens)
             | Some(crate::events::ResultSubtype::ErrorMaxCost)
             | Some(crate::events::ResultSubtype::ErrorBudgetUsageUnknown)
+            | Some(crate::events::ResultSubtype::ErrorOutputTruncated)
             | Some(crate::events::ResultSubtype::ErrorDuringExecution) => SubagentStatus::Failed,
             Some(crate::events::ResultSubtype::Cancelled) => SubagentStatus::Cancelled,
             // No terminal result: a child cancelled by itself or the parent is
