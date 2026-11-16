@@ -1,7 +1,7 @@
 //! M17.2 (#286): grader material (task manifest, normalized task, hidden
 //! fixture, reference patch, earlier results) must not be reachable from the
-//! agent workspace. Bash absolute-path reads are only blocked by the #253 OS
-//! sandbox; see the ignored test at the bottom.
+//! agent workspace. Bash absolute-path reads are blocked only by the #253 OS
+//! sandbox, so that test runs with `sandbox = required`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -165,10 +165,16 @@ async fn read_tool_rejects_absolute_paths_to_grader_material() {
     );
 }
 
-/// Bash cannot read the task source dir by absolute path; requires the #253 agent sandbox.
+/// Bash cannot read the task source dir by absolute path under the #253 agent sandbox.
 #[tokio::test]
-#[ignore = "requires the #253 OS sandbox for agent Bash"]
 async fn bash_cannot_read_task_source_by_absolute_path() {
+    if let Err(reason) = crom_tools::sandbox::probe(&crom_core::SandboxConfig::required()) {
+        if std::env::var_os("CROM_REQUIRE_SANDBOX_TESTS").is_some() {
+            panic!("sandbox required but unavailable: {reason}");
+        }
+        eprintln!("SKIP: OS sandbox unavailable: {reason}");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let run = RunDir::create(&tmp.path().join("runs"), "abs-bash").unwrap();
     let task = leak_canary();
@@ -185,9 +191,17 @@ async fn bash_cannot_read_task_source_by_absolute_path() {
         ),
         final_text_turn("done"),
     ]);
-    let cfg = config(ProviderMode::Scripted(script), &tmp.path().join("ws"));
+    let cfg = RunConfig {
+        sandbox: crom_core::SandboxMode::Required,
+        ..config(ProviderMode::Scripted(script), &tmp.path().join("ws"))
+    };
 
     let result = run_task(&task, &run, &cfg).await;
 
-    assert!(!read_ws_file(&result, "FOUND.txt").contains(TOKEN));
+    let found = read_ws_file(&result, "FOUND.txt");
+    assert!(!found.contains(TOKEN), "{found}");
+    assert!(
+        !found.is_empty(),
+        "Bash did not run; the test proves nothing"
+    );
 }

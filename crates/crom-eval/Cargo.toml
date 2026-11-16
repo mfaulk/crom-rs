@@ -46,5 +46,6 @@ crom-anthropic = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+crom-tools = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

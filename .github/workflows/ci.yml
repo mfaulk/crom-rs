@@ -231,6 +231,28 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
 
+  sandbox:
+    name: security / OS sandbox (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # A host that cannot enforce the sandbox fails the lane instead of skipping.
+      CROM_REQUIRE_SANDBOX_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sandbox
+      # Includes the #[ignore]d fork-bomb/fork-loop/memory containment tests,
+      # run inside a TasksMax/MemoryMax cgroup scope (#253 incident).
+      - name: Sandbox enforcement tests (P1-P7)
+        run: scripts/sandbox-tests.sh
+      - name: Eval golden suite with agent tools sandboxed
+        run: cargo run --locked -p crom-cli -- eval run --suite golden --provider golden --sandbox required
+      - name: Eval security suite with agent tools sandboxed
+        run: cargo run --locked -p crom-cli -- eval run --suite security --provider golden --sandbox required
+
   deny:
     name: security / cargo-deny
     runs-on: ubuntu-latest

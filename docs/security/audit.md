@@ -19,7 +19,7 @@ consumers as `SdkEvent::SecurityDecision` under **every** verbosity.
 | `policy_source` | `PolicyDecisionSource` stage that decided (`hook`, `disallow_rule`, `permission_mode`, `allow_rule`, `approval_callback`, `approval_memory`, `external_effect_policy`, `default_deny`); absent when the call never reached the policy engine or was refused below it |
 | `rule` | Matching rule as `<list>[<index>]: <rule json>`, e.g. `disallowed_tools[0]: "Write"` |
 | `decision` | `allow` / `deny` / `ask` |
-| `enforcement` | `policy` (policy engine, tool allowlist, tool-catalog loading gate), `hook` (`PreToolUse` hook), `checkpoint` (checkpoint safety gate), `sandbox` (tool-level `PermissionDenied`, e.g. the Read/Write/Edit path sandbox; the #253 OS sandbox will report here) |
+| `enforcement` | `policy` (policy engine, tool allowlist, tool-catalog loading gate), `hook` (`PreToolUse` hook), `checkpoint` (checkpoint safety gate), `sandbox` (tool-level `PermissionDenied`: the Read/Write/Edit path sandbox, and a Bash call refused because the [OS sandbox](sandbox.md) is `required` but cannot be enforced) |
 | `outcome` | `blocked`, `executed`, `failed` |
 | `reason` | Redacted free text |
 

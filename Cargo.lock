@@ -468,6 +468,7 @@ dependencies = [
  "crom-auth",
  "crom-core",
  "crom-sdk",
+ "crom-tools",
  "futures",
  "libc",
  "regex",

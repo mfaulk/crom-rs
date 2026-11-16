@@ -14,11 +14,11 @@ if the engine is missing or the opt-in flag is unset, constructing the backend
 fails and the run is reported with an `isolation_error` (it is not silently
 downgraded).
 
-> **Agent tool calls always run on the host.** The isolation backend applies
-> only to verification. The agent's own tool calls (`Bash`, `Edit`, `Write`,
-> …) execute directly on the host with the workspace directory as their
-> working directory, under every backend including `docker` and `podman`. A
-> container backend does **not** sandbox what the agent runs.
+> **Agent tool calls run on the host.** The isolation backend applies only to
+> verification; a container backend does **not** sandbox what the agent runs.
+> The agent's `Bash` calls are confined by the separate
+> [agent sandbox](#agent-sandbox) (`--sandbox`), which is on by default for
+> live providers.
 
 ## Flags
 
@@ -38,6 +38,32 @@ $ crom eval run --suite <suite> \
 - `--cpu-limit` / `--memory-limit` — enforced by container backends only
   (`--cpus`, `--memory`); recorded but not enforced for `local`.
 - `--container-image` — the image to run in (default `rust:latest`).
+- `--sandbox required|off` — OS sandbox for the agent's `Bash` calls (see
+  [Agent sandbox](#agent-sandbox)). Default `required` for live providers,
+  `off` for `fake`/`golden`.
+
+## Agent sandbox
+
+`--sandbox required` runs every agent `Bash` call under the Linux OS sandbox
+([docs/security/sandbox.md](security/sandbox.md)): writes only to the agent
+workspace and a private tmp dir, no reads of `$HOME`, the task source, or the
+runs dir, no network unless `--network true` or the task sets
+`requires_network`, provider keys removed from the environment, and every
+descendant killed when the call ends.
+
+- Fails closed: if the host cannot enforce the sandbox (non-Linux, landlock
+  ABI < 3, root), the run stops before any task starts with
+  `agent sandbox is required but cannot be enforced on this host: …`. Pass
+  `--sandbox off` to run unsandboxed.
+- Before the first task the CLI measures the mean per-call overhead and prints
+  `agent sandbox: required (landlock ABI N), overhead X ms/call`.
+- Recorded in `run.json` as `agent_sandbox: { mode, overhead_ms }` and in each
+  result as `repro.security.agent_sandbox` (`landlock` or `off`) and
+  `repro.security.agent_sandbox_overhead_ms`.
+
+```console
+$ crom eval run --suite security --provider golden --sandbox required
+```
 
 ## Opt-in
 
@@ -85,7 +111,7 @@ Task-authoring rules are in
 | Overlap guard | A workspace root inside (or containing) the runs dir or tasks dir is refused as a harness error. | runner |
 | Hidden overlay | `[hidden].fixture` is copied only into the verification copy (`runs/<id>/tasks/<task>/workspace/`) after the agent exits. | runner |
 | Path tools | `Read`/`Write`/`Edit`/`Glob`/`Grep` reject paths outside the workspace, including absolute paths to the task source or run dir. | `crom-tools` path sandbox |
-| Agent Bash, absolute paths | **Not enforced yet.** Bash can still read the task source dir or `target/crom-eval/runs` by absolute path. | #253 (OS sandbox must not mount the artifacts dir or task source dir) |
+| Agent Bash, absolute paths | With `--sandbox required` (default for live providers), Bash cannot read the task source dir or the runs dir by absolute path. With `--sandbox off` it can. | [agent sandbox](#agent-sandbox) (#253) |
 
 `TMPDIR` controls the workspace root. The `leak-canary` task (suite
 `security`, `kind = "security"`) asks the agent to copy grader material into
@@ -96,15 +122,15 @@ $ crom eval run --suite security --provider golden
 ```
 
 Coverage lives in `crates/crom-eval/tests/leakage.rs`; the Bash
-absolute-path test is `#[ignore]`d until #253 lands.
+absolute-path test runs with `sandbox = required` and skips (or fails under
+`CROM_REQUIRE_SANDBOX_TESTS=1`) on hosts without the sandbox.
 
 ## Known limitations
 
-- No backend sandboxes the agent: tool calls run on the host under `local`,
-  `docker`, and `podman` alike (container backends confine verification only).
-  The workspace is a separate temp dir (see [Leakage](#leakage)), not an OS
-  sandbox. Run
-  live evals that enable Bash only against trusted tasks, or run the whole
-  harness inside an externally sandboxed environment (container/VM).
+- Container backends confine verification only; agent tool calls run on the
+  host under every backend. Agent `Bash` is OS-sandboxed only with
+  `--sandbox required` (Linux only); with `--sandbox off` run live evals that
+  enable Bash only against trusted tasks, or run the whole harness inside an
+  externally sandboxed environment (container/VM).
 - On timeout the harness kills the wrapping `sh`; a long-running child (e.g.
   cargo) may briefly outlive the timeout before exiting.

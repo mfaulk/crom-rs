@@ -523,10 +523,12 @@ without the secret, live tasks skip cleanly.
 - Oracle commands run in the host environment, so Rust tasks require a working
   cargo toolchain (and network for fixtures with external dependencies; those
   tasks set `requires_network = true`, e.g. `rust-serde-edge-case`).
-- The workspace is isolated by directory (cwd), **not** by OS sandboxing. Under
-  a live provider a task that enables Bash can in principle run commands that
-  reach outside the fixture directory. Run live evals with Bash only against
-  trusted tasks, or in an externally sandboxed environment (container/VM).
+- Agent `Bash` is OS-sandboxed only with `--sandbox required`, the default
+  for live providers (Linux only; other hosts fail closed). With
+  `--sandbox off` a task that enables Bash can run commands that reach outside
+  the fixture directory, so run such evals only against trusted tasks or in an
+  externally sandboxed environment. See
+  [eval isolation](eval-isolation.md#agent-sandbox).
 - Patch quality cannot tell "relevant" from "irrelevant" files perfectly; it
   uses tags (e.g. `small`) and simple churn/deletion heuristics.
 - The harness avoids exact-diff matching by design: any patch that satisfies the

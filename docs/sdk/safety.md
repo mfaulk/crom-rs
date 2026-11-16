@@ -19,7 +19,11 @@ should never make a destructive choice on the host's behalf.
 
 Threat model, trust boundaries, and required OS-enforcement properties:
 [`docs/security/threat-model.md`](../security/threat-model.md). The SDK
-controls below are policy-level; they are not an OS sandbox.
+controls below are policy-level. For OS enforcement of built-in `Bash` calls on
+Linux, set `ToolPolicy { sandbox: crom_core::SandboxConfig::required(), .. }`
+(default `off`); a command the host cannot sandbox is refused with
+`ToolError::PermissionDenied`. See
+[`docs/security/sandbox.md`](../security/sandbox.md).
 
 ## Defense in depth
 

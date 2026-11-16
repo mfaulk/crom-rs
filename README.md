@@ -182,6 +182,17 @@ The `cargo run -p crom-cli -- <args>` form is the easiest way to
 iterate on the CLI while developing — every CLI subcommand documented above
 works after `--`.
 
+The OS sandbox suites include fork-bomb and memory containment tests that are
+`#[ignore]`d by default because a broken sandbox would exhaust the host. Run
+them only through the script, which wraps them in a capped cgroup scope
+(Linux, systemd user session):
+
+```sh
+scripts/sandbox-tests.sh
+```
+
+See [`docs/security/sandbox.md`](docs/security/sandbox.md).
+
 Live provider tests are kept out of the default suite. `ANTHROPIC_API_KEY`
 (or the equivalent for OpenAI / Gemini) is only needed when actually running
 the agent against a real model.
@@ -190,7 +201,10 @@ the agent against a real model.
 
 `.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy
 --workspace --all-targets -- -D warnings`, `cargo build --workspace`, and
-`cargo test --workspace --all-targets` on each push and pull request.
+`cargo test --workspace --all-targets` on each push and pull request. The
+`security / OS sandbox (linux)` job runs `scripts/sandbox-tests.sh` on
+`ubuntu-24.04` with `CROM_REQUIRE_SANDBOX_TESTS=1` and the golden/security
+eval suites with `--sandbox required`.
 
 ## Roadmap
 
@@ -198,7 +212,9 @@ Milestone specs live in [`docs/milestones/`](docs/milestones/). The current
 plan is [M17 — Measurable Agent Capability and Secure Execution](docs/milestones/MILESTONE_17.md).
 The security threat model is in [`docs/security/threat-model.md`](docs/security/threat-model.md).
 Security audit events (`SecurityDecision`) and secret redaction are described in
-[`docs/security/audit.md`](docs/security/audit.md).
+[`docs/security/audit.md`](docs/security/audit.md). The Linux OS sandbox for
+agent `Bash` (`sandbox` settings, `crom eval run --sandbox`) is described in
+[`docs/security/sandbox.md`](docs/security/sandbox.md).
 
 ## License
 

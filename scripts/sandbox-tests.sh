@@ -13,7 +13,7 @@ memory_max="${SANDBOX_TESTS_MEMORY_MAX:-8G}"
 tests=(--test sandbox --test sandbox_env)
 
 if [[ "$(uname -s)" != Linux ]]; then
-  exec cargo test -p crom-tools "${tests[@]}" -- "$@"
+  exec cargo test --locked -p crom-tools "${tests[@]}" -- "$@"
 fi
 
 if ! command -v systemd-run >/dev/null || ! systemd-run --user --scope --quiet true 2>/dev/null; then
@@ -23,8 +23,8 @@ if ! command -v systemd-run >/dev/null || ! systemd-run --user --scope --quiet t
 fi
 
 # Compile outside the scope: a parallel build legitimately needs more tasks.
-cargo test -p crom-tools "${tests[@]}" --no-run
+cargo test --locked -p crom-tools "${tests[@]}" --no-run
 
 exec systemd-run --user --scope --quiet \
   -p "TasksMax=${tasks_max}" -p "MemoryMax=${memory_max}" -p MemorySwapMax=0 \
-  cargo test -p crom-tools "${tests[@]}" -- --include-ignored "$@"
+  cargo test --locked -p crom-tools "${tests[@]}" -- --include-ignored "$@"
