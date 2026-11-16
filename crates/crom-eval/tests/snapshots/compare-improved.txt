@@ -1,0 +1,34 @@
+Paired comparison: base -> cand (kind: capability, experiment: model)
+
+Metadata diff:
+  [expected] model (1 task(s), e.g. t00): {"model":"deepseek-chat","profile":"deepseek"} != {"model":"gpt-4.1-mini","profile":"deepseek"}
+
+Verdict: IMPROVED (delta +0.500, McNemar p = 0.0005, bootstrap 95% CI [+0.292, +0.708], non-overlapping Wilson intervals)
+
+Paired tasks: 24
+  baseline:  6/24 = 0.250 [0.120, 0.449]
+  candidate: 18/24 = 0.750 [0.551, 0.880]
+  delta: +0.500  bootstrap 95% CI: [+0.292, +0.708]
+  McNemar exact: pass->fail 0, fail->pass 12, p = 0.0005
+
+Newly solved: 12
+  t06  0/1 -> 1/1
+  t07  0/1 -> 1/1
+  t08  0/1 -> 1/1
+  t09  0/1 -> 1/1
+  t10  0/1 -> 1/1
+  t11  0/1 -> 1/1
+  t12  0/1 -> 1/1
+  t13  0/1 -> 1/1
+  t14  0/1 -> 1/1
+  t15  0/1 -> 1/1
+  t16  0/1 -> 1/1
+  t17  0/1 -> 1/1
+Newly failing: 0
+Flaky: 0
+Still passing: 6, still failing: 6
+
+Cost and usage (paired tasks, all non-skipped attempts):
+  spend USD: 0.2400 (24 priced) -> 0.2400 (24 priced), delta +0.0000
+  input tokens: unknown -> unknown (unknown); output tokens: unknown -> unknown (unknown)
+  mean tool calls: 3.00 -> 3.00 (+0.00)

@@ -63,7 +63,8 @@ $ crom eval validate-suite <suite> --repeat 5
 $ CROM_EVAL_PODMAN=1 crom eval validate-suite <suite> --isolation podman
 $ crom eval history
 $ crom eval trend <suite>
-$ crom eval regressions --baseline <run-or-sha> --candidate <run-or-sha>
+$ crom eval regressions --baseline <run-or-sha> --candidate <run-or-sha>   # index-only diff
+$ crom eval regressions --since main [--candidate <run-id>]                  # paired, see "Comparing runs"
 $ crom eval task-history <task-id>
 $ crom eval triage <run-id>
 $ crom eval show <run-id> <task-id>
@@ -133,7 +134,7 @@ Report and compare prior runs:
 
 ```console
 $ crom eval report <run-id>
-$ crom eval compare <baseline-run-id> <candidate-run-id>
+$ crom eval compare <baseline-run-id> <candidate-run-id> [--experiment <preset>]
 ```
 
 ## Provider modes
@@ -648,6 +649,84 @@ and security results never enter capability numbers.
   weighted score. It shows the resolved rate with a Wilson interval, plus
   attempted, blocked, and executed tool calls and audit coverage summed from
   each attempt's `security-summary.json`.
+
+## Comparing runs (M17.4)
+
+`crom eval compare <baseline> <candidate>` pairs two runs (run ids under
+`--runs-dir`, or run directory paths) by task id and reports whether the
+candidate is better, worse, or not distinguishable. `crom eval regressions
+--since <ref>` does the same with the baseline taken from the index: the most
+recent run evaluated at `<ref>`'s commit, otherwise the most recent run
+recorded on a branch named `<ref>`. The candidate defaults to the most recent
+other indexed run (override with `--candidate`). The older
+`regressions --baseline A --candidate B` still prints the index-only diff.
+
+```console
+crom eval compare run-a run-b                          # refuses if configs differ
+crom eval compare run-a run-b --experiment model       # model A vs B: model may differ
+crom eval compare run-a run-b --allow budgets --force --format json
+crom eval regressions --since main --kind all
+```
+
+**Comparability.** The first attempt of each paired task is checked on these
+`repro` factors: `model` (provider profile + model), `task_version`
+(`task_version` + content hash), `tool_policy`, `security` (the measured
+sandbox overhead is ignored), `isolation`, `budgets` (max turns, timeout,
+mode, attempts), `repair` (repair-loop settings), and `prompt` (template
+version, variant, hash). Results without `repro` (v1) produce a `metadata`
+mismatch. Each mismatch is printed as a metadata diff. A factor that is not
+allowed makes the command exit non-zero. You allow a factor with an
+experiment preset, with `--allow <factor>`, or override everything with
+`--force`, which prints a warning banner.
+
+| `--experiment` | Factor allowed to differ |
+|---|---|
+| `commit` | none: the code changed, the configuration must not |
+| `model` | `model` |
+| `security` | `security` |
+| `repair` | `repair` |
+| `policy` | `tool_policy` |
+| `reps` | none: k repetitions of one configuration, to measure the noise floor |
+
+**Pairing.** Only tasks of `--kind` (default `capability`; also `harness`,
+`security`, `all`) are paired. For each task, `(resolved, scored)` counts
+come from its `resolved`/`failed` attempts, so repetitions are pooled. Each
+pair is classified:
+
+- *newly solved*: none resolved before, all resolved after
+- *newly failing*: the reverse
+- *flaky*: mixed results on either side
+- *still passing* / *still failing*
+
+Tasks present on only one side, or with no scored attempt on a side, are
+listed separately and left out of the statistics.
+
+**Statistics** (`docs/milestones/MILESTONE_17.md` §8.3):
+
+- *delta* = pooled candidate resolved rate − pooled baseline resolved rate.
+- *bootstrap 95% CI*: percentile interval over 2000 resamples of tasks with
+  replacement. It uses a fixed seed, so the output is reproducible.
+- *McNemar exact*: two-sided binomial test on per-task majority outcomes
+  (resolved in more than half of the scored attempts). `b` counts
+  pass→fail pairs and `c` counts fail→pass pairs.
+- Each side's rate is shown with a Wilson 95% interval and n.
+
+**Verdict.** The verdict is `improved` or `regressed` only when all of these
+hold:
+
+- at least 20 paired tasks
+- both runs reliable
+- McNemar p < 0.05
+- the bootstrap CI excludes 0
+- the two Wilson intervals do not overlap
+
+Otherwise it is `inconclusive`, and the output gives the reason, for example
+`n too small to conclude: 10 paired tasks < 20`.
+
+**Cost and usage.** Spend, input/output tokens, and mean tool calls per side
+cover every non-skipped attempt of the paired tasks. The cost delta is shown
+only when every attempt on both sides is priced; otherwise it is `unknown`.
+`cost_usd` stays `null` until #282 lands.
 
 ## Scoring
 

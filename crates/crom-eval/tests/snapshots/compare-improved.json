@@ -1,0 +1,379 @@
+{
+  "schema_version": 1,
+  "kind": "capability",
+  "experiment": "model",
+  "mismatches": [
+    {
+      "factor": "model",
+      "tasks": 1,
+      "example_task": "t00",
+      "baseline": {
+        "model": "deepseek-chat",
+        "profile": "deepseek"
+      },
+      "candidate": {
+        "model": "gpt-4.1-mini",
+        "profile": "deepseek"
+      },
+      "allowed": true
+    }
+  ],
+  "forced": false,
+  "baseline": {
+    "run": "base",
+    "outcomes": {
+      "resolved": 6,
+      "failed": 18,
+      "provider_error": 0,
+      "infra_error": 0,
+      "skipped": 0,
+      "unscorable": 0
+    },
+    "resolved_rate": 0.25,
+    "wilson95": {
+      "low": 0.11999366228595004,
+      "high": 0.44899444005154004
+    },
+    "unreliable": false,
+    "attempts": 24,
+    "priced": 24,
+    "spend_usd": 0.24000000000000007,
+    "input_tokens": null,
+    "output_tokens": null,
+    "mean_tool_calls": 3.0,
+    "mean_wall_ms": 100.0
+  },
+  "candidate": {
+    "run": "cand",
+    "outcomes": {
+      "resolved": 18,
+      "failed": 6,
+      "provider_error": 0,
+      "infra_error": 0,
+      "skipped": 0,
+      "unscorable": 0
+    },
+    "resolved_rate": 0.75,
+    "wilson95": {
+      "low": 0.55100555994846,
+      "high": 0.8800063377140499
+    },
+    "unreliable": false,
+    "attempts": 24,
+    "priced": 24,
+    "spend_usd": 0.24000000000000007,
+    "input_tokens": null,
+    "output_tokens": null,
+    "mean_tool_calls": 3.0,
+    "mean_wall_ms": 100.0
+  },
+  "pairs": [
+    {
+      "task_id": "t00",
+      "baseline": [
+        1,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "still_passing"
+    },
+    {
+      "task_id": "t01",
+      "baseline": [
+        1,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "still_passing"
+    },
+    {
+      "task_id": "t02",
+      "baseline": [
+        1,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "still_passing"
+    },
+    {
+      "task_id": "t03",
+      "baseline": [
+        1,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "still_passing"
+    },
+    {
+      "task_id": "t04",
+      "baseline": [
+        1,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "still_passing"
+    },
+    {
+      "task_id": "t05",
+      "baseline": [
+        1,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "still_passing"
+    },
+    {
+      "task_id": "t06",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t07",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t08",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t09",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t10",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t11",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t12",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t13",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t14",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t15",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t16",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t17",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        1,
+        1
+      ],
+      "change": "newly_solved"
+    },
+    {
+      "task_id": "t18",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        0,
+        1
+      ],
+      "change": "still_failing"
+    },
+    {
+      "task_id": "t19",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        0,
+        1
+      ],
+      "change": "still_failing"
+    },
+    {
+      "task_id": "t20",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        0,
+        1
+      ],
+      "change": "still_failing"
+    },
+    {
+      "task_id": "t21",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        0,
+        1
+      ],
+      "change": "still_failing"
+    },
+    {
+      "task_id": "t22",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        0,
+        1
+      ],
+      "change": "still_failing"
+    },
+    {
+      "task_id": "t23",
+      "baseline": [
+        0,
+        1
+      ],
+      "candidate": [
+        0,
+        1
+      ],
+      "change": "still_failing"
+    }
+  ],
+  "unpaired_baseline": [],
+  "unpaired_candidate": [],
+  "unscored": [],
+  "delta": 0.5,
+  "bootstrap95": {
+    "low": 0.2916666666666667,
+    "high": 0.7083333333333333
+  },
+  "mcnemar": {
+    "b": 0,
+    "c": 12,
+    "p_value": 0.0004882812500000003
+  },
+  "cost_delta_usd": 0.0,
+  "input_token_delta": null,
+  "output_token_delta": null,
+  "tool_calls_delta": 0.0,
+  "verdict": "improved",
+  "verdict_reason": "delta +0.500, McNemar p = 0.0005, bootstrap 95% CI [+0.292, +0.708], non-overlapping Wilson intervals"
+}
