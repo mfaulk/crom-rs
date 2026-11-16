@@ -3,6 +3,15 @@
 //! On Linux each test skips with an explicit `SKIP:` line when the kernel
 //! cannot enforce the sandbox; set `CROM_REQUIRE_SANDBOX_TESTS=1` (as the
 //! ubuntu CI lane does) to turn a skip into a failure.
+//!
+//! The P6 containment tests (fork loop, fork bomb, memory) take down the host
+//! if the sandbox is broken: a fork bomb run without it exhausted 300 GB of RAM
+//! on 2026-11-14 (#253). They are `#[ignore]`d and run only through
+//! `scripts/sandbox-tests.sh`, which places the test binary in a cgroup scope
+//! with `TasksMax`/`MemoryMax`. Each one also refuses to start unless it can
+//! see that outer limit, and unless a probe through the same Bash path shows
+//! the sandbox is actually engaged. Never weaken these guards for a mutation
+//! check.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -174,6 +183,92 @@ mod linux {
 
     fn required() -> BashTool {
         tool(SandboxConfig::required())
+    }
+
+    /// Ceiling on the outer cgroup `pids.max` a containment test accepts.
+    const OUTER_TASKS_CEILING: u64 = 4096;
+    /// Ceiling on the outer cgroup `memory.max` a containment test accepts.
+    const OUTER_MEMORY_CEILING: u64 = 16 << 30;
+
+    /// Tightest `(pids.max, memory.max)` over this process's cgroup v2 path and
+    /// its ancestors; `None` for a limit that is `max` all the way up.
+    fn outer_cgroup_limits() -> (Option<u64>, Option<u64>) {
+        let rel = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_string()))
+            })
+            .unwrap_or_default();
+        let read = |dir: &Path, file: &str| -> Option<u64> {
+            std::fs::read_to_string(dir.join(file))
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        };
+        let (mut pids, mut mem) = (None::<u64>, None::<u64>);
+        let mut dir = Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+        loop {
+            if let Some(v) = read(&dir, "pids.max") {
+                pids = Some(pids.map_or(v, |p| p.min(v)));
+            }
+            if let Some(v) = read(&dir, "memory.max") {
+                mem = Some(mem.map_or(v, |m| m.min(v)));
+            }
+            if dir == Path::new("/sys/fs/cgroup") || !dir.pop() {
+                return (pids, mem);
+            }
+        }
+    }
+
+    /// Guard for host-destructive tests: refuse (panic, spawning nothing)
+    /// unless an outer cgroup bounds this process independently of the code
+    /// under test, then require the sandbox itself.
+    fn containment_preconditions() -> bool {
+        let (pids, mem) = outer_cgroup_limits();
+        let bounded = pids.is_some_and(|p| p <= OUTER_TASKS_CEILING)
+            && mem.is_some_and(|m| m <= OUTER_MEMORY_CEILING);
+        assert!(
+            bounded,
+            "refusing to run a containment test without an outer cgroup limit \
+             (pids.max={pids:?}, memory.max={mem:?}); run scripts/sandbox-tests.sh"
+        );
+        sandbox_available()
+    }
+
+    /// Fail before any bomb is started unless a probe through the same Bash
+    /// path shows seccomp, no_new_privs, and finite NPROC/DATA rlimits.
+    async fn assert_sandbox_engaged(tool: &BashTool, ws: &Path) {
+        let probe = "grep -E '^(NoNewPrivs|Seccomp):' /proc/self/status; \
+                     grep -E '^Max (processes|data size)' /proc/self/limits";
+        let r = run(tool, ws, probe).await.expect("engagement probe");
+        let out = text(&r);
+        let field = |name: &str| {
+            out.lines()
+                .find(|l| l.starts_with(name))
+                .map(|l| l.split_whitespace().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert_eq!(field("NoNewPrivs:").get(1), Some(&"1"), "no_new_privs off: {out}");
+        assert_eq!(field("Seccomp:").get(1), Some(&"2"), "seccomp filter off: {out}");
+        let host_limits = std::fs::read_to_string("/proc/self/limits").unwrap();
+        for limit in ["Max processes", "Max data size"] {
+            let soft_of = |text: &str| -> Option<u64> {
+                let words: Vec<&str> = text
+                    .lines()
+                    .find(|l| l.starts_with(limit))?
+                    .split_whitespace()
+                    .collect();
+                words.get(limit.split(' ').count())?.parse().ok()
+            };
+            // An inherited host limit can be finite but huge (NPROC ~2M), so
+            // the child's limit must be strictly tighter than this process's.
+            let child = soft_of(&out);
+            let host = soft_of(&host_limits);
+            assert!(
+                child.is_some_and(|c| host.is_none_or(|h| c < h)),
+                "{limit} rlimit not tightened in child (child={child:?}, host={host:?}): {out}"
+            );
+        }
     }
 
     // P1: writes, truncation, renames, and deletes outside the workspace fail and leave targets unchanged.
@@ -388,8 +483,9 @@ mod linux {
 
     // P6: the number of processes a call can create is bounded by max_processes.
     #[tokio::test]
+    #[ignore = "host-destructive if the sandbox is broken; run via scripts/sandbox-tests.sh"]
     async fn process_count_is_bounded() {
-        if !sandbox_available() {
+        if !containment_preconditions() {
             return;
         }
         if !has("python3") {
@@ -403,7 +499,9 @@ mod linux {
         };
         let script = "import os,time\nn=0\nfor i in range(400):\n    try:\n        pid=os.fork()\n    except OSError:\n        break\n    if pid==0:\n        time.sleep(3); os._exit(0)\n    n+=1\nprint('forks=%d' % n)\n";
         std::fs::write(ws.path().join("fork.py"), script).unwrap();
-        let r = run(&tool(cfg), ws.path(), "python3 fork.py").await.unwrap();
+        let t = tool(cfg);
+        assert_sandbox_engaged(&t, ws.path()).await;
+        let r = run(&t, ws.path(), "python3 fork.py").await.unwrap();
         let out = text(&r);
         let n: u64 = out
             .split("forks=")
@@ -417,8 +515,9 @@ mod linux {
 
     // P6: a shell fork bomb is contained, the call ends, and no bomb process survives.
     #[tokio::test]
+    #[ignore = "host-destructive if the sandbox is broken; run via scripts/sandbox-tests.sh"]
     async fn fork_bomb_is_contained() {
-        if !sandbox_available() {
+        if !containment_preconditions() {
             return;
         }
         let ws = TempDir::new().unwrap();
@@ -428,8 +527,10 @@ mod linux {
             ..SandboxConfig::required()
         };
         let cmd = format!("# {m}\nbomb() {{ bomb | bomb & }}; bomb; sleep 2; echo survived");
+        let t = tool(cfg);
+        assert_sandbox_engaged(&t, ws.path()).await;
         let started = std::time::Instant::now();
-        let _ = run_with_timeout(&tool(cfg), ws.path(), &cmd, Some(4)).await;
+        let _ = run_with_timeout(&t, ws.path(), &cmd, Some(4)).await;
         assert!(started.elapsed() < Duration::from_secs(20));
         let left = wait_gone(&m, Duration::from_secs(5)).await;
         assert!(left.is_empty(), "fork bomb processes survived: {}", left.len());
@@ -437,8 +538,9 @@ mod linux {
 
     // P6: an allocation past max_memory_bytes fails.
     #[tokio::test]
+    #[ignore = "host-destructive if the sandbox is broken; run via scripts/sandbox-tests.sh"]
     async fn memory_limit_is_enforced() {
-        if !sandbox_available() {
+        if !containment_preconditions() {
             return;
         }
         if !has("python3") {
@@ -451,7 +553,9 @@ mod linux {
             ..SandboxConfig::required()
         };
         let cmd = "python3 -c 'b = bytearray(1024 * 1024 * 1024); print(\"ALLOC\" + \"ATED\")'";
-        let r = run(&tool(cfg), ws.path(), cmd).await.unwrap();
+        let t = tool(cfg);
+        assert_sandbox_engaged(&t, ws.path()).await;
+        let r = run(&t, ws.path(), cmd).await.unwrap();
         let out = text(&r);
         assert!(!out.contains("ALLOCATED"), "{out}");
         assert!(!out.contains("[exit: 0]"), "{out}");
