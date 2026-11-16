@@ -147,6 +147,14 @@ async fn emitted_golden_result_validates_against_v2_schema() {
     assert!(errors.is_empty(), "schema violations: {errors:#?}");
 }
 
+/// result.json records the task's kind and capability level so reports can separate harness from capability results.
+#[tokio::test]
+async fn result_records_task_kind_and_level() {
+    let (_tmp, json) = run("golden-edit-recover", golden(), "kind-level").await;
+    assert_eq!(json["kind"], "harness");
+    assert_eq!(json["level"], "L0");
+}
+
 /// A fake-provider run's result.json (unresolved, usage null) also validates against the schema.
 #[tokio::test]
 async fn emitted_fake_result_validates_against_v2_schema() {

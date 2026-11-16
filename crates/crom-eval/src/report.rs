@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::artifacts::RunDir;
 use crate::fixture::PatchInfo;
 use crate::oracle::OracleReport;
+use crate::result_schema::OutcomeCounts;
 use crate::runner::{EvalResult, EvalStatus};
+use crate::schema::{Level, TaskKind};
 use crate::score::EvalScore;
 use crate::task::EvalTask;
 
@@ -154,6 +156,29 @@ pub struct TaskSummary {
     /// M17.4 outcome class (`None` in pre-v2 summaries).
     #[serde(default)]
     pub outcome: Option<crate::result_schema::Outcome>,
+    /// Task kind (`None` for v1/v2 tasks and older summaries).
+    #[serde(default)]
+    pub kind: Option<TaskKind>,
+    #[serde(default)]
+    pub level: Option<Level>,
+}
+
+/// Label used for results whose task declares no `kind`.
+pub const UNCLASSIFIED_KIND: &str = "unclassified";
+
+/// `harness`, `capability`, `security`, or [`UNCLASSIFIED_KIND`].
+pub fn kind_label(kind: Option<TaskKind>) -> &'static str {
+    kind.map_or(UNCLASSIFIED_KIND, |k| k.as_str())
+}
+
+/// Outcome counts for one task kind. Pass rates are computed per kind so
+/// harness successes never inflate capability numbers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KindSummary {
+    pub kind: String,
+    pub outcomes: OutcomeCounts,
+    /// `resolved / (resolved + failed)` within this kind.
+    pub pass_rate: Option<f64>,
 }
 
 /// Aggregate repair-loop statistics across a run (M16M).
@@ -246,6 +271,17 @@ pub struct RunSummary {
     /// Tasks skipped because a spend cap was reached or unenforceable.
     #[serde(default)]
     pub budget_skipped: usize,
+    /// Outcome counts and pass rate per task kind, in the order harness,
+    /// capability, security, unclassified (kinds with no results omitted).
+    #[serde(default)]
+    pub by_kind: Vec<KindSummary>,
+    /// Pass rate over `kind = capability` results only; `None` when no
+    /// capability result was scored. This is the headline capability metric.
+    #[serde(default)]
+    pub capability_pass_rate: Option<f64>,
+    /// Capability results by level; `total` is resolved + failed.
+    #[serde(default)]
+    pub capability_by_level: Vec<AggBucket>,
 }
 
 /// Aggregate resolved-rate by a key extractor (possibly multi-valued).
@@ -336,7 +372,61 @@ fn aggregate_repair(results: &[EvalResult]) -> RepairSummaryAgg {
     agg
 }
 
+/// Per-kind outcome counts, in a fixed kind order.
+pub fn aggregate_kinds(results: &[EvalResult]) -> Vec<KindSummary> {
+    let order = [
+        TaskKind::Harness.as_str(),
+        TaskKind::Capability.as_str(),
+        TaskKind::Security.as_str(),
+        UNCLASSIFIED_KIND,
+    ];
+    order
+        .iter()
+        .filter_map(|&label| {
+            let outcomes = OutcomeCounts::from_outcomes(
+                results
+                    .iter()
+                    .filter(|r| kind_label(r.kind) == label)
+                    .map(|r| r.outcome()),
+            );
+            (outcomes != OutcomeCounts::default()).then(|| KindSummary {
+                kind: label.to_string(),
+                pass_rate: outcomes.pass_rate(),
+                outcomes,
+            })
+        })
+        .collect()
+}
+
+/// Scored (resolved + failed) capability results bucketed by level.
+fn capability_by_level(results: &[EvalResult]) -> Vec<AggBucket> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<Option<Level>, (usize, usize)> = BTreeMap::new();
+    for r in results {
+        if r.kind != Some(TaskKind::Capability) || !r.outcome().is_scored() {
+            continue;
+        }
+        let e = map.entry(r.level).or_default();
+        e.0 += 1;
+        if r.outcome() == crate::result_schema::Outcome::Resolved {
+            e.1 += 1;
+        }
+    }
+    map.into_iter()
+        .map(|(level, (total, resolved))| AggBucket {
+            key: level.map_or("unleveled", |l| l.as_str()).to_string(),
+            total,
+            resolved,
+        })
+        .collect()
+}
+
 impl RunSummary {
+    /// The per-kind bucket for `kind` (`harness`, `capability`, ...).
+    pub fn kind(&self, kind: &str) -> Option<&KindSummary> {
+        self.by_kind.iter().find(|k| k.kind == kind)
+    }
+
     pub fn from_results(run_id: &str, provider: &str, results: &[EvalResult]) -> Self {
         let mut summary = RunSummary {
             run_id: run_id.to_string(),
@@ -367,6 +457,9 @@ impl RunSummary {
             total_cost_usd: None,
             cost_unknown: 0,
             budget_skipped: 0,
+            by_kind: Vec::new(),
+            capability_pass_rate: None,
+            capability_by_level: Vec::new(),
         };
         let mut score_sum = 0.0;
         for r in results {
@@ -427,6 +520,8 @@ impl RunSummary {
                 repair_focused_used: r.repair.focused_validation_used,
                 repair_final_validation: final_validation_label(r.repair.final_validation_status),
                 outcome: Some(r.outcome()),
+                kind: r.kind,
+                level: r.level,
             });
         }
         summary.repair = aggregate_repair(results);
@@ -450,6 +545,11 @@ impl RunSummary {
                         .is_some_and(|s| s.starts_with("budget:"))
             })
             .count();
+        summary.by_kind = aggregate_kinds(results);
+        summary.capability_pass_rate = summary
+            .kind(TaskKind::Capability.as_str())
+            .and_then(|k| k.pass_rate);
+        summary.capability_by_level = capability_by_level(results);
         if !results.is_empty() {
             summary.mean_score = (score_sum / results.len() as f64 * 1000.0).round() / 1000.0;
         }
@@ -502,6 +602,19 @@ impl RunSummary {
             )),
             None => s.push_str("- pass rate: n/a (nothing scored)\n"),
         }
+        match self.kind(TaskKind::Capability.as_str()) {
+            Some(KindSummary {
+                pass_rate: Some(rate),
+                outcomes,
+                ..
+            }) => s.push_str(&format!(
+                "- capability pass rate: {:.3} ({}/{}; harness and security excluded)\n",
+                rate,
+                outcomes.resolved,
+                outcomes.scored()
+            )),
+            _ => s.push_str("- capability pass rate: n/a (no capability results scored)\n"),
+        }
         if self.unreliable {
             s.push_str("- **UNRELIABLE**: provider + infra errors exceed 10% of attempts; do not compare\n");
         }
@@ -543,6 +656,27 @@ impl RunSummary {
             s.push('\n');
         }
 
+        if !self.by_kind.is_empty() {
+            s.push_str("## By kind\n\n");
+            s.push_str("| kind | resolved | failed | provider_error | infra_error | skipped | unscorable | pass rate |\n");
+            s.push_str("|------|----------|--------|----------------|-------------|---------|------------|-----------|\n");
+            for k in &self.by_kind {
+                let o = &k.outcomes;
+                s.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    k.kind,
+                    o.resolved,
+                    o.failed,
+                    o.provider_error,
+                    o.infra_error,
+                    o.skipped,
+                    o.unscorable,
+                    k.pass_rate.map_or("n/a".to_string(), |r| format!("{r:.3}"))
+                ));
+            }
+            s.push('\n');
+        }
+        render_buckets(&mut s, "Capability by level", &self.capability_by_level);
         render_buckets(&mut s, "By category", &self.by_category);
         render_buckets(&mut s, "By capability", &self.by_capability);
         render_buckets(&mut s, "By tag", &self.by_tag);
@@ -835,6 +969,70 @@ mod tests {
         let md = summary.to_markdown();
         assert!(md.contains("provider_error 1"), "{md}");
         assert!(md.contains("UNRELIABLE"), "{md}");
+    }
+
+    fn kinded(id: &str, status: EvalStatus, kind: TaskKind, level: Level) -> EvalResult {
+        let mut r = result(
+            id,
+            status,
+            if status == EvalStatus::Passed {
+                1.0
+            } else {
+                0.0
+            },
+        );
+        r.kind = Some(kind);
+        r.level = Some(level);
+        r
+    }
+
+    /// Harness and security results never enter the capability pass rate; each kind gets its own bucket.
+    #[test]
+    fn capability_pass_rate_excludes_harness_and_security() {
+        let results = vec![
+            kinded("h1", EvalStatus::Passed, TaskKind::Harness, Level::L0),
+            kinded("h2", EvalStatus::Passed, TaskKind::Harness, Level::L0),
+            kinded("c1", EvalStatus::Passed, TaskKind::Capability, Level::L1),
+            kinded("c2", EvalStatus::Failed, TaskKind::Capability, Level::L1),
+            kinded("c3", EvalStatus::Failed, TaskKind::Capability, Level::L2),
+            kinded("s1", EvalStatus::Passed, TaskKind::Security, Level::L1),
+            result("u", EvalStatus::Passed, 1.0),
+        ];
+        let summary = RunSummary::from_results("run-k", "fake", &results);
+        assert_eq!(summary.tasks[0].kind, Some(TaskKind::Harness));
+        assert_eq!(summary.tasks[2].level, Some(Level::L1));
+        let cap = summary.kind("capability").expect("capability bucket");
+        assert_eq!((cap.outcomes.resolved, cap.outcomes.failed), (1, 2));
+        assert_eq!(cap.pass_rate, Some(1.0 / 3.0));
+        assert_eq!(summary.capability_pass_rate, Some(1.0 / 3.0));
+        let harness = summary.kind("harness").expect("harness bucket");
+        assert_eq!(harness.outcomes.resolved, 2);
+        assert_eq!(summary.kind("security").unwrap().outcomes.resolved, 1);
+        assert_eq!(summary.kind("unclassified").unwrap().outcomes.resolved, 1);
+        let levels: Vec<(&str, usize, usize)> = summary
+            .capability_by_level
+            .iter()
+            .map(|b| (b.key.as_str(), b.total, b.resolved))
+            .collect();
+        assert_eq!(levels, vec![("L1", 2, 1), ("L2", 1, 0)]);
+        let md = summary.to_markdown();
+        assert!(md.contains("capability pass rate: 0.333 (1/3;"), "{md}");
+        assert!(md.contains("| harness | 2 | 0 |"), "{md}");
+    }
+
+    /// A summary with no capability results reports the capability pass rate as n/a, not the harness rate.
+    #[test]
+    fn harness_only_run_has_no_capability_pass_rate() {
+        let results = vec![kinded(
+            "h",
+            EvalStatus::Passed,
+            TaskKind::Harness,
+            Level::L0,
+        )];
+        let summary = RunSummary::from_results("run-h", "fake", &results);
+        assert_eq!(summary.pass_rate, Some(1.0));
+        assert_eq!(summary.capability_pass_rate, None);
+        assert!(summary.to_markdown().contains("capability pass rate: n/a"));
     }
 
     /// A pre-v2 summary.json without outcome fields still deserializes.
