@@ -122,8 +122,17 @@ pub struct EvalResult {
     pub repetition: usize,
     pub seed: u64,
     pub attempts_used: usize,
-    /// Estimated cost in USD if the provider reports usage; `None` otherwise.
+    /// Nominal list-price cost in USD (pricing table x reported usage, all
+    /// attempts). `None` whenever any needed usage or price is unknown; see
+    /// `cost_unknown_reason`. Never zero-filled.
     pub cost_usd: Option<f64>,
+    /// Why `cost_usd` is `None` (`no_pricing_entry`, `usage_unknown`, ...).
+    #[serde(default)]
+    pub cost_unknown_reason: Option<String>,
+    /// SDK budget diagnostic that stopped the agent
+    /// (`budget.max_cost_exceeded`, `budget.max_tool_calls_exceeded`, ...).
+    #[serde(default)]
+    pub budget_exceeded: Option<String>,
     /// M16: repair-loop metrics (always present; `enabled=false` when the
     /// repair loop was off).
     #[serde(default)]
@@ -207,6 +216,17 @@ pub struct RunConfig {
     pub sandbox: crom_core::SandboxMode,
     /// Measured mean per-call sandbox overhead, recorded in results.
     pub sandbox_overhead_ms: Option<f64>,
+    /// Nominal pricing used for `cost_usd` and cost caps (#282).
+    pub pricing: crom_core::PricingTable,
+    /// Per-task nominal cost cap (`--max-cost-usd`); the tighter of this and
+    /// a task's `limits.max_cost_usd` applies across all of its attempts.
+    pub max_cost_usd: Option<f64>,
+    /// Run-level nominal spend cap (`--max-run-cost-usd`). Once reached,
+    /// remaining tasks are recorded as `skipped` with a `budget:` reason.
+    pub max_run_cost_usd: Option<f64>,
+    /// Remaining run-level budget for the task being run. Set by
+    /// [`run_tasks`]; callers leave it `None`.
+    pub run_cost_remaining: Option<f64>,
 }
 
 impl Default for RunConfig {
@@ -230,6 +250,10 @@ impl Default for RunConfig {
             workspace_root: None,
             sandbox: crom_core::SandboxMode::Off,
             sandbox_overhead_ms: None,
+            pricing: crom_core::PricingTable::builtin(),
+            max_cost_usd: None,
+            max_run_cost_usd: None,
+            run_cost_remaining: None,
         }
     }
 }
@@ -256,6 +280,62 @@ struct RunOutcome {
     provider_errored: bool,
     /// The harness/runtime failed for a reason other than the provider.
     harness_errored: bool,
+    /// SDK budget diagnostic code that stopped the run, if any.
+    budget_breach: Option<String>,
+}
+
+/// SDK diagnostic codes that mean a run budget (not a turn cap) stopped it.
+const BUDGET_STOP_CODES: &[&str] = &[
+    "budget.max_tool_calls_exceeded",
+    "budget.max_input_tokens_exceeded",
+    "budget.max_output_tokens_exceeded",
+    "budget.max_cost_exceeded",
+    "budget.usage_unknown",
+    "budget.unsupported_mode",
+];
+
+fn budget_breach(diags: &[crom_sdk::Diagnostic]) -> Option<String> {
+    diags
+        .iter()
+        .find(|d| BUDGET_STOP_CODES.contains(&d.code.as_str()))
+        .map(|d| d.code.clone())
+}
+
+/// The static per-task nominal cost cap: the tighter of the task's
+/// `limits.max_cost_usd` and the run config's `max_cost_usd`.
+pub fn task_cost_cap(task: &EvalTask, config: &RunConfig) -> Option<f64> {
+    match (task.limits.max_cost_usd, config.max_cost_usd) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Cost cap for this task right now: the static cap tightened by the
+/// remaining run-level budget.
+fn effective_cost_cap(task: &EvalTask, config: &RunConfig) -> Option<f64> {
+    match (task_cost_cap(task, config), config.run_cost_remaining) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Run budgets handed to the SDK for one attempt.
+fn budgets_for(task: &EvalTask, cost_cap: Option<f64>) -> crom_sdk::RunBudgets {
+    let mut b = crom_sdk::RunBudgets::default();
+    if let Some(n) = task.limits.max_tool_calls {
+        b = b.with_max_tool_calls(u32::try_from(n).unwrap_or(u32::MAX));
+    }
+    if let Some(c) = cost_cap {
+        b = b.with_max_cost_usd(c.max(0.0));
+    }
+    b
+}
+
+/// Nominal cost of the events so far, or why it is unknown.
+fn cost_of(config: &RunConfig, usage: Option<&crom_core::TokenUsage>) -> crom_core::CostEstimate {
+    config
+        .pricing
+        .estimate(&config.provider.label(), &provider_model(config), usage)
 }
 
 /// Prefix the core agent loop puts on a provider failure's result message.
@@ -324,24 +404,31 @@ async fn drive_agent(
     prompt: &str,
     workspace_dir: &std::path::Path,
     config: &RunConfig,
+    cost_cap: Option<f64>,
 ) -> Result<RunOutcome, String> {
     let setup = providers::build(&config.provider, task, &config.provider_profiles)
         .map_err(|u| u.reason)?;
+    let price = config
+        .pricing
+        .lookup(&config.provider.label(), &provider_model(config))
+        .map(|e| e.model_pricing());
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::new(CollectingSink {
         events: events.clone(),
     });
 
-    let runtime = AgentRuntime::builder()
+    let mut builder = AgentRuntime::builder()
         .provider(setup.config)
         .model(setup.model)
         .workspace(WorkspaceSource::filesystem(workspace_dir.to_path_buf()))
         .tool_policy(tool_policy_for(task, config))
         .interactivity(InteractivityMode::Headless)
         .approval_callback(Arc::new(AllowAllApprovals))
-        .event_sink(sink)
-        .build()
-        .await;
+        .event_sink(sink);
+    if let Some(p) = price {
+        builder = builder.pricing(p);
+    }
+    let runtime = builder.build().await;
     let runtime = match runtime {
         Ok(r) => r,
         Err(e) => {
@@ -353,12 +440,14 @@ async fn drive_agent(
                 errored: true,
                 provider_errored,
                 harness_errored,
+                budget_breach: budget_breach(&e.diagnostics),
             });
         }
     };
 
     let mut request = AgentRequest::new(prompt.to_string())
         .max_turns(task.max_turns as u32)
+        .budgets(budgets_for(task, cost_cap))
         .deadline(task.timeout)
         .approval_policy(ApprovalPolicy::CallbackRequired)
         .interactivity(InteractivityMode::Headless);
@@ -384,6 +473,7 @@ async fn drive_agent(
             errored: true,
             provider_errored: false,
             harness_errored: false,
+            budget_breach: None,
         }),
         Ok(Err(sdk_err)) => {
             let (provider_errored, harness_errored) = classify_sdk_error(&sdk_err);
@@ -394,6 +484,7 @@ async fn drive_agent(
                 errored: true,
                 provider_errored,
                 harness_errored,
+                budget_breach: budget_breach(&sdk_err.diagnostics),
             })
         }
         Ok(Ok(run_result)) => {
@@ -415,6 +506,7 @@ async fn drive_agent(
                 errored,
                 provider_errored,
                 harness_errored: false,
+                budget_breach: budget_breach(&run_result.diagnostics),
             })
         }
     }
@@ -515,6 +607,8 @@ fn default_result(
         seed: config.seed,
         attempts_used: 0,
         cost_usd: None,
+        cost_unknown_reason: None,
+        budget_exceeded: None,
         repair: crate::repair::RepairMetrics::default(),
         usage: None,
         model_round_trips: 0,
@@ -602,7 +696,9 @@ pub fn run_metadata(config: &RunConfig, repetitions: usize) -> serde_json::Value
         "git": env.git,
         "host": env.host,
         "crom_version": env.crom_version,
-        "pricing_source_version": serde_json::Value::Null,
+        "pricing_source_version": config.pricing.version,
+        "max_cost_usd": config.max_cost_usd,
+        "max_run_cost_usd": config.max_run_cost_usd,
         "agent_sandbox": {
             "mode": config.sandbox.as_str(),
             "overhead_ms": config.sandbox_overhead_ms,
@@ -744,6 +840,19 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         );
     }
 
+    // The SDK does not meter usage in plan modes, so a cost cap there could
+    // not be enforced: skip instead of running unmetered.
+    if task.mode == TaskMode::PlanThenAct && effective_cost_cap(task, config).is_some() {
+        return skipped_result(
+            task,
+            &artifacts,
+            config,
+            "budget: cost caps are not enforced in plan_then_act mode".to_string(),
+            started,
+            &prompt,
+        );
+    }
+
     // Build the isolation backend; a missing engine is an isolation error.
     let backend = match isolation::build_backend(&config.isolation, config.container_image.clone())
     {
@@ -820,6 +929,8 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     let mut repair_session = crate::repair::RepairSession::new(config.repair.clone());
     let mut attempts_used = 0usize;
     let mut feedback = String::new();
+    let cost_cap = effective_cost_cap(task, config);
+    let mut budget_breach_code: Option<String> = None;
 
     for attempt in 0..max_attempts {
         attempts_used += 1;
@@ -828,7 +939,15 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         } else {
             feedback.clone()
         };
-        match drive_agent(task, &attempt_prompt, &workspace_dir, config).await {
+        // Retries share the task's cost cap: each attempt gets what earlier
+        // attempts left over.
+        let attempt_cap = cost_cap.map(|cap| {
+            let spent = cost_of(config, usage_from_events(&events).0.as_ref())
+                .cost_usd
+                .unwrap_or(0.0);
+            (cap - spent).max(0.0)
+        });
+        match drive_agent(task, &attempt_prompt, &workspace_dir, config, attempt_cap).await {
             Ok(o) => {
                 events.extend(o.events);
                 summary = o.summary;
@@ -836,6 +955,9 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
                 errored = o.errored;
                 provider_errored = o.provider_errored;
                 harness_errored = o.harness_errored;
+                if o.budget_breach.is_some() {
+                    budget_breach_code = o.budget_breach;
+                }
             }
             Err(reason) => {
                 summary = reason;
@@ -855,7 +977,13 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
             repair_session.record_pass(&public_report, &workspace_dir);
             break;
         }
-        let is_last = attempt + 1 == max_attempts;
+        // No retry once a budget stopped the agent, or when the cost cap can
+        // no longer be checked because earlier spend is unknown.
+        let spend_unknown = cost_cap.is_some()
+            && cost_of(config, usage_from_events(&events).0.as_ref())
+                .cost_usd
+                .is_none();
+        let is_last = attempt + 1 == max_attempts || budget_breach_code.is_some() || spend_unknown;
         let outcome = repair_session.record_failure(&public_report, &workspace_dir);
         if is_last {
             break;
@@ -951,6 +1079,7 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         && forbidden_changed.is_empty()
         && required_missing.is_empty()
         && !timed_out
+        && budget_breach_code.is_none()
         && !rule_violation;
 
     // Failure classification.
@@ -1005,9 +1134,21 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         }
     }
 
+    // A budget stop is the primary failure; the signal-derived class is kept
+    // as a secondary label.
+    if budget_breach_code.is_some() && !resolved {
+        if let Some(prev) = failure_class {
+            if prev != FailureClass::BudgetExceeded && !secondary_failures.contains(&prev) {
+                secondary_failures.push(prev);
+            }
+        }
+        failure_class = Some(FailureClass::BudgetExceeded);
+    }
+
     let turns_used = count_turns(&events);
     let tool_calls = count_tool_calls(&events);
     let (usage, model_round_trips) = usage_from_events(&events);
+    let cost = cost_of(config, usage.as_ref());
     let score = score::compute(&ScoreInputs {
         task,
         oracle: &merged,
@@ -1026,6 +1167,7 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         errored,
         provider_errored,
         harness_errored,
+        budget_breach: budget_breach_code.clone(),
     };
     let status = status_for(resolved, &outcome, &merged);
 
@@ -1073,6 +1215,9 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     result.repair = repair_metrics;
     result.usage = usage;
     result.model_round_trips = model_round_trips;
+    result.cost_usd = cost.cost_usd;
+    result.cost_unknown_reason = cost.unknown_reason.map(|r| r.key().to_string());
+    result.budget_exceeded = budget_breach_code;
     stamp_v2(&mut result, task, config, &prompt);
 
     let _ = artifacts.write_json("result.json", &result);
@@ -1383,16 +1528,109 @@ pub async fn run_tasks(
     run_dir: &RunDir,
     config: &RunConfig,
 ) -> Vec<EvalResult> {
+    run_tasks_metered(tasks, run_dir, config, &mut SpendLedger::default()).await
+}
+
+/// Nominal spend across a whole `crom eval run` (all repetitions).
+#[derive(Debug, Default)]
+struct SpendLedger {
+    spent: f64,
+    /// First task whose cost is unknown, with the reason.
+    unknown: Option<(String, String)>,
+}
+
+impl SpendLedger {
+    fn record(&mut self, r: &EvalResult) {
+        if r.status == EvalStatus::Skipped {
+            return;
+        }
+        match r.cost_usd {
+            Some(c) => self.spent += c,
+            None => {
+                self.unknown.get_or_insert_with(|| {
+                    (
+                        r.task_id.clone(),
+                        r.cost_unknown_reason.clone().unwrap_or_default(),
+                    )
+                });
+            }
+        }
+    }
+
+    /// Why the run-level cap forbids starting another task, if it does.
+    /// Fail-closed: an unpriced model or an earlier task with unknown cost
+    /// stops scheduling, since the cap could not be checked.
+    fn stop_reason(&self, config: &RunConfig, cap: f64) -> Option<String> {
+        let (label, model) = (config.provider.label(), provider_model(config));
+        if config.pricing.lookup(&label, &model).is_none() {
+            return Some(format!(
+                "budget: no pricing entry for {label}/{model}; --max-run-cost-usd cannot be enforced"
+            ));
+        }
+        if let Some((task, reason)) = &self.unknown {
+            return Some(format!(
+                "budget: cost of {task} is unknown ({reason}); --max-run-cost-usd cannot be enforced"
+            ));
+        }
+        if self.spent >= cap {
+            return Some(format!(
+                "budget: run spend ${:.4} reached --max-run-cost-usd ${cap:.4}",
+                self.spent
+            ));
+        }
+        None
+    }
+}
+
+async fn run_tasks_metered(
+    tasks: &[EvalTask],
+    run_dir: &RunDir,
+    config: &RunConfig,
+    ledger: &mut SpendLedger,
+) -> Vec<EvalResult> {
     let mut config = config.clone();
     if config.environment.is_none() {
         config.environment = Some(RunEnvironment::gather());
     }
     let mut results = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let result = run_task(task, run_dir, &config).await;
+        let Some(cap) = config.max_run_cost_usd else {
+            results.push(run_task(task, run_dir, &config).await);
+            continue;
+        };
+        if let Some(reason) = ledger.stop_reason(&config, cap) {
+            results.push(budget_skipped(task, run_dir, &config, reason));
+            continue;
+        }
+        let mut task_config = config.clone();
+        task_config.run_cost_remaining = Some(cap - ledger.spent);
+        let result = run_task(task, run_dir, &task_config).await;
+        ledger.record(&result);
         results.push(result);
     }
     results
+}
+
+/// A `skipped(budget)` result for a task the run-level cap kept from starting.
+fn budget_skipped(
+    task: &EvalTask,
+    run_dir: &RunDir,
+    config: &RunConfig,
+    reason: String,
+) -> EvalResult {
+    let started = Instant::now();
+    let prompt = task.resolved_prompt(config.prompt_variant.as_deref(), config.seed);
+    match run_dir.task(&task.id) {
+        Ok(artifacts) => skipped_result(task, &artifacts, config, reason, started, &prompt),
+        Err(_) => {
+            let dir = run_dir.root.join("tasks").join(&task.id);
+            let mut r = default_result(task, config, EvalStatus::Skipped, &dir);
+            r.score = EvalScore::zero(format!("skipped: {reason}"));
+            r.skipped_reason = Some(reason);
+            stamp_v2(&mut r, task, config, &prompt);
+            r
+        }
+    }
 }
 
 /// Run a selection of tasks `repetitions` times. Each repetition writes its
@@ -1406,6 +1644,8 @@ pub async fn run_tasks_repeated(
 ) -> Vec<EvalResult> {
     let repetitions = repetitions.max(1);
     let mut all = Vec::new();
+    // `--max-run-cost-usd` caps the whole run, across repetitions.
+    let mut ledger = SpendLedger::default();
     for rep in 0..repetitions {
         // Each repetition gets its own sub-run-dir so artifacts never collide.
         // If a repetition's dir cannot be created, skip it rather than writing
@@ -1424,7 +1664,7 @@ pub async fn run_tasks_repeated(
         let mut rep_config = config.clone();
         rep_config.repetition = rep;
         rep_config.seed = config.seed.wrapping_add(rep as u64);
-        let results = run_tasks(tasks, &sub, &rep_config).await;
+        let results = run_tasks_metered(tasks, &sub, &rep_config, &mut ledger).await;
         all.extend(results);
     }
     all
@@ -1487,6 +1727,8 @@ pub mod test_support {
             seed: 0,
             attempts_used: 1,
             cost_usd: None,
+            cost_unknown_reason: None,
+            budget_exceeded: None,
             repair: crate::repair::RepairMetrics::default(),
             usage: None,
             model_round_trips: 0,
@@ -1525,7 +1767,11 @@ mod provider_metadata_tests {
         assert_eq!(meta["git"]["dirty"], true);
         assert_eq!(meta["crom_version"], "9.9.9");
         assert!(meta["host"]["cpus"].as_u64().unwrap() > 0);
-        assert!(meta["pricing_source_version"].is_null());
+        assert_eq!(
+            meta["pricing_source_version"],
+            crom_core::PricingTable::builtin().version.as_str()
+        );
+        assert!(meta["max_run_cost_usd"].is_null());
         assert_eq!(meta["repair"]["enabled"], false);
     }
 

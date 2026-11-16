@@ -151,7 +151,9 @@ pub struct ReproMetadata {
     pub host: HostInfo,
     /// Version of the crom build that produced the result.
     pub crom_version: String,
-    /// Pricing table version used for `cost_usd`; `None` until pricing lands.
+    /// Version of the pricing table used for `cost_usd`
+    /// (`crates/crom-core/pricing/prices.toml`, `+`-joined with any
+    /// override). `None` only on results written before #282.
     pub pricing_source_version: Option<String>,
 }
 
@@ -208,7 +210,7 @@ pub struct IsolationMeta {
     pub container_image: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeMeta {
     pub max_turns: usize,
     pub timeout_secs: u64,
@@ -217,6 +219,14 @@ pub struct RuntimeMeta {
     pub repair_enabled: bool,
     pub repair_max_attempts: u32,
     pub repair_require_validation_after_mutation: bool,
+    /// Enforced tool-call cap (`limits.max_tool_calls`).
+    #[serde(default)]
+    pub max_tool_calls: Option<usize>,
+    /// Static per-task nominal cost cap: the tighter of `limits.max_cost_usd`
+    /// and `--max-cost-usd`. A run-level cap may tighten it further at run
+    /// time; that is not recorded here.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +401,8 @@ impl ReproMetadata {
                 repair_require_validation_after_mutation: config
                     .repair
                     .require_validation_after_mutation,
+                max_tool_calls: task.limits.max_tool_calls,
+                max_cost_usd: crate::runner::task_cost_cap(task, config),
             },
             prompt: PromptMeta {
                 template_version: PROMPT_TEMPLATE_VERSION.to_string(),
@@ -401,7 +413,7 @@ impl ReproMetadata {
             seed: config.seed,
             host: i.env.host.clone(),
             crom_version: i.env.crom_version.clone(),
-            pricing_source_version: None,
+            pricing_source_version: Some(config.pricing.version.clone()),
         }
     }
 }

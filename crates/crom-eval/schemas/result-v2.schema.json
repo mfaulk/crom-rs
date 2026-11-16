@@ -230,6 +230,28 @@
         "null"
       ]
     },
+    "cost_unknown_reason": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "enum": [
+            "no_pricing_entry",
+            "usage_unknown",
+            "input_tokens_unknown",
+            "output_tokens_unknown",
+            "cache_tokens_unknown"
+          ]
+        }
+      ]
+    },
+    "budget_exceeded": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "repair": {
       "type": "object"
     },
@@ -284,7 +306,8 @@
         "repeated_same_failure",
         "unvalidated_completion",
         "repair_attempt_limit_exceeded",
-        "diagnostic_parse_failure"
+        "diagnostic_parse_failure",
+        "budget_exceeded"
       ]
     },
     "outcome": {
@@ -587,6 +610,20 @@
             },
             "repair_require_validation_after_mutation": {
               "type": "boolean"
+            },
+            "max_tool_calls": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "max_cost_usd": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
             }
           },
           "additionalProperties": false

@@ -1721,6 +1721,7 @@ async fn resolve_common(
         permission_mode: mode,
         max_turns: Some(max_turns),
         max_tool_calls: None,
+        usage_budget: Default::default(),
         session_id: None,
         permission_callback,
         system_prompt: None,
