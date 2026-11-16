@@ -1,6 +1,6 @@
 # Milestone 17 — Measurable Agent Capability and Secure Execution
 
-**Status:** planned · **GitHub milestone:**
+**Status:** in progress (infrastructure merged; live runs and #297 baseline pending) · **GitHub milestone:**
 [M17 — Measurable Agent Capability and Secure Execution](https://github.com/mfaulk/crom-rs/milestone/1)
 
 **Theme:** Stop measuring progress by features shipped. Establish Crom as a
@@ -361,16 +361,16 @@ Rules (enforced by `validate-task`, #285):
 
 ### Task audit (#285)
 
-Every shipped task (57) is a schema v3 manifest with a `kind`, a `level`,
+Every shipped task (77) is a schema v3 manifest with a `kind`, a `level`,
 a `task_version`, and provenance. "Validates" means `crom eval validate-task
 <id>` reports 0 errors: for capability tasks that includes hidden
 verification, a reference that passes public + hidden checks, and an
 unmodified fixture that fails them (passes, for `no_change`).
 
 Every suite is validated in CI: `smoke`, `golden`, `safety`, `security`,
-`repair-smoke`, `repair-mini`, `planning`, `rust-small`, and `rust-mini` in
-one step; `l1`, `l2`, and `l3-mini` in their own steps; `l3` in the
-`eval / L3 upstream fixtures` job. The `private` suite is local-only.
+`adversarial`, `repair-smoke`, `repair-mini`, `planning`, `rust-small`,
+`rust-mini`, and `provider-conformance` in one step; `l1`, `l2`, and
+`l3-mini` in their own steps; `l3` and `l4` in their upstream-fixture jobs. The `private` suite is local-only.
 
 | Task | kind | level | network | expected_outcome | task_version | Validates | Suites |
 |---|---|---|---|---|---|---|---|
@@ -431,6 +431,26 @@ one step; `l1`, `l2`, and `l3-mini` in their own steps; `l3` in the
 | l3-throttle-refill | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
 | l3-toml-crlf-error-position | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
 | l3-url-path-caret | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+| conf-bash-check-loop | harness | L0 | none | change | 1.0.0 | yes | `provider-conformance` |
+| conf-invalid-args-recovery | harness | L0 | none | change | 1.0.0 | yes | `provider-conformance` |
+| conf-long-output | harness | L0 | none | change | 1.0.0 | yes | `provider-conformance` |
+| conf-parallel-tools | harness | L0 | none | change | 1.0.0 | yes | `provider-conformance` |
+| conf-read-edit-verify | harness | L0 | none | change | 1.0.0 | yes | `provider-conformance` |
+| conf-tool-error-recovery | harness | L0 | none | change | 1.0.0 | yes | `provider-conformance` |
+| l4-glob-hidden-dir-leading-dot | capability | L4 | none | change | 1.0.0 | yes | `l4` |
+| l4-quick-xml-dtd-chunk-panic | capability | L4 | none | change | 1.0.0 | yes | `l4` |
+| l4-tempfile-relative-temppath | capability | L4 | none | change | 1.0.0 | yes | `l4` |
+| l4-toml-writer-quote-overflow | capability | L4 | none | change | 1.0.0 | yes | `l4` |
+| l4-which-relative-path-cwd | capability | L4 | none | change | 1.0.0 | yes | `l4` |
+| sec-deceptive-shell | security | L0 | none | change | 1.0.0 | yes | `adversarial` |
+| sec-env-credential | security | L0 | none | change | 1.0.0 | yes | `adversarial` |
+| sec-mcp-poisoned-description | security | L0 | none | change | 1.0.0 | yes | `adversarial` |
+| sec-network-egress | security | L0 | none | change | 1.0.0 | yes | `adversarial` |
+| sec-read-outside-secret | security | L0 | none | change | 1.0.0 | yes | `adversarial` |
+| sec-readme-injection | security | L0 | none | change | 1.0.0 | yes | `adversarial` |
+| sec-repo-settings-escalation | security | L0 | none | change | 1.0.0 | yes | `adversarial` |
+| sec-tool-output-injection | security | L0 | none | change | 1.0.0 | yes | `adversarial` |
+| sec-write-outside | security | L0 | none | change | 1.0.0 | yes | `adversarial` |
 
 ¹ Upstream-repo snapshot; validated by the `eval / L3 upstream fixtures` CI
 job, which fetches the pinned fixtures repository.
@@ -742,7 +762,7 @@ Six `provider-conformance` tasks (L0 harness), one invocation per profile.
 Offline rows come from `crates/crom-eval/tests/provider_conformance.rs`
 replaying synthetic transcripts in `cargo test`; they prove Crom's request
 and response handling per wire format, not provider behavior. Live rows are
-filled by an opt-in `Eval (live provider)` dispatch with
+filled by an opt-in `Eval (live smoke)` dispatch (`eval-live.yml`) with
 `suite = provider-conformance`; classify failures per
 [eval.md](../eval.md#provider-conformance-284).
 
