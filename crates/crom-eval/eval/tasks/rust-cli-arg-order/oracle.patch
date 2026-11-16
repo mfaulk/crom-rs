@@ -1,0 +1,24 @@
+--- a/src/args.rs
++++ b/src/args.rs
+@@ -6,10 +6,8 @@
+     pub verbose: bool,
+ }
+ 
+-/// Parse arguments (excluding argv[0]).
+-///
+-/// Bug: once a positional (the input path) is seen, parsing stops, so any
+-/// `--output` that appears *after* the input path is silently dropped.
++/// Parse arguments (excluding argv[0]). Flags may appear before or after the
++/// input path.
+ pub fn parse(argv: &[String]) -> Result<Args, String> {
+     let mut args = Args::default();
+     let mut i = 0;
+@@ -24,8 +22,6 @@
+             "--verbose" => args.verbose = true,
+             _ => {
+                 args.input = Some(a.clone());
+-                // Bug: stop parsing once the positional is found.
+-                break;
+             }
+         }
+         i += 1;

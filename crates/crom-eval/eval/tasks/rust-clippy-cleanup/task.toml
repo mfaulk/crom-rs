@@ -1,8 +1,9 @@
 schema_version = 3
-task_version = "1.0.0"
+task_version = "1.1.0"
 kind = "capability"
 level = "L1"
 network = "none"
+reference = "oracle_patch"
 id = "rust-clippy-cleanup"
 title = "Make the code pass clippy with -D warnings"
 category = "refactor"
@@ -11,12 +12,13 @@ tags = ["rust", "clippy", "lint", "small"]
 suites = ["rust-small", "rust-mini"]
 
 prompt = """
-The tests pass but `cargo clippy --all-targets -- -D warnings` fails. Resolve
-the clippy lints idiomatically without changing behavior or deleting tests.
+The test suite passes but `cargo clippy --all-targets -- -D warnings` fails. Resolve
+the clippy lints idiomatically without changing behavior or deleting any test.
 """
 
 max_turns = 20
 timeout_secs = 300
+oracle_patch = "oracle.patch"
 
 [capabilities]
 requires_test_feedback = true
@@ -39,3 +41,11 @@ author = "crom maintainers"
 source = "original"
 license = "Apache-2.0 OR MIT"
 created = "2026-06-03"
+
+# Hidden: behavior checks the agent never sees.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]

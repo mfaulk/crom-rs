@@ -1,8 +1,9 @@
 schema_version = 3
-task_version = "1.0.0"
+task_version = "1.1.0"
 kind = "capability"
 level = "L1"
 network = "registry"
+reference = "oracle_patch"
 id = "rust-serde-edge-case"
 title = "Fix a JSON deserialization edge case"
 category = "bugfix"
@@ -13,11 +14,12 @@ suites = ["rust-small", "rust-mini"]
 prompt = """
 Config parsing breaks when the optional `retries` field is missing from the
 JSON. It should default to 3 instead of failing. Fix the deserialization and
-keep the existing tests passing.
+keep the existing test suite passing.
 """
 
 max_turns = 20
 timeout_secs = 300
+oracle_patch = "oracle.patch"
 # The fixture depends on serde / serde_json from crates.io, so verification
 # (`cargo test`) needs network access unless the registry is already cached.
 requires_network = true
@@ -48,3 +50,11 @@ author = "crom maintainers"
 source = "original"
 license = "Apache-2.0 OR MIT"
 created = "2026-06-03"
+
+# Hidden: behavior checks the agent never sees.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]
