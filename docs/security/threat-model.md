@@ -109,9 +109,9 @@ Verified against `5bc1fb2`.
 
 | ID | Gap | Property | Tracked |
 |---|---|---|---|
-| G1 | No OS enforcement for Bash: FS, network, env, rlimits | P1–P6 | #253 |
-| G2 | `setsid`/double-fork escapes process-group kill; group not killed on normal exit or cancel | P5 | #253 |
-| G3 | No fail-closed mode; no backend exists | P7 | #253 |
+| G1 | ~~No OS enforcement for Bash: FS, network, env, rlimits~~ Addressed for Bash when `sandbox.mode = required` ([sandbox.md](sandbox.md)); the default is `off` (`crom-core/src/sandbox.rs`), so unsandboxed Bash still inherits the full environment | P1–P6 | #253 |
+| G2 | ~~`setsid`/double-fork escapes process-group kill~~ Addressed under `required` by the subreaper supervisor | P5 | #253 |
+| G3 | ~~No fail-closed mode; no backend exists~~ `required` refuses before spawn when the backend cannot enforce | P7 | #253 |
 | G4 | Hidden material on the agent-reachable FS; overlay into the same workspace | P8 | #286 |
 | G5 | ~~Repo `.agent/settings.json` / `.agent/mcp.json` loosen policy and spawn processes without a trust decision; MCP `${VAR}` interpolation~~ Fixed: untrusted project settings may only tighten, repo MCP config needs trust and never interpolates host env (`crom trust`) | P9 | #290 |
 | G6 | ~~Hook `Allow` short-circuits disallow rules; subagents raise `permission_mode`~~ Fixed: disallow rules run before hook `Allow`; child mode is capped at the parent's and inherits parent disallow rules (`agents.inherit_permissions`) | S0 | #290 |
@@ -164,3 +164,12 @@ suite that measures executed effects is [`adversarial-suite.md`](adversarial-sui
 - A malicious operator, a compromised provider, or other local users with
   write access to the workspace.
 - Multi-tenant isolation, credential scoping, delegation (S4).
+
+## 9. Planned extension (M18)
+
+M18 plans an authorization and credential-isolation component, Crom Guard,
+for business operations performed by agents. The planned assets (A7–A10),
+actors (T6–T9), trusted computing base, and supported deployment are in
+[`MILESTONE_18.md` §7](../milestones/MILESTONE_18.md#7-threat-model-and-trusted-computing-base).
+Folding them into this document, with numbered Guard properties, is tracked
+in #345. Nothing in §9 is implemented yet.

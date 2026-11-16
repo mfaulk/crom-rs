@@ -268,6 +268,8 @@ environment. See [CI lanes and spend controls](docs/eval.md#ci-lanes-and-spend-c
 
 Milestone specs live in [`docs/milestones/`](docs/milestones/). The current
 plan is [M17 — Measurable Agent Capability and Secure Execution](docs/milestones/MILESTONE_17.md).
+The next milestone, [M18 — Crom Guard v0: Enforceable Agent Authority](docs/milestones/MILESTONE_18.md),
+is planned (not yet implemented).
 The security threat model is in [`docs/security/threat-model.md`](docs/security/threat-model.md).
 Security audit events (`SecurityDecision`) and secret redaction are described in
 [`docs/security/audit.md`](docs/security/audit.md). The Linux OS sandbox for
