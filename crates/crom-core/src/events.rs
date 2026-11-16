@@ -628,6 +628,15 @@ pub enum ResultSubtype {
     /// dispatch them and ended the run. Distinct from `ErrorMaxTurns` so a
     /// tool-call budget breach is not conflated with a turn budget breach.
     ErrorMaxToolCalls,
+    /// Cumulative prompt tokens exceeded `UsageBudget::max_input_tokens`.
+    ErrorMaxInputTokens,
+    /// Cumulative output tokens exceeded `UsageBudget::max_output_tokens`.
+    ErrorMaxOutputTokens,
+    /// Nominal cost exceeded `UsageBudget::max_cost_usd`.
+    ErrorMaxCost,
+    /// A usage budget is set but the quantity it caps is unknown
+    /// (unreported usage or no price), so the run stopped (fail-closed).
+    ErrorBudgetUsageUnknown,
     ErrorDuringExecution,
     Cancelled,
 }

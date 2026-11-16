@@ -1130,3 +1130,155 @@ impl Tool for ExecToolNamed {
         Ok(ToolResult::ok_text("ran"))
     }
 }
+
+// --- Usage budgets (#282) ---
+
+fn usage_tool_provider(
+    tool_turns: usize,
+    per_turn: Option<crom_core::TokenUsage>,
+) -> Arc<ScriptedProvider> {
+    use crom_core::ToolCall;
+    let stop = |reason: &str| ModelEvent::MessageStop {
+        stop_reason: Some(reason.into()),
+        usage: per_turn.clone(),
+    };
+    let mut turns: Vec<Vec<ModelEvent>> = Vec::new();
+    for i in 0..tool_turns {
+        turns.push(vec![
+            ModelEvent::MessageStart,
+            ModelEvent::ToolCall(ToolCall {
+                id: format!("t{i}"),
+                name: "Echo".into(),
+                input: json!({"v": i}),
+            }),
+            stop("tool_use"),
+        ]);
+    }
+    turns.push(vec![
+        ModelEvent::MessageStart,
+        ModelEvent::TextDelta {
+            text: "done".into(),
+        },
+        stop("end_turn"),
+    ]);
+    Arc::new(ScriptedProvider::new(turns))
+}
+
+fn fixed_usage(input: u64, output: u64) -> crom_core::TokenUsage {
+    crom_core::TokenUsage {
+        input_tokens: Some(input),
+        output_tokens: Some(output),
+        ..Default::default()
+    }
+}
+
+async fn run_budgeted(
+    provider: Arc<ScriptedProvider>,
+    budget: crom_core::UsageBudget,
+    pricing: Option<crom_core::ModelPricing>,
+) -> Vec<AgentEvent> {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+    let opts = AgentOptions {
+        max_turns: Some(20),
+        usage_budget: budget,
+        allowed_tools: vec!["Echo".into()],
+        permission_callback: Some(Arc::new(AlwaysAllow)),
+        ..AgentOptions::default()
+    };
+    let mut builder = crom_core::AgentBuilder::new()
+        .options(opts)
+        .provider(provider)
+        .tools(tools);
+    if let Some(p) = pricing {
+        builder = builder.pricing(p);
+    }
+    let mut s = builder.build().unwrap().run("hi".to_string());
+    let mut events = Vec::new();
+    while let Some(e) = s.next().await {
+        events.push(e);
+    }
+    events
+}
+
+#[tokio::test]
+// An output-token cap stops the run on the first turn whose cumulative
+// output exceeds it, before that turn's tool calls start.
+async fn output_token_budget_stops_run_deterministically() {
+    let provider = usage_tool_provider(5, Some(fixed_usage(100, 40)));
+    let budget = crom_core::UsageBudget {
+        max_output_tokens: Some(100),
+        ..Default::default()
+    };
+    let events = run_budgeted(provider.clone(), budget, None).await;
+    let r = final_result(&events);
+    assert_eq!(r.subtype, ResultSubtype::ErrorMaxOutputTokens);
+    // 40, 80 within budget; 120 on turn 3 breaches.
+    assert_eq!(r.num_turns, 3);
+    assert_eq!(count_tool_starts(&events), 2);
+    assert_eq!(provider.turns_seen(), 3);
+}
+
+#[tokio::test]
+// A nominal cost cap stops the run once the priced cumulative usage exceeds it.
+async fn cost_budget_stops_run() {
+    let provider = usage_tool_provider(5, Some(fixed_usage(1_000_000, 0)));
+    let pricing = crom_core::ModelPricing {
+        input_per_million: 1.0,
+        output_per_million: 1.0,
+        cache_creation_per_million: None,
+        cache_read_per_million: None,
+    };
+    let budget = crom_core::UsageBudget {
+        max_cost_usd: Some(1.5),
+        ..Default::default()
+    };
+    let events = run_budgeted(provider, budget, Some(pricing)).await;
+    let r = final_result(&events);
+    assert_eq!(r.subtype, ResultSubtype::ErrorMaxCost);
+    assert_eq!(r.num_turns, 2);
+    assert_eq!(r.total_cost_usd, Some(2.0));
+}
+
+#[tokio::test]
+// A cost cap without a price never calls the provider; a token cap with
+// unreported usage stops after the first turn (fail-closed).
+async fn unknown_budget_quantity_fails_closed() {
+    let provider = usage_tool_provider(3, Some(fixed_usage(1, 1)));
+    let budget = crom_core::UsageBudget {
+        max_cost_usd: Some(1.0),
+        ..Default::default()
+    };
+    let events = run_budgeted(provider.clone(), budget, None).await;
+    assert_eq!(
+        final_result(&events).subtype,
+        ResultSubtype::ErrorBudgetUsageUnknown
+    );
+    assert_eq!(provider.turns_seen(), 0);
+
+    let provider = usage_tool_provider(3, None);
+    let budget = crom_core::UsageBudget {
+        max_input_tokens: Some(1_000),
+        ..Default::default()
+    };
+    let events = run_budgeted(provider.clone(), budget, None).await;
+    assert_eq!(
+        final_result(&events).subtype,
+        ResultSubtype::ErrorBudgetUsageUnknown
+    );
+    assert_eq!(provider.turns_seen(), 1);
+    assert_eq!(count_tool_starts(&events), 0);
+}
+
+#[tokio::test]
+// A budget that is never exceeded leaves the run's success untouched.
+async fn budget_within_limits_succeeds() {
+    let provider = usage_tool_provider(2, Some(fixed_usage(10, 10)));
+    let budget = crom_core::UsageBudget {
+        max_input_tokens: Some(30),
+        max_output_tokens: Some(30),
+        ..Default::default()
+    };
+    let events = run_budgeted(provider, budget, None).await;
+    assert_eq!(final_result(&events).subtype, ResultSubtype::Success);
+}

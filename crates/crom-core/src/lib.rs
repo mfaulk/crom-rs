@@ -19,6 +19,7 @@ pub mod permission;
 pub mod plan;
 pub mod plugins;
 pub mod policy;
+pub mod pricing;
 pub mod provider;
 pub mod provider_profile;
 pub mod provider_retry;
@@ -36,6 +37,7 @@ pub mod tool_rule;
 pub mod trust;
 pub mod ui;
 pub mod usage;
+pub mod usage_budget;
 
 pub use agent::{query, Agent, AgentBuilder, SessionSink, TelemetrySink};
 pub use agents::{
@@ -148,6 +150,7 @@ pub use policy::{
     approval_key, ApprovalMemory, ApprovalMemorySnapshot, MemoryDecision, PolicyConfig,
     PolicyDecision, PolicyDecisionSource, PolicyEngine, PolicyOutcome, PolicyToolContext,
 };
+pub use pricing::{CostEstimate, PriceEntry, PricingTable};
 pub use provider::{ModelEvent, ModelProvider, ModelRequest};
 pub use provider_profile::{
     MaxTokensField, ProfileError, ProviderCapabilities, ProviderKind, ProviderProfile,
@@ -182,7 +185,9 @@ pub use slash::{
     SlashCommandHandler, SlashCommandRegistry, SlashCommandSource, SlashCommandSummary,
     SlashExpansionOptions, SlashExpansionResult,
 };
-pub use telemetry::{AgentTelemetryEvent, ModelPricing, SessionLoadKind, TelemetryOutcome};
+pub use telemetry::{
+    AgentTelemetryEvent, CostUnknownReason, ModelPricing, SessionLoadKind, TelemetryOutcome,
+};
 pub use todo::{TodoError, TodoItem, TodoList, TodoStatus};
 pub use tool::{Tool, ToolContent, ToolContext, ToolRegistry, ToolResult};
 pub use tool_catalog::{
@@ -205,3 +210,4 @@ pub use ui::{
     TerminalRenderer, UiConfig, UiSettingsConfig, UiSettingsError, DEFAULT_STATUSLINE_TEMPLATE,
 };
 pub use usage::{TokenUsage, UsageTotals};
+pub use usage_budget::{BudgetBreach, BudgetKind, UsageBudget};
