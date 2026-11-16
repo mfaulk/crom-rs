@@ -497,6 +497,13 @@ pub(crate) async fn execute_request(
                             .unwrap_or("usage budget exceeded");
                         diagnostics.push(Diagnostic::error(usage_budget_code(r.subtype), msg));
                     }
+                    ResultSubtype::ErrorOutputTruncated => {
+                        status = AgentRunStatus::Failed;
+                        diagnostics.push(Diagnostic::error(
+                            "model.output_truncated",
+                            r.result.clone().unwrap_or_default(),
+                        ));
+                    }
                     ResultSubtype::ErrorDuringExecution => {
                         status = AgentRunStatus::Failed;
                         if let Some(msg) = &r.result {

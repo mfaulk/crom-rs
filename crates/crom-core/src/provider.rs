@@ -45,6 +45,17 @@ pub enum ModelEvent {
     },
 }
 
+/// Whether a raw provider stop reason means the turn was cut off at the
+/// output token limit: Anthropic `max_tokens`, OpenAI-compatible `length`,
+/// Gemini `MAX_TOKENS`.
+pub fn is_output_truncated(stop_reason: &str) -> bool {
+    matches!(stop_reason, "max_tokens" | "length" | "MAX_TOKENS")
+}
+
+/// Consecutive truncated turns the agent loop continues before ending the
+/// run with `ResultSubtype::ErrorOutputTruncated`.
+pub const MAX_OUTPUT_CONTINUATIONS: u32 = 2;
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     async fn stream_turn(
