@@ -73,9 +73,16 @@ fn every_capability_task_has_hidden_verification_and_reference() {
 fn offline_ci_suites_are_harness_l0() {
     use crom_eval::schema::{Level, TaskKind};
     for t in load_all() {
-        if ["smoke", "golden", "safety", "repair-smoke", "repair-mini"]
-            .iter()
-            .any(|s| t.in_suite(s))
+        if [
+            "smoke",
+            "golden",
+            "safety",
+            "repair-smoke",
+            "repair-mini",
+            "provider-conformance",
+        ]
+        .iter()
+        .any(|s| t.in_suite(s))
         {
             assert_eq!(t.kind, Some(TaskKind::Harness), "{}", t.id);
             assert_eq!(t.level, Some(Level::L0), "{}", t.id);

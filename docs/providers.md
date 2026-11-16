@@ -220,6 +220,29 @@ tasks from starting. Remaining tasks are recorded as `skipped` with a
 5. Commit as `chore(pricing): refresh prices (<date>)`. Results priced
    with different table versions are not comparable on cost.
 
+### Compatibility matrix
+
+How each built-in profile carries multi-turn tool use, as exercised by the
+`provider-conformance` suite (see [eval.md](eval.md#provider-conformance-284)).
+
+| | `anthropic` | `openai` | `deepseek` | `gemini` |
+|---|---|---|---|---|
+| Wire / transport | Messages, SSE | Chat Completions, non-streaming | Chat Completions, non-streaming | `generateContent`, non-streaming |
+| Max-tokens field sent | `max_tokens` | `max_completion_tokens` | `max_tokens` | `maxOutputTokens` |
+| Tool-call ids | Provider `toolu_…` ids round-tripped | Provider `call_…` ids round-tripped | Provider ids round-tripped | None on the wire; Crom synthesizes ids and maps results back by function name and order |
+| Error tool result | `is_error: true` | Content prefixed `ERROR:` (no flag on the wire) | Same as `openai` | `functionResponse.response.isError: true` |
+| Unparseable arguments | Reported to the tool as `_invalid_tool_input`; tool returns an error result | Passed as a JSON string; tool returns an error result | Same as `openai` | Arguments are always an object; schema errors return an error result |
+| Parallel calls in one turn | Declared | Declared | Handled by the transport; not declared in the profile | Handled (same-name calls get distinct ids); not declared in the profile |
+| Output-truncation stop reason | `max_tokens` | `length` | `length` | `MAX_TOKENS` |
+| Offline conformance (synthetic transcripts) | 6/6 | 6/6 | 6/6 | 6/6 |
+| Live conformance | Not yet run | Not yet run | Not yet run | Not yet run |
+
+On a truncation stop reason the agent loop discards the turn's tool calls
+(never executes them), keeps any text, and asks the model to continue. After
+`MAX_OUTPUT_CONTINUATIONS` (2) consecutive truncated turns the run ends with
+`ResultSubtype::ErrorOutputTruncated`, surfaced by the SDK as a `Failed` run
+with diagnostic `model.output_truncated`.
+
 ## Errors, retries, timeouts
 
 Applies to `crom-anthropic`, `crom-provider-openai`, and `crom-provider-gemini`.

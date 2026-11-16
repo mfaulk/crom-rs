@@ -735,3 +735,20 @@ capability, and are reported separately from L1–L4 results.
 
 All four run in the CI `eval` job. No git tag has been created for the
 baseline commit.
+
+### Provider conformance — #284
+
+Six `provider-conformance` tasks (L0 harness), one invocation per profile.
+Offline rows come from `crates/crom-eval/tests/provider_conformance.rs`
+replaying synthetic transcripts in `cargo test`; they prove Crom's request
+and response handling per wire format, not provider behavior. Live rows are
+filled by an opt-in `Eval (live provider)` dispatch with
+`suite = provider-conformance`; classify failures per
+[eval.md](../eval.md#provider-conformance-284).
+
+| Profile | Model | Offline (synthetic transcripts) | Live | Live failures (capability / provider / Crom) |
+|---|---|---|---|---|
+| `anthropic` | `claude-sonnet-4-6` | 6/6 resolved | _pending_ | — |
+| `openai` | `gpt-4.1` | 6/6 resolved | _pending_ | — |
+| `deepseek` | `deepseek-chat` | 6/6 resolved | _pending_ | — |
+| `gemini` | `gemini-2.5-pro` | 6/6 resolved | _pending_ (not required by #284) | — |

@@ -1,0 +1,36 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
+id = "conf-bash-check-loop"
+title = "Conformance: failing command, fix, rerun"
+tags = ["conformance", "tool-loop", "bash"]
+suites = ["provider-conformance"]
+
+prompt = """
+Run `sh check.sh` with the Bash tool. It fails until status.txt contains
+exactly the line `ready`. Fix status.txt, then rerun `sh check.sh` to confirm
+it exits 0.
+"""
+
+max_turns = 10
+timeout_secs = 120
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+[oracle]
+kind = "command"
+commands = ["sh check.sh"]
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "check.sh"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-15"

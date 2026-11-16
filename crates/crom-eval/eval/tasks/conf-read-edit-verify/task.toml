@@ -1,0 +1,42 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
+id = "conf-read-edit-verify"
+title = "Conformance: read, edit, and verify with Bash"
+tags = ["conformance", "tool-loop"]
+suites = ["provider-conformance"]
+
+prompt = """
+data.txt contains `value=0`. Read it, change the value to 42 with the Edit
+tool, then run `grep -q 'value=42' data.txt` with the Bash tool to verify.
+Reply with one short sentence when done.
+"""
+
+max_turns = 10
+timeout_secs = 120
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# Multi-turn tool loop: read -> edit -> bash -> final answer, with every
+# tool-call id round-tripped back to the provider.
+[oracle]
+kind = "command"
+commands = ["grep -qx 'value=42' data.txt"]
+
+[[oracle.behavior]]
+kind = "must_use_tool"
+tool = "Edit"
+
+[[oracle.behavior]]
+kind = "must_run_command"
+command_contains = "grep"
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-15"

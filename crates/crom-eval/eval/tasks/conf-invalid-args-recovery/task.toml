@@ -1,0 +1,34 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
+id = "conf-invalid-args-recovery"
+title = "Conformance: recover from invalid tool arguments"
+tags = ["conformance", "invalid-arguments"]
+suites = ["provider-conformance"]
+
+prompt = """
+Create out.txt containing the single line `hello`.
+"""
+
+max_turns = 8
+timeout_secs = 120
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# Live models rarely emit malformed arguments on a task this small; the
+# recorded transcripts inject one (unparseable JSON on OpenAI-compatible and
+# Anthropic wires, a schema-invalid object on Gemini) to prove the error is
+# returned to the model as a tool result and the loop recovers.
+[oracle]
+kind = "command"
+commands = ["test \"$(cat out.txt)\" = hello"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-15"

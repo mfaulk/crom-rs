@@ -1,0 +1,36 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "harness"
+level = "L0"
+network = "none"
+id = "conf-long-output"
+title = "Conformance: output-token truncation and continuation"
+tags = ["conformance", "max-tokens"]
+suites = ["provider-conformance"]
+
+prompt = """
+Create numbers.txt containing the integers 1 through 3000 in order, one per
+line, and nothing else.
+"""
+
+max_turns = 10
+timeout_secs = 120
+
+[fixture]
+kind = "copy_dir"
+path = "repo"
+
+# Writing the file inline needs more output tokens than one turn allows
+# (`max_tokens` 4096), so a model that tries it is truncated (`max_tokens` /
+# `length` / `MAX_TOKENS`). The agent loop must discard the incomplete tool
+# call, ask the model to continue, and the model should switch to a smaller
+# step such as `seq`.
+[oracle]
+kind = "command"
+commands = ["seq 1 3000 | cmp -s - numbers.txt"]
+
+[provenance]
+author = "crom maintainers"
+source = "original"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-15"

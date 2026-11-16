@@ -1,0 +1,55 @@
+{
+  "format": "crom-conformance-transcript/v1",
+  "profile": "deepseek",
+  "task": "conf-tool-error-recovery",
+  "model": "deepseek-chat",
+  "source": "synthetic",
+  "path": "/v1/chat/completions",
+  "exchanges": [
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"deepseek-chat\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"tool_calls\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": null,\n        \"role\": \"assistant\",\n        \"tool_calls\": [\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"file_path\\\":\\\"settings.toml\\\"}\",\n              \"name\": \"Read\"\n            },\n            \"id\": \"call_ter1\",\n            \"type\": \"function\"\n          }\n        ]\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"deepseek-chat\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"deepseek-chat\"",
+        "\"tool_call_id\":\"call_ter1\"",
+        "\"content\":\"ERROR: "
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"tool_calls\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": null,\n        \"role\": \"assistant\",\n        \"tool_calls\": [\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"file_path\\\":\\\"config/settings.toml\\\"}\",\n              \"name\": \"Read\"\n            },\n            \"id\": \"call_ter2\",\n            \"type\": \"function\"\n          }\n        ]\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"deepseek-chat\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"deepseek-chat\"",
+        "\"tool_call_id\":\"call_ter2\"",
+        "enabled = false"
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"tool_calls\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": null,\n        \"role\": \"assistant\",\n        \"tool_calls\": [\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"file_path\\\":\\\"config/settings.toml\\\",\\\"new_string\\\":\\\"enabled = true\\\",\\\"old_string\\\":\\\"enabled = false\\\"}\",\n              \"name\": \"Edit\"\n            },\n            \"id\": \"call_ter3\",\n            \"type\": \"function\"\n          }\n        ]\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"deepseek-chat\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"deepseek-chat\"",
+        "\"tool_call_id\":\"call_ter3\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"stop\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": \"settings.toml was missing; enabled config/settings.toml instead.\",\n        \"role\": \"assistant\"\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"deepseek-chat\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    }
+  ]
+}

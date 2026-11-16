@@ -1,0 +1,41 @@
+{
+  "format": "crom-conformance-transcript/v1",
+  "profile": "gemini",
+  "task": "conf-parallel-tools",
+  "model": "gemini-2.5-pro",
+  "source": "synthetic",
+  "path": "/v1beta/models/gemini-2.5-pro:generateContent",
+  "exchanges": [
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096"
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"args\": {\n                \"file_path\": \"a.txt\"\n              },\n              \"name\": \"Read\"\n            }\n          },\n          {\n            \"functionCall\": {\n              \"args\": {\n                \"file_path\": \"b.txt\"\n              },\n              \"name\": \"Read\"\n            }\n          },\n          {\n            \"functionCall\": {\n              \"args\": {\n                \"file_path\": \"c.txt\"\n              },\n              \"name\": \"Read\"\n            }\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096",
+        "\"functionResponse\":{\"name\":\"Read\"",
+        "\"functionResponse\":{\"name\":\"Read\"",
+        "\"functionResponse\":{\"name\":\"Read\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"args\": {\n                \"content\": \"60\\n\",\n                \"file_path\": \"sum.txt\"\n              },\n              \"name\": \"Write\"\n            }\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"maxOutputTokens\":4096",
+        "\"functionResponse\":{\"name\":\"Write\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"parts\": [\n          {\n            \"text\": \"10 + 20 + 30 = 60, written to sum.txt.\"\n          }\n        ],\n        \"role\": \"model\"\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"candidatesTokenCount\": 24,\n    \"promptTokenCount\": 120\n  }\n}"
+    }
+  ]
+}

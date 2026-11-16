@@ -1,0 +1,54 @@
+{
+  "format": "crom-conformance-transcript/v1",
+  "profile": "anthropic",
+  "task": "conf-read-edit-verify",
+  "model": "claude-sonnet-4-6",
+  "source": "synthetic",
+  "path": "/v1/messages",
+  "exchanges": [
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"claude-sonnet-4-6\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body": "event: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"msg_conformance\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"stop_reason\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":120,\"output_tokens\":0}},\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"content_block\":{\"id\":\"toolu_rev1\",\"input\":{},\"name\":\"Read\",\"type\":\"tool_use\"},\"index\":0,\"type\":\"content_block_start\"}\n\nevent: content_block_delta\ndata: {\"delta\":{\"partial_json\":\"{\\\"file_path\\\":\\\"data.txt\\\"}\",\"type\":\"input_json_delta\"},\"index\":0,\"type\":\"content_block_delta\"}\n\nevent: content_block_stop\ndata: {\"index\":0,\"type\":\"content_block_stop\"}\n\nevent: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"},\"type\":\"message_delta\",\"usage\":{\"output_tokens\":24}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    },
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"claude-sonnet-4-6\"",
+        "\"tool_use_id\":\"toolu_rev1\"",
+        "value=0"
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body": "event: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"msg_conformance\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"stop_reason\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":120,\"output_tokens\":0}},\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"content_block\":{\"id\":\"toolu_rev2\",\"input\":{},\"name\":\"Edit\",\"type\":\"tool_use\"},\"index\":0,\"type\":\"content_block_start\"}\n\nevent: content_block_delta\ndata: {\"delta\":{\"partial_json\":\"{\\\"file_path\\\":\\\"data.txt\\\",\\\"new_string\\\":\\\"value=42\\\",\\\"old_string\\\":\\\"value=0\\\"}\",\"type\":\"input_json_delta\"},\"index\":0,\"type\":\"content_block_delta\"}\n\nevent: content_block_stop\ndata: {\"index\":0,\"type\":\"content_block_stop\"}\n\nevent: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"},\"type\":\"message_delta\",\"usage\":{\"output_tokens\":24}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    },
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"claude-sonnet-4-6\"",
+        "\"tool_use_id\":\"toolu_rev2\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body": "event: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"msg_conformance\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"stop_reason\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":120,\"output_tokens\":0}},\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"content_block\":{\"id\":\"toolu_rev3\",\"input\":{},\"name\":\"Bash\",\"type\":\"tool_use\"},\"index\":0,\"type\":\"content_block_start\"}\n\nevent: content_block_delta\ndata: {\"delta\":{\"partial_json\":\"{\\\"command\\\":\\\"grep -q 'value=42' data.txt\\\"}\",\"type\":\"input_json_delta\"},\"index\":0,\"type\":\"content_block_delta\"}\n\nevent: content_block_stop\ndata: {\"index\":0,\"type\":\"content_block_stop\"}\n\nevent: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"},\"type\":\"message_delta\",\"usage\":{\"output_tokens\":24}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    },
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"claude-sonnet-4-6\"",
+        "\"tool_use_id\":\"toolu_rev3\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body": "event: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"msg_conformance\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"stop_reason\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":120,\"output_tokens\":0}},\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}\n\nevent: content_block_delta\ndata: {\"delta\":{\"text\":\"data.txt now has value=42 and the check passes.\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}\n\nevent: content_block_stop\ndata: {\"index\":0,\"type\":\"content_block_stop\"}\n\nevent: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"type\":\"message_delta\",\"usage\":{\"output_tokens\":24}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "format": "crom-conformance-transcript/v1",
+  "profile": "deepseek",
+  "task": "conf-long-output",
+  "model": "deepseek-chat",
+  "source": "synthetic",
+  "path": "/v1/chat/completions",
+  "exchanges": [
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"deepseek-chat\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"length\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": \"Writing the file now.\\n1\\n2\\n3\\n\",\n        \"role\": \"assistant\",\n        \"tool_calls\": [\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"file_path\\\": \\\"numbers.txt\\\", \\\"content\\\": \\\"1\\\\n2\\\\n3\\\\n4\\\\n5\\\\n\",\n              \"name\": \"Write\"\n            },\n            \"id\": \"call_lo1\",\n            \"type\": \"function\"\n          }\n        ]\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"deepseek-chat\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"deepseek-chat\"",
+        "output token limit"
+      ],
+      "request_excludes": [
+        "call_lo1"
+      ],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"tool_calls\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": null,\n        \"role\": \"assistant\",\n        \"tool_calls\": [\n          {\n            \"function\": {\n              \"arguments\": \"{\\\"command\\\":\\\"seq 1 3000 > numbers.txt\\\"}\",\n              \"name\": \"Bash\"\n            },\n            \"id\": \"call_lo2\",\n            \"type\": \"function\"\n          }\n        ]\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"deepseek-chat\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"max_tokens\":4096",
+        "\"model\":\"deepseek-chat\"",
+        "\"tool_call_id\":\"call_lo2\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"choices\": [\n    {\n      \"finish_reason\": \"stop\",\n      \"index\": 0,\n      \"message\": {\n        \"content\": \"Generated numbers.txt with seq.\",\n        \"role\": \"assistant\"\n      }\n    }\n  ],\n  \"id\": \"chatcmpl-conformance\",\n  \"model\": \"deepseek-chat\",\n  \"object\": \"chat.completion\",\n  \"usage\": {\n    \"completion_tokens\": 24,\n    \"prompt_tokens\": 120,\n    \"total_tokens\": 144\n  }\n}"
+    }
+  ]
+}

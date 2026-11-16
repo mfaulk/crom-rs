@@ -249,6 +249,51 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
   [L3 corpus](#l3-corpus-289).
 - `l3-mini` — ten synthetic, std-only three-crate workspaces stored in-tree;
   fully offline. See [L3-mini corpus](#l3-mini-corpus-m172).
+- `provider-conformance` — six L0 harness tasks (#284) that exercise
+  multi-turn tool use per provider. Replayed offline against recorded
+  transcripts in `cargo test`; run live with any profile. See
+  [Provider conformance](#provider-conformance-284).
+
+### Provider conformance (#284)
+
+A provider handshake does not prove reliable multi-turn tool use. Each task
+targets one behavior that differs across wire formats:
+
+| Task | Exercises |
+|---|---|
+| `conf-read-edit-verify` | Read → Edit → Bash → final answer; tool-call ids round-tripped. |
+| `conf-tool-error-recovery` | A failing Read (`is_error`; `ERROR:` prefix on OpenAI-compatible wires) the model must recover from. |
+| `conf-parallel-tools` | Three independent reads in one turn (an opportunity, not a requirement). |
+| `conf-bash-check-loop` | A failing command, a fix, and a passing rerun. |
+| `conf-invalid-args-recovery` | Tool arguments that fail to parse (Gemini: schema-invalid) return an error result and the loop recovers. Live models rarely trigger this; the transcripts inject it. |
+| `conf-long-output` | Output truncated at the token limit (`max_tokens` / `length` / `MAX_TOKENS`); the agent drops the incomplete call and continues. |
+
+Offline: `crates/crom-eval/tests/provider_conformance.rs` replays every task
+for `anthropic`, `openai`, `deepseek`, and `gemini` against
+`crates/crom-eval/tests/fixtures/conformance/<profile>/<task>.json`. Each
+exchange also checks the request the agent sent: the model, the profile's
+max-tokens field, the tool-result id for every prior call, error results,
+and that a truncated call is never sent back. The committed transcripts are
+`source = "synthetic"`, rendered from provider-neutral scripts in that test;
+regenerate with
+`CROM_CONFORMANCE_REGEN=1 cargo test -p crom-eval --test provider_conformance`.
+
+Live (opt-in, costs tokens):
+
+```console
+$ CROM_EVAL_LIVE=1 OPENAI_API_KEY=... \
+    crom eval run --suite provider-conformance --provider openai --allow-failures
+```
+
+Classify each live failure from its `result.json` `outcome` and
+`failure_class`:
+
+| Outcome / failure class | Class |
+|---|---|
+| `provider_error` | Provider error (HTTP, auth, rate limit, malformed response). |
+| `infra_error` (`harness_error`, `isolation_error`, `adapter_error`) | Crom bug until shown otherwise. |
+| `failed`, run ended `model.output_truncated` or wrong tool use | Capability limitation, after checking `events.jsonl` that Crom sent well-formed requests. |
+| `failed` with a malformed request or a dropped tool result in `events.jsonl` | Crom bug. |
 
 ### L1 capability corpus
 
