@@ -4,7 +4,7 @@
 //! M15 subcommands: `adapters`, `validate-task`, `validate-suite`, `history`,
 //! `trend`, `regressions`, `task-history`, `triage`, `show`, `open`, plus an
 //! adapter-, isolation-, repetition-, and prompt-variant-aware `run`.
-//! M17.4: `scoreboard`.
+//! M17.4: `scoreboard`, paired `compare`, and `regressions --since`.
 //!
 //! Runs drive the agent through the SDK runtime; provider selection is `fake`
 //! (default, offline) / `golden` (scripted) / a provider profile id such as
@@ -50,13 +50,14 @@ pub enum EvalCommand {
     ValidateSuite(ValidateSuiteArgs),
     /// Print the summary from a prior run.
     Report(EvalReportArgs),
-    /// Compare two prior runs.
+    /// Paired comparison of two runs with comparability checks and uncertainty.
     Compare(EvalCompareArgs),
     /// Show per-run rollups from the result index.
     History(HistoryArgs),
     /// Show per-task pass-rate trend for a suite.
     Trend(TrendArgs),
-    /// Show fixed/regressed tasks between two runs (from the index).
+    /// Paired regression check against a ref (`--since main`), or an
+    /// index-only diff of two runs (`--baseline A --candidate B`).
     Regressions(RegressionsArgs),
     /// Show the history of a single task across runs.
     TaskHistory(TaskHistoryArgs),
@@ -235,10 +236,42 @@ pub struct EvalReportArgs {
 
 #[derive(Parser, Debug)]
 pub struct EvalCompareArgs {
+    /// Baseline run id or run directory path.
     pub baseline: String,
+    /// Candidate run id or run directory path.
     pub candidate: String,
     #[arg(long)]
     pub runs_dir: Option<PathBuf>,
+    #[command(flatten)]
+    pub paired: PairedArgs,
+}
+
+/// Options shared by `compare` and `regressions --since`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct PairedArgs {
+    /// Experiment preset naming the factor allowed to differ:
+    /// commit | model | security | repair | policy | reps.
+    #[arg(long)]
+    pub experiment: Option<crom_eval::compare::Experiment>,
+    /// Additional factor allowed to differ (repeatable): model, task_version,
+    /// tool_policy, security, isolation, budgets, repair, prompt, metadata.
+    #[arg(long)]
+    pub allow: Vec<crom_eval::compare::Factor>,
+    /// Compare even when disallowed factors differ (prints a warning).
+    #[arg(long)]
+    pub force: bool,
+    /// Task kinds to pair: capability (default) | harness | security | all.
+    #[arg(long, default_value = "capability")]
+    pub kind: crom_eval::compare::KindScope,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: CompareFormat,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareFormat {
+    Text,
+    Json,
 }
 
 #[derive(Parser, Debug)]
@@ -259,13 +292,24 @@ pub struct TrendArgs {
 }
 
 #[derive(Parser, Debug)]
+#[command(group(clap::ArgGroup::new("base").required(true).args(["since", "baseline"])))]
 pub struct RegressionsArgs {
+    /// Paired check: baseline = the latest indexed run at this ref's commit
+    /// (else the latest run recorded on the branch of that name).
     #[arg(long)]
-    pub baseline: String,
+    pub since: Option<String>,
+    /// Index-only diff: baseline run id or SHA prefix (needs --candidate).
+    #[arg(long, requires = "candidate")]
+    pub baseline: Option<String>,
+    /// Candidate run id (default with --since: the latest other indexed run).
     #[arg(long)]
-    pub candidate: String,
+    pub candidate: Option<String>,
     #[arg(long)]
     pub index: Option<PathBuf>,
+    #[arg(long)]
+    pub runs_dir: Option<PathBuf>,
+    #[command(flatten)]
+    pub paired: PairedArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -956,11 +1000,65 @@ fn cmd_report(args: EvalReportArgs) -> Result<()> {
 fn cmd_compare(args: EvalCompareArgs) -> Result<()> {
     let base_path = resolve_run_path(&args.baseline, args.runs_dir.clone());
     let cand_path = resolve_run_path(&args.candidate, args.runs_dir);
-    let baseline = report::load_summary(&base_path)
-        .with_context(|| format!("loading baseline {}", base_path.display()))?;
-    let candidate = report::load_summary(&cand_path)
-        .with_context(|| format!("loading candidate {}", cand_path.display()))?;
-    println!("{}", report::compare(&baseline, &candidate));
+    paired_compare(&base_path, &cand_path, &args.paired)
+}
+
+/// Load every attempt of the run at `path` (including repetitions).
+fn load_run_attempts(path: &Path) -> Result<(String, Vec<crom_eval::scoreboard::Attempt>)> {
+    let run_id = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| anyhow!("bad run path {}", path.display()))?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let (attempts, warnings) =
+        crom_eval::scoreboard::load_attempts(parent, std::slice::from_ref(&run_id))
+            .with_context(|| format!("reading {}", path.display()))?;
+    for w in &warnings {
+        eprintln!("warning: skipping unreadable result {w}");
+    }
+    if attempts.is_empty() {
+        return Err(anyhow!("no result.json found under {}", path.display()));
+    }
+    Ok((run_id, attempts))
+}
+
+fn paired_compare(base_path: &Path, cand_path: &Path, args: &PairedArgs) -> Result<()> {
+    use crom_eval::compare::{compare_runs, CompareOptions};
+    let (base_id, base) = load_run_attempts(base_path)?;
+    let (cand_id, cand) = load_run_attempts(cand_path)?;
+    let cmp = compare_runs(
+        &base_id,
+        &base,
+        &cand_id,
+        &cand,
+        &CompareOptions {
+            kind: args.kind,
+            experiment: args.experiment,
+            allow: args.allow.clone(),
+            force: args.force,
+        },
+    );
+    let blocking = cmp.blocking();
+    if !blocking.is_empty() && !args.force {
+        eprintln!("Runs are not comparable; differing factors:");
+        for m in &blocking {
+            eprintln!(
+                "  {} ({} task(s), e.g. {}): {} != {}",
+                m.factor.as_str(),
+                m.tasks,
+                m.example_task,
+                m.baseline,
+                m.candidate
+            );
+        }
+        return Err(anyhow!(
+            "refusing to compare: pass --experiment <preset> or --allow <factor> if the difference is intended, or --force"
+        ));
+    }
+    match args.format {
+        CompareFormat::Text => print!("{}", cmp.to_text()),
+        CompareFormat::Json => print!("{}", cmp.to_json()),
+    }
     Ok(())
 }
 
@@ -1052,7 +1150,31 @@ fn cmd_trend(args: TrendArgs) -> Result<()> {
 fn cmd_regressions(args: RegressionsArgs) -> Result<()> {
     let entries = index::load_entries(&resolve_index(args.index))
         .map_err(|e| anyhow!("reading index: {e}"))?;
-    let r = index::regressions(&entries, &args.baseline, &args.candidate);
+    if let Some(reference) = &args.since {
+        use crom_eval::compare::{latest_run_except, resolve_baseline_run};
+        let sha = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let baseline = resolve_baseline_run(&entries, sha.as_deref(), reference)
+            .ok_or_else(|| anyhow!("no indexed run at '{reference}' (commit or branch)"))?;
+        let candidate = match args.candidate {
+            Some(c) => c,
+            None => latest_run_except(&entries, &baseline)
+                .ok_or_else(|| anyhow!("no candidate run in the index besides {baseline}"))?,
+        };
+        eprintln!("baseline: {baseline} ({reference}); candidate: {candidate}");
+        let base_path = resolve_run_path(&baseline, args.runs_dir.clone());
+        let cand_path = resolve_run_path(&candidate, args.runs_dir);
+        return paired_compare(&base_path, &cand_path, &args.paired);
+    }
+    // `--baseline` requires `--candidate` (enforced by clap).
+    let (Some(baseline), Some(candidate)) = (args.baseline, args.candidate) else {
+        return Err(anyhow!("--baseline needs --candidate"));
+    };
+    let r = index::regressions(&entries, &baseline, &candidate);
     println!(
         "Resolved: {} -> {} ({:+})",
         r.baseline_resolved,
@@ -1334,5 +1456,66 @@ mod scoreboard_flag_tests {
         assert_eq!((d.group_by, d.format), (GroupBy::Model, Format::Text));
         assert!(ScoreboardArgs::try_parse_from(["scoreboard", "--level", "L9"]).is_err());
         assert!(ScoreboardArgs::try_parse_from(["scoreboard", "--format", "csv"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod compare_flag_tests {
+    use super::*;
+    use crom_eval::compare::{Experiment, Factor, KindScope};
+
+    // compare parses the experiment preset, repeatable --allow factors, --force, --kind, and --format.
+    #[test]
+    fn compare_flags_parse() {
+        let a = EvalCompareArgs::try_parse_from([
+            "compare",
+            "base",
+            "cand",
+            "--experiment",
+            "model",
+            "--allow",
+            "budgets",
+            "--allow",
+            "prompt",
+            "--force",
+            "--kind",
+            "all",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        assert_eq!(
+            (a.baseline.as_str(), a.candidate.as_str()),
+            ("base", "cand")
+        );
+        assert_eq!(a.paired.experiment, Some(Experiment::Model));
+        assert_eq!(a.paired.allow, [Factor::Budgets, Factor::Prompt]);
+        assert!(a.paired.force);
+        assert_eq!(a.paired.kind, KindScope::All);
+        assert_eq!(a.paired.format, CompareFormat::Json);
+        assert!(
+            EvalCompareArgs::try_parse_from(["compare", "a", "b", "--experiment", "x"]).is_err()
+        );
+    }
+
+    // regressions takes either --since <ref> (paired, baseline from the index) or --baseline with --candidate.
+    #[test]
+    fn regressions_since_or_baseline() {
+        let s = RegressionsArgs::try_parse_from(["regressions", "--since", "main"]).unwrap();
+        assert_eq!(s.since.as_deref(), Some("main"));
+        assert_eq!(s.candidate, None);
+        let old =
+            RegressionsArgs::try_parse_from(["regressions", "--baseline", "a", "--candidate", "b"])
+                .unwrap();
+        assert_eq!(old.baseline.as_deref(), Some("a"));
+        assert!(RegressionsArgs::try_parse_from(["regressions"]).is_err());
+        assert!(RegressionsArgs::try_parse_from([
+            "regressions",
+            "--since",
+            "main",
+            "--baseline",
+            "a"
+        ])
+        .is_err());
     }
 }

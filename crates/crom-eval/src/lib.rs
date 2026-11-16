@@ -31,6 +31,7 @@ pub mod adapter;
 pub mod adversarial;
 pub mod artifacts;
 pub mod behavior;
+pub mod compare;
 pub mod external;
 pub mod failure;
 pub mod fixture;
