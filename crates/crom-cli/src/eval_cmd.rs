@@ -148,12 +148,35 @@ pub struct EvalRunArgs {
     pub allow_failures: bool,
 }
 
+/// Where `validate-task` / `validate-suite` run verification commands.
+#[derive(clap::Args, Debug, Clone)]
+pub struct ValidateIsolationArgs {
+    /// Verification backend: local | docker | podman (containers are opt-in
+    /// via CROM_EVAL_DOCKER=1 / CROM_EVAL_PODMAN=1).
+    #[arg(long, default_value = "local")]
+    pub isolation: String,
+    /// Container image (container backends only).
+    #[arg(long)]
+    pub container_image: Option<String>,
+}
+
+impl ValidateIsolationArgs {
+    fn options(&self) -> Result<validate::ValidationOptions> {
+        Ok(validate::ValidationOptions {
+            isolation: IsolationKind::parse(&self.isolation).map_err(|e| anyhow!("{e}"))?,
+            container_image: self.container_image.clone(),
+        })
+    }
+}
+
 #[derive(Parser, Debug)]
 pub struct ValidateTaskArgs {
     /// A task id (internal) or a path to a task directory / task.toml.
     pub target: String,
     #[arg(long)]
     pub tasks_dir: Option<PathBuf>,
+    #[command(flatten)]
+    pub isolation_args: ValidateIsolationArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -166,6 +189,8 @@ pub struct ValidateSuiteArgs {
     pub repeat: usize,
     #[arg(long)]
     pub include_private: bool,
+    #[command(flatten)]
+    pub isolation_args: ValidateIsolationArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -635,7 +660,7 @@ fn write_artifact(path: std::path::PathBuf, content: String) -> std::io::Result<
 
 async fn cmd_validate_task(args: ValidateTaskArgs) -> Result<()> {
     let task = resolve_single_task(&args.target, args.tasks_dir)?;
-    let report = validate::validate_task(&task).await;
+    let report = validate::validate_task_with(&task, &args.isolation_args.options()?).await;
     println!("{}", report.to_markdown());
     if !report.ok() {
         return Err(anyhow!("{} validation error(s)", report.errors()));
@@ -654,13 +679,14 @@ async fn cmd_validate_suite(args: ValidateSuiteArgs) -> Result<()> {
     if tasks.is_empty() {
         return Err(anyhow!("suite '{}' matched no tasks", args.suite));
     }
+    let opts = args.isolation_args.options()?;
     let mut total_errors = 0usize;
     for task in tasks {
-        let report = validate::validate_task(task).await;
+        let report = validate::validate_task_with(task, &opts).await;
         total_errors += report.errors();
         println!("{}", report.to_markdown());
         if args.repeat > 1 {
-            let verdict = validate::flake_detect(task, args.repeat).await;
+            let verdict = validate::flake_detect_with(task, args.repeat, &opts).await;
             println!("flake verdict ({}x): {:?}\n", args.repeat, verdict);
         }
     }
@@ -879,4 +905,35 @@ fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod validate_isolation_flag_tests {
+    use super::*;
+
+    // validate-task and validate-suite accept --isolation and --container-image and map them to ValidationOptions.
+    #[test]
+    fn validate_flags_map_to_options() {
+        let a = ValidateTaskArgs::try_parse_from([
+            "validate-task",
+            "l3-x",
+            "--isolation",
+            "podman",
+            "--container-image",
+            "rust:1.88",
+        ])
+        .unwrap();
+        let o = a.isolation_args.options().unwrap();
+        assert_eq!(o.isolation, IsolationKind::Podman);
+        assert_eq!(o.container_image.as_deref(), Some("rust:1.88"));
+
+        let s = ValidateSuiteArgs::try_parse_from(["validate-suite", "l3"]).unwrap();
+        let o = s.isolation_args.options().unwrap();
+        assert_eq!(o.isolation, IsolationKind::Local);
+        assert_eq!(o.container_image, None);
+
+        let bad = ValidateSuiteArgs::try_parse_from(["validate-suite", "l3", "--isolation", "vm"])
+            .unwrap();
+        assert!(bad.isolation_args.options().is_err());
+    }
 }
