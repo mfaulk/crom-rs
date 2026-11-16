@@ -1,0 +1,76 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L4"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l4-glob-hidden-dir-leading-dot"
+title = "Honor require_literal_leading_dot for directories matched by **"
+category = "bugfix"
+difficulty = "hard"
+tags = ["rust", "hidden-tests", "bugfix", "upstream", "real-issue", "l4", "tooling", "filesystem"]
+suites = ["l4"]
+
+prompt = """
+This repository is the `glob` project (https://github.com/rust-lang/glob). Resolve the GitHub issue below. The issue text is reproduced as filed.
+
+Keep the existing public API working, keep the existing test suite green, and do not edit `Cargo.toml`, `Cargo.lock`, `.cargo/`, or `vendor/`. There is no network access; build and test with `--offline`.
+
+---
+
+Issue #67: Using 'require_literal_leading_dot' matches folders that start with dot
+
+Hey,
+
+It seems like 'require_literal_leading_dot' option doesn't work as intended and matches files in directories that start with dot. For example if I would search for `*c*` file at `aaa/.bbb/ccc`, I would get a match even though the file is in hidden folder.
+
+I've added some cases that fail main test at https://github.com/kitogo/glob fork.
+
+Cheers,
+Igor
+"""
+
+timeout_secs = 600
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock", ".cargo/", "vendor/"]
+
+[limits]
+wall_secs = 1800
+max_turns = 60
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "d506fca9fda166ac6b5fdaa47c8e283d93a965fc"
+path = "l4-glob-hidden-dir-leading-dot"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --offline -- --test-threads 8 --skip test_iteration_errors"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline --test glob-std"]
+
+[provenance]
+author = "The Rust Project Developers"
+source = "https://github.com/rust-lang/glob/issues/67"
+license = "MIT OR Apache-2.0"
+created = "2026-11-15"
+upstream = "https://github.com/rust-lang/glob"
+base_commit = "55d550eab0f7a0ba537baba77a12c2d11e32fe4d"
+fix_commit = "4ab7f0fb50d3b74e16ba92824779823b888ab018"

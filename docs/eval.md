@@ -257,6 +257,9 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
   multi-turn tool use per provider. Replayed offline against recorded
   transcripts in `cargo test`; run live with any profile. See
   [Provider conformance](#provider-conformance-284).
+- `l4` — L4 corpus (#296): five real, closed upstream issues frozen before
+  any baseline run. The prompt is the issue text; fixtures are pinned in the
+  same fixtures repository as `l3`. See [L4 corpus](#l4-corpus-296).
 
 ### Provider conformance (#284)
 
@@ -417,6 +420,35 @@ upstream provenance, permissive licenses, and Cargo manifests forbidden.
 On a 64-core host, cap build parallelism inside a container that limits PIDs
 (`CARGO_BUILD_JOBS=8`, `--test-threads 8`); otherwise `rust-lld` aborts with
 `Resource temporarily unavailable`.
+
+### L4 corpus (#296)
+
+Five `kind = "capability"`, `level = "L4"` tasks. Each is a real, closed issue
+in a permissively licensed Rust repository, snapshotted at the parent of the
+commit that resolved it, with dependencies vendored. The prompt is the issue
+text as filed. The hidden oracle is the fix's tests (an owner-written
+acceptance test for `l4-tempfile-relative-temppath`), and `oracle.patch` is
+the fix's non-test diff. `[provenance] source` is the issue URL.
+
+| Task | Issue | Area |
+|---|---|---|
+| `l4-which-relative-path-cwd` | harryfei/which-rs#127 | tooling: executable lookup |
+| `l4-tempfile-relative-temppath` | Stebalien/tempfile#395 | security: cleanup deletes the wrong file |
+| `l4-quick-xml-dtd-chunk-panic` | tafia/quick-xml#960 | untrusted input: parser panic |
+| `l4-toml-writer-quote-overflow` | toml-rs/toml#1188 | serializer panic in a workspace |
+| `l4-glob-hidden-dir-leading-dot` | rust-lang/glob#67 | tooling: file matching |
+
+The selection criteria, provenance, rejected candidates, freeze date, and
+owner sign-off are in [eval/real-world-tasks.md](eval/real-world-tasks.md).
+`crates/crom-eval/tests/l4_corpus.rs` checks structure, and CI validates the
+suite in the `eval / L4 real-world issues` job.
+
+```console
+crom eval validate-suite l4
+CROM_EVAL_PODMAN=1 crom eval validate-suite l4 --isolation podman \
+  --container-image docker.io/library/rust:1-slim
+crom eval run --suite l4 --provider <profile>
+```
 
 ### L3-mini corpus (M17.2)
 
