@@ -1,8 +1,9 @@
 schema_version = 3
-task_version = "1.0.0"
+task_version = "1.1.0"
 kind = "capability"
 level = "L2"
 network = "none"
+reference = "oracle_patch"
 id = "rust-cli-arg-order"
 title = "Fix a CLI arg-parsing edge case spanning multiple files"
 category = "bugfix"
@@ -13,11 +14,12 @@ suites = ["rust-small", "rust-mini"]
 prompt = """
 The CLI fails when --output is passed after the input path (e.g. `app in.txt
 --output out.txt`). Fix the parser so flags may appear in any order. Do not
-change the public CLI syntax. Tests describe the expected behavior.
+change the public CLI syntax. The test suite describes the expected behavior.
 """
 
 max_turns = 24
 timeout_secs = 300
+oracle_patch = "oracle.patch"
 
 [capabilities]
 requires_repo_search = true
@@ -46,3 +48,11 @@ author = "crom maintainers"
 source = "original"
 license = "Apache-2.0 OR MIT"
 created = "2026-06-03"
+
+# Hidden: behavior checks the agent never sees.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]

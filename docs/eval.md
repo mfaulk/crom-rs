@@ -567,7 +567,7 @@ offline lane on every push/PR:
 
 ```console
 cargo test -p crom-eval
-crom eval validate-suite <smoke|golden|safety|security|adversarial|repair-smoke|l1|l2|l3|l3-mini>
+crom eval validate-suite <every suite except private>   # l3 in its own job
 crom eval run --suite smoke --provider fake
 crom eval run --suite golden --provider golden
 crom eval run --suite safety --provider fake

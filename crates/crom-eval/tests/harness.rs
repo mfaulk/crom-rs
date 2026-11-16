@@ -56,6 +56,18 @@ fn every_shipped_task_is_v3_with_kind_and_level() {
     }
 }
 
+/// Every shipped capability task declares hidden verification and a reference, so `validate-suite` can pass over the whole corpus.
+#[test]
+fn every_capability_task_has_hidden_verification_and_reference() {
+    use crom_eval::schema::TaskKind;
+    for t in load_all() {
+        if t.kind == Some(TaskKind::Capability) {
+            assert!(t.hidden.is_some(), "{} has no hidden verification", t.id);
+            assert!(t.reference.is_some(), "{} declares no reference", t.id);
+        }
+    }
+}
+
 /// Tasks in the scripted/offline CI suites are harness tasks at L0, never capability tasks.
 #[test]
 fn offline_ci_suites_are_harness_l0() {

@@ -1,0 +1,31 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,6 +3,17 @@
+     input.chars().rev().collect()
+ }
+ 
++/// True if `input` reads the same forwards and backwards, ignoring ASCII case
++/// and non-alphanumeric characters.
++pub fn is_palindrome(input: &str) -> bool {
++    let cleaned: Vec<char> = input
++        .chars()
++        .filter(|c| c.is_ascii_alphanumeric())
++        .map(|c| c.to_ascii_lowercase())
++        .collect();
++    cleaned.iter().eq(cleaned.iter().rev())
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -11,4 +22,10 @@
+     fn reverses() {
+         assert_eq!(reverse("abc"), "cba");
+     }
++
++    #[test]
++    fn palindromes() {
++        assert!(is_palindrome("A man, a plan, a canal: Panama"));
++        assert!(!is_palindrome("abc"));
++    }
+ }

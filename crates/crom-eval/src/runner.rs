@@ -154,6 +154,14 @@ pub struct EvalResult {
     /// M17.4 reproducibility metadata. `None` on v1 results.
     #[serde(default)]
     pub repro: Option<ReproMetadata>,
+    /// Task kind from a v3 manifest (#285). `None` for v1/v2 tasks and for
+    /// results written before the field existed; such results are reported
+    /// as `unclassified`, never as capability.
+    #[serde(default)]
+    pub kind: Option<crate::schema::TaskKind>,
+    /// Capability level from a v3 manifest; `None` like `kind`.
+    #[serde(default)]
+    pub level: Option<crate::schema::Level>,
 }
 
 fn legacy_result_schema_version() -> u32 {
@@ -617,6 +625,8 @@ fn default_result(
         repair: crate::repair::RepairMetrics::default(),
         usage: None,
         model_round_trips: 0,
+        kind: task.kind,
+        level: task.level,
         outcome: None,
         repro: None,
     }
@@ -1739,6 +1749,8 @@ pub mod test_support {
             model_round_trips: 0,
             outcome: None,
             repro: None,
+            kind: None,
+            level: None,
         }
     }
 }

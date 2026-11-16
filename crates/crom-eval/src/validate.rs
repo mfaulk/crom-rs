@@ -136,7 +136,11 @@ async fn run_oracle_in(
         timeout,
         ..Default::default()
     };
-    oracle::evaluate_oracle(oracle_spec, workspace, &[], backend, &limits).await
+    // Behavior rules grade the agent's transcript; validation has none, so
+    // they would fail every reference. Only outcome checks are validated here.
+    let mut spec = oracle_spec.clone();
+    spec.behavior.clear();
+    oracle::evaluate_oracle(&spec, workspace, &[], backend, &limits).await
 }
 
 fn git_apply_check(workspace: &Path, patch: &Path) -> Result<(), String> {
@@ -809,6 +813,18 @@ mod tests {
             .checks
             .iter()
             .any(|c| c.name == "capability_base_outcome" && c.passed));
+    }
+
+    /// Transcript-based behavior rules do not count against a reference patch, which has no transcript.
+    #[tokio::test]
+    async fn behavior_rules_ignored_when_validating_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = capability_task(tmp.path(), true, Some(FIX_PATCH));
+        task.oracle
+            .behavior
+            .push(crate::task::BehaviorSpec::MustEmitPlan);
+        let report = validate_task(&task).await;
+        assert!(report.ok(), "{}", report.to_markdown());
     }
 
     /// A capability task without hidden verification is a validation error.

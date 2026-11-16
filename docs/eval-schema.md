@@ -196,6 +196,8 @@ fixture and fails (error) unless:
 - `capability_reference`: a `reference` is declared.
 - `capability_base_outcome`: the unmodified fixture **fails** public + hidden
   verification, or — for `expected_outcome = "no_change"` — **passes** it.
+- Transcript-based `[[oracle.behavior]]` rules are skipped during validation:
+  neither the base fixture nor the reference has a transcript.
 - With `reference = "oracle_patch"`, the existing `oracle_patch_applies`,
   `oracle_patch_passes_public`, and `oracle_patch_passes_hidden` checks must
   pass. With `reference = "validated_oracle"` the unmodified fixture is the
@@ -271,10 +273,22 @@ Reports and the regression index aggregate resolved-rate by `category`, each
 `tag`, each enabled capability label, adapter, isolation backend, provider, and
 model — so a regression scoped to (say) `requires_multifile_edit` is visible.
 
-Run reports do not yet aggregate by v3 `kind`/`level`. Until they do, compute
-capability pass rates only from suites whose tasks are all
-`kind = "capability"`; the offline CI suites (`smoke`, `golden`, `safety`,
-`repair-*`) are entirely `kind = "harness"`.
+Run reports also aggregate by v3 `kind` and `level`, so harness successes
+never inflate capability numbers:
+
+- `result.json` records `kind` (`harness | capability | security`) and `level`
+  (`L0`..`L5`); both are `null` for v1/v2 tasks and absent from results
+  written before #285.
+- `summary.json` adds `by_kind` (outcome counts and pass rate per kind, in the
+  order harness, capability, security, `unclassified`), `capability_pass_rate`
+  (resolved / (resolved + failed) over `kind = "capability"` results only;
+  `null` when none was scored), and `capability_by_level` (capability
+  resolved / scored per level). Each task line carries `kind` and `level`.
+- `summary.md` prints the capability pass rate beside the overall pass rate,
+  plus "By kind" and "Capability by level" tables.
+
+The overall `pass_rate` still covers every kind; quote `capability_pass_rate`
+as the capability metric.
 
 ## Complete example
 
@@ -400,12 +414,14 @@ outcome   # resolved | failed | provider_error | infra_error | skipped | unscora
   cost is unknown.
 
 `summary.json` carries `outcomes` (counts per class), `pass_rate` (`null`
-when nothing was scored), `unreliable`, a per-task `outcome`, and cost
-fields: `total_cost_usd` (nominal spend over non-skipped results; `null`
-when any of them has an unknown cost, `0.0` when none ran), `cost_unknown`
-(non-skipped results without a cost), and `budget_skipped` (tasks skipped
-because a spend cap was reached or could not be enforced). `summary.md`
-prints the same. Provider and harness failures are never
+when nothing was scored), `unreliable`, a per-task `outcome`, the per-kind
+breakdown described under [Capabilities, categories, and
+tags](#capabilities-categories-and-tags), and cost fields: `total_cost_usd`
+(nominal spend over non-skipped results; `null` when any of them has an
+unknown cost, `0.0` when none ran), `cost_unknown` (non-skipped results
+without a cost), and `budget_skipped` (tasks skipped because a spend cap was
+reached or could not be enforced). `summary.md` prints the same. Provider and
+harness failures are never
 refined into M16 repair classes.
 
 ### Reproducibility metadata (`repro`)

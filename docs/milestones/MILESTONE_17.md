@@ -359,39 +359,94 @@ Rules (enforced by `validate-task`, #285):
 - **No grader material in the agent's reach.** Covered by #286, plus the
   sandbox (#253).
 
-### Existing-task audit (#285)
+### Task audit (#285)
 
-All 19 shipped tasks are schema v3 with `task_version = "1.0.0"` and
-provenance. "Validates" is `crom eval validate-task <id>` with 0 errors.
+Every shipped task (57) is a schema v3 manifest with a `kind`, a `level`,
+a `task_version`, and provenance. "Validates" means `crom eval validate-task
+<id>` reports 0 errors: for capability tasks that includes hidden
+verification, a reference that passes public + hidden checks, and an
+unmodified fixture that fails them (passes, for `no_change`).
 
-| Task | kind | level | network | expected_outcome | Validates | Notes |
-|---|---|---|---|---|---|---|
-| smoke-noop | harness | L0 | none | no_change | yes | `smoke` |
-| noop-already-correct | harness | L0 | none | no_change | yes | `smoke` |
-| prompt-variants-demo | harness | L0 | none | no_change | yes | `smoke` |
-| private-canary-demo | harness | L0 | none | no_change | yes | `private` |
-| policy-denied-bash | harness | L0 | none | change | yes | security harness (`smoke`, `safety`) |
-| dangerous-command-denial | harness | L0 | none | change | yes | security harness (`smoke`, `safety`) |
-| golden-edit-recover | harness | L0 | none | change | yes | scripted `golden` |
-| golden-rust-recover | harness | L0 | none | change | yes | scripted `golden` |
-| repair-grep-recover | harness | L0 | none | change | yes | scripted `repair-smoke` |
-| repair-grep-trap | harness | L0 | none | change | yes | scripted negative (`repair-smoke`) |
-| rust-hidden-sum-bug | capability | L1 | none | change | yes | hidden test + `oracle_patch` reference |
-| rust-failing-unit-test | capability | L1 | none | change | yes | hidden tests + `oracle_patch`; `l1` suite (#287) |
-| rust-compiler-error | capability | L1 | none | change | yes | hidden tests + `oracle_patch`; `l1` suite (#287) |
-| rust-clippy-cleanup | capability | L1 | none | change | no | needs hidden tests + reference (#287) |
-| rust-serde-edge-case | capability | L1 | registry | change | no | needs hidden tests + reference (#287) |
-| rust-add-regression-test | capability | L1 | none | change | yes | hidden tests + `oracle_patch`; `l1` suite (#287) |
-| rust-refactor-preserve | capability | L1 | none | change | yes | hidden tests + `oracle_patch`; `l1` suite (#287) |
-| rust-cli-arg-order | capability | L2 | none | change | no | 3-file fixture; needs hidden tests + reference (#287/#288) |
-| plan-act-small-feature | capability | L2 | none | change | no | plan-then-act; needs hidden tests + reference (#287/#288) |
+Every suite is validated in CI: `smoke`, `golden`, `safety`, `security`,
+`repair-smoke`, `repair-mini`, `planning`, `rust-small`, and `rust-mini` in
+one step; `l1`, `l2`, and `l3-mini` in their own steps; `l3` in the
+`eval / L3 upstream fixtures` job. The `private` suite is local-only.
 
-The capability tasks marked "no" fail `capability_hidden` and
-`capability_reference`, so `validate-suite rust-small` / `rust-mini` exit
-non-zero until they are upgraded. CI validates `smoke`, `golden`, `safety`,
-`repair-smoke`, `rust-hidden-sum-bug`, and the `l1` suite (#287: the L1 tasks
-marked "yes" above plus seven new single-file tasks, two of them `no_change`;
-see the task table in [eval.md](../eval.md#l1-capability-corpus)).
+| Task | kind | level | network | expected_outcome | task_version | Validates | Suites |
+|---|---|---|---|---|---|---|---|
+| dangerous-command-denial | harness | L0 | none | change | 1.0.0 | yes | `smoke`, `safety` |
+| golden-edit-recover | harness | L0 | none | change | 1.0.0 | yes | `golden` |
+| golden-rust-recover | harness | L0 | none | change | 1.0.0 | yes | `golden`, `rust-small` |
+| noop-already-correct | harness | L0 | none | no_change | 1.0.0 | yes | `smoke` |
+| policy-denied-bash | harness | L0 | none | change | 1.0.0 | yes | `smoke`, `safety` |
+| private-canary-demo | harness | L0 | none | no_change | 1.0.0 | yes | `private` |
+| prompt-variants-demo | harness | L0 | none | no_change | 1.0.0 | yes | `smoke` |
+| repair-grep-recover | harness | L0 | none | change | 1.0.0 | yes | `repair-smoke`, `repair-mini` |
+| repair-grep-trap | harness | L0 | none | change | 1.0.0 | yes | `repair-smoke`, `repair-mini` |
+| smoke-noop | harness | L0 | none | no_change | 1.0.0 | yes | `smoke` |
+| leak-canary | security | L0 | none | change | 1.0.0 | yes | `security` |
+| rust-add-regression-test | capability | L1 | none | change | 1.1.0 | yes | `rust-small`, `rust-mini`, `l1` |
+| rust-api-addition | capability | L1 | none | change | 1.0.0 | yes | `l1` |
+| rust-borrow-iter-fix | capability | L1 | none | change | 1.0.0 | yes | `l1` |
+| rust-clippy-cleanup | capability | L1 | none | change | 1.1.0 | yes | `rust-small`, `rust-mini` |
+| rust-compiler-error | capability | L1 | none | change | 1.1.0 | yes | `rust-small`, `rust-mini`, `l1` |
+| rust-edge-case-paginate | capability | L1 | none | change | 1.0.0 | yes | `l1` |
+| rust-error-handling | capability | L1 | none | change | 1.0.0 | yes | `l1` |
+| rust-failing-unit-test | capability | L1 | none | change | 1.1.0 | yes | `rust-small`, `rust-mini`, `l1` |
+| rust-hidden-sum-bug | capability | L1 | none | change | 1.0.0 | yes | `rust-mini`, `l1` |
+| rust-implement-from-doc | capability | L1 | none | change | 1.0.0 | yes | `l1` |
+| rust-nochange-leap-year | capability | L1 | none | no_change | 1.0.0 | yes | `l1` |
+| rust-nochange-midpoint | capability | L1 | none | no_change | 1.0.0 | yes | `l1` |
+| rust-refactor-preserve | capability | L1 | none | change | 1.1.0 | yes | `rust-small`, `rust-mini`, `l1` |
+| rust-serde-edge-case | capability | L1 | registry | change | 1.1.0 | yes | `rust-small`, `rust-mini` |
+| l2-config-error-enum | capability | L2 | none | change | 1.0.0 | yes | `l2` |
+| l2-contacts-schema-v2 | capability | L2 | none | change | 1.0.0 | yes | `l2` |
+| l2-expr-test-cascade | capability | L2 | none | change | 1.0.0 | yes | `l2` |
+| l2-feature-flag-json | capability | L2 | none | change | 1.0.0 | yes | `l2` |
+| l2-library-borrow-repair | capability | L2 | none | change | 1.0.0 | yes | `l2` |
+| l2-noop-bankers-rounding | capability | L2 | none | no_change | 1.0.0 | yes | `l2` |
+| l2-order-discount-codes | capability | L2 | none | change | 1.0.0 | yes | `l2` |
+| l2-pipeline-shutdown | capability | L2 | none | change | 1.0.0 | yes | `l2` |
+| l2-shape-trait-refactor | capability | L2 | none | change | 1.0.0 | yes | `l2` |
+| l2-todo-cli-done | capability | L2 | none | change | 1.0.0 | yes | `l2` |
+| plan-act-small-feature | capability | L2 | none | change | 1.1.0 | yes | `rust-small`, `planning`, `rust-mini` |
+| rust-cli-arg-order | capability | L2 | none | change | 1.1.0 | yes | `rust-small`, `rust-mini` |
+| l3-buildplan-cycles | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
+| l3-bytes-try-get-int-sign | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+| l3-cron-ranges-steps | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
+| l3-csv-quoting | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
+| l3-http-header-case | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
+| l3-http-insert-mult | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+| l3-indexmap-macro-hygiene | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+| l3-itertools-combinations-zero | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+| l3-layercfg-merge | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
+| l3-ledger-split | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
+| l3-logstore-reopen | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
+| l3-mdtoc-anchors | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
+| l3-nom-multispace-eof | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+| l3-petgraph-floyd-multiedge | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+| l3-ron-integer-suffix-base | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+| l3-semver-prerelease | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
+| l3-serde-yaml-duplicate-keys | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+| l3-throttle-refill | capability | L3 | none | change | 1.0.0 | yes | `l3-mini` |
+| l3-toml-crlf-error-position | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+| l3-url-path-caret | capability | L3 | none | change | 1.0.0 | yes¹ | `l3` |
+
+¹ Upstream-repo snapshot; validated by the `eval / L3 upstream fixtures` CI
+job, which fetches the pinned fixtures repository.
+
+Four legacy tasks (`rust-clippy-cleanup`, `rust-serde-edge-case`,
+`rust-cli-arg-order`, `plan-act-small-feature`) were still failing
+`capability_hidden`/`capability_reference` after the L1/L2 corpus PRs; they
+gained hidden tests and an `oracle_patch` reference at `task_version =
+"1.1.0"` rather than being reclassified. `validate-task` ignores
+transcript-based `[[oracle.behavior]]` rules when checking a reference, since a
+reference patch has no transcript.
+
+Reports keep kinds apart: `result.json` records `kind` and `level`, and
+`summary.json` carries `by_kind`, `capability_pass_rate` (capability results
+only), and `capability_by_level`. Harness and security results never enter the
+capability pass rate; results from v1/v2 tasks are `unclassified`.
 
 ## 10. Provider support and cost strategy
 

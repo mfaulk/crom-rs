@@ -1,8 +1,9 @@
 schema_version = 3
-task_version = "1.0.0"
+task_version = "1.1.0"
 kind = "capability"
 level = "L2"
 network = "none"
+reference = "oracle_patch"
 id = "plan-act-small-feature"
 title = "Add a small feature using explicit plan-then-act"
 category = "feature"
@@ -14,11 +15,12 @@ mode = "plan_then_act"
 prompt = """
 Add a `is_palindrome(&str) -> bool` function to the crate that ignores ASCII
 case and non-alphanumeric characters, then add a test for it. First produce a
-short plan, then implement it. Keep existing tests passing.
+short plan, then implement it. Keep the existing test suite passing.
 """
 
 max_turns = 24
 timeout_secs = 300
+oracle_patch = "oracle.patch"
 
 [capabilities]
 requires_test_feedback = true
@@ -44,3 +46,11 @@ author = "crom maintainers"
 source = "original"
 license = "Apache-2.0 OR MIT"
 created = "2026-06-03"
+
+# Hidden: behavior checks the agent never sees.
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --test hidden"]

@@ -274,6 +274,14 @@
     },
     "repro": {
       "$ref": "#/$defs/repro"
+    },
+    "kind": {
+      "description": "Task kind from a schema v3 manifest; null for v1/v2 tasks. Optional: absent in results written before #285.",
+      "enum": ["harness", "capability", "security", null]
+    },
+    "level": {
+      "description": "Capability level from a schema v3 manifest; null for v1/v2 tasks. Optional like kind.",
+      "enum": ["L0", "L1", "L2", "L3", "L4", "L5", null]
     }
   },
   "$defs": {

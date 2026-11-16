@@ -145,15 +145,16 @@ jobs:
       - name: Eval harness unit + integration tests
         run: cargo test --locked -p crom-eval
       # Model-free task validation. Capability tasks must have hidden
-      # verification and a reference that passes it (schema v3, #285);
-      # rust-small/rust-mini are not listed until their remaining capability
-      # tasks gain hidden tests + references.
-      - name: Validate offline suites and capability tasks
+      # verification and a reference that passes it (schema v3, #285).
+      # Together with the l1/l2/l3-mini steps below and the l3 job, this
+      # covers every shipped suite. rust-serde-edge-case (rust-small,
+      # rust-mini) fetches serde from crates.io.
+      - name: Validate harness and legacy capability suites
         run: |
-          for suite in smoke golden safety security adversarial repair-smoke; do
+          for suite in smoke golden safety security adversarial repair-smoke \
+                       repair-mini planning rust-small rust-mini; do
             cargo run --locked -p crom-cli -- eval validate-suite "$suite"
           done
-          cargo run --locked -p crom-cli -- eval validate-task rust-hidden-sum-bug
       # L1 capability corpus (#287): every reference passes public + hidden
       # verification and every unmodified fixture fails it (no_change: passes).
       - name: Validate L1 capability suite
