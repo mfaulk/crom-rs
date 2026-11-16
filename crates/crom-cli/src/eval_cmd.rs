@@ -283,8 +283,8 @@ pub struct ScoreboardArgs {
     /// Only these run ids (repeatable; default: every run under --runs-dir).
     #[arg(long)]
     pub run: Vec<String>,
-    /// Only results whose evaluating commit is <rev> or reachable from HEAD
-    /// but not from <rev> (`git rev-list <rev>..HEAD`).
+    /// Only results whose evaluating commit is `<rev>` or reachable from HEAD
+    /// but not from `<rev>` (`git rev-list <rev>..HEAD`).
     #[arg(long)]
     pub since: Option<String>,
     /// Only this model, as `model` or `provider/model` (repeatable).
