@@ -101,22 +101,35 @@ pub fn pending_repo_config(cwd: &Path, settings: &Settings) -> Vec<String> {
 /// `cwd`, persisting a yes. Headless callers never get here and keep the
 /// restricted config.
 pub fn prompt_for_trust(cwd: &Path, pending: &[String]) -> Result<bool> {
-    let mut err = std::io::stderr();
+    ask_trust(
+        cwd,
+        pending,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+    )
+}
+
+fn ask_trust(
+    cwd: &Path,
+    pending: &[String],
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+) -> Result<bool> {
     writeln!(
-        err,
+        out,
         "This workspace has repository config that would loosen permissions or start processes:"
     )?;
     for p in pending {
-        writeln!(err, "  - {p}")?;
+        writeln!(out, "  - {p}")?;
     }
     write!(
-        err,
+        out,
         "Trust {} and apply it? Saved for future runs; undo with `crom untrust`. [y/N] ",
         cwd.display()
     )?;
-    err.flush()?;
+    out.flush()?;
     let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
+    input.read_line(&mut line)?;
     if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         trust::set_workspace_trust(cwd, WorkspaceTrust::Trusted)
             .context("persist workspace trust")?;
@@ -154,6 +167,34 @@ pub fn trust_denial_decisions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // Answering yes persists trust; anything else (including EOF) leaves the workspace untrusted.
+    fn prompt_persists_only_on_yes() {
+        let home = tempfile::TempDir::new().unwrap();
+        let ws = tempfile::TempDir::new().unwrap();
+        temp_env::with_vars(
+            [
+                ("CROM_CONFIG_HOME", Some(home.path().to_str().unwrap())),
+                ("CODE_AGENT_CONFIG_HOME", None),
+            ],
+            || {
+                let pending = vec![".agent/settings.json: allowed_tools".to_string()];
+                for answer in ["", "n\n", "nope\n"] {
+                    let mut out = Vec::new();
+                    let trusted =
+                        ask_trust(ws.path(), &pending, &mut answer.as_bytes(), &mut out).unwrap();
+                    assert!(!trusted);
+                    assert!(!trust::workspace_trust(ws.path()).is_trusted());
+                    assert!(String::from_utf8(out).unwrap().contains("allowed_tools"));
+                }
+                let trusted =
+                    ask_trust(ws.path(), &pending, &mut "Y\n".as_bytes(), &mut Vec::new()).unwrap();
+                assert!(trusted);
+                assert!(trust::workspace_trust(ws.path()).is_trusted());
+            },
+        );
+    }
 
     #[test]
     // Each settings and MCP denial becomes a blocked workspace_trust SecurityDecision.
