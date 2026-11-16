@@ -475,6 +475,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "similar 3.2.1",
+ "temp-env",
  "tempfile",
  "thiserror",
  "time",
