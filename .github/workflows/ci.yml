@@ -45,9 +45,9 @@ jobs:
             toolchain: stable
             lint: false
           # MSRV lane. Must match `workspace.package.rust-version` in Cargo.toml.
-          - name: ubuntu / msrv 1.88.0
+          - name: ubuntu / msrv 1.89.0
             os: ubuntu-latest
-            toolchain: 1.88.0
+            toolchain: 1.89.0
             lint: false
           # Early-warning lane for upcoming compiler changes.
           - name: ubuntu / beta
