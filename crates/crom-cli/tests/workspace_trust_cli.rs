@@ -177,3 +177,38 @@ fn trusted_repo_mcp_env_interpolation_is_refused() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("never reads host environment"));
     assert!(!ws.path().join("spawned").exists());
 }
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let st = Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("git on PATH");
+    assert!(st.success(), "git {args:?} failed");
+}
+
+/// `crom run` in a repo whose `.git/config` sets `core.fsmonitor` never executes it (#334).
+#[test]
+fn repo_git_fsmonitor_is_not_executed_by_run() {
+    let ws = TempDir::new().unwrap();
+    let marker = ws.path().join("pwned");
+    git_in(ws.path(), &["init", "-q"]);
+    std::fs::write(ws.path().join("a.txt"), "one\n").unwrap();
+    git_in(ws.path(), &["add", "a.txt"]);
+    git_in(ws.path(), &["commit", "-qm", "init"]);
+    let cmd = format!("touch '{}'; false", marker.display());
+    git_in(ws.path(), &["config", "core.fsmonitor", &cmd]);
+    let home = TempDir::new().unwrap();
+
+    let out = run(&["run", "--provider", "fake", "hi"], ws.path(), home.path());
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!marker.exists(), "core.fsmonitor executed");
+}

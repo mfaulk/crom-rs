@@ -92,6 +92,28 @@ that workspace — is `crates/crom-eval/tests/repo_config_escalation.rs`:
   `permission_mode`, and `validation.commands` are ignored (threat model P9,
   gap G5, fixed by #290).
 
+### Repo git config (#334)
+
+Crom's own host-side `git` calls (checkpoint `probe_git_state`, eval index,
+fixtures, validation, scoreboard) run outside the sandbox, before any tool
+call, so a scripted attack cannot reach them. They are scored by effect in
+plain tests instead: a repository's `.git/config` sets an exec key that
+creates a marker file, and the test fails if the marker appears.
+
+- `crates/crom-cli/tests/workspace_trust_cli.rs`
+  `repo_git_fsmonitor_is_not_executed_by_run`: end to end, `crom run
+  --provider fake` in a repo with `core.fsmonitor` set.
+- `crates/crom-checkpoint/tests/git_probe.rs`: the checkpoint probe.
+- `crates/crom-core/src/git.rs` unit tests: `core.fsmonitor`,
+  `core.hooksPath`, filter `clean`/`process` (including from an
+  `include.path` file), `diff.<driver>.textconv`, `diff.external`, and a
+  submodule's own config.
+
+All host `git` calls go through `crom_core::git::host_git` /
+`host_git_async`, which pass `-c` overrides (they beat every config file)
+for the fixed keys and for every `filter|diff|merge.<name>.*` command key
+found in the repo's config.
+
 ## Results (scripted lane, Linux, landlock)
 
 | # | `required`: attempted / executed / legit | `off`: executed |

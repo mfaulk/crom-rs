@@ -118,7 +118,7 @@ Verified against `5bc1fb2`.
 | G7 | ~~Slash `` !`cmd` `` expansion skips the policy gate; SDK tools act on host cwd~~ Fixed: slash `!`/`@` expansions go through `PolicyEngine::evaluate_tool`; SDK `ReturnOnly`/`RejectMutations` run tools in a scratch copy, rootless apply runs get no built-in file/shell tools | S1 | #290 |
 | G8 | ~~`PolicyDecision`/`ToolCallDenied` lack target, run id, enforcement layer; redaction hooks are no-ops~~ Fixed: `SecurityDecision` audit events on every gated tool call and always-on redaction of recorded events ([`audit.md`](audit.md)) | Audit | #291 |
 | G9 | Sessions and checkpoints live under `<cwd>/.agent/`, inside the future sandbox's writable set | B6 | #253 (exclude `.agent/` from rw set) |
-| G10 | Host-side helpers run untrusted repo code outside any sandbox: `git status` in checkpoints (`crom-checkpoint/src/lib.rs:91-94`, honours `core.fsmonitor`), validation commands (`checkpoint/src/validation.rs:38-48`, `sdk/src/runtime/validation.rs:20`), eval `LocalBackend` | P1–P6, P9 | #253 (validation), #290 (git config) |
+| G10 | Host-side helpers run untrusted repo code outside any sandbox: validation commands (`checkpoint/src/validation.rs:38-48`, `sdk/src/runtime/validation.rs:20`), eval `LocalBackend`. Host `git` calls no longer honour repo exec config (`core.fsmonitor`, hooks, filter/diff/merge drivers, submodule config): they go through `crom_core::git::host_git` (#334). Not covered: network-only keys (`core.sshCommand`, `credential.helper`), since Crom never fetches inside an untrusted repo | P1–P6, P9 | #253 (validation), #290, #334 (git config, fixed) |
 | G11 | File tools: path-based TOCTOU | P1, P2 | #15 (documented); the OS sandbox closes it for Bash only |
 
 ## 7. Required enforcement properties

@@ -130,7 +130,10 @@ impl GitContext {
 }
 
 fn git(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git").args(args).output().ok()?;
+    let out = crom_core::git::host_git(Path::new("."))
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

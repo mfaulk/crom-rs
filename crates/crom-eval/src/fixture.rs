@@ -6,7 +6,6 @@
 //! agent runs, [`generate_patch`] diffs the workspace against that baseline.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::task::{EvalTask, FixtureKind};
 
@@ -141,10 +140,8 @@ pub fn fetch_git_fixture(
         .map_err(|e| FixtureError::Io(format!("staging dir: {e}")))?;
     let dir = staging.path();
     let git = |args: &[&str]| -> Result<String, FixtureError> {
-        let out = Command::new("git")
+        let out = crom_core::git::host_git(dir)
             .args(args)
-            .current_dir(dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .map_err(|e| FixtureError::Git(format!("spawn git: {e}")))?;
         if !out.status.success() {
@@ -230,7 +227,7 @@ fn copy_dir_inner(src: &Path, dst: &Path, at_root: bool) -> Result<(), FixtureEr
 
 /// Run a git command in `dir`, returning stdout on success.
 fn git(dir: &Path, args: &[&str]) -> Result<String, FixtureError> {
-    let output = Command::new("git")
+    let output = crom_core::git::host_git(dir)
         // Local identity, gpg-off, and safe.directory so git operations never
         // depend on (or fail against) the host's global git config — important
         // in CI containers where the directory owner may differ from the user.
@@ -239,7 +236,6 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, FixtureError> {
         .args(["-c", "commit.gpgsign=false"])
         .args(["-c", "init.defaultBranch=main"])
         .args(["-c", "safe.directory=*"])
-        .current_dir(dir)
         .args(args)
         .output()
         .map_err(|e| FixtureError::Git(format!("spawn git {args:?}: {e}")))?;
@@ -492,6 +488,7 @@ mod git_fixture_tests {
     use super::*;
     use crate::task::{FixtureSpec, OracleSpec};
     use std::fs;
+    use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
