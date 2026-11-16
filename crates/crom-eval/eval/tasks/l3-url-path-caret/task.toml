@@ -1,0 +1,97 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-url-path-caret"
+title = "Percent-encode the caret in URL paths per the WHATWG URL Standard"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "parsing", "upstream", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is the `rust-url` workspace (`url`, `idna`, `percent-encoding`,
+`form_urlencoded`, `data-url`). The `url` crate does not percent-encode the
+caret (`^`, U+005E) in URL paths, so it disagrees with browsers and the WHATWG
+URL Standard:
+
+    let url = url::Url::parse("http://localhost/a^b").unwrap();
+    assert_eq!(url.path(), "/a%5Eb"); // actually returns "/a^b"
+
+The same happens for non-special schemes (`foo://host/^` keeps a raw `^`)
+and when a path is assigned through the path / pathname setters, e.g. setting
+the pathname of `a:/` to a string containing `^`.
+
+Expected behavior: when parsing or setting a path, the `url` crate uses the
+Standard's path percent-encode set, which is the query percent-encode set
+(C0 controls, space, `"`, `#`, `<`, `>`) plus `?`, `^`, `` ` ``, `{` and `}`.
+Characters already encoded today must stay encoded, userinfo encoding must not
+change, and queries and fragments are unaffected.
+
+The workspace's web-platform-tests runner keeps a list of known failures; if
+your fix makes some of those cases pass, it will tell you so, and the list
+should be updated accordingly. Keep the public API of every crate unchanged
+and keep the existing test suite green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "url/Cargo.toml",
+  "idna/Cargo.toml",
+  "percent_encoding/Cargo.toml",
+  "form_urlencoded/Cargo.toml",
+  "data-url/Cargo.toml",
+  "url_debug_tests/Cargo.toml",
+]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "c8cb4371478cbba96ca25bce6681d13f05e2377d"
+path = "l3-url-path-caret"
+
+[oracle]
+kind = "command"
+commands = [
+  "cargo test --workspace --offline --lib --tests",
+  "cargo test --workspace --offline --doc -- --test-threads 8",
+]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+  "cargo test --offline -p url --test unit",
+  "cargo test --offline -p url --test url_wpt",
+]
+
+[provenance]
+author = "rust-url contributors"
+source = "upstream"
+license = "MIT OR Apache-2.0"
+created = "2026-11-15"
+upstream = "https://github.com/servo/rust-url"
+base_commit = "51f71580e2d8a58eb98b53fdb139dfffa13571bf"
+fix_commit = "25137be1fc1d35cc8ea7d43fc0a02166b023a483"

@@ -256,12 +256,28 @@ impl IsolationBackend for ContainerBackend {
         command: &str,
         limits: &CommandLimits,
     ) -> Result<CommandOutcome, IsolationError> {
+        let args = self.run_args(workspace, command, limits);
+        let result =
+            crate::oracle::run_argv(&self.engine, &args, Path::new("."), limits.timeout).await;
+        Ok(CommandOutcome {
+            result,
+            backend: self.engine.clone(),
+        })
+    }
+}
+
+impl ContainerBackend {
+    /// Engine argv for running `command` in `workspace`.
+    fn run_args(&self, workspace: &Path, command: &str, limits: &CommandLimits) -> Vec<String> {
         let ws = workspace.to_string_lossy().to_string();
+        // `:Z` gives the per-run workspace a private SELinux label so an
+        // enforcing host (Fedora, RHEL) lets the container read it; engines
+        // ignore it where SELinux is off.
         let mut args: Vec<String> = vec![
             "run".into(),
             "--rm".into(),
             "-v".into(),
-            format!("{ws}:/work"),
+            format!("{ws}:/work:Z"),
             "-w".into(),
             "/work".into(),
         ];
@@ -289,13 +305,7 @@ impl IsolationBackend for ContainerBackend {
         args.push("sh".into());
         args.push("-c".into());
         args.push(command.to_string());
-
-        let result =
-            crate::oracle::run_argv(&self.engine, &args, Path::new("."), limits.timeout).await;
-        Ok(CommandOutcome {
-            result,
-            backend: self.engine.clone(),
-        })
+        args
     }
 }
 
@@ -315,6 +325,19 @@ pub fn build_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The workspace bind mount is relabeled (`:Z`) so SELinux-enforcing hosts let the container read it.
+    #[test]
+    fn container_mount_is_selinux_relabeled() {
+        let b = ContainerBackend {
+            engine: "podman".into(),
+            version: None,
+            image: "img".into(),
+        };
+        let args = b.run_args(Path::new("/ws"), "true", &CommandLimits::default());
+        assert!(args.iter().any(|a| a == "/ws:/work:Z"), "{args:?}");
+        assert_eq!(args.last().map(String::as_str), Some("true"));
+    }
 
     #[test]
     fn parse_kinds() {

@@ -10,7 +10,7 @@ title = "Fix data loss when reopening a log-structured store with large values"
 category = "bugfix"
 difficulty = "medium"
 tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "debugging", "l3"]
-suites = ["l3"]
+suites = ["l3-mini"]
 
 prompt = """
 Bug report against the `logkv` workspace (`wire`, `logstore`, `kvtool`):

@@ -10,7 +10,7 @@ title = "Deep-merge config layers and fix environment overrides in layercfg"
 category = "bugfix"
 difficulty = "hard"
 tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "config", "l3"]
-suites = ["l3"]
+suites = ["l3-mini"]
 
 prompt = """
 The `layercfg` workspace (`confval`, `layers`, `appconfig`) loads the

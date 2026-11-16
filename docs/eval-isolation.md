@@ -38,6 +38,10 @@ $ crom eval run --suite <suite> \
 - `--cpu-limit` / `--memory-limit` — enforced by container backends only
   (`--cpus`, `--memory`); recorded but not enforced for `local`.
 - `--container-image` — the image to run in (default `rust:latest`).
+- The workspace is bind-mounted with `:Z`, so SELinux-enforcing hosts
+  (Fedora, RHEL) let the container read it; engines ignore the flag elsewhere.
+- `crom eval validate-task` / `validate-suite` take the same `--isolation` and
+  `--container-image` flags to verify tasks inside a container.
 - `--sandbox required|off` — OS sandbox for the agent's `Bash` calls (see
   [Agent sandbox](#agent-sandbox)). Default `required` for live providers,
   `off` for `fake`/`golden`.

@@ -65,6 +65,11 @@ checks flag both.
 ```console
 $ crom eval validate-task <task-id>
 $ crom eval validate-suite <suite> --repeat 5   # flake detection
+$ CROM_EVAL_PODMAN=1 crom eval validate-suite <suite> --isolation podman \
+    --container-image docker.io/library/rust:1-slim   # verification in a container, network none
 ```
 
-Both must report 0 errors before the task is merged.
+Both must report 0 errors before the task is merged. `--isolation
+docker|podman` runs every verification command in the container backend
+(opt-in via `CROM_EVAL_DOCKER=1` / `CROM_EVAL_PODMAN=1`); an unavailable
+backend is a validation error, never a silent fallback to the host.

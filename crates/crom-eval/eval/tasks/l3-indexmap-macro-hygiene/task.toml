@@ -1,0 +1,87 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-indexmap-macro-hygiene"
+title = "Stop indexmap!/indexset! macros from shadowing a caller's CAP constant"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "macros", "upstream", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is the `indexmap` crate (with its `test-nostd`, `test-serde` and
+`test-sval` workspace members). The construction macros `indexmap!`,
+`indexmap_with_default!`, `indexset!` and `indexset_with_default!` silently
+produce the wrong contents when the caller has an item named `CAP` in scope.
+
+Reproduce it from outside the crate:
+
+```rust
+const CAP: usize = 42;
+let m = indexmap::indexmap! { "k" => CAP };
+assert_eq!(m["k"], 42); // fails: the value stored is 1
+
+let s = indexmap::indexset!(CAP);
+assert_eq!(s[0], 42);   // fails: the element stored is 1
+```
+
+The same happens with `indexmap_with_default!(fnv::FnvHasher; ...)` and
+`indexset_with_default!(fnv::FnvHasher; ...)`. A caller's local variable
+named `map` (for the map macros) used as a key or value must also keep
+referring to the caller's binding.
+
+Expected: the macros must evaluate the caller's key/value/element
+expressions exactly as written, regardless of which names the caller has in
+scope, while still pre-sizing the collection for the number of entries.
+
+Keep the public API (macro names and accepted syntax) unchanged and keep
+`cargo test --workspace` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "c8cb4371478cbba96ca25bce6681d13f05e2377d"
+path = "l3-indexmap-macro-hygiene"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --workspace --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline -p indexmap --test macros_full_path"]
+
+[provenance]
+author = "indexmap contributors"
+source = "upstream"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-15"
+upstream = "https://github.com/indexmap-rs/indexmap"
+base_commit = "fdf7e1738b3b53869bdc15d666f9b81961041825"
+fix_commit = "c067355e1ca5ec39348f42dcee582d4f222c3295"

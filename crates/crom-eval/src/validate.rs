@@ -15,7 +15,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::fixture::{copy_dir_recursive, prepare_workspace};
-use crate::isolation::{CommandLimits, LocalBackend};
+use crate::isolation::{build_backend, CommandLimits, IsolationBackend, IsolationKind};
 use crate::oracle::{self, OracleReport};
 use crate::schema::{Level, ReferenceKind, TaskKind, SUPPORTED_SCHEMA_VERSIONS};
 use crate::task::EvalTask;
@@ -117,17 +117,26 @@ impl ValidationReport {
     }
 }
 
+/// Where validation runs verification commands.
+#[derive(Debug, Clone, Default)]
+pub struct ValidationOptions {
+    /// Verification backend (`local`, or opt-in `docker`/`podman`).
+    pub isolation: IsolationKind,
+    /// Container image override (container backends only).
+    pub container_image: Option<String>,
+}
+
 async fn run_oracle_in(
+    backend: &dyn IsolationBackend,
     workspace: &Path,
     oracle_spec: &crate::task::OracleSpec,
     timeout: std::time::Duration,
 ) -> OracleReport {
-    let backend = LocalBackend;
     let limits = CommandLimits {
         timeout,
         ..Default::default()
     };
-    oracle::evaluate_oracle(oracle_spec, workspace, &[], &backend, &limits).await
+    oracle::evaluate_oracle(oracle_spec, workspace, &[], backend, &limits).await
 }
 
 fn git_apply_check(workspace: &Path, patch: &Path) -> Result<(), String> {
@@ -158,8 +167,13 @@ fn git_apply(workspace: &Path, patch: &Path) -> Result<(), String> {
     }
 }
 
-/// Validate a single task without invoking a model.
+/// Validate a single task without invoking a model (local verification).
 pub async fn validate_task(task: &EvalTask) -> ValidationReport {
+    validate_task_with(task, &ValidationOptions::default()).await
+}
+
+/// Validate a single task, running verification on `opts.isolation`.
+pub async fn validate_task_with(task: &EvalTask, opts: &ValidationOptions) -> ValidationReport {
     let mut checks = Vec::new();
 
     // Schema version.
@@ -221,6 +235,25 @@ pub async fn validate_task(task: &EvalTask) -> ValidationReport {
         ));
     }
 
+    // An unavailable backend is an error, never a silent local fallback.
+    let backend = match build_backend(&opts.isolation, opts.container_image.clone()) {
+        Ok(b) => {
+            checks.push(Check::ok(
+                "isolation",
+                format!("verification runs in {}", b.id()),
+            ));
+            b
+        }
+        Err(e) => {
+            checks.push(Check::error("isolation", e.to_string()));
+            return ValidationReport {
+                task_id: task.id.clone(),
+                checks,
+            };
+        }
+    };
+    let backend = backend.as_ref();
+
     // Materialize the fixture into a temp workspace.
     let tmp = match tempfile::tempdir() {
         Ok(t) => t,
@@ -255,7 +288,7 @@ pub async fn validate_task(task: &EvalTask) -> ValidationReport {
     let timeout = oracle::task_command_timeout(task);
 
     // Public verification runs.
-    let public = run_oracle_in(&ws, &task.oracle, timeout).await;
+    let public = run_oracle_in(backend, &ws, &task.oracle, timeout).await;
     checks.push(Check::ok(
         "public_verification_runs",
         format!(
@@ -277,7 +310,7 @@ pub async fn validate_task(task: &EvalTask) -> ValidationReport {
                     let _ = copy_dir_recursive(&src, &ws);
                 }
             }
-            let base_hidden = run_oracle_in(&ws, &hidden.oracle, timeout).await;
+            let base_hidden = run_oracle_in(backend, &ws, &hidden.oracle, timeout).await;
             checks.push(Check::ok(
                 "hidden_verification_runs",
                 format!(
@@ -316,7 +349,7 @@ pub async fn validate_task(task: &EvalTask) -> ValidationReport {
                     Ok(()) => {
                         let _ = git_apply(&ws2, &patch);
                         checks.push(Check::ok("oracle_patch_applies", "applies cleanly"));
-                        let pub2 = run_oracle_in(&ws2, &task.oracle, timeout).await;
+                        let pub2 = run_oracle_in(backend, &ws2, &task.oracle, timeout).await;
                         if pub2.all_passed() {
                             checks.push(Check::ok(
                                 "oracle_patch_passes_public",
@@ -336,7 +369,8 @@ pub async fn validate_task(task: &EvalTask) -> ValidationReport {
                                         let _ = copy_dir_recursive(&src, &ws2);
                                     }
                                 }
-                                let hid2 = run_oracle_in(&ws2, &hidden.oracle, timeout).await;
+                                let hid2 =
+                                    run_oracle_in(backend, &ws2, &hidden.oracle, timeout).await;
                                 if hid2.all_passed() {
                                     checks.push(Check::ok(
                                         "oracle_patch_passes_hidden",
@@ -492,6 +526,52 @@ fn canary_checks(task: &EvalTask, checks: &mut Vec<Check>) {
         }
     }
 
+    // A git fixture must be pinned to an exact commit on an https (or local
+    // file) repo, and its sub-path must stay inside that checkout (#289).
+    if task.fixture.kind == crate::task::FixtureKind::Git {
+        use std::path::Component;
+        let f = &task.fixture;
+        let mut problems = Vec::new();
+        match f.repo.as_deref() {
+            Some(r) if r.starts_with("https://") || r.starts_with("file://") => {}
+            Some(r) => problems.push(format!("repo {r:?} must be an https:// or file:// URL")),
+            None => problems.push("missing `repo`".to_string()),
+        }
+        match f.rev.as_deref() {
+            Some(r) if crate::fixture::is_full_sha(r) => {}
+            Some(r) => problems.push(format!("rev {r:?} must be a full 40-hex commit SHA")),
+            None => problems.push("missing `rev`".to_string()),
+        }
+        match f.path.as_deref() {
+            Some(p) => {
+                let comps: Vec<Component> = Path::new(p).components().collect();
+                let relative = comps.iter().any(|c| matches!(c, Component::Normal(_)))
+                    && comps
+                        .iter()
+                        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+                if !relative {
+                    problems.push(format!("path {p:?} must be a relative sub-directory"));
+                }
+            }
+            None => problems.push("missing `path`".to_string()),
+        }
+        if problems.is_empty() {
+            checks.push(Check::ok(
+                "git_fixture_pin",
+                format!(
+                    "fixture pinned to {}@{}",
+                    f.repo.as_deref().unwrap_or_default(),
+                    f.rev.as_deref().unwrap_or_default()
+                ),
+            ));
+        } else {
+            checks.push(Check::error(
+                "git_fixture_pin",
+                format!("git fixture: {}", problems.join("; ")),
+            ));
+        }
+    }
+
     // Hidden test filenames leaking into the prompt.
     if let Some(hidden) = &task.hidden {
         let mut leaked = Vec::new();
@@ -568,6 +648,19 @@ pub enum FlakeVerdict {
 /// verdict. (Determinism here measures the verification harness/commands, not
 /// the model.) `repeat` must be >= 1.
 pub async fn flake_detect(task: &EvalTask, repeat: usize) -> FlakeVerdict {
+    flake_detect_with(task, repeat, &ValidationOptions::default()).await
+}
+
+/// [`flake_detect`] on `opts.isolation`.
+pub async fn flake_detect_with(
+    task: &EvalTask,
+    repeat: usize,
+    opts: &ValidationOptions,
+) -> FlakeVerdict {
+    let Ok(backend) = build_backend(&opts.isolation, opts.container_image.clone()) else {
+        return FlakeVerdict::HarnessError;
+    };
+    let backend = backend.as_ref();
     let repeat = repeat.max(1);
     let timeout = oracle::task_command_timeout(task);
     let mut public_results = Vec::new();
@@ -583,7 +676,7 @@ pub async fn flake_detect(task: &EvalTask, repeat: usize) -> FlakeVerdict {
         if prepare_workspace(task, &ws).is_err() {
             return FlakeVerdict::HarnessError;
         }
-        let public = run_oracle_in(&ws, &task.oracle, timeout).await;
+        let public = run_oracle_in(backend, &ws, &task.oracle, timeout).await;
         if public.commands.iter().any(|c| c.timed_out) {
             any_timeout = true;
         }
@@ -597,7 +690,7 @@ pub async fn flake_detect(task: &EvalTask, repeat: usize) -> FlakeVerdict {
                         let _ = copy_dir_recursive(&src, &ws);
                     }
                 }
-                let hid = run_oracle_in(&ws, &hidden.oracle, timeout).await;
+                let hid = run_oracle_in(backend, &ws, &hidden.oracle, timeout).await;
                 if hid.commands.iter().any(|c| c.timed_out) {
                     any_timeout = true;
                 }
@@ -638,6 +731,7 @@ mod tests {
         t.fixture = crate::task::FixtureSpec {
             kind: crate::task::FixtureKind::CopyDir,
             path: Some("repo".to_string()),
+            ..Default::default()
         };
         t
     }
@@ -895,6 +989,167 @@ mod tests {
                 FlakeVerdict::FlakyPublic | FlakeVerdict::StablePass | FlakeVerdict::StableFail
             ),
             "unexpected verdict {verdict:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod git_fixture_validation_tests {
+    use super::*;
+    use crate::task::{FixtureKind, FixtureSpec};
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn git_task(repo: Option<&str>, rev: Option<&str>, path: Option<&str>) -> EvalTask {
+        let mut t = EvalTask::minimal(
+            "t",
+            "t",
+            "p",
+            crate::task::OracleSpec::default(),
+            std::path::PathBuf::from("."),
+        );
+        t.fixture = FixtureSpec {
+            kind: FixtureKind::Git,
+            path: path.map(str::to_string),
+            repo: repo.map(str::to_string),
+            rev: rev.map(str::to_string),
+        };
+        t
+    }
+
+    fn pin_check(t: &EvalTask) -> Option<bool> {
+        let mut checks = Vec::new();
+        canary_checks(t, &mut checks);
+        checks
+            .iter()
+            .find(|c| c.name == "git_fixture_pin")
+            .map(|c| c.passed)
+    }
+
+    // A git fixture pinned to a full SHA on an https repo with a relative sub-path passes.
+    #[test]
+    fn git_fixture_pin_accepts_full_sha() {
+        let t = git_task(
+            Some("https://github.com/mfaulk/crom-eval-fixtures"),
+            Some(SHA),
+            Some("l3-x"),
+        );
+        assert_eq!(pin_check(&t), Some(true));
+    }
+
+    // Branch names, short SHAs, missing fields, non-https repos, and escaping paths are rejected.
+    #[test]
+    fn git_fixture_pin_rejects_unpinned_or_unsafe() {
+        let repo = Some("https://github.com/mfaulk/crom-eval-fixtures");
+        for (r, rev, path) in [
+            (repo, Some("main"), Some("l3-x")),
+            (repo, Some("0123456"), Some("l3-x")),
+            (repo, None, Some("l3-x")),
+            (None, Some(SHA), Some("l3-x")),
+            (Some("http://example.com/r"), Some(SHA), Some("l3-x")),
+            (Some("ssh://git@example.com/r"), Some(SHA), Some("l3-x")),
+            (repo, Some(SHA), Some("../x")),
+            (repo, Some(SHA), Some("/abs")),
+            (repo, Some(SHA), None),
+        ] {
+            assert_eq!(
+                pin_check(&git_task(r, rev, path)),
+                Some(false),
+                "{r:?} {rev:?} {path:?} must be rejected"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod isolation_option_tests {
+    use super::*;
+    use crate::isolation::IsolationKind;
+
+    fn trivial_task(dir: &Path) -> EvalTask {
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        std::fs::write(dir.join("repo/marker.txt"), "x\n").unwrap();
+        let mut t = EvalTask::minimal(
+            "iso",
+            "iso",
+            "p",
+            crate::task::OracleSpec {
+                kind: crate::task::OracleKind::Command,
+                commands: vec!["test -f marker.txt".into()],
+                ..Default::default()
+            },
+            dir.to_path_buf(),
+        );
+        t.timeout = std::time::Duration::from_secs(120);
+        t
+    }
+
+    // An unavailable container backend (opt-in env unset) is reported as an `isolation` error, not a local fallback.
+    #[tokio::test]
+    async fn unavailable_backend_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task = trivial_task(tmp.path());
+        let opts = ValidationOptions {
+            isolation: IsolationKind::Docker,
+            container_image: None,
+        };
+        let report = temp_env::async_with_vars(
+            [(crate::isolation::DOCKER_ENV, None::<&str>)],
+            validate_task_with(&task, &opts),
+        )
+        .await;
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "isolation" && !c.passed),
+            "{}",
+            report.to_markdown()
+        );
+    }
+
+    // The report names the backend that ran verification.
+    #[tokio::test]
+    async fn local_backend_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task = trivial_task(tmp.path());
+        let report = validate_task_with(&task, &ValidationOptions::default()).await;
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "isolation" && c.passed && c.detail.contains("local")),
+            "{}",
+            report.to_markdown()
+        );
+    }
+
+    // Opt-in: with CROM_EVAL_PODMAN=1 and podman present, verification runs inside a container.
+    #[tokio::test]
+    #[ignore = "needs podman and the rust image; run with CROM_EVAL_PODMAN=1"]
+    async fn podman_backend_runs_public_oracle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task = trivial_task(tmp.path());
+        let opts = ValidationOptions {
+            isolation: IsolationKind::Podman,
+            container_image: Some("docker.io/library/alpine:3.20".into()),
+        };
+        let report = validate_task_with(&task, &opts).await;
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "isolation" && c.passed && c.detail.contains("podman")),
+            "{}",
+            report.to_markdown()
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "public_verification_runs" && c.detail.starts_with("1/1")),
+            "{}",
+            report.to_markdown()
         );
     }
 }

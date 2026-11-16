@@ -1,0 +1,90 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-petgraph-floyd-multiedge"
+title = "Fix Floyd-Warshall distances on graphs with parallel edges in petgraph"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "upstream", "hidden-tests", "bugfix", "graph-algorithms", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is the `petgraph` graph library. `petgraph::algo::floyd_warshall`
+returns wrong shortest-path distances when the graph has more than one edge
+between the same pair of nodes (parallel edges).
+
+Reproduce:
+
+```rust
+use petgraph::{algo::floyd_warshall, Graph, Directed};
+let mut g: Graph<(), i32, Directed> = Graph::new();
+let a = g.add_node(());
+let b = g.add_node(());
+let c = g.add_node(());
+g.extend_with_edges(&[(a, b, 1), (b, c, 2), (a, c, 20), (a, b, 10)]);
+let d = floyd_warshall(&g, |e| *e.weight()).unwrap();
+// expected d[&(a, b)] == 1 and d[&(a, c)] == 3, but we get 10 and 12
+```
+
+The result depends on edge insertion order: a later, more expensive
+parallel edge overwrites the cost of a cheaper one that was added earlier,
+so paths can come out longer than the true shortest path. (The distance
+from a node to itself must stay 0, even with a self-loop.)
+
+Expected behavior: for every ordered pair of nodes, the distance is the true
+shortest-path distance. Among parallel edges the cheapest one counts,
+whatever order the edges were added in. This applies to directed and
+undirected graphs (in an undirected graph an edge counts in both
+directions).
+
+Keep the public API unchanged and keep `cargo test` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = false
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "c8cb4371478cbba96ca25bce6681d13f05e2377d"
+path = "l3-petgraph-floyd-multiedge"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline --test floyd_warshall"]
+
+[provenance]
+author = "petgraph contributors"
+source = "upstream"
+license = "MIT OR Apache-2.0"
+created = "2026-11-15"
+upstream = "https://github.com/petgraph/petgraph"
+base_commit = "ee87fa29507b25030d5f7998a17b94e83d67af71"
+fix_commit = "45053893f3ef7d32924aa53fc26dbac7e79290c8"

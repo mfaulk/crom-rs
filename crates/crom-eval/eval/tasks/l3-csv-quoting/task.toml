@@ -10,7 +10,7 @@ title = "Implement RFC 4180 quoting in the tabular CSV reader"
 category = "bugfix"
 difficulty = "medium"
 tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "parsing", "l3"]
-suites = ["l3"]
+suites = ["l3-mini"]
 
 prompt = """
 The `tabular` workspace (`csvread`, `schema`, `colstats`) mangles real-world

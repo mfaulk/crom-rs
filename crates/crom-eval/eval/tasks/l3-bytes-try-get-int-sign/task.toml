@@ -1,0 +1,82 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-bytes-try-get-int-sign"
+title = "Sign-extend n-byte integers in the fallible Buf getters"
+category = "bugfix"
+difficulty = "easy"
+tags = ["rust", "crate", "hidden-tests", "bugfix", "upstream", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is the `bytes` crate. The fallible signed n-byte getters on `Buf`
+return wrong values for negative numbers when fewer than 8 bytes are read.
+
+Reproduce:
+
+```rust
+use bytes::Buf;
+
+let mut a = &[0xff, 0xff, 0xff][..];
+assert_eq!(a.try_get_int(3), Ok(-1));   // actually returns Ok(16777215)
+
+let mut b = &[0xff, 0xff, 0xff][..];
+assert_eq!(b.get_int(3), -1);           // the panicking variant is correct
+```
+
+`try_get_int`, `try_get_int_le` and `try_get_int_ne` must return the same
+value as `get_int`, `get_int_le` and `get_int_ne` respectively: the
+`nbytes`-byte two's-complement value sign-extended to `i64`. Positive values,
+full 8-byte reads, the `TryGetError` returned when not enough bytes remain,
+and the panic when `nbytes > 8` must stay as they are.
+
+Keep the public API unchanged and the existing test suite green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "c8cb4371478cbba96ca25bce6681d13f05e2377d"
+path = "l3-bytes-try-get-int-sign"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --offline -- --test-threads 8"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline --test test_buf -- --test-threads 8"]
+
+[provenance]
+author = "bytes contributors"
+source = "upstream"
+license = "MIT"
+created = "2026-11-15"
+upstream = "https://github.com/tokio-rs/bytes"
+base_commit = "d5c8ad3227afe459c09f1d0d85455abf00f0381a"
+fix_commit = "7930d93d583757e922014312d4aa3e58a415131f"

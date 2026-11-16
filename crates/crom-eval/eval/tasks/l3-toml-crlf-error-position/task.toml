@@ -1,0 +1,96 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-toml-crlf-error-position"
+title = "Fix wrong error line/column for CRLF input in the toml crate"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "workspace", "hidden-tests", "bugfix", "parsing", "upstream", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is the `toml` crate (with its `toml_test_suite` workspace member).
+Error messages from `toml::from_str` report the wrong position when the
+input uses Windows (CRLF, `\\r\\n`) line endings. Positions are correct for
+the same document with plain `\\n` line endings.
+
+Reproduce:
+
+```rust
+let lf   = "\\n[t1]\\n[t2]\\na = 1\\na = 2\\n";
+let crlf = "\\r\\n[t1]\\r\\n[t2]\\r\\na = 1\\r\\na = 2\\r\\n";
+let e1 = toml::from_str::<toml::Value>(lf).unwrap_err().to_string();
+let e2 = toml::from_str::<toml::Value>(crlf).unwrap_err().to_string();
+```
+
+`e1` is "duplicate key: `a` for key `t2` at line 3 column 1", but `e2`
+reports a different column for the same error (the error drifts further
+the more CRLF lines precede it).
+
+Expected: line and column numbers in error messages are the same whether
+the document uses `\\n` or `\\r\\n` line endings (the `\\r` belongs to the
+line terminator, not to the next line). For the example above both
+messages must be "duplicate key: `a` for key `t2` at line 3 column 1".
+
+Keep the public API unchanged and keep the existing test suite green
+(`cargo test --workspace --lib --tests -- --skip float_inf` and the
+`toml` doc tests).
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock", "test-suite/Cargo.toml", ".cargo/config.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = false
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "c8cb4371478cbba96ca25bce6681d13f05e2377d"
+path = "l3-toml-crlf-error-position"
+
+# `--lib --tests` skips the upstream examples, which use
+# `#![deny(warnings)]` and no longer compile warning-free on current stable.
+# `float_inf` fails at the base commit on current stable because std now
+# formats `-0.0` differently (unrelated to this task).
+[oracle]
+kind = "command"
+commands = [
+  "cargo test --workspace --offline --lib --tests -- --skip float_inf",
+  "cargo test --offline -p toml --doc",
+]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = [
+  "cargo test --offline -p toml_test_suite --test de-errors",
+]
+
+[provenance]
+author = "toml-rs contributors"
+source = "upstream"
+license = "MIT OR Apache-2.0"
+created = "2026-11-15"
+upstream = "https://github.com/toml-rs/toml-rs"
+base_commit = "d03b251af5f935ea8363ebc59f1caddf99feb790"
+fix_commit = "f4dd4a2438c0000846a6bfd21d8b18dc47f280cf"

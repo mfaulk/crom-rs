@@ -1,0 +1,93 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-serde-yaml-duplicate-keys"
+title = "Reject duplicate mapping keys when deserializing serde_yaml::Value"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "hidden-tests", "bugfix", "parsing", "serde", "upstream", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is the `serde_yaml` crate. YAML requires the keys of a mapping to be
+unique, but deserializing a document with a repeated key into
+`serde_yaml::Value` (or `serde_yaml::Mapping`) silently succeeds and keeps
+only the last value:
+
+```rust
+let v: serde_yaml::Value = serde_yaml::from_str("---\\nthing: true\\nthing: false\\n").unwrap();
+// Ok(Mapping {"thing": Bool(false)}) -- the first entry is silently lost
+```
+
+Expected: deserializing a `Mapping` (and therefore a `Value`) fails as
+soon as a key that is already present is seen again. Keys are compared
+the way `Mapping` already compares them (so `null` and `~` are the same
+key). The error's `to_string()` must be the following text, then the usual
+` at line L column C` position suffix serde_yaml adds to errors:
+
+- string key: `duplicate entry with key "thing"` (the key `Debug`-quoted)
+- null key: `duplicate entry with null key`
+- boolean key: the key wrapped in backticks, e.g. duplicate entry with key `true`
+- number key: `duplicate entry with key 99`
+- sequence, mapping or tagged key: `duplicate entry in YAML map`
+
+For example `---\\nthing: true\\nthing: false\\n` must produce
+`duplicate entry with key "thing" at line 2 column 1`, and
+`---\\n{}: true\\n{}: false\\n` must produce
+`duplicate entry in YAML map at line 2 column 1`. Documents without
+duplicate keys must deserialize exactly as before.
+
+Keep the public API unchanged and keep `cargo test` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = false
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "c8cb4371478cbba96ca25bce6681d13f05e2377d"
+path = "l3-serde-yaml-duplicate-keys"
+
+# The snapshot's .cargo/config.toml allows rustc's deny-by-default
+# `dangerous_implicit_autorefs` lint, which the base commit's src/libyaml
+# code predates; without it the crate does not build on current stable.
+[oracle]
+kind = "command"
+commands = ["cargo test --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline --test test_error"]
+
+[provenance]
+author = "serde-yaml contributors"
+source = "upstream"
+license = "MIT OR Apache-2.0"
+created = "2026-11-15"
+upstream = "https://github.com/dtolnay/serde-yaml"
+base_commit = "13837fd5686a4f39fc8d9b8287622fe254b5d9bc"
+fix_commit = "ec1c1e42cbf5f740e72e378553a63af52fcc9f29"
