@@ -10,6 +10,8 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::audit::AuditScope;
+use crate::builtin_hooks::redact_secrets_in_str;
 use crate::checkpoint::CheckpointHandle;
 use crate::conversation::{
     AssistantContent, AssistantMessage, ContentBlock, Conversation, Message, MessageRole,
@@ -23,6 +25,7 @@ use crate::events::{
     ToolLoadingModeResolved, ToolSearchCompleted, ToolSearchFailed, ToolSearchStarted,
     UserToolResult,
 };
+use crate::events::{EnforcementLayer, SecurityDecision, SecurityOutcome, SecurityPrincipal};
 use crate::hooks::{aggregate, HookAggregateDecision, HookEventName, HookInput, Hooks, StopReason};
 use crate::mcp::{
     mcp_completion_from_result, mcp_failure_from_error, register_mcp_tools, tool_metadata,
@@ -98,6 +101,7 @@ pub struct Agent {
     /// need external cancellation).
     cancel: Option<Arc<AtomicBool>>,
     cancel_notify: Option<Arc<tokio::sync::Notify>>,
+    principal: SecurityPrincipal,
 }
 
 #[derive(Default)]
@@ -120,6 +124,7 @@ pub struct AgentBuilder {
     /// Issue #145 / #155.
     cancel: Option<Arc<AtomicBool>>,
     cancel_notify: Option<Arc<tokio::sync::Notify>>,
+    principal: SecurityPrincipal,
 }
 
 impl AgentBuilder {
@@ -202,6 +207,13 @@ impl AgentBuilder {
         self
     }
 
+    /// Identity recorded as `principal` on this agent's `SecurityDecision`
+    /// events. Defaults to [`SecurityPrincipal::Session`].
+    pub fn principal(mut self, principal: SecurityPrincipal) -> Self {
+        self.principal = principal;
+        self
+    }
+
     pub fn build(self) -> Result<Agent, AgentError> {
         let options = self
             .options
@@ -224,6 +236,7 @@ impl AgentBuilder {
             child_session_sink_factory: self.child_session_sink_factory,
             cancel: self.cancel,
             cancel_notify: self.cancel_notify,
+            principal: self.principal,
         })
     }
 }
@@ -273,7 +286,7 @@ impl Agent {
                 let _ = tx
                     .send(AgentEvent::Result(AgentResult {
                         subtype: ResultSubtype::ErrorDuringExecution,
-                        result: Some(format!("agent error: {e}")),
+                        result: Some(redact_secrets_in_str(&format!("agent error: {e}"))),
                         session_id,
                         run_id: None,
                         num_turns: 0,
@@ -347,6 +360,7 @@ pub(crate) async fn run_loop(
         child_session_sink_factory,
         cancel: _,
         cancel_notify: _,
+        principal,
     } = agent;
 
     let session_id = options
@@ -1092,6 +1106,10 @@ pub(crate) async fn run_loop(
                     // stream) was dropped. Treat that as an implicit cancel
                     // so the loop stops streaming work nobody is reading
                     // (#160). The next iteration's cancel check breaks out.
+                    // Per-chunk redaction is best effort: a secret split
+                    // across deltas is only caught in the persisted
+                    // `AssistantMessage`.
+                    let text = redact_secrets_in_str(&text);
                     if tx
                         .send(AgentEvent::AssistantTextDelta { text })
                         .await
@@ -1402,6 +1420,7 @@ pub(crate) async fn run_loop(
         struct PerCallState {
             effective_input: serde_json::Value,
             started: Instant,
+            audit: SecurityDecision,
         }
         let mut per_call_state: Vec<Option<PerCallState>> =
             (0..tool_calls.len()).map(|_| None).collect();
@@ -1439,6 +1458,13 @@ pub(crate) async fn run_loop(
                 AgentEvent::ToolCallStarted(ToolCallStarted { call: call.clone() }),
             )
             .await;
+            let audit_scope = AuditScope {
+                session_id: &session_id,
+                run_id: &cfg.run_id,
+                turn_index: turns,
+                principal: &principal,
+                cwd: &options.cwd,
+            };
             // Count every started call (including ones later denied) so the
             // `max_tool_calls` gate above mirrors the SDK's `ToolCallStarted`
             // tracking exactly.
@@ -1446,6 +1472,14 @@ pub(crate) async fn run_loop(
 
             if search_runtime.is_some() && !turn_loaded_names.contains(&call.name) {
                 let reason = format!("tool not loaded: {}", call.name);
+                let kind = allowed_tools.get(&call.name).map(|t| t.permission_kind());
+                emit_security(
+                    &tx,
+                    &session_sink,
+                    &session_id,
+                    audit_scope.blocked(call, kind, EnforcementLayer::Policy, &reason),
+                )
+                .await;
                 emit(
                     &tx,
                     &session_sink,
@@ -1468,6 +1502,13 @@ pub(crate) async fn run_loop(
                 Some(t) => t,
                 None => {
                     let reason = format!("tool not allowed: {}", call.name);
+                    emit_security(
+                        &tx,
+                        &session_sink,
+                        &session_id,
+                        audit_scope.blocked(call, None, EnforcementLayer::Policy, &reason),
+                    )
+                    .await;
                     emit(
                         &tx,
                         &session_sink,
@@ -1534,8 +1575,17 @@ pub(crate) async fn run_loop(
                 .clone()
                 .unwrap_or_else(|| call.input.clone());
 
+            let mut audit = audit_scope.from_policy(
+                call,
+                &effective_input,
+                kind,
+                &pdec,
+                SecurityOutcome::Blocked,
+            );
+
             if !matches!(pdec.outcome, PolicyOutcome::Allow) {
                 let reason = pdec.reason.clone().unwrap_or_else(|| "denied".to_string());
+                emit_security(&tx, &session_sink, &session_id, audit).await;
                 emit(
                     &tx,
                     &session_sink,
@@ -1589,6 +1639,10 @@ pub(crate) async fn run_loop(
                         .await;
                     }
                     if let Some(reason) = action.deny {
+                        audit.decision = PolicyOutcome::Deny;
+                        audit.enforcement = EnforcementLayer::Checkpoint;
+                        audit.reason = Some(redact_secrets_in_str(&reason));
+                        emit_security(&tx, &session_sink, &session_id, audit).await;
                         emit(
                             &tx,
                             &session_sink,
@@ -1620,6 +1674,10 @@ pub(crate) async fn run_loop(
                         .await;
                     }
                     if let Some(reason) = result.deny {
+                        audit.decision = PolicyOutcome::Deny;
+                        audit.enforcement = EnforcementLayer::Checkpoint;
+                        audit.reason = Some(redact_secrets_in_str(&reason));
+                        emit_security(&tx, &session_sink, &session_id, audit).await;
                         emit(
                             &tx,
                             &session_sink,
@@ -1728,6 +1786,7 @@ pub(crate) async fn run_loop(
             per_call_state[idx] = Some(PerCallState {
                 effective_input: effective_input.clone(),
                 started,
+                audit,
             });
             continue;
         }
@@ -1770,12 +1829,18 @@ pub(crate) async fn run_loop(
                 .expect("gate-loop must have recorded per-call state for runnable calls");
             let effective_input = state.effective_input;
             let started = state.started;
+            let mut audit = state.audit;
             // Re-establish the inner `_old_body_start_` once-only block:
             {
                 let duration_ms = elapsed_ms(started);
                 let (text, is_error, tool_result_obj) = match &exec {
                     Ok(res) => (res.flatten_text(), res.is_error, Some(res.clone())),
                     Err(ToolError::PermissionDenied(msg)) => {
+                        audit.decision = PolicyOutcome::Deny;
+                        audit.policy_source = None;
+                        audit.rule = None;
+                        audit.enforcement = EnforcementLayer::Sandbox;
+                        audit.reason = Some(redact_secrets_in_str(msg));
                         emit(
                             &tx,
                             &session_sink,
@@ -1892,6 +1957,12 @@ pub(crate) async fn run_loop(
                     }),
                 )
                 .await;
+                audit.outcome = match &exec {
+                    Err(ToolError::PermissionDenied(_)) => SecurityOutcome::Blocked,
+                    _ if is_error => SecurityOutcome::Failed,
+                    _ => SecurityOutcome::Executed,
+                };
+                emit_security(&tx, &session_sink, &session_id, audit).await;
                 emit_telemetry(
                     &telemetry_sink,
                     AgentTelemetryEvent::ToolExecutionCompleted {
@@ -2638,6 +2709,18 @@ async fn emit_cancellable(
     ev: AgentEvent,
     cancel: Option<&AtomicBool>,
 ) {
+    // Secrets are scrubbed from every recorded copy (session file and
+    // consumer stream); the model and tools keep the real values.
+    let ev = match crate::builtin_hooks::redact_secrets_in_serializable(ev) {
+        Ok(ev) => ev,
+        Err(_) => {
+            tracing::warn!(
+                session_id = %sid,
+                "dropping event whose redacted form no longer deserializes"
+            );
+            return;
+        }
+    };
     if let Some(s) = sink {
         // Persistence errors must not crash the run, but they must not
         // disappear silently either — a buggy/internal caller could supply
@@ -2660,9 +2743,20 @@ async fn emit_cancellable(
     }
 }
 
+async fn emit_security(
+    tx: &mpsc::Sender<AgentEvent>,
+    sink: &Option<Arc<dyn SessionSink>>,
+    sid: &SessionId,
+    decision: SecurityDecision,
+) {
+    emit(tx, sink, sid, AgentEvent::SecurityDecision(decision)).await;
+}
+
 async fn emit_telemetry(sink: &Option<Arc<dyn TelemetrySink>>, ev: AgentTelemetryEvent) {
     if let Some(s) = sink {
-        s.record(&ev).await;
+        if let Ok(ev) = crate::builtin_hooks::redact_secrets_in_serializable(ev) {
+            s.record(&ev).await;
+        }
     }
 }
 

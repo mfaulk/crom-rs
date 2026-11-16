@@ -698,12 +698,11 @@ impl AgentClient {
             summary_preview: result.summary_preview,
         };
         if let Some(sink) = &self.inner.session_sink {
-            let _ = sink
-                .record(
-                    &self.session_id,
-                    &crate::events::AgentEvent::CompactBoundary(boundary.clone()),
-                )
-                .await;
+            if let Ok(ev) = crate::builtin_hooks::redact_secrets_in_serializable(
+                crate::events::AgentEvent::CompactBoundary(boundary.clone()),
+            ) {
+                let _ = sink.record(&self.session_id, &ev).await;
+            }
         }
         Ok(boundary)
     }

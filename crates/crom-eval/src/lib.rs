@@ -43,6 +43,7 @@ pub mod result_schema;
 pub mod runner;
 pub mod schema;
 pub mod score;
+pub mod security;
 pub mod task;
 pub mod triage;
 pub mod validate;

@@ -64,6 +64,9 @@ pub enum SdkEvent {
     Diagnostic(DiagnosticEvent),
     /// A provider call failed transiently and is being retried.
     ProviderRetry(ProviderRetryEvent),
+    /// Structured security audit record for one tool call (M17.3). Emitted
+    /// under every verbosity. See `docs/security/audit.md`.
+    SecurityDecision(crom_core::events::SecurityDecision),
     RunCompleted(RunCompletedEvent),
     RunFailed(RunFailedEvent),
     RunCancelled(RunCancelledEvent),

@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod agents;
+pub mod audit;
 pub mod builtin_hooks;
 pub mod checkpoint;
 pub mod client;
@@ -44,11 +45,12 @@ pub use agents::{
     SubagentRuntime, SubagentStatus, SUBAGENT_TOOL_NAME,
 };
 pub use builtin_hooks::{
-    compiled_dangerous_bash_patterns, dangerous_bash_patterns, is_dangerous_bash_command,
-    redact_secrets_in_value, AuditEntry, AuditLogHook, BlockDangerousBashHook,
-    BlockEnvFileWritesHook, BlockMcpServerHook, BlockMcpToolNameHook, BlockMcpWriteLikeToolHook,
-    MaxPatchSizeHook, McpAuditLogHook, McpResultSizeLimitHook, McpSecretRedactionHook,
-    SecretRedactionHook,
+    compiled_dangerous_bash_patterns, contains_secret, dangerous_bash_patterns,
+    is_dangerous_bash_command, redact_secret_strings_in_value, redact_secrets_in_serializable,
+    redact_secrets_in_str, redact_secrets_in_value, AuditEntry, AuditLogHook,
+    BlockDangerousBashHook, BlockEnvFileWritesHook, BlockMcpServerHook, BlockMcpToolNameHook,
+    BlockMcpWriteLikeToolHook, MaxPatchSizeHook, McpAuditLogHook, McpResultSizeLimitHook,
+    McpSecretRedactionHook, SecretRedactionHook,
 };
 pub use checkpoint::{
     CheckpointApi, CheckpointBashAction, CheckpointCaptureResult, CheckpointHandle,

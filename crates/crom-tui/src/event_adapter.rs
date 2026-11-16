@@ -219,6 +219,29 @@ pub fn map_sdk_event(event: &SdkEvent) -> SdkEventOutcome {
             run_terminal: Some(false),
             ..SdkEventOutcome::default()
         },
+        // Only blocks get a card; executed/failed records duplicate the
+        // tool cards.
+        SdkEvent::SecurityDecision(d) => match d.outcome {
+            crom_core::events::SecurityOutcome::Blocked => SdkEventOutcome::with_card(EventCard {
+                kind: "security_blocked",
+                headline: format!(
+                    "⛔ {} blocked by {:?}{}",
+                    d.tool_name,
+                    d.enforcement,
+                    d.resource
+                        .as_deref()
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default()
+                ),
+                body: d
+                    .reason
+                    .as_deref()
+                    .map(|r| vec![preview(r, 240)])
+                    .unwrap_or_default(),
+                ..Default::default()
+            }),
+            _ => SdkEventOutcome::default(),
+        },
         SdkEvent::Internal(i) => SdkEventOutcome::with_card(EventCard {
             kind: "internal",
             headline: format!("· {}", i.kind),
@@ -284,6 +307,39 @@ mod tests {
         let out = map_sdk_event(&ev);
         assert!(out.card.is_none());
         assert_eq!(out.coalesce_assistant_delta.as_deref(), Some("partial"));
+    }
+
+    #[test]
+    // A blocked SecurityDecision renders a card; an executed one renders nothing.
+    fn security_decision_cards_only_for_blocks() {
+        let mk = |outcome| {
+            SdkEvent::SecurityDecision(crom_core::events::SecurityDecision {
+                session_id: crom_core::SessionId::new(),
+                run_id: rid(),
+                turn_index: 0,
+                principal: crom_core::events::SecurityPrincipal::Session,
+                tool_use_id: "t".into(),
+                tool_name: "Bash".into(),
+                action_class: None,
+                resource: Some("rm".into()),
+                policy_source: None,
+                rule: None,
+                decision: crom_core::PolicyOutcome::Deny,
+                enforcement: crom_core::events::EnforcementLayer::Policy,
+                outcome,
+                reason: Some("nope".into()),
+            })
+        };
+        let card = map_sdk_event(&mk(crom_core::events::SecurityOutcome::Blocked))
+            .card
+            .unwrap();
+        assert_eq!(card.kind, "security_blocked");
+        assert!(card.headline.contains("(rm)"));
+        assert!(
+            map_sdk_event(&mk(crom_core::events::SecurityOutcome::Executed))
+                .card
+                .is_none()
+        );
     }
 
     #[test]

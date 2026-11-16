@@ -727,7 +727,10 @@ async fn run_subagent(
                 ApprovalMemory::new()
             },
         )
-        .session_sink(child_sink);
+        .session_sink(child_sink)
+        .principal(crate::events::SecurityPrincipal::Subagent {
+            agent: definition.name.clone(),
+        });
     if inherit_ckpt {
         if let Some(handle) = runtime.parent_checkpoint_handle.clone() {
             child_builder = child_builder.checkpoint_handle(handle);

@@ -1832,9 +1832,9 @@ async fn resolve_common(
             .post_tool_use_failure("*", audit)
             .expect("built-in pattern is always valid");
     }
-    // Wire SecretRedactionHook so the toggle is honored. The hook itself
-    // returns Continue and is informational; the real redaction is applied
-    // by the audit-log hook to its own entries (see `redact_secrets_in_value`).
+    // SecretRedactionHook is a compatibility marker (it returns Continue).
+    // Recorded events and session files are always redacted by the agent
+    // loop; this toggle only controls slash-expansion output redaction.
     if settings.hooks.secret_redaction.unwrap_or(true) {
         hooks = hooks
             .post_tool_use("*", Arc::new(SecretRedactionHook))
@@ -2541,9 +2541,10 @@ async fn maybe_handle_slash_command(cfg: &ResolvedRunConfig, raw: &str) -> Resul
                 .ok_or_else(|| anyhow!("custom command not found at {}", path.display()))?;
             let executor = make_cli_expansion_executor(cfg)?;
             let opts = slash_expansion_options_from_settings(&cfg.settings);
-            let result = crom_core::expand_custom_command(&parsed, &def, &opts, executor.as_ref())
-                .await
-                .map_err(|e| anyhow!("expansion failed: {e}"))?;
+            let result =
+                crom_core::expand_custom_command(&parsed, &def, &opts, executor.as_ref()).await;
+            render_expansion_audit(cfg, &executor);
+            let result = result.map_err(|e| anyhow!("expansion failed: {e}"))?;
             Ok(SlashOutcome::Rewrite(result.expanded_prompt))
         }
     }
@@ -2612,9 +2613,10 @@ async fn maybe_handle_slash_command_for_chat(
                 .ok_or_else(|| anyhow!("custom command not found at {}", path.display()))?;
             let executor = make_cli_expansion_executor(cfg)?;
             let opts = slash_expansion_options_from_settings(&cfg.settings);
-            let result = crom_core::expand_custom_command(&parsed, &def, &opts, executor.as_ref())
-                .await
-                .map_err(|e| anyhow!("expansion failed: {e}"))?;
+            let result =
+                crom_core::expand_custom_command(&parsed, &def, &opts, executor.as_ref()).await;
+            render_expansion_audit(cfg, &executor);
+            let result = result.map_err(|e| anyhow!("expansion failed: {e}"))?;
             Ok(ChatSlashOutcome::Rewrite(result.expanded_prompt))
         }
     }
@@ -3023,9 +3025,7 @@ async fn handle_builtin_slash(
     Ok(())
 }
 
-fn make_cli_expansion_executor(
-    cfg: &ResolvedRunConfig,
-) -> Result<Arc<dyn crom_core::slash::expansion::SlashExpansionExecutor>> {
+fn make_cli_expansion_executor(cfg: &ResolvedRunConfig) -> Result<Arc<CliExpansionExecutor>> {
     // Build the ReadTool and BashTool with the same limits the agent loop
     // uses. Routing expansion through these tools means slash `@file` and
     // `!`bash`` reuse the existing path sandbox, output cap, timeout, and
@@ -3043,6 +3043,20 @@ fn make_cli_expansion_executor(
         cfg.hooks.clone(),
         cfg.settings.hooks.secret_redaction.unwrap_or(true),
     )))
+}
+
+/// Surface blocked-expansion `SecurityDecision` records through the normal
+/// event renderer (a JSON line under `--log-format json`; silent in text
+/// mode, where the expansion error already reports the denial).
+fn render_expansion_audit(cfg: &ResolvedRunConfig, executor: &CliExpansionExecutor) {
+    for d in executor.take_audit() {
+        render_event(
+            &AgentEvent::SecurityDecision(d),
+            cfg.log_format,
+            &mut String::new(),
+            false,
+        );
+    }
 }
 
 fn tool_limits_from_settings(settings: &Settings) -> ToolLimits {
@@ -3072,6 +3086,9 @@ struct CliExpansionExecutor {
     bash: std::sync::Arc<crom_tools::BashTool>,
     policy: crom_core::PolicyEngine,
     secret_redaction: bool,
+    /// Blocked-expansion audit records, drained by the caller after
+    /// expansion and rendered like any other event.
+    audit: std::sync::Mutex<Vec<crom_core::events::SecurityDecision>>,
 }
 
 impl CliExpansionExecutor {
@@ -3103,7 +3120,12 @@ impl CliExpansionExecutor {
             bash: Arc::new(crom_tools::BashTool::new(limits)),
             policy,
             secret_redaction,
+            audit: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn take_audit(&self) -> Vec<crom_core::events::SecurityDecision> {
+        std::mem::take(&mut *self.audit.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Run the full policy pipeline for an expansion. Returns the (possibly
@@ -3131,6 +3153,32 @@ impl CliExpansionExecutor {
                 metadata: serde_json::json!({"source": "slash_expansion"}),
             })
             .await;
+        if decision.outcome != crom_core::PolicyOutcome::Allow {
+            let principal = crom_core::events::SecurityPrincipal::Session;
+            let scope = crom_core::audit::AuditScope {
+                session_id: &self.session_id,
+                run_id: &run_id,
+                turn_index: 0,
+                principal: &principal,
+                cwd: &self.cwd,
+            };
+            let call = crom_core::ToolCall {
+                id: format!("slash-expansion-{}", run_id.0),
+                name: tool_name.to_string(),
+                input: input.clone(),
+            };
+            let record = scope.from_policy(
+                &call,
+                decision.updated_tool_input.as_ref().unwrap_or(&input),
+                permission_kind,
+                &decision,
+                crom_core::events::SecurityOutcome::Blocked,
+            );
+            self.audit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(record);
+        }
         match decision.outcome {
             crom_core::PolicyOutcome::Allow => Ok(decision.updated_tool_input.unwrap_or(input)),
             _ => Err(crom_core::SlashCommandError::ExpansionFailed(format!(
@@ -5705,6 +5753,9 @@ fn render_event(ev: &AgentEvent, format: LogFormat, current_text: &mut String, q
                 );
             }
         }
+        // Audit records are for JSON consumers; text mode already shows
+        // `[policy]` and `[denied]` lines for the same decisions.
+        AgentEvent::SecurityDecision(_) => {}
         AgentEvent::PolicyDecision(d) => {
             if !quiet {
                 println!(
@@ -8381,6 +8432,29 @@ mod slash_expansion_policy_tests {
         let err = executor(dir.path(), &o).run_bash("touch marker").await;
         assert!(err.is_err(), "expansion should be denied");
         assert!(!dir.path().join("marker").exists());
+    }
+
+    #[tokio::test]
+    // A denied slash expansion records a blocked SecurityDecision with the matching rule and command head.
+    async fn denied_expansion_records_security_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = options(dir.path());
+        o.permission_mode = PermissionMode::DontAsk;
+        o.allowed_tool_rules = vec![ToolRule::ExactTool("Bash".into())];
+        o.disallowed_tool_rules = vec![ToolRule::BashCommandRegex("^touch ".into())];
+        let ex = executor(dir.path(), &o);
+        assert!(ex.run_bash("touch marker").await.is_err());
+        let audit = ex.take_audit();
+        assert_eq!(audit.len(), 1);
+        let d = &audit[0];
+        assert_eq!(d.tool_name, "Bash");
+        assert_eq!(d.outcome, crom_core::events::SecurityOutcome::Blocked);
+        assert_eq!(
+            d.policy_source,
+            Some(crom_core::PolicyDecisionSource::DisallowRule)
+        );
+        assert_eq!(d.resource.as_deref(), Some("touch"));
+        assert!(d.tool_use_id.starts_with("slash-expansion-"));
     }
 
     #[tokio::test]

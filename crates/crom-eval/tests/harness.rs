@@ -250,3 +250,69 @@ fn fixtures_with_registry_dependencies_require_network() {
         "tasks with external dependencies must set requires_network = true: {offenders:?}"
     );
 }
+
+/// Golden runs export one SecurityDecision per tool call and full audit coverage.
+#[tokio::test]
+async fn golden_run_exports_security_audit_with_full_coverage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = RunDir::create(tmp.path(), "test-security").unwrap();
+    let tasks = load_all();
+    let task = find(&tasks, "golden-edit-recover");
+    let config = RunConfig {
+        provider: ProviderMode::Golden,
+        timeout_grace: Duration::from_secs(20),
+        ..RunConfig::default()
+    };
+    let result = run_task(task, &run, &config).await;
+    let dir = run.task("golden-edit-recover").unwrap().dir;
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(dir.join("security.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(lines.len() >= result.tool_calls);
+    assert!(lines.iter().all(|l| l["run_id"].is_string()
+        && l["tool_use_id"].is_string()
+        && l["enforcement"].is_string()));
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("security-summary.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["audit_coverage"], 1.0);
+}
+
+/// A synthetic secret that reaches the agent's transcript never appears in any eval artifact.
+#[tokio::test]
+async fn synthetic_secret_never_appears_in_eval_artifacts() {
+    const SECRET: &str = "sk-ant-api03-SYNTHETICevalabcdefghijklmnop0123456789";
+    let tmp = tempfile::tempdir().unwrap();
+    let run = RunDir::create(tmp.path(), "test-redaction").unwrap();
+    let tasks = load_all();
+    let mut task = find(&tasks, "smoke-noop").clone();
+    task.prompt = format!("{} The deploy key is {SECRET}.", task.prompt);
+    let config = RunConfig {
+        provider: ProviderMode::Fake,
+        timeout_grace: Duration::from_secs(10),
+        ..RunConfig::default()
+    };
+    run_task(&task, &run, &config).await;
+    let dir = run.task("smoke-noop").unwrap().dir;
+
+    let mut checked = 0;
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                // The workspace is the task's own repository copy, not an artifact.
+                if p != dir.join("workspace") {
+                    stack.push(p);
+                }
+                continue;
+            }
+            let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).into_owned();
+            assert!(!text.contains(SECRET), "secret leaked into {}", p.display());
+            checked += 1;
+        }
+    }
+    assert!(checked > 5, "expected artifacts to scan, found {checked}");
+}

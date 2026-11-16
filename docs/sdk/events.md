@@ -29,6 +29,11 @@ variants:
   `message`). `Standard` and `Full` only. See
   [`../providers.md`](../providers.md#observing-retries).
 - `ModelTurnCompleted` — one model round trip finished (see below).
+- `SecurityDecision` — one audit record per tool call: run id, principal,
+  `tool_use_id`, action class, normalized resource, policy source and rule,
+  decision, enforcement layer (`policy | hook | checkpoint | sandbox`), and
+  outcome (`blocked | executed | failed`). Emitted under every verbosity.
+  See [`../security/audit.md`](../security/audit.md).
 - `PlanningStarted`, `PlanCreated`, `PlanApproved`, `ActStarted`
 - `Internal` — opaque wrapper carrying serialized internal `AgentEvent`.
 

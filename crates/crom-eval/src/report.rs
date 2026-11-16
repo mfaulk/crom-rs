@@ -653,8 +653,8 @@ pub fn write_summaries(
 ) -> std::io::Result<RunSummary> {
     let summary = RunSummary::from_results(&run_dir.run_id, provider, results);
     let json = serde_json::to_string_pretty(&summary).map_err(std::io::Error::other)?;
-    std::fs::write(run_dir.summary_json_path(), json)?;
-    std::fs::write(run_dir.summary_md_path(), summary.to_markdown())?;
+    crate::artifacts::write_redacted(&run_dir.summary_json_path(), &json)?;
+    crate::artifacts::write_redacted(&run_dir.summary_md_path(), &summary.to_markdown())?;
     Ok(summary)
 }
 

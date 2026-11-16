@@ -67,6 +67,16 @@ pub struct PolicyDecision {
     /// Empty for tool decisions.
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub added_context: String,
+    /// Allow/disallow rule that produced the decision, as
+    /// `<list>[<index>]: <rule json>` (see [`rule_label`]).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rule: Option<String>,
+}
+
+/// Stable label for a configured rule, used in audit records.
+pub fn rule_label(list: &str, index: usize, rule: &impl Serialize) -> String {
+    let body = serde_json::to_string(rule).unwrap_or_else(|_| "?".into());
+    format!("{list}[{index}]: {body}")
 }
 
 impl PolicyDecision {
@@ -77,6 +87,7 @@ impl PolicyDecision {
             reason,
             updated_tool_input: None,
             added_context: String::new(),
+            rule: None,
         }
     }
 
@@ -87,6 +98,7 @@ impl PolicyDecision {
             reason: Some(reason),
             updated_tool_input: None,
             added_context: String::new(),
+            rule: None,
         }
     }
 }
@@ -341,12 +353,14 @@ impl PolicyEngine {
         }
 
         // 2. Disallow rules.
-        for r in &self.config.disallowed_tools {
+        for (i, r) in self.config.disallowed_tools.iter().enumerate() {
             if r.matches(ctx.tool_name, &tool_input) {
-                return PolicyDecision::deny(
+                let mut d = PolicyDecision::deny(
                     PolicyDecisionSource::DisallowRule,
                     format!("disallowed: tool {} blocked by policy rule", ctx.tool_name),
                 );
+                d.rule = Some(rule_label("disallowed_tools", i, r));
+                return d;
             }
         }
 
@@ -386,16 +400,17 @@ impl PolicyEngine {
                     if let Some(d) = self.match_allow(ctx.tool_name, &tool_input) {
                         return d;
                     }
-                    if self
+                    if let Some(i) = self
                         .config
                         .allowed_tool_names
                         .iter()
-                        .any(|n| n == ctx.tool_name)
+                        .position(|n| n == ctx.tool_name)
                     {
                         let mut d = PolicyDecision::allow(
                             PolicyDecisionSource::AllowRule,
                             Some("dontAsk: tool name allowlist".into()),
                         );
+                        d.rule = Some(rule_label("allowed_tool_names", i, &ctx.tool_name));
                         d.updated_tool_input = Some(tool_input.clone());
                         return d;
                     }
@@ -539,12 +554,13 @@ impl PolicyEngine {
     }
 
     fn match_allow(&self, tool_name: &str, input: &Value) -> Option<PolicyDecision> {
-        for r in &self.config.allowed_tools {
+        for (i, r) in self.config.allowed_tools.iter().enumerate() {
             if r.matches(tool_name, input) {
                 let mut d = PolicyDecision::allow(
                     PolicyDecisionSource::AllowRule,
                     Some("allow rule".into()),
                 );
+                d.rule = Some(rule_label("allowed_tools", i, r));
                 d.updated_tool_input = Some(input.clone());
                 return Some(d);
             }

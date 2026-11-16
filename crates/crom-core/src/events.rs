@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::conversation::{AssistantMessage, SystemInit, ToolCall};
 use crate::hooks::HookEventName;
 use crate::options::SessionId;
+use crate::permission::PermissionKind;
 use crate::plan::{
     PlanApprovalScope, PlanDeviation, PlanDeviationSeverity, PlanExecutionStatus, PlanId,
     PlanStatus, PlanStepStatus, PlanSummary,
@@ -31,6 +32,9 @@ pub enum AgentEvent {
     UserToolResult(UserToolResult),
     HookEvaluated(HookEvaluated),
     PolicyDecision(PolicyDecisionEvent),
+    /// M17.3: structured audit record for one tool call's authorization
+    /// decision and its enforcement outcome. See `docs/security/audit.md`.
+    SecurityDecision(SecurityDecision),
     TodoUpdate(TodoUpdate),
     Interrupted(InterruptedEvent),
     /// Emitted by the checkpoint subsystem (M3). The payload's `event` field
@@ -656,6 +660,74 @@ pub struct PolicyDecisionEvent {
     pub source: PolicyDecisionSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Audit record emitted once per tool call: when the call is blocked
+/// (outcome `blocked`) or after it ran (`executed` / `failed`). `(run_id,
+/// tool_use_id)` is the correlation key. Free-text fields are secret-redacted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SecurityDecision {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub turn_index: u32,
+    pub principal: SecurityPrincipal,
+    pub tool_use_id: String,
+    pub tool_name: String,
+    /// `None` when the tool is not registered for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_class: Option<PermissionKind>,
+    /// Normalized target: workspace-relative path, command head, URL host,
+    /// `mcp:<server>`, or `agent:<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    /// Policy pipeline stage that decided; `None` when the call never
+    /// reached the policy engine (unknown/unloaded tool) or was blocked
+    /// below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_source: Option<PolicyDecisionSource>,
+    /// Matching allow/disallow rule, as `<list>[<index>]: <rule json>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    pub decision: PolicyOutcome,
+    pub enforcement: EnforcementLayer,
+    pub outcome: SecurityOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Who issued the tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SecurityPrincipal {
+    /// The top-level session agent.
+    #[default]
+    Session,
+    /// A subagent spawned through the `Agent` tool.
+    Subagent { agent: String },
+}
+
+/// Layer that enforced the decision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementLayer {
+    /// Policy engine, tool allowlist, or tool-catalog loading gate.
+    Policy,
+    /// A `PreToolUse` hook decision.
+    Hook,
+    /// Checkpoint safety gate (e.g. untracked Bash under `require_checkpoint`).
+    Checkpoint,
+    /// Tool-level guard that refused at execution time
+    /// (`ToolError::PermissionDenied`, e.g. the Read/Write/Edit path sandbox).
+    Sandbox,
+}
+
+/// What actually happened to the call.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityOutcome {
+    Blocked,
+    Executed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
