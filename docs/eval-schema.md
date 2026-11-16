@@ -139,6 +139,10 @@ author = "crom maintainers"
 source = "original"             # or an upstream URL / benchmark name
 license = "Apache-2.0 OR MIT"   # SPDX expression
 created = "2026-11-14"          # YYYY-MM-DD
+# Upstream-derived fixtures (L3) also record:
+# upstream = "https://github.com/<org>/<repo>"
+# base_commit = "<sha>"         # snapshot = parent of the fix
+# fix_commit = "<sha>"          # its tests are the hidden oracle
 
 [limits]                        # optional; unknown keys rejected, zero values rejected
 wall_secs = 300                 # overrides timeout_secs
