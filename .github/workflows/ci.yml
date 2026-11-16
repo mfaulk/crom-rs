@@ -222,9 +222,13 @@ jobs:
         with:
           path: ~/.cache/crom/eval-fixtures
           key: eval-fixtures-${{ steps.rev.outputs.rev }}
+      # Upstream snapshots are not warning-clean on current Rust; the
+      # workflow-level `-D warnings` must not reach their builds (and would
+      # also override per-snapshot `.cargo/config.toml` rustflags).
       - name: Validate L3 capability suite
         env:
           CARGO_BUILD_JOBS: "4"
+          RUSTFLAGS: ""
         run: cargo run --locked -p crom-cli -- eval validate-suite l3
 
   coverage:
