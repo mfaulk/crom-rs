@@ -56,6 +56,7 @@ $ crom eval run --suite <suite> --prompt-variant concise
 $ crom eval run <path> --adapter aider --attempts 2
 $ crom eval validate-task <id-or-path>
 $ crom eval validate-suite <suite> --repeat 5
+$ CROM_EVAL_PODMAN=1 crom eval validate-suite <suite> --isolation podman
 $ crom eval history
 $ crom eval trend <suite>
 $ crom eval regressions --baseline <run-or-sha> --candidate <run-or-sha>

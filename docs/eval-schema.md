@@ -82,8 +82,13 @@ bug_report = "..."
 customer_request = "..."
 
 [fixture]
-kind = "copy_dir"                   # or "empty"
+kind = "copy_dir"                   # or "empty", or "git" (below)
 path = "repo"                       # relative to the task directory
+
+# kind = "git": a snapshot pinned in a fixtures repository (L3)
+# repo = "https://github.com/mfaulk/crom-eval-fixtures"   # https:// or file://
+# rev  = "<40-hex commit sha>"      # branch names / short SHAs are rejected
+# path = "<task-id>"                # relative to the repository root
 
 [oracle]                            # PUBLIC verification (visible during the run)
 kind = "command"                    # "command" | "rust" | "none"
@@ -229,6 +234,12 @@ Rules for task authors (L1/L2/L3 corpora included):
 - `[fixture].path` must be a strict subdirectory of the task dir
   (`canary_fixture_root`); `"."`, `".."`, or absolute paths are errors because
   they would copy `task.toml`/`hidden/` into the workspace.
+- A `git` fixture must name an `https://` (or `file://`) `repo`, a full 40-hex
+  `rev`, and a relative `path` (`git_fixture_pin`). It is fetched once into
+  `$CROM_EVAL_FIXTURE_CACHE` (default `~/.cache/crom/eval-fixtures/<rev>/`),
+  published only after `HEAD` is verified to equal `rev`, and reused offline
+  afterwards. Keep `task.toml`, `hidden/`, and `oracle.patch` in crom-rs; only
+  the agent-visible snapshot lives in the fixtures repository.
 - `[hidden].fixture` and `oracle_patch` must not be inside the public fixture
   (`canary_hidden_visible`, `canary_oracle_visible`).
 - Do not name hidden files in the prompt (`canary_hidden_names`).
