@@ -307,8 +307,13 @@ fn tool_policy_for(task: &EvalTask, config: &RunConfig) -> ToolPolicy {
         builtins.bash = allowed("Bash");
         builtins.todo = allowed("TodoWrite");
     }
+    let custom_tools = match &config.provider {
+        ProviderMode::Scripted(script) => script.tools().to_vec(),
+        _ => Vec::new(),
+    };
     ToolPolicy {
         enable_builtin_tools: builtins,
+        custom_tools,
         side_effect_policy: SideEffectPolicy::full(),
         sandbox: sandbox_config_for(task, config),
         ..Default::default()

@@ -46,18 +46,47 @@ pub enum ProviderMode {
 
 /// Model turns replayed by [`ProviderMode::Scripted`]. Each agent attempt
 /// replays the full script. Equality is identity of the shared script.
+///
+/// Test-only extras: `tools` are registered as custom tools for the run (e.g.
+/// tools from a stub MCP server), and a context log receives every model
+/// request as JSON so a test can tell what reached the model's context.
 #[derive(Clone)]
-pub struct ScriptedTurns(pub Arc<Vec<Vec<ModelEvent>>>);
+pub struct ScriptedTurns {
+    turns: Arc<Vec<Vec<ModelEvent>>>,
+    tools: Vec<Arc<dyn crom_core::Tool>>,
+    context_log: Option<ModelContextLog>,
+}
+
+/// Every model request of a scripted run, serialized as JSON.
+pub type ModelContextLog = Arc<std::sync::Mutex<Vec<String>>>;
 
 impl ScriptedTurns {
     pub fn new(turns: Vec<Vec<ModelEvent>>) -> Self {
-        Self(Arc::new(turns))
+        Self {
+            turns: Arc::new(turns),
+            tools: Vec::new(),
+            context_log: None,
+        }
+    }
+
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn crom_core::Tool>>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn with_context_log(mut self, log: ModelContextLog) -> Self {
+        self.context_log = Some(log);
+        self
+    }
+
+    pub fn tools(&self) -> &[Arc<dyn crom_core::Tool>] {
+        &self.tools
     }
 }
 
 impl PartialEq for ScriptedTurns {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.turns, &other.turns)
     }
 }
 
@@ -65,7 +94,34 @@ impl Eq for ScriptedTurns {}
 
 impl std::fmt::Debug for ScriptedTurns {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ScriptedTurns({} turns)", self.0.len())
+        write!(
+            f,
+            "ScriptedTurns({} turns, {} tools)",
+            self.turns.len(),
+            self.tools.len()
+        )
+    }
+}
+
+/// Appends each request to a [`ModelContextLog`] before replaying the script.
+struct RecordingProvider {
+    inner: ScriptedFakeProvider,
+    log: ModelContextLog,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for RecordingProvider {
+    async fn stream_turn(
+        &self,
+        request: crom_core::ModelRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<ModelEvent, crom_core::ProviderError>>,
+        crom_core::ProviderError,
+    > {
+        if let Ok(json) = serde_json::to_string(&request) {
+            self.log.lock().unwrap().push(json);
+        }
+        self.inner.stream_turn(request).await
     }
 }
 
@@ -180,10 +236,17 @@ pub fn build(
             model: "fault".to_string(),
             label: "fault".to_string(),
         }),
-        ProviderMode::Scripted(turns) => Ok(ProviderSetup {
-            config: ProviderConfig::fake(Arc::new(ScriptedFakeProvider::new(
-                turns.0.as_ref().clone(),
-            ))),
+        ProviderMode::Scripted(script) => Ok(ProviderSetup {
+            config: ProviderConfig::fake({
+                let inner = ScriptedFakeProvider::new(script.turns.as_ref().clone());
+                match &script.context_log {
+                    Some(log) => Arc::new(RecordingProvider {
+                        inner,
+                        log: log.clone(),
+                    }) as Arc<dyn ModelProvider>,
+                    None => Arc::new(inner),
+                }
+            }),
             model: "scripted".to_string(),
             label: "scripted".to_string(),
         }),
