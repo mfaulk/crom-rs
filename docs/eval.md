@@ -171,9 +171,12 @@ Tasks declare the suites they belong to in their manifest (`suites = [...]`):
 - `l2` — the M17 L2 capability corpus (multi-step coding and repair). Every
   task is `kind = "capability"`, `level = "L2"`, with hidden tests and a
   reference. Intended for a live provider; see [L2 corpus](#l2-corpus-m172).
-- `l3` — M17.2 L3 capability corpus (real-repository engineering): ten
-  multi-crate Rust workspaces with hidden behavioral tests and oracle-patch
-  references. Intended for a live provider; see [L3 corpus](#l3-corpus-m172).
+- `l3` — L3 capability corpus (#289): ten upstream Rust repositories
+  (2k–30k LoC) pinned in a fixtures repository, each at the parent of a real
+  bug fix whose tests are the hidden oracle. Intended for a live provider; see
+  [L3 corpus](#l3-corpus-289).
+- `l3-mini` — ten synthetic, std-only three-crate workspaces stored in-tree;
+  fully offline. See [L3-mini corpus](#l3-mini-corpus-m172).
 
 ### L1 capability corpus
 
@@ -224,12 +227,83 @@ crom eval run --suite l2 --provider <profile> --repair disabled
 
 Each run needs a cargo toolchain; no task needs the network.
 
-### L3 corpus (M17.2)
+### L3 corpus (#289)
 
-Each `l3-*` task is a `kind = "capability"`, `level = "L3"` task whose
-fixture is a realistic three-crate Cargo workspace with an existing, passing
-test suite. The agent must locate the root cause or extension point across
-crates; grading is behavioral.
+Each `l3` task is a real, permissively licensed Rust repository (2k–30k lines
+of Rust) snapshotted at the parent of an upstream bug-fix commit. The agent
+gets the snapshot and a bug report; grading reruns the tests that the upstream
+fix added, which the agent never sees. Tasks are `kind = "capability"`,
+`level = "L3"`, `network = "none"`.
+
+| Task | Upstream | Rust LoC | `vendor/` | Bug |
+|---|---|---|---|---|
+| `l3-bytes-try-get-int-sign` | [tokio-rs/bytes](https://github.com/tokio-rs/bytes) | 13,787 | 37M | Sign-extend n-byte integers in the fallible Buf getters |
+| `l3-http-insert-mult` | [hyperium/http](https://github.com/hyperium/http) | 18,408 | 22M | Fix HeaderMap corruption when replacing a header that has 3+ values |
+| `l3-indexmap-macro-hygiene` | [indexmap-rs/indexmap](https://github.com/indexmap-rs/indexmap) | 15,798 | 19M | Stop indexmap!/indexset! macros from shadowing a caller's CAP constant |
+| `l3-itertools-combinations-zero` | [rust-itertools/itertools](https://github.com/rust-itertools/itertools) | 12,266 | 17M | Fix zero-length combinations in itertools |
+| `l3-nom-multispace-eof` | [rust-bakery/nom](https://github.com/rust-bakery/nom) | 27,455 | 45M | Fix the remaining input returned by complete &str parsers that consume everything |
+| `l3-petgraph-floyd-multiedge` | [petgraph/petgraph](https://github.com/petgraph/petgraph) | 28,700 | 31M | Fix Floyd-Warshall distances on graphs with parallel edges in petgraph |
+| `l3-ron-integer-suffix-base` | [ron-rs/ron](https://github.com/ron-rs/ron) | 21,757 | 12M | Parse octal and hex RON integers that carry a type suffix |
+| `l3-serde-yaml-duplicate-keys` | [dtolnay/serde-yaml](https://github.com/dtolnay/serde-yaml) | 10,970 | 7.5M | Reject duplicate mapping keys when deserializing serde_yaml::Value |
+| `l3-toml-crlf-error-position` | [toml-rs/toml-rs](https://github.com/toml-rs/toml-rs) | 11,583 | 7.0M | Fix wrong error line/column for CRLF input in the toml crate |
+| `l3-url-path-caret` | [servo/rust-url](https://github.com/servo/rust-url) | 14,728 | 33M | Percent-encode the caret in URL paths per the WHATWG URL Standard |
+
+Storage: snapshots live in the public fixtures repository
+[`mfaulk/crom-eval-fixtures`](https://github.com/mfaulk/crom-eval-fixtures),
+one directory per task, all at one commit. Each task pins it with
+`[fixture] kind = "git"`, the repository URL, the full commit SHA as `rev`, and
+`path = "<task-id>"`. crom fetches that commit once into
+`$CROM_EVAL_FIXTURE_CACHE` (default `~/.cache/crom/eval-fixtures/<rev>/`) and
+reuses it offline afterwards. Only `task.toml`, `hidden/`, and `oracle.patch`
+are in this repository. `[provenance]` records `upstream`, `base_commit` (the
+snapshot), and `fix_commit` (the source of the hidden tests and the reference).
+
+Snapshots: the tree at `base_commit` without `.git`, plus `vendor/` (from
+`cargo vendor --versioned-dirs`), a `.cargo/config.toml` source replacement,
+and a generated `Cargo.lock` when upstream had none. To keep the repository
+small, vendored crates that never compile on x86_64 Linux (Windows, wasm,
+redox, and similar targets) are replaced by stubs that keep their
+`Cargo.toml`; those snapshots therefore build only on x86_64 Linux.
+`l3-url-path-caret` pins four ICU crates to the releases current at its base
+commit, and `l3-serde-yaml-duplicate-keys` allows the
+`dangerous_implicit_autorefs` lint in `.cargo/config.toml` so the old
+`unsafe-libyaml` code compiles on current Rust.
+
+Verification:
+
+- Public oracle: the upstream test suite with `--offline` (a subset where
+  upstream tests fail on current Rust for unrelated reasons; see each
+  `task.toml`).
+- Hidden oracle: the integration-test files the fix commit added or changed,
+  overlaid from `hidden/` after the agent finishes.
+- Two prompts ask the agent to update a public test file that encodes the old
+  behavior (`tests/test_std.rs` in itertools, `url/tests/expected_failures.txt`
+  in rust-url); their `oracle.patch` includes the upstream change to it.
+- `Cargo.toml` and `Cargo.lock` are in every task's `forbidden_paths`.
+
+```console
+crom eval validate-suite l3                      # fetches the fixtures commit once
+CROM_EVAL_PODMAN=1 crom eval validate-suite l3 --isolation podman \
+  --container-image docker.io/library/rust:1-slim   # build untrusted code in a container
+crom eval run --suite l3 --provider <profile>
+```
+
+CI validates `l3` in a separate job with the fixture cache restored from
+`actions/cache`. `crates/crom-eval/tests/l3_corpus.rs` checks structure: git
+fixtures pinned by full SHA to one fixtures commit, offline commands,
+upstream provenance, permissive licenses, and Cargo manifests forbidden.
+
+On a 64-core host, cap build parallelism inside a container that limits PIDs
+(`CARGO_BUILD_JOBS=8`, `--test-threads 8`); otherwise `rust-lld` aborts with
+`Resource temporarily unavailable`.
+
+### L3-mini corpus (M17.2)
+
+The `l3-mini` suite is ten synthetic three-crate workspaces (~4.1k lines in
+total, `provenance.source = "original"`, `Apache-2.0 OR MIT`) stored in-tree
+under `repo/`. They depend only on `std` and on each other through path
+dependencies, so `crom eval validate-suite l3-mini` runs fully offline with no
+fixture fetch; CI runs it with the other offline suites.
 
 | Task | Category | Crates | What the reference changes |
 |---|---|---|---|
@@ -244,35 +318,10 @@ crates; grading is behavioral.
 | `l3-throttle-refill` | bugfix | `clock`, `bucket`, `gateway` | Token-bucket refill drift and exact `Retry-After` |
 | `l3-layercfg-merge` | bugfix | `confval`, `layers`, `appconfig` | Deep merge of layers and `APP_A__B` env overrides |
 
-Verification:
-
-- Public oracle: `cargo test --workspace --offline` (passes on the
-  unmodified fixture; guards against regressions).
-- Hidden oracle: `acceptance_*.rs` integration tests overlaid from
-  `hidden/crates/<crate>/tests/` after the agent finishes, run with
-  `cargo test --offline -p <crate> --test <name>`.
-- `crom eval validate-suite l3` proves, offline, that every reference patch
-  passes public + hidden verification and every unmodified fixture fails it.
-  CI runs it on every push/PR; `crates/crom-eval/tests/l3_corpus.rs` checks
-  structure (kind/level, offline commands, hidden dir outside `repo/`,
-  path-only dependencies, provenance, size budget).
-
-Provenance and storage: the fixtures are original, synthetic workspaces
-(`provenance.source = "original"`, `Apache-2.0 OR MIT`), not snapshots of
-upstream repositories. They depend only on `std` and on each other through
-path dependencies, so no `cargo vendor` tarball or registry cache is needed
-and verification works with `network = "none"`. The corpus adds ~190 KB of
-plain files to the repository (~4.1k lines of fixture Rust, 10–25 KB per
-task); `l3_corpus.rs` caps each task at 96 KB. Larger pinned upstream
-snapshots (the 2k–30k LoC target in #289) need a separate storage decision
-(git bundle plus vendored-deps tarball, or a fixtures repository) and are
-not part of this corpus.
-
-Leakage: as for every task (#286), only `repo/` is copied into the agent
-workspace; `hidden/` is overlaid onto the workspace root recursively after
-the agent exits, so `hidden/crates/<crate>/tests/acceptance_*.rs` lands next
-to that crate's existing `tests/`. `task.toml` and `oracle.patch` never enter
-the workspace.
+Public verification is `cargo test --workspace --offline`; hidden
+`acceptance_*.rs` tests are overlaid from `hidden/crates/<crate>/tests/`.
+`l3_corpus.rs` caps each task at 96 KB and checks that every dependency is a
+path dependency.
 
 ## Adding a new task
 
@@ -491,7 +540,7 @@ offline lane on every push/PR:
 
 ```console
 cargo test -p crom-eval
-crom eval validate-suite <smoke|golden|safety|repair-smoke|l1|l2|l3>
+crom eval validate-suite <smoke|golden|safety|repair-smoke|l1|l2|l3|l3-mini>
 crom eval run --suite smoke --provider fake
 crom eval run --suite golden --provider golden
 crom eval run --suite safety --provider fake
