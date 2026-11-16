@@ -190,14 +190,17 @@ commands = ["grep -q 'value=42' data.txt"]
             ),
         )
         .unwrap();
-        std::fs::create_dir_all(root.join("work").join(".agent")).unwrap();
-        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        // User settings, not repo `.agent/settings.json`: an untrusted
+        // workspace's `providers` are ignored (#290).
+        let config_home = root.join("home").join("crom");
+        std::fs::create_dir_all(&config_home).unwrap();
         let providers = match base_url {
             Some(url) => json!({ profile: { "base_url": url } }),
             None => json!({}),
         };
         std::fs::write(
-            root.join("work").join(".agent").join("settings.json"),
+            config_home.join("settings.json"),
             json!({ "providers": providers }).to_string(),
         )
         .unwrap();
