@@ -1,0 +1,88 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-http-insert-mult"
+title = "Fix HeaderMap corruption when replacing a header that has 3+ values"
+category = "bugfix"
+difficulty = "hard"
+tags = ["rust", "hidden-tests", "bugfix", "data-structures", "upstream", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is the `http` crate. Replacing every value of a header through the entry
+API breaks the `HeaderMap` when the header has three or more values:
+
+    use http::header::{Entry, HeaderMap};
+
+    let mut headers = HeaderMap::new();
+    for v in ["a", "b", "c", "d"] {
+        headers.append("hello", v.parse().unwrap());
+    }
+    headers.append("other", "x".parse().unwrap());
+    headers.append("other", "y".parse().unwrap());
+
+    if let Entry::Occupied(mut e) = headers.entry("hello") {
+        let old: Vec<_> = e.insert_mult("new".parse().unwrap()).collect();
+    }
+
+In a debug build (e.g. under `cargo test`) this panics with an internal
+assertion about the map's extra-value links instead of returning the old
+values. With one or two values it works.
+
+Expected behavior: `OccupiedEntry::insert_mult` returns all previous values in
+insertion order (`["a", "b", "c", "d"]` above), after which `hello` has
+exactly the single new value, other headers (`other` = `["x", "y"]`) are
+untouched, `len()` reflects the change (3 above), and appending to `hello`
+again works normally. `HeaderMap::insert` and the other entry methods must
+keep their current behavior.
+
+Keep the public API unchanged and keep the existing test suite green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "c8cb4371478cbba96ca25bce6681d13f05e2377d"
+path = "l3-http-insert-mult"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --offline -- --test-threads 8"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline --test header_map"]
+
+[provenance]
+author = "http contributors"
+source = "upstream"
+license = "MIT OR Apache-2.0"
+created = "2026-11-15"
+upstream = "https://github.com/hyperium/http"
+base_commit = "c6af28bfd8ef171a7f8c61e551d3ee68db4ca577"
+fix_commit = "3dd9f5e1c3c228c26e6836ee60b36129351bfd3b"

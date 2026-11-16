@@ -1,0 +1,58 @@
+diff --git a/url/src/parser.rs b/url/src/parser.rs
+index 27d7cb7..5b7f5be 100644
+--- a/url/src/parser.rs
++++ b/url/src/parser.rs
+@@ -19,8 +19,12 @@ use percent_encoding::{percent_encode, utf8_percent_encode, AsciiSet, CONTROLS};
+ /// https://url.spec.whatwg.org/#fragment-percent-encode-set
+ const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`');
+ 
++/// https://url.spec.whatwg.org/#query-percent-encode-set
++const QUERY: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>');
++const SPECIAL_QUERY: &AsciiSet = &QUERY.add(b'\'');
++
+ /// https://url.spec.whatwg.org/#path-percent-encode-set
+-const PATH: &AsciiSet = &FRAGMENT.add(b'#').add(b'?').add(b'{').add(b'}');
++const PATH: &AsciiSet = &QUERY.add(b'?').add(b'^').add(b'`').add(b'{').add(b'}');
+ 
+ /// https://url.spec.whatwg.org/#userinfo-percent-encode-set
+ pub(crate) const USERINFO: &AsciiSet = &PATH
+@@ -32,7 +36,6 @@ pub(crate) const USERINFO: &AsciiSet = &PATH
+     .add(b'[')
+     .add(b'\\')
+     .add(b']')
+-    .add(b'^')
+     .add(b'|');
+ 
+ pub(crate) const PATH_SEGMENT: &AsciiSet = &PATH.add(b'/').add(b'%');
+@@ -41,10 +44,6 @@ pub(crate) const PATH_SEGMENT: &AsciiSet = &PATH.add(b'/').add(b'%');
+ // so it needs to be additionally escaped in that case.
+ pub(crate) const SPECIAL_PATH_SEGMENT: &AsciiSet = &PATH_SEGMENT.add(b'\\');
+ 
+-// https://url.spec.whatwg.org/#query-state
+-const QUERY: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>');
+-const SPECIAL_QUERY: &AsciiSet = &QUERY.add(b'\'');
+-
+ pub type ParseResult<T> = Result<T, ParseError>;
+ 
+ macro_rules! simple_enum_error {
+diff --git a/url/tests/expected_failures.txt b/url/tests/expected_failures.txt
+index 8d4407c..2332b2a 100644
+--- a/url/tests/expected_failures.txt
++++ b/url/tests/expected_failures.txt
+@@ -51,8 +51,6 @@
+ <non-special:opaque \t\t  \t#hi>
+ <non-special:opaque \t\t  #hi>
+ <non-special:opaque\t\t  \r #hi>
+-<foo://host/ !\"$%&\'()*+,-./:;<=>@[\\]^_`{|}~>
+-<wss://host/ !\"$%&\'()*+,-./:;<=>@[\\]^_`{|}~>
+ <///test> against <http://example.org/>
+ <///\\//\\//test> against <http://example.org/>
+ <///example.org/path> against <http://example.org/>
+@@ -61,7 +59,6 @@
+ <///example.org/../path/../../> against <http://example.org/>
+ <///example.org/../path/../../path> against <http://example.org/>
+ </\\//\\/a/../> against <file:///>
+-<a:/> set pathname to <\u{0}\u{1}\t\n\r\u{1f} !\"#$%&\'()*+,-./09:;<=>?@AZ[\\]^_`az{|}~\u{7f}\u{80}\u{81}\u{c9}\u{e9}>
+ <data:space                                                                                                                                  #fragment> set hash to <>
+ <sc:space    #fragment> set hash to <>
+ <data:space  ?query#fragment> set hash to <>
