@@ -661,7 +661,7 @@ Related, not in M17:
 **Infrastructure completion targets (all required):**
 
 - [ ] All required CI jobs (§7, M17.0) green on `main`; rename landed.
-- [ ] `provider-conformance` completes on Anthropic, OpenAI, and DeepSeek
+- [x] `provider-conformance` completes on Anthropic, OpenAI, and DeepSeek
   through the headless SDK. Failures are classified. The offline variant runs
   in PR CI.
 - [ ] Usage is recorded with unknown ≠ 0. Nominal cost comes from versioned
@@ -768,7 +768,7 @@ filled by an opt-in `Eval (live smoke)` dispatch (`eval-live.yml`) with
 
 | Profile | Model | Offline (synthetic transcripts) | Live | Live failures (capability / provider / Crom) |
 |---|---|---|---|---|
-| `anthropic` | `claude-sonnet-4-6` | 6/6 resolved | 2/6 resolved, 1 errored, 3 skipped ([run 43956910916](https://github.com/mfaulk/crom-rs/actions/runs/43956910916), $0.062); re-run after #336 _pending_ | `conf-long-output`: **Crom** (see below); 3 skipped as a consequence |
+| `anthropic` | `claude-sonnet-4-6` | 6/6 resolved | 2/6 resolved, 1 errored, 3 skipped ([run 43956910916](https://github.com/mfaulk/crom-rs/actions/runs/43956910916), $0.062); after #336: 6/6 resolved ([run 43959506643](https://github.com/mfaulk/crom-rs/actions/runs/43959506643), $0.207) | first run: `conf-long-output` **Crom** bug (see below), 3 skipped as a consequence; re-run: none |
 | `openai` | `gpt-4.1` | 6/6 resolved | 6/6 resolved ([run 43957425729](https://github.com/mfaulk/crom-rs/actions/runs/43957425729), $0.058) | — |
 | `deepseek` | `deepseek-flash` | 6/6 resolved | 6/6 resolved ([run 43956919752](https://github.com/mfaulk/crom-rs/actions/runs/43956919752), $0.004) | — |
 | `gemini` | `gemini-2.5-pro` | 6/6 resolved | _pending_ (not required by #284) | — |
@@ -786,6 +786,9 @@ Live runs on 2026-11-16, `max_run_cost_usd = 2` each. DeepSeek ran
   the incomplete call, ask the model to continue) never ran. The synthetic
   transcript sent `content_block_stop`, so offline CI missed it; it now
   matches the live stream.
+  In the re-run the model generated the file with `seq` and never hit
+  `max_tokens` (99 output tokens on turn 1), so the fix is verified by the
+  offline replay and a unit test, not yet by a live truncation.
 - **Cascade (open finding for M18).** The errored turn's usage was recorded as
   unknown, so `--max-run-cost-usd` could no longer be enforced and the
   remaining three tasks were skipped (fail-closed, as designed). Usage that
