@@ -6,8 +6,13 @@
 //! adapter-, isolation-, repetition-, and prompt-variant-aware `run`.
 //!
 //! Runs drive the agent through the SDK runtime; provider selection is `fake`
-//! (default, offline) / `golden` (scripted) / a live provider name such as
-//! `anthropic` (opt-in via `CROM_EVAL_LIVE=1`).
+//! (default, offline) / `golden` (scripted) / a provider profile id such as
+//! `anthropic`, `openai`, `deepseek`, or `gemini` (opt-in via
+//! `CROM_EVAL_LIVE=1`).
+//!
+//! `eval run` exit codes: 0 ok, [`EXIT_TASKS_FAILED`] when a task did not
+//! resolve, [`EXIT_ALL_SKIPPED`] when every task was skipped (e.g. missing
+//! credentials), so CI can tell "nothing ran" from "ran and failed".
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -85,9 +90,16 @@ pub struct EvalRunArgs {
     /// Adapter: internal | directory | swebench | aider | terminal.
     #[arg(long, default_value = "internal")]
     pub adapter: String,
-    /// Provider mode: `fake` (default), `golden`, or a live provider name.
+    /// Provider mode: `fake` (default), `golden`, or a live provider-profile
+    /// id (`anthropic`, `openai`, `deepseek`, `gemini`, `local`, or one
+    /// defined under settings `providers`). Live runs need `CROM_EVAL_LIVE=1`
+    /// and the profile's API-key env var; otherwise tasks are skipped.
     #[arg(long, default_value = "fake")]
     pub provider: String,
+    /// Model for a live provider. Defaults to `CROM_EVAL_MODEL`, then the
+    /// profile's `default_model`. Rejected for offline providers.
+    #[arg(long)]
+    pub model: Option<String>,
     /// Directory containing internal tasks (defaults to bundled eval/tasks).
     #[arg(long)]
     pub tasks_dir: Option<PathBuf>,
@@ -479,8 +491,67 @@ fn eval_pricing(args: &EvalRunArgs) -> Result<crom_core::PricingTable> {
     }
 }
 
+/// `eval run` exit code when at least one task did not resolve.
+pub const EXIT_TASKS_FAILED: u8 = 1;
+/// `eval run` exit code when every task was skipped (nothing ran).
+pub const EXIT_ALL_SKIPPED: u8 = 3;
+
+/// An error that maps to a specific process exit code.
+#[derive(Debug)]
+pub struct EvalExit {
+    pub code: u8,
+    pub message: String,
+}
+
+impl std::fmt::Display for EvalExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EvalExit {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RunVerdict {
+    Ok,
+    /// Non-resolved, non-skipped, non-quarantined result count.
+    Failed(usize),
+    /// Every result was skipped; holds the count.
+    AllSkipped(usize),
+}
+
+/// Gate an `eval run`. Each item is `(status, resolved, quarantined)`.
+/// Failures win over skips; `allow_failures` does not hide an all-skipped run.
+fn run_verdict(results: &[(EvalStatus, bool, bool)], allow_failures: bool) -> RunVerdict {
+    let skipped = |s: &EvalStatus| matches!(s, EvalStatus::Skipped);
+    let failures = results
+        .iter()
+        .filter(|(s, resolved, quarantined)| !resolved && !quarantined && !skipped(s))
+        .count();
+    if failures > 0 && !allow_failures {
+        return RunVerdict::Failed(failures);
+    }
+    if !results.is_empty() && results.iter().all(|(s, _, _)| skipped(s)) {
+        return RunVerdict::AllSkipped(results.len());
+    }
+    RunVerdict::Ok
+}
+
+/// `--model` for a live provider; an error for offline providers, whose
+/// model is fixed.
+fn model_override(args: &EvalRunArgs, provider: &ProviderMode) -> Result<Option<String>> {
+    match (&args.model, provider.is_live()) {
+        (Some(m), false) => Err(anyhow!(
+            "--model {m} applies only to live providers; '{}' is offline",
+            provider.label()
+        )),
+        (m, _) => Ok(m.clone()),
+    }
+}
+
 async fn cmd_run(args: EvalRunArgs) -> Result<()> {
     let provider = ProviderMode::parse(&args.provider);
+    let model = model_override(&args, &provider)?;
     let provider_profiles = if let ProviderMode::Live(name) = &provider {
         let profiles = eval_provider_profiles()?;
         crom_eval::providers::resolve_live_profile(name, &profiles).map_err(|u| {
@@ -519,6 +590,7 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
 
     let config = RunConfig {
         provider: provider.clone(),
+        model,
         timeout_grace: Duration::from_secs(30),
         adapter: args.adapter.clone(),
         isolation: isolation.clone(),
@@ -654,17 +726,29 @@ async fn cmd_run(args: EvalRunArgs) -> Result<()> {
     }
     println!("artifacts: {}", run.root.display());
 
-    // Gate: non-resolved, non-skip, non-quarantined tasks fail the command.
-    let failures = results
+    let gate: Vec<(EvalStatus, bool, bool)> = results
         .iter()
-        .filter(|r| !r.resolved && !r.quarantined && !matches!(r.status, EvalStatus::Skipped))
-        .count();
-    if failures > 0 && !args.allow_failures {
-        return Err(anyhow!(
-            "{failures} task result(s) did not resolve (use --allow-failures to ignore)"
-        ));
+        .map(|r| (r.status, r.resolved, r.quarantined))
+        .collect();
+    match run_verdict(&gate, args.allow_failures) {
+        RunVerdict::Ok => Ok(()),
+        RunVerdict::Failed(n) => Err(EvalExit {
+            code: EXIT_TASKS_FAILED,
+            message: format!("{n} task result(s) did not resolve (use --allow-failures to ignore)"),
+        }
+        .into()),
+        RunVerdict::AllSkipped(n) => Err(EvalExit {
+            code: EXIT_ALL_SKIPPED,
+            message: format!(
+                "all {n} task result(s) were skipped; nothing ran ({})",
+                results
+                    .iter()
+                    .find_map(|r| r.skipped_reason.as_deref())
+                    .unwrap_or("no reason recorded")
+            ),
+        }
+        .into()),
     }
-    Ok(())
 }
 
 fn write_behavior_summary(run_root: &Path, results: &[EvalResult]) {
@@ -1084,5 +1168,70 @@ mod validate_isolation_flag_tests {
         let bad = ValidateSuiteArgs::try_parse_from(["validate-suite", "l3", "--isolation", "vm"])
             .unwrap();
         assert!(bad.isolation_args.options().is_err());
+    }
+}
+
+#[cfg(test)]
+mod live_provider_flag_tests {
+    use super::*;
+    use crom_eval::providers::ProviderMode;
+
+    // `--model` parses and is passed through for live providers.
+    #[test]
+    fn model_flag_applies_to_live_providers() {
+        let args = EvalRunArgs::try_parse_from([
+            "run",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-chat",
+        ])
+        .unwrap();
+        let mode = ProviderMode::parse(&args.provider);
+        assert_eq!(
+            model_override(&args, &mode).unwrap().as_deref(),
+            Some("deepseek-chat")
+        );
+        let args = EvalRunArgs::try_parse_from(["run", "--provider", "openai"]).unwrap();
+        assert_eq!(
+            model_override(&args, &ProviderMode::parse("openai")).unwrap(),
+            None
+        );
+    }
+
+    // `--model` with an offline provider is rejected instead of silently ignored.
+    #[test]
+    fn model_flag_rejected_for_offline_providers() {
+        let args = EvalRunArgs::try_parse_from(["run", "--model", "gpt-4.1"]).unwrap();
+        assert!(model_override(&args, &ProviderMode::Fake).is_err());
+    }
+
+    // Failures exit 1, an all-skipped run exits 3, and a run with anything resolved exits 0.
+    #[test]
+    fn verdict_distinguishes_skipped_from_failed() {
+        use EvalStatus::*;
+        assert_eq!(run_verdict(&[(Passed, true, false)], false), RunVerdict::Ok);
+        assert_eq!(
+            run_verdict(&[(Skipped, false, false), (Skipped, false, false)], false),
+            RunVerdict::AllSkipped(2)
+        );
+        assert_eq!(
+            run_verdict(&[(Skipped, false, false), (Failed, false, false)], false),
+            RunVerdict::Failed(1)
+        );
+        assert_eq!(
+            run_verdict(&[(Skipped, false, false), (Passed, true, false)], false),
+            RunVerdict::Ok
+        );
+        // --allow-failures ignores failures but not an all-skipped run.
+        assert_eq!(run_verdict(&[(Failed, false, false)], true), RunVerdict::Ok);
+        assert_eq!(
+            run_verdict(&[(Skipped, false, false)], true),
+            RunVerdict::AllSkipped(1)
+        );
+        // Quarantined failures do not gate.
+        assert_eq!(run_verdict(&[(Failed, false, true)], false), RunVerdict::Ok);
+        assert_eq!(EXIT_TASKS_FAILED, 1);
+        assert_eq!(EXIT_ALL_SKIPPED, 3);
     }
 }

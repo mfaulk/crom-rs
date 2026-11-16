@@ -3,8 +3,9 @@ name: Eval (live provider)
 # Manual-only. Live-provider evals are informative, not a deterministic CI
 # gate, and cost real model tokens — so they never run on push/PR. Trigger this
 # workflow by hand from the Actions tab. It requires the API-key secret for
-# the chosen provider profile (ANTHROPIC_API_KEY, or DEEPSEEK_API_KEY for
-# deepseek); without it the run skips cleanly.
+# the chosen provider profile (ANTHROPIC_API_KEY, OPENAI_API_KEY,
+# DEEPSEEK_API_KEY, or GEMINI_API_KEY); without it every task skips, the CLI
+# exits 3, and this job reports a warning instead of failing.
 on:
   workflow_dispatch:
     inputs:
@@ -13,9 +14,13 @@ on:
         required: false
         default: 'rust-small'
       provider:
-        description: 'Live provider profile id (anthropic, deepseek, ...)'
+        description: 'Live provider profile id (anthropic, openai, deepseek, gemini)'
         required: false
         default: 'anthropic'
+      model:
+        description: 'Model override (blank = the profile default_model)'
+        required: false
+        default: ''
 
 jobs:
   eval-live:
@@ -28,7 +33,12 @@ jobs:
       # as skipped rather than failing.
       CROM_EVAL_LIVE: '1'
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      SUITE: ${{ inputs.suite }}
+      PROVIDER: ${{ inputs.provider }}
+      MODEL: ${{ inputs.model }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -37,10 +47,17 @@ jobs:
           key: eval-live
       - name: Run live eval suite
         run: |
-          cargo run --locked -p crom-cli -- eval run \
-            --suite "${{ inputs.suite }}" \
-            --provider "${{ inputs.provider }}" \
-            --allow-failures
+          args=(--suite "$SUITE" --provider "$PROVIDER" --allow-failures)
+          if [ -n "$MODEL" ]; then args+=(--model "$MODEL"); fi
+          set +e
+          cargo run --locked -p crom-cli -- eval run "${args[@]}"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 3 ]; then
+            echo "::warning::all tasks skipped (missing CROM_EVAL_LIVE or the $PROVIDER API-key secret)"
+            exit 0
+          fi
+          exit "$rc"
       - name: Upload eval artifacts
         if: always()
         uses: actions/upload-artifact@v7

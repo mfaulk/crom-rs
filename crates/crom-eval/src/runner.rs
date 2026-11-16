@@ -181,6 +181,9 @@ impl EvalResult {
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub provider: ProviderMode,
+    /// Live model override (`--model`). Falls back to `CROM_EVAL_MODEL`,
+    /// then the profile's `default_model`. Ignored by offline providers.
+    pub model: Option<String>,
     /// Extra wall-clock grace beyond the task timeout before the harness force
     /// aborts the run.
     pub timeout_grace: Duration,
@@ -241,6 +244,7 @@ impl Default for RunConfig {
     fn default() -> Self {
         Self {
             provider: ProviderMode::Fake,
+            model: None,
             timeout_grace: Duration::from_secs(30),
             adapter: "internal".to_string(),
             isolation: IsolationKind::Local,
@@ -419,8 +423,13 @@ async fn drive_agent(
     config: &RunConfig,
     cost_cap: Option<f64>,
 ) -> Result<RunOutcome, String> {
-    let setup = providers::build(&config.provider, task, &config.provider_profiles)
-        .map_err(|u| u.reason)?;
+    let setup = providers::build(
+        &config.provider,
+        task,
+        &config.provider_profiles,
+        config.model.as_deref(),
+    )
+    .map_err(|u| u.reason)?;
     let price = config
         .pricing
         .lookup(&config.provider.label(), &provider_model(config))
@@ -664,7 +673,7 @@ fn provider_model(config: &RunConfig) -> String {
         ProviderMode::Live(name) => {
             providers::resolve_live_profile(name, &config.provider_profiles)
                 .ok()
-                .and_then(|p| providers::live_model(&p))
+                .and_then(|p| providers::live_model(&p, config.model.as_deref()))
                 .unwrap_or_default()
         }
     }
@@ -844,7 +853,12 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     let verification_dir = artifacts.workspace_dir();
 
     // Provider availability is checked first so skips are clean and cheap.
-    if let Err(unavailable) = providers::build(&config.provider, task, &config.provider_profiles) {
+    if let Err(unavailable) = providers::build(
+        &config.provider,
+        task,
+        &config.provider_profiles,
+        config.model.as_deref(),
+    ) {
         return skipped_result(
             task,
             &artifacts,
