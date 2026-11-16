@@ -2,7 +2,7 @@
 
 **Frozen:** 2026-11-15. No live L4 run happened before this date: the M17
 baseline (#297) is still open.
-**Owner sign-off:** pending (see [Sign-off](#sign-off)).
+**Owner sign-off:** 2026-11-16 (see [Sign-off](#sign-off)).
 
 The `l4` suite is five real, closed issues from permissively licensed Rust
 repositories. Each one is frozen as a v3 `level = "L4"` task:
@@ -179,10 +179,10 @@ crom eval run --suite l4 --provider <profile>    # #297: 3 attempts per task
 
 ## Sign-off
 
-The owner has not yet signed off on this selection; #296 requires it.
+The owner signed off on this selection on 2026-11-16, before any live L4 run.
 Changing a task after sign-off means bumping its `task_version` and recording
 the reason here.
 
 | Date | Owner | Decision |
 |---|---|---|
-| — | — | pending |
+| 2026-11-16 | @mfaulk | approved as frozen (2026-11-15); no live L4 run before sign-off |
