@@ -85,13 +85,9 @@ async fn required_mode_refuses_when_backend_cannot_enforce() {
 #[tokio::test]
 async fn required_mode_refuses_on_unsupported_platform() {
     let ws = TempDir::new().unwrap();
-    let err = run(
-        &tool(SandboxConfig::required()),
-        ws.path(),
-        "touch marker",
-    )
-    .await
-    .expect_err("required sandbox must refuse");
+    let err = run(&tool(SandboxConfig::required()), ws.path(), "touch marker")
+        .await
+        .expect_err("required sandbox must refuse");
     assert!(err.to_string().contains("sandbox"), "{err}");
     assert!(!ws.path().join("marker").exists());
 }
@@ -119,7 +115,9 @@ mod linux {
             Ok(_) => true,
             Err(reason) => {
                 if std::env::var_os("CROM_REQUIRE_SANDBOX_TESTS").is_some() {
-                    panic!("sandbox required by CROM_REQUIRE_SANDBOX_TESTS but unavailable: {reason}");
+                    panic!(
+                        "sandbox required by CROM_REQUIRE_SANDBOX_TESTS but unavailable: {reason}"
+                    );
                 }
                 eprintln!("SKIP: OS sandbox unavailable on this host: {reason}");
                 false
@@ -248,8 +246,16 @@ mod linux {
                 .map(|l| l.split_whitespace().collect::<Vec<_>>())
                 .unwrap_or_default()
         };
-        assert_eq!(field("NoNewPrivs:").get(1), Some(&"1"), "no_new_privs off: {out}");
-        assert_eq!(field("Seccomp:").get(1), Some(&"2"), "seccomp filter off: {out}");
+        assert_eq!(
+            field("NoNewPrivs:").get(1),
+            Some(&"1"),
+            "no_new_privs off: {out}"
+        );
+        assert_eq!(
+            field("Seccomp:").get(1),
+            Some(&"2"),
+            "seccomp filter off: {out}"
+        );
         let host_limits = std::fs::read_to_string("/proc/self/limits").unwrap();
         for limit in ["Max processes", "Max data size"] {
             let soft_of = |text: &str| -> Option<u64> {
@@ -311,7 +317,10 @@ mod linux {
         let out = text(&r);
         assert!(out.contains("done"), "{out}");
         assert!(!out.contains("SYNTHETIC-SECRET"), "{out}");
-        assert!(!out.contains("id_fake\n"), "directory listing leaked: {out}");
+        assert!(
+            !out.contains("id_fake\n"),
+            "directory listing leaked: {out}"
+        );
     }
 
     // P2/P4: the host process's /proc environ (which holds provider keys) is unreadable.
@@ -374,7 +383,10 @@ mod linux {
             .await
             .unwrap();
         let out = text(&r);
-        assert!(out.contains("[exit: 0]") && out.contains("test result: ok"), "{out}");
+        assert!(
+            out.contains("[exit: 0]") && out.contains("test result: ok"),
+            "{out}"
+        );
     }
 
     // P3: TCP to a host loopback server, UDP connect, and unix-socket connect all fail by default.
@@ -425,9 +437,8 @@ mod linux {
             network: true,
             ..SandboxConfig::required()
         };
-        let cmd = format!(
-            "(exec 3<>/dev/tcp/127.0.0.1/{port}) && echo tcp-open || echo TCP-BLOCKED"
-        );
+        let cmd =
+            format!("(exec 3<>/dev/tcp/127.0.0.1/{port}) && echo tcp-open || echo TCP-BLOCKED");
         let r = run(&tool(cfg), ws.path(), &cmd).await.unwrap();
         assert!(text(&r).contains("tcp-open"), "{}", text(&r));
     }
@@ -533,7 +544,11 @@ mod linux {
         let _ = run_with_timeout(&t, ws.path(), &cmd, Some(4)).await;
         assert!(started.elapsed() < Duration::from_secs(20));
         let left = wait_gone(&m, Duration::from_secs(5)).await;
-        assert!(left.is_empty(), "fork bomb processes survived: {}", left.len());
+        assert!(
+            left.is_empty(),
+            "fork bomb processes survived: {}",
+            left.len()
+        );
     }
 
     // P6: an allocation past max_memory_bytes fails.
@@ -572,13 +587,9 @@ mod linux {
             max_file_size_bytes: 1 << 20,
             ..SandboxConfig::required()
         };
-        let r = run(
-            &tool(cfg),
-            ws.path(),
-            "head -c 4194304 /dev/zero > big.bin",
-        )
-        .await
-        .unwrap();
+        let r = run(&tool(cfg), ws.path(), "head -c 4194304 /dev/zero > big.bin")
+            .await
+            .unwrap();
         assert!(!text(&r).contains("[exit: 0]"), "{}", text(&r));
         let len = std::fs::metadata(ws.path().join("big.bin")).unwrap().len();
         assert!(len <= 1 << 20, "file grew to {len}");
@@ -592,7 +603,10 @@ mod linux {
         }
         let info = crom_tools::sandbox::probe(&SandboxConfig::required()).unwrap();
         if info.landlock_abi < 6 {
-            eprintln!("SKIP: landlock ABI {} has no signal scoping", info.landlock_abi);
+            eprintln!(
+                "SKIP: landlock ABI {} has no signal scoping",
+                info.landlock_abi
+            );
             return;
         }
         let ws = TempDir::new().unwrap();

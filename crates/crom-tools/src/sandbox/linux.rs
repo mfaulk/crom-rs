@@ -236,7 +236,11 @@ fn add_path_rule(ruleset: &OwnedFd, path: &Path, access: u64) -> Result<(), Stri
         return Err(last_err(&format!("fstat {}", path.display())));
     }
     let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
-    let allowed = if is_dir { access } else { access & FS_FILE_ONLY };
+    let allowed = if is_dir {
+        access
+    } else {
+        access & FS_FILE_ONLY
+    };
     let rule = PathBeneathAttr {
         allowed_access: allowed,
         parent_fd: pfd.as_raw_fd(),
@@ -289,12 +293,7 @@ fn seccomp_program(network: bool) -> Vec<SockFilter> {
         p.push(jump(BPF_JMP_JGE_K, 0x4000_0000, 0, 1));
         p.push(stmt(BPF_RET_K, enosys));
     }
-    p.push(jump(
-        BPF_JMP_JEQ_K,
-        libc::SYS_io_uring_setup as u32,
-        0,
-        1,
-    ));
+    p.push(jump(BPF_JMP_JEQ_K, libc::SYS_io_uring_setup as u32, 0, 1));
     p.push(stmt(BPF_RET_K, enosys));
     if network {
         p.push(jump(BPF_JMP_JEQ_K, libc::SYS_socket as u32, 0, 3));
@@ -379,7 +378,11 @@ fn toolchain_bin_dirs() -> Vec<PathBuf> {
             .find(|p| p.is_file())
         {
             out.extend(bin.parent().map(Path::to_path_buf));
-            if let Some(dir) = bin.canonicalize().ok().and_then(|c| c.parent().map(Path::to_path_buf)) {
+            if let Some(dir) = bin
+                .canonicalize()
+                .ok()
+                .and_then(|c| c.parent().map(Path::to_path_buf))
+            {
                 out.push(dir);
             }
         }
@@ -437,7 +440,12 @@ pub(crate) fn prepare(
         return Err("workspace `/` cannot be sandboxed".into());
     }
     let host_home = std::env::var_os("HOME").map(PathBuf::from);
-    if host_home.as_deref().and_then(|h| h.canonicalize().ok()).as_deref() == Some(ws.as_path()) {
+    if host_home
+        .as_deref()
+        .and_then(|h| h.canonicalize().ok())
+        .as_deref()
+        == Some(ws.as_path())
+    {
         return Err(format!(
             "workspace {} is the home directory; refusing to expose it read-write",
             ws.display()
@@ -637,9 +645,18 @@ unsafe fn enter_sandbox(
 
 unsafe fn supervise(child: libc::pid_t, host: libc::pid_t, block: &libc::sigset_t) -> ! {
     TERMINATE.store(false, Ordering::SeqCst);
-    set_handler(libc::SIGTERM, on_terminate as *const () as libc::sighandler_t);
-    set_handler(libc::SIGHUP, on_terminate as *const () as libc::sighandler_t);
-    set_handler(libc::SIGINT, on_terminate as *const () as libc::sighandler_t);
+    set_handler(
+        libc::SIGTERM,
+        on_terminate as *const () as libc::sighandler_t,
+    );
+    set_handler(
+        libc::SIGHUP,
+        on_terminate as *const () as libc::sighandler_t,
+    );
+    set_handler(
+        libc::SIGINT,
+        on_terminate as *const () as libc::sighandler_t,
+    );
     set_handler(libc::SIGALRM, on_wakeup as *const () as libc::sighandler_t);
     libc::signal(libc::SIGCHLD, libc::SIG_DFL);
     libc::signal(libc::SIGPIPE, libc::SIG_IGN);

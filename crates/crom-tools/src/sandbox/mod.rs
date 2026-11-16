@@ -77,7 +77,10 @@ pub async fn measure_overhead_ms(
 
     let reps = reps.max(1);
     let mut mean = [0f64; 2];
-    for (i, mode) in [SandboxMode::Off, SandboxMode::Required].into_iter().enumerate() {
+    for (i, mode) in [SandboxMode::Off, SandboxMode::Required]
+        .into_iter()
+        .enumerate()
+    {
         let tool = BashTool::new(Arc::new(ToolLimits {
             bash_timeout: Duration::from_secs(10),
             sandbox: SandboxConfig {

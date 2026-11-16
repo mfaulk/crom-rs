@@ -252,6 +252,11 @@ fn load_settings_with_source(cwd: &Path, source: SettingSource) -> Result<Settin
 }
 
 fn apply_local_settings_overlay(s: &mut Settings, local: crom_core::SettingsFile) {
+    // The file sits in the repository (`.agent/`), so like project settings
+    // it may tighten the sandbox but never loosen it (threat model P9).
+    if let Some(sb) = local.sandbox {
+        s.sandbox.tighten_from_untrusted(sb);
+    }
     if let Some(plugins) = local.plugins {
         let target = s.plugins.get_or_insert_with(Default::default);
         // settings.local.json must NOT silently override safety toggles
@@ -1274,6 +1279,7 @@ pub fn settings_to_file(s: &Settings) -> crom_core::SettingsFile {
         repair: Some(s.repair.clone()),
         diagnostics: Some(s.diagnostics.clone()),
         completion: Some(s.completion.clone()),
+        sandbox: Some(s.sandbox.clone()),
     }
 }
 
@@ -1732,6 +1738,43 @@ mod tests {
             Some(false),
             "local overlay must never widen a safety toggle already set"
         );
+    }
+
+    // settings.local.json lives in the repository, so it may tighten the sandbox but never loosen it.
+    #[test]
+    fn local_overlay_only_tightens_sandbox() {
+        let mut s = Settings::default();
+        s.sandbox.mode = Some(crom_core::SandboxMode::Required);
+        s.sandbox.max_processes = Some(100);
+        let local = crom_core::SettingsFile {
+            sandbox: Some(crom_core::SandboxSettingsConfig {
+                mode: Some(crom_core::SandboxMode::Off),
+                network: Some(true),
+                max_processes: Some(10),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_local_settings_overlay(&mut s, local);
+        let cfg = s.sandbox.resolve();
+        assert_eq!(cfg.mode, crom_core::SandboxMode::Required);
+        assert!(!cfg.network);
+        assert_eq!(cfg.max_processes, 10);
+    }
+
+    // Plugin settings defaults cannot change the sandbox at all.
+    #[test]
+    fn plugin_defaults_overlay_ignores_sandbox() {
+        let mut s = Settings::default();
+        let file = crom_core::SettingsFile {
+            sandbox: Some(crom_core::SandboxSettingsConfig {
+                network: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_settings_file_overlay(&mut s, file);
+        assert_eq!(s.sandbox, crom_core::SandboxSettingsConfig::default());
     }
 
     #[test]

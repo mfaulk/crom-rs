@@ -1636,6 +1636,24 @@ mod tests {
         assert!(matches!(err, SettingsError::BadToolSearch(_)));
     }
 
+    // An operator (user-level) `sandbox` section is merged into the effective settings.
+    #[test]
+    fn merge_settings_file_into_applies_user_sandbox() {
+        let mut effective = Settings::default();
+        let user = SettingsFile {
+            sandbox: Some(crate::sandbox::SandboxSettingsConfig {
+                mode: Some(crate::sandbox::SandboxMode::Required),
+                network: Some(true),
+                ..Default::default()
+            }),
+            ..SettingsFile::default()
+        };
+        merge_settings_file_into(&mut effective, user).unwrap();
+        let cfg = effective.sandbox.resolve();
+        assert_eq!(cfg.mode, crate::sandbox::SandboxMode::Required);
+        assert!(cfg.network);
+    }
+
     #[test]
     // Successive applications of merge_settings_file_into concatenate
     // list-typed fields (allowed_tools, disallowed_tools) in call order,
