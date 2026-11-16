@@ -33,6 +33,7 @@ pub mod todo;
 pub mod tool;
 pub mod tool_catalog;
 pub mod tool_rule;
+pub mod trust;
 pub mod ui;
 pub mod usage;
 
@@ -195,6 +196,7 @@ pub use tool_catalog::{
     SEARCH_TOOLS_NAME,
 };
 pub use tool_rule::ToolRule;
+pub use trust::{UntrustedConfigDenial, WorkspaceTrust};
 pub use ui::{
     merge_recovery_into, merge_ui_into, render_status_line, supported_status_line_variables,
     unknown_status_line_variables, ColorCapability, ComposerConfig, ComposerSettingsConfig,

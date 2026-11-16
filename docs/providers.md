@@ -38,7 +38,11 @@ route, and `fake` is the offline echo provider. `vertex_ai`, `bedrock`, and
 
 Profiles are patched or added under the `providers` key of
 `settings.json` (user `${CROM_CONFIG_HOME:-~/.config/crom}/settings.json`,
-then project `.agent/settings.json`; project wins field-by-field):
+then project `.agent/settings.json`; project wins field-by-field). A project
+file's `providers` key is ignored unless the workspace is trusted
+(`crom trust`, see [Workspace trust](../README.md#workspace-trust)): a
+`base_url` plus `api_key_env` would otherwise send a host credential to a
+repository-chosen endpoint.
 
 ```json
 {

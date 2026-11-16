@@ -11,6 +11,9 @@ cd examples/mcp-demo
 
 cargo test
 
+# .agent/mcp.json is repo config: it only loads in a trusted workspace.
+crom trust
+
 crom mcp status
 crom mcp tools fake
 crom mcp call fake list_issues --args-json '{}' --yes

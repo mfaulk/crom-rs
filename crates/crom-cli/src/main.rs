@@ -5,6 +5,7 @@ mod m9;
 mod plan_cmd;
 mod plugins;
 mod sdk_cmd;
+mod trust_cmd;
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -172,6 +173,11 @@ enum Command {
     /// diagnostics, without an agent session.
     #[command(subcommand)]
     Diagnostics(diagnostics_cmd::DiagnosticsCommand),
+    /// Trust a workspace so its `.agent/settings.json` and `.agent/mcp.json`
+    /// may loosen permissions and start MCP servers.
+    Trust(trust_cmd::TrustArgs),
+    /// Stop trusting a workspace.
+    Untrust(trust_cmd::UntrustArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -1473,6 +1479,8 @@ async fn main() -> ExitCode {
         Command::HeadlessRun(args) => sdk_cmd::cmd_headless_run(args).await,
         Command::Eval(cmd) => eval_cmd::run(cmd).await,
         Command::Diagnostics(cmd) => diagnostics_cmd::run(cmd),
+        Command::Trust(args) => trust_cmd::cmd_trust(args),
+        Command::Untrust(args) => trust_cmd::cmd_untrust(args),
     };
 
     match result {
@@ -1527,7 +1535,20 @@ async fn resolve_common(
             .with_context(|| format!("apply --config {}", p.display()))?;
         s
     } else {
-        crom_core::settings::load(&cwd, source).context("load settings")?
+        let s = crom_core::settings::load(&cwd, source).context("load settings")?;
+        // #290: repo config that would loosen policy needs a trust decision.
+        // Interactive runs are asked; headless runs keep the restricted set.
+        let pending = trust_cmd::pending_repo_config(&cwd, &s);
+        if !pending.is_empty()
+            && !matches!(log_format, LogFormat::Json)
+            && trust_cmd::is_interactive_terminal()
+            && trust_cmd::prompt_for_trust(&cwd, &pending)?
+        {
+            crom_core::settings::load_with_trust(&cwd, source, crom_core::WorkspaceTrust::Trusted)
+                .context("load settings")?
+        } else {
+            s
+        }
     };
 
     // Apply CLI rule overrides.
@@ -1574,8 +1595,10 @@ async fn resolve_common(
         mcp_enabled_override,
         common.mcp_strict.then_some(true),
         mcp_timeout,
+        workspace_trusted(&cwd, &settings),
     )
     .context("load MCP config")?;
+    report_trust_denials(&cwd, &settings, &mcp_options, log_format);
     if !common.mcp_servers.is_empty() {
         mcp_options
             .servers
@@ -3044,6 +3067,44 @@ fn render_expansion_audit(cfg: &ResolvedRunConfig, executor: &CliExpansionExecut
     }
 }
 
+/// Whether repo-local MCP config may load for `cwd` (#290).
+fn workspace_trusted(cwd: &Path, settings: &Settings) -> bool {
+    settings.workspace_trust.is_trusted() || crom_core::trust::workspace_trust(cwd).is_trusted()
+}
+
+/// Record each ignored repo-config entry as a blocked `SecurityDecision`
+/// (a JSON line under `--log-format json`) and warn on stderr in text mode.
+fn report_trust_denials(
+    cwd: &Path,
+    settings: &Settings,
+    mcp: &crom_mcp::McpOptions,
+    log_format: LogFormat,
+) {
+    let decisions = trust_cmd::trust_denial_decisions(cwd, settings, mcp);
+    if decisions.is_empty() {
+        return;
+    }
+    for d in &decisions {
+        if matches!(log_format, LogFormat::Json) {
+            render_event(
+                &AgentEvent::SecurityDecision(d.clone()),
+                log_format,
+                &mut String::new(),
+                false,
+            );
+        } else {
+            eprintln!(
+                "[trust] ignored {}: {}",
+                d.resource.as_deref().unwrap_or("?"),
+                d.reason.as_deref().unwrap_or("")
+            );
+        }
+    }
+    if !matches!(log_format, LogFormat::Json) {
+        eprintln!("[trust] workspace is not trusted; run `crom trust` to apply its .agent config");
+    }
+}
+
 fn tool_limits_from_settings(settings: &Settings) -> ToolLimits {
     let mut limits = ToolLimits::default();
     if let Some(v) = settings.tool_limits.max_read_bytes {
@@ -4206,8 +4267,10 @@ async fn build_tools_catalog(common: &ToolsCommonArgs) -> Result<ToolsCatalogCon
         common.mcp_config.as_ref().map(|_| true),
         common.mcp_strict.then_some(true),
         mcp_timeout,
+        workspace_trusted(&cwd, &settings),
     )
     .context("load MCP config")?;
+    report_trust_denials(&cwd, &settings, &mcp_options, LogFormat::Pretty);
     if !common.mcp_servers.is_empty() {
         mcp_options
             .servers
@@ -4288,8 +4351,10 @@ async fn resolve_mcp_cli_options(common: &McpCommonArgs) -> Result<crom_mcp::Mcp
         Some(true),
         common.mcp_strict.then_some(true),
         common.mcp_timeout.map(Duration::from_secs),
+        crom_core::trust::workspace_trust(&cwd).is_trusted(),
     )
     .context("load MCP config")?;
+    report_trust_denials(&cwd, &Settings::default(), &options, LogFormat::Pretty);
     if !common.mcp_servers.is_empty() {
         options
             .servers
@@ -7466,6 +7531,21 @@ async fn cmd_tui(args: TuiArgs) -> Result<()> {
             e
         })
         .context("load settings")?;
+    let pending = trust_cmd::pending_repo_config(&cwd, &settings);
+    let settings = if !args.list_sessions
+        && !pending.is_empty()
+        && trust_cmd::is_interactive_terminal()
+        && trust_cmd::prompt_for_trust(&cwd, &pending)?
+    {
+        crom_core::settings::load_with_trust(
+            &cwd,
+            SettingSource::UserAndProject,
+            crom_core::WorkspaceTrust::Trusted,
+        )
+        .context("load settings")?
+    } else {
+        settings
+    };
 
     // M13 Phase I: list-sessions short-circuits the launch entirely
     // and emits one session per line in tab-separated columns:
@@ -7697,14 +7777,33 @@ async fn build_inspector_snapshot_for_tui(
 
     // --- MCP: configured servers. The handshake itself is reserved
     // for Phase G+.
-    let mut mcp_options =
-        match crom_mcp::load_mcp_options(cwd, settings.mcp.as_ref(), None, None, None, None) {
-            Ok(opts) => opts,
-            Err(e) => {
-                diagnostics.push(format!("mcp options load failed: {e}"));
-                crom_mcp::McpOptions::default()
-            }
-        };
+    let mut mcp_options = match crom_mcp::load_mcp_options(
+        cwd,
+        settings.mcp.as_ref(),
+        None,
+        None,
+        None,
+        None,
+        workspace_trusted(cwd, settings),
+    ) {
+        Ok(opts) => opts,
+        Err(e) => {
+            diagnostics.push(format!("mcp options load failed: {e}"));
+            crom_mcp::McpOptions::default()
+        }
+    };
+    for d in &settings.untrusted_denials {
+        diagnostics.push(format!(
+            "untrusted workspace: ignored .agent/settings.json {}",
+            d.key
+        ));
+    }
+    for d in &mcp_options.repo_config_denials {
+        diagnostics.push(format!(
+            "untrusted workspace: ignored .agent/mcp.json {}",
+            d.key
+        ));
+    }
 
     // --- Plugins: build runtime then merge plugin-contributed
     // components into the skills/agents/mcp registries so the

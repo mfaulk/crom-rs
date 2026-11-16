@@ -68,3 +68,13 @@ cargo test          # passes after the agent's edit
 
 Each demo's own `README.md` (where present) and `AGENTS.md` describe the
 intent, the planted bug or scenario, and any demo-specific flags.
+
+Demos that ship `.agent/settings.json` allow rules, validation commands or
+`.agent/mcp.json` servers (`checkpoint-demo`, `mcp-demo`, `planning-demo`,
+`policy-demo`, `skills-demo`, `subagent-demo`, `tool-search-demo`) need the
+demo directory trusted first, or that config is ignored (see
+[Workspace trust](../README.md#workspace-trust)):
+
+```sh
+crom trust examples/mcp-demo
+```

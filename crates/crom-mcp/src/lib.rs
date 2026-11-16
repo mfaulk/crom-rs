@@ -11,9 +11,10 @@ pub mod transport;
 
 pub use client::{McpClient, McpServerInit, MCP_MAX_LIST_PAGES};
 pub use config::{
-    load_mcp_options, merge_mcp_options, redact_json_value, redact_text_with_secrets,
-    redact_value_with_secrets, McpConfigFile, McpExternalEffectPolicy, McpLimits, McpOptions,
-    McpServerConfig, McpSettingsConfig, StdioMcpServerConfig, StreamableHttpMcpServerConfig,
+    first_env_placeholder, load_mcp_options, merge_mcp_options, redact_json_value,
+    redact_text_with_secrets, redact_value_with_secrets, McpConfigFile, McpExternalEffectPolicy,
+    McpLimits, McpOptions, McpRepoConfigDenial, McpServerConfig, McpSettingsConfig,
+    StdioMcpServerConfig, StreamableHttpMcpServerConfig,
 };
 pub use errors::{McpError, McpResult};
 pub use lifecycle::{

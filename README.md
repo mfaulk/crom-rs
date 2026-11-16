@@ -118,6 +118,12 @@ drop an `mcp.json` file at `.agent/mcp.json` in your project root:
 
 HTTP transports are also supported (`"type": "http"` with a `"url"` field).
 
+`.agent/mcp.json` is repository config: it is only loaded after you trust the
+workspace (`crom trust`, see [Workspace trust](#workspace-trust)), and it may
+not use `${VAR}` placeholders. Put servers that need host secrets in user
+settings or pass them with `--mcp-config <file>`; those still interpolate
+`${VAR}` from your environment.
+
 Allow the MCP tools on the run:
 
 ```sh
@@ -150,6 +156,50 @@ crom run "Find the parser bug issue and inspect the likely source" \
 
 A fully offline MCP walkthrough lives in `examples/mcp-demo/` (a fake stdio
 server bundled in-tree, no external services required).
+
+## Workspace trust
+
+A cloned repository can ship `.agent/settings.json` and `.agent/mcp.json`.
+Until you trust the workspace, crom treats both as untrusted:
+
+- `.agent/settings.json` may only tighten policy. These keys are ignored:
+  `permission_mode` looser than your user setting (order
+  `plan < dontAsk < default < acceptEdits`), `allowed_tools`, safety hooks set
+  to `false` (`hooks.block_dangerous_bash`, `block_env_file_writes`,
+  `audit_log`, `secret_redaction`), a larger `hooks.max_patch_size_bytes`,
+  `validation.commands`, `checkpointing.enabled: false`, a looser
+  `checkpointing.bash_policy`, `mcp.enabled: true`, `mcp.config_file`,
+  `mcp.servers`, `mcp.external_effect_policy`, `mcp.load_resources`/`load_prompts: true`,
+  `agents.inherit_permissions: false`, `plugins.allow_*: true`,
+  `plugins.marketplaces`, and `providers`. Everything else (model, disallow
+  rules, UI, limits, a tighter sandbox) still applies.
+- `.agent/mcp.json` (or any MCP config file under the workspace that was not
+  passed with `--mcp-config`) is not read, so no repo server starts.
+
+Each ignored key is reported: a `[trust] ignored …` line on stderr, or a
+blocked `security_decision` event (`policy_source: workspace_trust`) under
+`--log-format json`. `crom config` lists them too.
+
+When stdin and stderr are a terminal, agent commands (`run`, `chat`,
+`resume`, `continue`, `fork`, `plan`, `act`, `replan`, `tui`) list the ignored
+keys and ask once whether to trust the workspace; a yes is saved. Headless
+runs (no TTY, `--log-format json`, `headless-run`, eval) never prompt and stay
+restricted.
+
+```sh
+crom trust                # trust the current directory
+crom trust path/to/repo   # trust another workspace
+crom trust --status       # print trusted/untrusted for the current directory
+crom trust --list         # list trusted workspaces
+crom untrust              # revoke
+```
+
+Decisions are stored in
+`${CROM_CONFIG_HOME:-${XDG_CONFIG_HOME:-~/.config}/crom}/trusted-workspaces.json`,
+keyed by canonical path. Trust is exact: trusting a directory does not trust
+its subdirectories. Even in a trusted workspace, repo-sourced MCP config never
+gets `${VAR}` interpolation. The SDK never reads `.agent/settings.json` or
+`.agent/mcp.json`; embedders pass configuration explicitly.
 
 ## Examples
 

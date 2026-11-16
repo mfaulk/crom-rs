@@ -66,8 +66,8 @@ Security ladder (S0–S4): [`MILESTONE_17.md` §6](../milestones/MILESTONE_17.md
 |---|---|---|---|
 | B1 | Model output → host | Every tool call passes the policy gate (§5) | Unchanged; audit events gain target/run/layer (#291) |
 | B2 | Host → tool process | Plain `spawn` with full env and cwd only | OS-enforced sandbox, properties P1–P7 (#253) |
-| B3 | Host ↔ MCP server | Unsandboxed child; `${VAR}` interpolation of host env into args/env | Repo-sourced servers need trust (P9); sandbox opt-in (ADR 0001 §6) |
-| B4 | Repo files → host config/prompt | `.agent/settings.json`, `.agent/mcp.json` load without a trust decision | Trust decision before loosening (P9, #290) |
+| B3 | Host ↔ MCP server | Unsandboxed child. Repo-sourced servers load only in a trusted workspace and never get `${VAR}` interpolation (#290); operator-sourced config still interpolates | Sandbox opt-in (ADR 0001 §6) |
+| B4 | Repo files → host config/prompt | Untrusted `.agent/settings.json` may only tighten; `.agent/mcp.json` is not loaded; a persisted trust decision (`crom trust`) lifts both (#290) | Done (P9) |
 | B5 | Agent phase ↔ grader | Hidden material on the same host FS, readable by agent Bash | Unreachable during agent phase (P8, #286) |
 | B6 | Host → persisted state | Sessions under `<cwd>/.agent/`, writable by agent Bash | Out of sandbox writable set, or integrity-checked (gap G9) |
 
@@ -96,9 +96,10 @@ Verified against `5bc1fb2`.
 | Bash timeout | `crom-tools/src/bash.rs:89-94` caps caller timeout at the configured max; `:134` | Bounds wall time | — |
 | Bash process group | `bash.rs:107-114` (`process_group(0)`), SIGKILL to the group on timeout only (`:144-160`); `kill_on_drop` (`:104`) kills bash only | Kills same-group descendants on timeout | `setsid` escapes; not killed on normal exit or cancel |
 | Bash spawn | `bash.rs:97-104` | cwd = workspace | Full env inherited (no `env_clear` anywhere in the repo), no FS/network/rlimit restriction |
-| Dangerous-bash / `.env` write hooks | `crom-core/src/builtin_hooks.rs:15`, `:137` | Pattern-based deny | Pattern matching, bypassable by encoding; repo settings can disable them |
+| Dangerous-bash / `.env` write hooks | `crom-core/src/builtin_hooks.rs:15`, `:137` | Pattern-based deny | Pattern matching, bypassable by encoding; only user settings or a trusted workspace can disable them |
 | Secret redaction | `builtin_hooks.rs` (`redact_secrets_in_str`), applied in `agent.rs` `emit`/`emit_telemetry` and `crom-eval/src/artifacts.rs` `write_redacted` | Scrubs known secret shapes from session JSONL, the event stream, telemetry, and eval artifacts (#291) | Pattern-based; the redaction hooks themselves remain `Continue` |
-| MCP config | `crom-mcp/src/config.rs:290-298` auto-loads `<cwd>/.agent/mcp.json` and enables MCP; `:331`/`:468-490` interpolate `${VAR}` from the host env | — | Repo-controlled spawn with host secrets — #290 |
+| Workspace trust | `crom-core/src/trust.rs` (store `${CROM_CONFIG_HOME:-~/.config/crom}/trusted-workspaces.json`, exact canonical path); `settings.rs` `restrict_untrusted_project`; `crom-mcp/src/config.rs` `load_mcp_options(.., workspace_trusted)` | Untrusted project settings may only tighten; a repo MCP config file is not read; each ignored key emits a blocked `SecurityDecision` (`policy_source: workspace_trust`) | CLI prompts only on an interactive terminal; headless runs stay restricted |
+| MCP config | `crom-mcp/src/config.rs` `load_mcp_options` | Repo-sourced servers (a config file under the workspace not named by `--mcp-config`, or project-settings `mcp.servers`) never get `${VAR}` interpolation; loading fails instead | Operator-sourced config (`--mcp-config`, user settings) still interpolates host env |
 | MCP stdio spawn | `crom-mcp/src/transport/stdio.rs:37-47` | `kill_on_drop` | Inherits env, no sandbox |
 | Eval verification isolation | `crom-eval/src/isolation.rs:244-291` (`docker`/`podman run --rm --network none`, optional cpu/memory) | Contains verification commands when a container backend is selected | Default `LocalBackend` (`:168-190`) runs on the host; agent phase never containerized |
 | Eval agent phase | `crom-eval/src/runner.rs:199-215` (`SideEffectPolicy::full()`), `:234` (`WorkspaceSource::filesystem`, cwd only), `:237` (`AllowAllApprovals`) | — | Live runs execute model-chosen Bash on the host — #253 |
@@ -112,7 +113,7 @@ Verified against `5bc1fb2`.
 | G2 | `setsid`/double-fork escapes process-group kill; group not killed on normal exit or cancel | P5 | #253 |
 | G3 | No fail-closed mode; no backend exists | P7 | #253 |
 | G4 | Hidden material on the agent-reachable FS; overlay into the same workspace | P8 | #286 |
-| G5 | Repo `.agent/settings.json` / `.agent/mcp.json` loosen policy and spawn processes without a trust decision; MCP `${VAR}` interpolation | P9 | #290 |
+| G5 | ~~Repo `.agent/settings.json` / `.agent/mcp.json` loosen policy and spawn processes without a trust decision; MCP `${VAR}` interpolation~~ Fixed: untrusted project settings may only tighten, repo MCP config needs trust and never interpolates host env (`crom trust`) | P9 | #290 |
 | G6 | ~~Hook `Allow` short-circuits disallow rules; subagents raise `permission_mode`~~ Fixed: disallow rules run before hook `Allow`; child mode is capped at the parent's and inherits parent disallow rules (`agents.inherit_permissions`) | S0 | #290 |
 | G7 | ~~Slash `` !`cmd` `` expansion skips the policy gate; SDK tools act on host cwd~~ Fixed: slash `!`/`@` expansions go through `PolicyEngine::evaluate_tool`; SDK `ReturnOnly`/`RejectMutations` run tools in a scratch copy, rootless apply runs get no built-in file/shell tools | S1 | #290 |
 | G8 | ~~`PolicyDecision`/`ToolCallDenied` lack target, run id, enforcement layer; redaction hooks are no-ops~~ Fixed: `SecurityDecision` audit events on every gated tool call and always-on redaction of recorded events ([`audit.md`](audit.md)) | Audit | #291 |

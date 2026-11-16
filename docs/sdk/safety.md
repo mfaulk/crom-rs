@@ -43,6 +43,23 @@ host process cwd: `ReturnOnly`/`RejectMutations` run them in a private
 scratch copy, apply policies use the real root, and a rootless workspace
 under an apply policy gets none (see [Workspaces](workspaces.md)).
 
+## Repository-local configuration
+
+The SDK never reads a workspace's `.agent/settings.json` or `.agent/mcp.json`;
+every policy, tool and MCP setting comes from the embedder's builder calls
+(`sdk_ignores_repo_local_agent_config` in `crom-sdk/tests/headless_run.rs`).
+`AgentClientBuilder::mcp_config_file` is operator-sourced and keeps `${VAR}`
+interpolation.
+
+The CLI does read them, under a persisted workspace trust decision (#290):
+untrusted project settings may only tighten policy, repo MCP config is not
+loaded, and repo-sourced MCP config never gets `${VAR}` interpolation. See
+[Workspace trust](../../README.md#workspace-trust). Embedders that want the
+same behaviour can load settings with `crom_core::settings::load` (which
+consults the trust store) or `load_with_trust`, and MCP options with
+`crom_mcp::load_mcp_options(.., workspace_trusted)`; ignored entries are in
+`Settings::untrusted_denials` and `McpOptions::repo_config_denials`.
+
 ## Threats addressed
 
 - **Inadvertent mutation**: ReturnOnly + read-only side effects + no Bash.
