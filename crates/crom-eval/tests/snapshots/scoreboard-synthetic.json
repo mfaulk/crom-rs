@@ -1,0 +1,326 @@
+{
+  "schema_version": 1,
+  "group_by": "model",
+  "since": null,
+  "models": [],
+  "levels": [],
+  "groups": [
+    {
+      "key": "deepseek/deepseek-chat",
+      "runs": 1,
+      "attempts": 1,
+      "capability": {
+        "overall": {
+          "key": "capability",
+          "tasks": 1,
+          "outcomes": {
+            "resolved": 0,
+            "failed": 1,
+            "provider_error": 0,
+            "infra_error": 0,
+            "skipped": 0,
+            "unscorable": 0
+          },
+          "resolved_rate": 0.0,
+          "wilson95": {
+            "low": 0.0,
+            "high": 0.7934506856227626
+          },
+          "pass_at_1": 0.0,
+          "pass_at_k": null
+        },
+        "by_level": [
+          {
+            "key": "L1",
+            "tasks": 1,
+            "outcomes": {
+              "resolved": 0,
+              "failed": 1,
+              "provider_error": 0,
+              "infra_error": 0,
+              "skipped": 0,
+              "unscorable": 0
+            },
+            "resolved_rate": 0.0,
+            "wilson95": {
+              "low": 0.0,
+              "high": 0.7934506856227626
+            },
+            "pass_at_1": 0.0,
+            "pass_at_k": null
+          }
+        ],
+        "by_category": [
+          {
+            "key": "bugfix",
+            "tasks": 1,
+            "outcomes": {
+              "resolved": 0,
+              "failed": 1,
+              "provider_error": 0,
+              "infra_error": 0,
+              "skipped": 0,
+              "unscorable": 0
+            },
+            "resolved_rate": 0.0,
+            "wilson95": {
+              "low": 0.0,
+              "high": 0.7934506856227626
+            },
+            "pass_at_1": 0.0,
+            "pass_at_k": null
+          }
+        ]
+      },
+      "harness": null,
+      "security": null,
+      "unclassified": null,
+      "efficiency": {
+        "attempts": 1,
+        "resolved": 0,
+        "cost_known": 0,
+        "total_spend_usd": null,
+        "cost_per_attempt_usd": null,
+        "cost_per_resolved_usd": null,
+        "median_wall_ms": 100,
+        "mean_tool_calls": 3.0,
+        "mean_round_trips": 0.0,
+        "usage_known": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "cache_read_tokens": null,
+        "cache_creation_tokens": null,
+        "reasoning_tokens": null,
+        "cache_hit_rate": null
+      },
+      "reliability": {
+        "attempts": 1,
+        "timeouts": 0,
+        "provider_errors": 0,
+        "infra_errors": 0,
+        "unscorable": 0,
+        "tool_loops": 0,
+        "repeated_tasks": 0,
+        "flaky_tasks": 0,
+        "mean_task_variance": null,
+        "repair_attempted": 0,
+        "repair_recovered": 0,
+        "repair_recovery_rate": null,
+        "repeated_failure_stops": 0,
+        "unvalidated_completions": 0,
+        "unreliable": false
+      }
+    },
+    {
+      "key": "fake/fake",
+      "runs": 3,
+      "attempts": 17,
+      "capability": {
+        "overall": {
+          "key": "capability",
+          "tasks": 4,
+          "outcomes": {
+            "resolved": 6,
+            "failed": 3,
+            "provider_error": 1,
+            "infra_error": 1,
+            "skipped": 1,
+            "unscorable": 1
+          },
+          "resolved_rate": 0.6666666666666666,
+          "wilson95": {
+            "low": 0.3542021355803963,
+            "high": 0.879416181613089
+          },
+          "pass_at_1": 0.6666666666666666,
+          "pass_at_k": {
+            "k": 3,
+            "n_min": 3,
+            "n_max": 3,
+            "value": 1.0
+          }
+        },
+        "by_level": [
+          {
+            "key": "L1",
+            "tasks": 2,
+            "outcomes": {
+              "resolved": 3,
+              "failed": 3,
+              "provider_error": 0,
+              "infra_error": 0,
+              "skipped": 0,
+              "unscorable": 0
+            },
+            "resolved_rate": 0.5,
+            "wilson95": {
+              "low": 0.1876163064826506,
+              "high": 0.8123836935173494
+            },
+            "pass_at_1": 0.5,
+            "pass_at_k": {
+              "k": 3,
+              "n_min": 3,
+              "n_max": 3,
+              "value": 1.0
+            }
+          },
+          {
+            "key": "L2",
+            "tasks": 2,
+            "outcomes": {
+              "resolved": 3,
+              "failed": 0,
+              "provider_error": 1,
+              "infra_error": 1,
+              "skipped": 1,
+              "unscorable": 1
+            },
+            "resolved_rate": 1.0,
+            "wilson95": {
+              "low": 0.4385029682449546,
+              "high": 1.0
+            },
+            "pass_at_1": 1.0,
+            "pass_at_k": {
+              "k": 3,
+              "n_min": 3,
+              "n_max": 3,
+              "value": 1.0
+            }
+          }
+        ],
+        "by_category": [
+          {
+            "key": "bugfix",
+            "tasks": 4,
+            "outcomes": {
+              "resolved": 6,
+              "failed": 3,
+              "provider_error": 1,
+              "infra_error": 1,
+              "skipped": 1,
+              "unscorable": 1
+            },
+            "resolved_rate": 0.6666666666666666,
+            "wilson95": {
+              "low": 0.3542021355803963,
+              "high": 0.879416181613089
+            },
+            "pass_at_1": 0.6666666666666666,
+            "pass_at_k": {
+              "k": 3,
+              "n_min": 3,
+              "n_max": 3,
+              "value": 1.0
+            }
+          }
+        ]
+      },
+      "harness": {
+        "key": "harness (L0)",
+        "tasks": 1,
+        "outcomes": {
+          "resolved": 2,
+          "failed": 0,
+          "provider_error": 0,
+          "infra_error": 0,
+          "skipped": 0,
+          "unscorable": 0
+        },
+        "resolved_rate": 1.0,
+        "wilson95": {
+          "low": 0.34238022750665303,
+          "high": 1.0
+        },
+        "pass_at_1": 1.0,
+        "pass_at_k": {
+          "k": 2,
+          "n_min": 2,
+          "n_max": 2,
+          "value": 1.0
+        }
+      },
+      "security": {
+        "row": {
+          "key": "security",
+          "tasks": 1,
+          "outcomes": {
+            "resolved": 1,
+            "failed": 0,
+            "provider_error": 0,
+            "infra_error": 0,
+            "skipped": 0,
+            "unscorable": 0
+          },
+          "resolved_rate": 1.0,
+          "wilson95": {
+            "low": 0.20654931437723745,
+            "high": 1.0
+          },
+          "pass_at_1": 1.0,
+          "pass_at_k": null
+        },
+        "audited": 1,
+        "tool_calls_attempted": 3,
+        "blocked": 2,
+        "executed": 1,
+        "audit_coverage": 1.0
+      },
+      "unclassified": {
+        "key": "unclassified",
+        "tasks": 1,
+        "outcomes": {
+          "resolved": 0,
+          "failed": 1,
+          "provider_error": 0,
+          "infra_error": 0,
+          "skipped": 0,
+          "unscorable": 0
+        },
+        "resolved_rate": 0.0,
+        "wilson95": {
+          "low": 0.0,
+          "high": 0.7934506856227626
+        },
+        "pass_at_1": 0.0,
+        "pass_at_k": null
+      },
+      "efficiency": {
+        "attempts": 12,
+        "resolved": 6,
+        "cost_known": 11,
+        "total_spend_usd": 0.22,
+        "cost_per_attempt_usd": 0.02,
+        "cost_per_resolved_usd": 0.03666666666666667,
+        "median_wall_ms": 1500,
+        "mean_tool_calls": 1.3333333333333333,
+        "mean_round_trips": 1.9166666666666667,
+        "usage_known": 12,
+        "input_tokens": 12000,
+        "output_tokens": 2400,
+        "cache_read_tokens": 6000,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": null,
+        "cache_hit_rate": 0.3333333333333333
+      },
+      "reliability": {
+        "attempts": 16,
+        "timeouts": 1,
+        "provider_errors": 1,
+        "infra_errors": 1,
+        "unscorable": 1,
+        "tool_loops": 0,
+        "repeated_tasks": 4,
+        "flaky_tasks": 2,
+        "mean_task_variance": 0.11111111111111112,
+        "repair_attempted": 2,
+        "repair_recovered": 1,
+        "repair_recovery_rate": 0.5,
+        "repeated_failure_stops": 1,
+        "unvalidated_completions": 1,
+        "unreliable": true
+      }
+    }
+  ]
+}

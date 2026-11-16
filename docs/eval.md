@@ -41,6 +41,8 @@ Companion docs:
 - **Regression index** (`target/crom-eval/index.jsonl`) feeding
   `eval history`, `eval trend`, `eval regressions`, `eval task-history`.
 - **Triage** (`eval triage`, `eval show`, `eval open`).
+- **Scoreboard** (`eval scoreboard`, M17.4): cross-run capability, efficiency,
+  reliability, and security tables; see [Scoreboard](#scoreboard-m174).
 
 ## M15 command reference
 
@@ -66,6 +68,7 @@ $ crom eval task-history <task-id>
 $ crom eval triage <run-id>
 $ crom eval show <run-id> <task-id>
 $ crom eval open <run-id> <task-id>
+$ crom eval scoreboard [--since <rev>] [--model <m>]... [--level <L>]... [--format text|md|json]
 ```
 
 `eval run` takes a suite only via `--suite`; a positional argument is a task
@@ -532,6 +535,74 @@ command_contains = "cargo test"
 kind = "must_not_run_command"
 command_contains = "rm -rf"
 ```
+
+## Scoreboard (M17.4)
+
+`crom eval scoreboard` aggregates every `result.json` under the runs directory
+(including `rep-<n>/` repetitions) into one cross-run view. Text, Markdown,
+and JSON come from the same aggregation.
+
+```console
+crom eval scoreboard                                  # every run, grouped by provider/model
+crom eval scoreboard --since main --format md         # results from main and commits after it
+crom eval scoreboard --model deepseek-chat --level L1 --level L2
+crom eval scoreboard --group-by commit --format json
+crom eval scoreboard --runs-dir path/to/runs --run <run-id> --run <run-id>
+```
+
+| Flag | Meaning |
+|---|---|
+| `--runs-dir` | Root holding run directories (default `target/crom-eval/runs`). |
+| `--run` | Only these run ids (repeatable). |
+| `--since <rev>` | Only results whose `repro.git.sha` is `<rev>` or in `git rev-list <rev>..HEAD`. Results without a SHA are dropped. |
+| `--model` | Only this `model` or `provider/model` (repeatable). |
+| `--level` | Only tasks at this level, `L0`..`L5` (repeatable). |
+| `--group-by` | `model` (default; `provider/model`) or `commit` (12-char SHA, `+dirty` for a dirty checkout). |
+| `--format` | `text` (default), `md`, or `json` (`schema_version: 1`). |
+
+Each group has these sections. Tasks are separated by v3 `kind`, so harness
+and security results never enter capability numbers.
+
+- **Capability** (`kind = capability`), overall, by level, and by category:
+  - *resolved/n* and *rate* = `resolved / (resolved + failed)`, with a Wilson
+    95% interval. `provider_error`, `infra_error`, `skipped`, and `unscorable`
+    stay out of the denominator and are listed under *excluded*.
+  - *pass@1* = mean over tasks of `c_i / n_i`, where `n_i` is a task's scored
+    attempts and `c_i` its resolved ones.
+  - *pass@k* = mean of the unbiased estimator `1 − C(n−c, k) / C(n, k)`
+    (Chen et al.), with `k` set to the smallest `n_i` in the row. It is shown
+    only when every task in the row has `n_i ≥ 2`, and the output gives `k`
+    and the range of `n`.
+- **Harness and unclassified**: `kind = harness` (L0) tasks, and results from
+  v1/v2 tasks with no `kind`. These rows use the same columns but are not
+  capability results.
+- **Efficiency** (capability attempts, skipped excluded):
+  - *total spend* = sum of known `cost_usd` over every attempt, failed and
+    errored ones included.
+  - *cost / resolved* = total spend ÷ resolved count. When some attempts have
+    no price, the output says how many were priced and the figure is a lower
+    bound. Until the pricing work (#282) lands, `cost_usd` is always `null` and
+    cost shows as `unknown`.
+  - Also: cost per attempt, median wall time, mean tool calls, mean model
+    round trips, token totals (input, output, cache read/write, reasoning)
+    over attempts that reported usage, and cache hit rate
+    `cache_read / (input + cache_read)`.
+- **Reliability** (every non-skipped attempt, all kinds):
+  - timeouts, provider errors, infra errors, unscorable.
+  - `tool_loop` failures. Results do not record individual tool-call errors.
+  - *flaky / repeated tasks*: tasks with ≥2 scored attempts that both
+    resolved and failed.
+  - *mean task variance*: mean `p(1−p)` over repeated tasks.
+  - repair recovery: attempts that entered the repair loop and later passed.
+  - repeated-failure stops: same error repeated, or the repair attempt limit
+    was hit.
+  - unvalidated completions: the attempt finished after a mutation without
+    validating.
+  - the *unreliable* flag: provider + infra errors above 10% of attempts.
+- **Security** (`kind = security`): a separate table, never folded into a
+  weighted score. It shows the resolved rate with a Wilson interval, plus
+  attempted, blocked, and executed tool calls and audit coverage summed from
+  each attempt's `security-summary.json`.
 
 ## Scoring
 

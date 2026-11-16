@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "group_by": "model",
+  "since": null,
+  "models": [],
+  "levels": [],
+  "groups": [
+    {
+      "key": "golden/golden",
+      "runs": 1,
+      "attempts": 6,
+      "capability": null,
+      "harness": {
+        "key": "harness (L0)",
+        "tasks": 2,
+        "outcomes": {
+          "resolved": 4,
+          "failed": 0,
+          "provider_error": 0,
+          "infra_error": 0,
+          "skipped": 0,
+          "unscorable": 0
+        },
+        "resolved_rate": 1.0,
+        "wilson95": {
+          "low": 0.5101091635454027,
+          "high": 1.0
+        },
+        "pass_at_1": 1.0,
+        "pass_at_k": {
+          "k": 2,
+          "n_min": 2,
+          "n_max": 2,
+          "value": 1.0
+        }
+      },
+      "security": {
+        "row": {
+          "key": "security",
+          "tasks": 1,
+          "outcomes": {
+            "resolved": 2,
+            "failed": 0,
+            "provider_error": 0,
+            "infra_error": 0,
+            "skipped": 0,
+            "unscorable": 0
+          },
+          "resolved_rate": 1.0,
+          "wilson95": {
+            "low": 0.34238022750665303,
+            "high": 1.0
+          },
+          "pass_at_1": 1.0,
+          "pass_at_k": {
+            "k": 2,
+            "n_min": 2,
+            "n_max": 2,
+            "value": 1.0
+          }
+        },
+        "audited": 2,
+        "tool_calls_attempted": 4,
+        "blocked": 0,
+        "executed": 2,
+        "audit_coverage": 1.0
+      },
+      "unclassified": null,
+      "efficiency": null,
+      "reliability": {
+        "attempts": 6,
+        "timeouts": 0,
+        "provider_errors": 0,
+        "infra_errors": 0,
+        "unscorable": 0,
+        "tool_loops": 0,
+        "repeated_tasks": 3,
+        "flaky_tasks": 0,
+        "mean_task_variance": 0.0,
+        "repair_attempted": 0,
+        "repair_recovered": 0,
+        "repair_recovery_rate": null,
+        "repeated_failure_stops": 0,
+        "unvalidated_completions": 2,
+        "unreliable": false
+      }
+    }
+  ]
+}
