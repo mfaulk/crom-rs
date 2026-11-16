@@ -817,6 +817,8 @@ mod tests {
                 repair_enabled: false,
                 repair_max_attempts: 3,
                 repair_require_validation_after_mutation: false,
+                max_tool_calls: None,
+                max_cost_usd: None,
             },
             prompt: PromptMeta {
                 template_version: PROMPT_TEMPLATE_VERSION.into(),
