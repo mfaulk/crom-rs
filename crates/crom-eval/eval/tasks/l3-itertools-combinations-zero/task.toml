@@ -1,0 +1,86 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-itertools-combinations-zero"
+title = "Fix zero-length combinations in itertools"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "upstream", "hidden-tests", "bugfix", "iterators", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is the `itertools` crate. Asking for combinations of length 0 gives
+the wrong answer in some cases:
+
+```rust
+use itertools::Itertools;
+// expected: [[]]   (one empty combination)
+let a: Vec<Vec<i32>> = (0..0).combinations(0).collect();                  // got: []
+let b: Vec<Vec<i32>> = (0..3).combinations_with_replacement(0).collect(); // got: []
+let c: Vec<Vec<i32>> = (0..0).combinations_with_replacement(0).collect(); // got: []
+```
+
+Mathematically there is exactly one combination of length 0 (the empty
+one), whatever the pool is, including an empty pool. `(1..3).combinations(0)`
+already returns `[[]]`, but the cases above return nothing.
+
+Expected behavior: `combinations(0)` and `combinations_with_replacement(0)`
+yield exactly one empty `Vec` and then end, for any source iterator,
+including an empty one. `permutations(0)` should behave the same way.
+Behavior for `k > 0` must not change, including for empty or too-short
+pools.
+
+`tests/test_std.rs` has an existing assertion that
+`(0..3).combinations_with_replacement(0)` is empty. That assertion encodes
+the bug, so update it to the correct expectation. Keep the public API
+unchanged and keep `cargo test` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_multifile_edit = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "c8cb4371478cbba96ca25bce6681d13f05e2377d"
+path = "l3-itertools-combinations-zero"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline --test test_std"]
+
+[provenance]
+author = "itertools contributors"
+source = "upstream"
+license = "MIT OR Apache-2.0"
+created = "2026-11-15"
+upstream = "https://github.com/rust-itertools/itertools"
+base_commit = "09403b3ca0a1361a9b781e3ee098107d13be3aa6"
+fix_commit = "13aa10e27a6bb5b5dd70cb677924af5846862560"

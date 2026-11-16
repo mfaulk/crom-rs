@@ -1,0 +1,81 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-ron-integer-suffix-base"
+title = "Parse octal and hex RON integers that carry a type suffix"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "hidden-tests", "bugfix", "parsing", "serde", "upstream", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is the `ron` crate (Rusty Object Notation). RON integer literals may be
+written in binary (`0b`), octal (`0o`) or hexadecimal (`0x`) and may carry
+an explicit type suffix such as `i32` or `u8`. Octal and hexadecimal
+literals stop parsing as soon as a suffix is added:
+
+```rust
+assert_eq!(ron::from_str::<i64>("0x2A"), Ok(42));           // works
+assert_eq!(ron::from_str::<u32>("0x2Au32"), Ok(42));        // Err(TrailingCharacters)
+assert_eq!(ron::from_str::<i32>("-0x2Ai32"), Ok(-42));      // Err(TrailingCharacters)
+assert_eq!(ron::from_str::<u32>("0o52u32"), Ok(42));        // Err(TrailingCharacters)
+```
+
+The same inputs also fail when deserialized into `ron::Value`.
+
+Expected: a suffixed integer literal is accepted in every supported base
+(binary, octal, decimal, hexadecimal), with or without a leading `-`, and
+produces the same value as the unsuffixed literal (and, for `ron::Value`,
+the number type named by the suffix). Decimal and unsuffixed literals must
+keep working as today.
+
+Keep the public API unchanged and keep `cargo test` green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "c8cb4371478cbba96ca25bce6681d13f05e2377d"
+path = "l3-ron-integer-suffix-base"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --offline"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline --test 599_integer_suffix"]
+
+[provenance]
+author = "ron contributors"
+source = "upstream"
+license = "Apache-2.0 OR MIT"
+created = "2026-11-15"
+upstream = "https://github.com/ron-rs/ron"
+base_commit = "567683c9c5ec4b9b6d4ccf056998fcd64b229aae"
+fix_commit = "420c082614cbc7280c619f0d189f6a911df2e504"

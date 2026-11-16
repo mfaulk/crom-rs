@@ -100,6 +100,12 @@ pub struct Provenance {
     pub license: Option<String>,
     /// ISO date (YYYY-MM-DD) the task was authored.
     pub created: Option<String>,
+    /// Upstream repository a real-repo fixture was taken from.
+    pub upstream: Option<String>,
+    /// Upstream commit the fixture snapshots (the fix commit's parent).
+    pub base_commit: Option<String>,
+    /// Upstream commit whose tests are the hidden oracle.
+    pub fix_commit: Option<String>,
 }
 
 /// Declared per-task resource limits. `wall_secs` and `max_turns` override the
@@ -363,6 +369,31 @@ pub fn assertion_oracle(assertions: Vec<AssertionSpec>) -> OracleSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream-derived tasks record the upstream repo and the base/fix commits.
+    #[test]
+    fn provenance_records_upstream_commits() {
+        let p: Provenance = toml::from_str(
+            r#"
+            source = "upstream"
+            license = "MIT OR Apache-2.0"
+            upstream = "https://github.com/example/repo"
+            base_commit = "0123456789abcdef0123456789abcdef01234567"
+            fix_commit = "89abcdef0123456789abcdef0123456789abcdef"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.upstream.as_deref(),
+            Some("https://github.com/example/repo")
+        );
+        assert_eq!(
+            p.base_commit.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert!(p.fix_commit.is_some());
+        assert!(toml::from_str::<Provenance>("bogus = 1").is_err());
+    }
 
     /// Unsupported-version errors list supported versions and do not reference a nonexistent CLI flag.
     #[test]

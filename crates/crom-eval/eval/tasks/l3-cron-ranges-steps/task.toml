@@ -10,7 +10,7 @@ title = "Add range and step syntax to the cronlite expression parser"
 category = "feature"
 difficulty = "medium"
 tags = ["rust", "workspace", "multi-crate", "hidden-tests", "feature", "parsing", "l3"]
-suites = ["l3"]
+suites = ["l3-mini"]
 
 prompt = """
 The `cronlite` workspace (`calendar`, `cronexpr`, `scheduler`) only accepts

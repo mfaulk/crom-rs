@@ -10,7 +10,7 @@ title = "Report dependency cycles instead of panicking in the build planner"
 category = "bugfix"
 difficulty = "medium"
 tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "algorithms", "l3"]
-suites = ["l3"]
+suites = ["l3-mini"]
 
 prompt = """
 In the `buildplan` workspace (`manifest`, `depgraph`, `planner`), a manifest

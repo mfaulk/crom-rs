@@ -1,0 +1,89 @@
+schema_version = 3
+task_version = "1.0.0"
+kind = "capability"
+level = "L3"
+network = "none"
+reference = "oracle_patch"
+oracle_patch = "oracle.patch"
+id = "l3-nom-multispace-eof"
+title = "Fix the remaining input returned by complete &str parsers that consume everything"
+category = "bugfix"
+difficulty = "medium"
+tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "parsing", "upstream", "l3"]
+suites = ["l3"]
+
+prompt = """
+This is the `nom` parser-combinator workspace (`nom`, `nom-language`,
+`benchmarks`). On `&str` input, `recognize` and `consumed` report the wrong
+slice when the inner parser is a complete-mode "zero or more" parser that
+consumes the whole input.
+
+Reproduce:
+
+```rust
+use nom::Parser;
+use nom::character::complete::multispace0;
+use nom::combinator::recognize;
+
+let r = recognize::<_, nom::error::Error<&str>, _>(multispace0).parse("\\n");
+// actual:   Ok(("", ""))
+// expected: Ok(("", "\\n"))
+```
+
+`multispace0` itself returns the right output (`"\\n"`), but the remaining
+input it hands back is an empty slice positioned at the *start* of the input
+instead of at its end, so anything that derives the consumed part from the
+remaining input's position (`recognize`, `consumed`, offset arithmetic)
+sees nothing consumed. The same parsers on `&[u8]` input behave correctly.
+The other `character::complete` "zero or more" parsers (for example
+`alpha0`, `digit0`, `space0`) share the same `&str` input handling and are
+affected whenever no character stops them.
+
+When such a parser consumes all of a `&str` input, the remaining input must
+be the empty slice at the end of the original input. Keep the public API
+unchanged and the existing test suite green.
+"""
+
+timeout_secs = 300
+
+forbidden_paths = ["Cargo.toml", "Cargo.lock", "nom-language/Cargo.toml", "benchmarks/Cargo.toml"]
+
+[limits]
+wall_secs = 900
+max_turns = 40
+
+[capabilities]
+requires_repo_search = true
+requires_test_feedback = true
+requires_public_api_preservation = true
+
+[behavior]
+require_read_before_write = true
+require_validation_after_edit = true
+penalize_test_deletion = true
+
+[fixture]
+kind = "git"
+repo = "https://github.com/mfaulk/crom-eval-fixtures"
+rev = "c8cb4371478cbba96ca25bce6681d13f05e2377d"
+path = "l3-nom-multispace-eof"
+
+[oracle]
+kind = "command"
+commands = ["cargo test --offline -p nom -p nom-language -- --test-threads 8"]
+
+[hidden]
+fixture = "hidden"
+
+[hidden.oracle]
+kind = "command"
+commands = ["cargo test --offline -p nom --test issues -- --test-threads 8"]
+
+[provenance]
+author = "nom contributors"
+source = "upstream"
+license = "MIT"
+created = "2026-11-15"
+upstream = "https://github.com/rust-bakery/nom"
+base_commit = "a44b52ed9052a66f5eb2add9aa5b314f034dc580"
+fix_commit = "51c3c4e44fa78a8a09b413419372b97b2cc2a787"

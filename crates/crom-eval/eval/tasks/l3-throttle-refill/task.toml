@@ -10,7 +10,7 @@ title = "Fix token-bucket refill drift and Retry-After hints in the throttle gat
 category = "bugfix"
 difficulty = "medium"
 tags = ["rust", "workspace", "multi-crate", "hidden-tests", "bugfix", "time", "l3"]
-suites = ["l3"]
+suites = ["l3-mini"]
 
 prompt = """
 Operators of the `throttle` gateway (`clock`, `bucket`, `gateway`) report two
