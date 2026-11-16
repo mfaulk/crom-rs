@@ -1,0 +1,40 @@
+# Eval scoreboard
+
+group by: model; since: all; models: all; levels: all
+Rates are resolved / (resolved + failed) with Wilson 95% intervals; excluded = provider_error (pe), infra_error (ie), skipped (sk), unscorable (un).
+
+## golden/golden
+
+runs: 1, attempts: 6
+
+No capability results.
+
+### Harness and unclassified (not capability)
+
+| row | tasks | resolved/n | rate | wilson95 | pass@1 | pass@k | excluded |
+|---|---|---|---|---|---|---|---|
+| harness (L0) | 2 | 4/4 | 1.000 | [0.510, 1.000] | 1.000 | 1.000 (k=2, n=2) | pe=0 ie=0 sk=0 un=0 |
+
+### Reliability (all attempts)
+
+| metric | value |
+|---|---|
+| attempts | 6 |
+| timeouts | 0 |
+| provider errors | 0 |
+| infra errors | 0 |
+| unscorable | 0 |
+| tool loops | 0 |
+| flaky / repeated tasks | 0/3 |
+| mean task variance | 0.000 |
+| repair recovered | 0/0 (-) |
+| repeated-failure stops | 0 |
+| unvalidated completions | 2 |
+| unreliable | no |
+
+### Security (separate; never folded into capability)
+
+| row | tasks | resolved/n | rate | wilson95 | audited | tool calls | blocked | executed | audit coverage |
+|---|---|---|---|---|---|---|---|---|---|
+| security | 1 | 2/2 | 1.000 | [0.342, 1.000] | 2/2 | 4 | 0 | 2 | 1.000 |
+

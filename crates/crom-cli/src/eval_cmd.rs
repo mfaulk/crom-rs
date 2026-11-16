@@ -4,6 +4,7 @@
 //! M15 subcommands: `adapters`, `validate-task`, `validate-suite`, `history`,
 //! `trend`, `regressions`, `task-history`, `triage`, `show`, `open`, plus an
 //! adapter-, isolation-, repetition-, and prompt-variant-aware `run`.
+//! M17.4: `scoreboard`.
 //!
 //! Runs drive the agent through the SDK runtime; provider selection is `fake`
 //! (default, offline) / `golden` (scripted) / a provider profile id such as
@@ -65,6 +66,8 @@ pub enum EvalCommand {
     Show(ShowArgs),
     /// List artifact paths for one task in a run.
     Open(ShowArgs),
+    /// Cross-run scoreboard: capability, efficiency, reliability, security.
+    Scoreboard(ScoreboardArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -273,6 +276,37 @@ pub struct TaskHistoryArgs {
 }
 
 #[derive(Parser, Debug)]
+pub struct ScoreboardArgs {
+    /// Root directory holding run directories (default `target/crom-eval/runs`).
+    #[arg(long)]
+    pub runs_dir: Option<PathBuf>,
+    /// Only these run ids (repeatable; default: every run under --runs-dir).
+    #[arg(long)]
+    pub run: Vec<String>,
+    /// Only results whose evaluating commit is <rev> or reachable from HEAD
+    /// but not from <rev> (`git rev-list <rev>..HEAD`).
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Only this model, as `model` or `provider/model` (repeatable).
+    #[arg(long)]
+    pub model: Vec<String>,
+    /// Only tasks at this level, L0..L5 (repeatable).
+    #[arg(long, value_parser = parse_level)]
+    pub level: Vec<crom_eval::schema::Level>,
+    /// Column grouping: `model` or `commit`.
+    #[arg(long, default_value = "model")]
+    pub group_by: crom_eval::scoreboard::GroupBy,
+    /// Output format: `text`, `md`, or `json`.
+    #[arg(long, default_value = "text")]
+    pub format: crom_eval::scoreboard::Format,
+}
+
+fn parse_level(s: &str) -> std::result::Result<crom_eval::schema::Level, String> {
+    serde_json::from_value(serde_json::Value::String(s.to_ascii_uppercase()))
+        .map_err(|_| format!("unknown level '{s}' (L0..L5)"))
+}
+
+#[derive(Parser, Debug)]
 pub struct TriageArgs {
     pub run: String,
     #[arg(long)]
@@ -304,6 +338,7 @@ pub async fn run(cmd: EvalCommand) -> Result<()> {
         EvalCommand::Triage(args) => cmd_triage(args),
         EvalCommand::Show(args) => cmd_show(args, false),
         EvalCommand::Open(args) => cmd_show(args, true),
+        EvalCommand::Scoreboard(args) => cmd_scoreboard(args),
     }
 }
 
@@ -963,6 +998,29 @@ fn cmd_history(args: HistoryArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_scoreboard(args: ScoreboardArgs) -> Result<()> {
+    use crom_eval::scoreboard::{self, Filters, Scoreboard};
+    let runs_dir = resolve_runs_dir(args.runs_dir);
+    let (attempts, warnings) = scoreboard::load_attempts(&runs_dir, &args.run)
+        .with_context(|| format!("reading runs under {}", runs_dir.display()))?;
+    for w in &warnings {
+        eprintln!("warning: skipping unreadable result {w}");
+    }
+    let since_shas = match &args.since {
+        Some(rev) => Some(scoreboard::commits_since(rev)?),
+        None => None,
+    };
+    let filters = Filters {
+        since: args.since,
+        since_shas,
+        models: args.model,
+        levels: args.level,
+    };
+    let board = Scoreboard::build(&attempts, &filters, args.group_by);
+    print!("{}", board.render(args.format));
+    Ok(())
+}
+
 fn cmd_trend(args: TrendArgs) -> Result<()> {
     let entries = index::load_entries(&resolve_index(args.index))
         .map_err(|e| anyhow!("reading index: {e}"))?;
@@ -1233,5 +1291,48 @@ mod live_provider_flag_tests {
         assert_eq!(run_verdict(&[(Failed, false, true)], false), RunVerdict::Ok);
         assert_eq!(EXIT_TASKS_FAILED, 1);
         assert_eq!(EXIT_ALL_SKIPPED, 3);
+    }
+}
+
+#[cfg(test)]
+mod scoreboard_flag_tests {
+    use super::*;
+    use crom_eval::schema::Level;
+    use crom_eval::scoreboard::{Format, GroupBy};
+
+    // scoreboard parses repeatable --model/--level/--run filters, --since, --group-by, and --format.
+    #[test]
+    fn scoreboard_flags_parse() {
+        let a = ScoreboardArgs::try_parse_from([
+            "scoreboard",
+            "--since",
+            "main",
+            "--model",
+            "deepseek-chat",
+            "--model",
+            "golden",
+            "--level",
+            "L1",
+            "--level",
+            "l2",
+            "--run",
+            "r1",
+            "--group-by",
+            "commit",
+            "--format",
+            "md",
+        ])
+        .unwrap();
+        assert_eq!(a.since.as_deref(), Some("main"));
+        assert_eq!(a.model, ["deepseek-chat", "golden"]);
+        assert_eq!(a.level, [Level::L1, Level::L2]);
+        assert_eq!(a.run, ["r1"]);
+        assert_eq!(a.group_by, GroupBy::Commit);
+        assert_eq!(a.format, Format::Markdown);
+
+        let d = ScoreboardArgs::try_parse_from(["scoreboard"]).unwrap();
+        assert_eq!((d.group_by, d.format), (GroupBy::Model, Format::Text));
+        assert!(ScoreboardArgs::try_parse_from(["scoreboard", "--level", "L9"]).is_err());
+        assert!(ScoreboardArgs::try_parse_from(["scoreboard", "--format", "csv"]).is_err());
     }
 }
