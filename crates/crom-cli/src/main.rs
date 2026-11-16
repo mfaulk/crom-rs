@@ -1583,22 +1583,7 @@ async fn resolve_common(
     }
 
     // Build effective tool limits.
-    let mut limits = ToolLimits::default();
-    if let Some(v) = settings.tool_limits.max_read_bytes {
-        limits.max_read_bytes = v;
-    }
-    if let Some(v) = settings.tool_limits.max_output_bytes {
-        limits.max_output_bytes = v;
-    }
-    if let Some(v) = settings.tool_limits.bash_timeout_seconds {
-        limits.bash_timeout = Duration::from_secs(v);
-    }
-    if let Some(v) = settings.tool_limits.max_glob_results {
-        limits.max_glob_results = v;
-    }
-    if let Some(v) = settings.tool_limits.max_grep_results {
-        limits.max_grep_results = v;
-    }
+    let limits = tool_limits_from_settings(&settings);
 
     let mut tools = ToolRegistry::new();
     register_builtin_with_limits(&mut tools, limits);
@@ -3076,6 +3061,7 @@ fn tool_limits_from_settings(settings: &Settings) -> ToolLimits {
     if let Some(v) = settings.tool_limits.max_grep_results {
         limits.max_grep_results = v;
     }
+    limits.sandbox = settings.sandbox.resolve();
     limits
 }
 
@@ -3623,22 +3609,7 @@ async fn cmd_chat(args: ChatArgs) -> Result<()> {
 
     // Tools.
     let mut tools = ToolRegistry::new();
-    let mut limits = ToolLimits::default();
-    if let Some(v) = cfg.settings.tool_limits.max_read_bytes {
-        limits.max_read_bytes = v;
-    }
-    if let Some(v) = cfg.settings.tool_limits.max_output_bytes {
-        limits.max_output_bytes = v;
-    }
-    if let Some(v) = cfg.settings.tool_limits.bash_timeout_seconds {
-        limits.bash_timeout = Duration::from_secs(v);
-    }
-    if let Some(v) = cfg.settings.tool_limits.max_glob_results {
-        limits.max_glob_results = v;
-    }
-    if let Some(v) = cfg.settings.tool_limits.max_grep_results {
-        limits.max_grep_results = v;
-    }
+    let limits = tool_limits_from_settings(&cfg.settings);
     register_builtin_with_limits(&mut tools, limits);
 
     // Hooks.
@@ -8507,5 +8478,33 @@ mod slash_expansion_policy_tests {
         o.disallowed_tool_rules = vec![ToolRule::ExactTool("Read".into())];
         let err = executor(dir.path(), &o).read_file(".env").await;
         assert!(err.is_err());
+    }
+}
+
+#[cfg(test)]
+mod tool_limits_tests {
+    use super::*;
+
+    // The resolved `sandbox` settings section reaches the Bash tool limits.
+    #[test]
+    fn tool_limits_apply_sandbox_settings() {
+        let settings = Settings {
+            sandbox: crom_core::SandboxSettingsConfig {
+                mode: Some(crom_core::SandboxMode::Required),
+                max_processes: Some(77),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let limits = tool_limits_from_settings(&settings);
+        assert_eq!(limits.sandbox.mode, crom_core::SandboxMode::Required);
+        assert_eq!(limits.sandbox.max_processes, 77);
+    }
+
+    // Without a `sandbox` section the tools stay unsandboxed (the M17 default).
+    #[test]
+    fn tool_limits_default_sandbox_is_off() {
+        let limits = tool_limits_from_settings(&Settings::default());
+        assert_eq!(limits.sandbox.mode, crom_core::SandboxMode::Off);
     }
 }

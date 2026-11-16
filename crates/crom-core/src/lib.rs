@@ -24,6 +24,7 @@ pub mod provider_profile;
 pub mod provider_retry;
 pub mod repair;
 pub mod run_id;
+pub mod sandbox;
 pub mod settings;
 pub mod skills;
 pub mod slash;
@@ -155,6 +156,7 @@ pub use provider_retry::{
     retry_provider_call, with_retry_observer, ProviderRetry, RetryObserver, RetryPolicy,
 };
 pub use run_id::RunId;
+pub use sandbox::{SandboxConfig, SandboxMode, SandboxSettingsConfig};
 pub use settings::{
     merge_settings_file_into, AgentsSettingsConfig, AuthProviderEntry, AuthSettingsConfig,
     CheckpointRetentionConfig, CheckpointingConfig, CompactionSettingsConfig, CompletionConfig,

@@ -410,7 +410,7 @@ repro.git                      # { sha, dirty } of the evaluating checkout
 repro.task                     # { id, schema_version, content_version, content_hash }
 repro.provider                 # { profile, model, base_url_host } (host only; never key or URL)
 repro.tool_policy              # { allowed_tools, builtin_tools }
-repro.security                 # { side_effects, approvals, agent_sandbox }
+repro.security                 # { side_effects, approvals, agent_sandbox ("landlock"|"off"), agent_sandbox_overhead_ms? }
 repro.isolation                # { backend, network, cpu_limit, memory_limit, container_image }
 repro.runtime                  # { max_turns, timeout_secs, mode, attempts, repair_* }
 repro.prompt                   # { template_version, variant, hash }
@@ -444,7 +444,8 @@ they are usually the variable under test.
 `run.json` declares `schema_version: 2` and records adapter, provider,
 model, `base_url_host`, isolation settings, repetitions, attempts,
 `prompt_variant`, `prompt_template_version`, `seed`, repair policy, `git`,
-`host`, `crom_version`, and `pricing_source_version`.
+`host`, `crom_version`, `pricing_source_version`, and
+`agent_sandbox: { mode, overhead_ms }`.
 
 ### Reading v1 results
 

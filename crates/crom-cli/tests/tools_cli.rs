@@ -55,7 +55,31 @@ fn write_config(dir: &Path) {
     .unwrap();
 }
 
+/// Build the fake MCP server once before any test spawns it through
+/// `cargo run`: a cold build otherwise outlasts the 5 s startup timeout and
+/// the catalog silently comes back without MCP tools (same race as #257).
+static BUILD_FAKE_SERVER: std::sync::Once = std::sync::Once::new();
+
+fn ensure_fake_server_built() {
+    BUILD_FAKE_SERVER.call_once(|| {
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "--quiet",
+                "--manifest-path",
+                &fake_manifest().display().to_string(),
+            ])
+            .status()
+            .expect("failed to spawn cargo build for fake-mcp-server fixture");
+        assert!(
+            status.success(),
+            "pre-building the fake-mcp-server fixture failed"
+        );
+    });
+}
+
 fn run(args: &[&str], cwd: &Path) -> std::process::Output {
+    ensure_fake_server_built();
     Command::new(bin())
         .args(args)
         .current_dir(cwd)

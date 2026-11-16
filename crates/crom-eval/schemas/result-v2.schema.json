@@ -506,6 +506,9 @@
             },
             "agent_sandbox": {
               "type": "string"
+            },
+            "agent_sandbox_overhead_ms": {
+              "type": "number"
             }
           },
           "additionalProperties": false

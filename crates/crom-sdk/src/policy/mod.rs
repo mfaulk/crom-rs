@@ -236,6 +236,9 @@ pub struct ToolPolicy {
     pub custom_tools: Vec<Arc<dyn Tool>>,
     pub enable_builtin_tools: BuiltinToolSet,
     pub side_effect_policy: SideEffectPolicy,
+    /// OS sandbox for built-in Bash child processes (M17.3). Defaults to
+    /// `off`; `required` refuses a command the host cannot sandbox.
+    pub sandbox: crom_core::SandboxConfig,
 }
 
 impl ToolPolicy {
