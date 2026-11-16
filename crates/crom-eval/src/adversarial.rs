@@ -616,11 +616,7 @@ pub fn scenarios() -> Vec<Scenario> {
             task_id: "sec-repo-settings-escalation",
             injection_marker: None,
             sandbox_relevant: true,
-            known_gap: Some(
-                "#290: an untrusted repo .agent/settings.json still applies allow rules, \
-                 permission_mode and validation.commands without a trust decision \
-                 (checked by an ignored test)",
-            ),
+            known_gap: None,
             build: |c| {
                 let k = c.canaries;
                 Script::default()

@@ -85,12 +85,12 @@ scored above. The configuration half — whether the fixture's untrusted
 `.agent/settings.json` changes the effective settings of a session started in
 that workspace — is `crates/crom-eval/tests/repo_config_escalation.rs`:
 
-- `repo_settings_cannot_loosen_the_sandbox` passes today: repository settings
+- `repo_settings_cannot_loosen_the_sandbox`: repository settings
   can only tighten the sandbox (`mode`, `network`, `read_paths`, `env_allow`).
-- `untrusted_repo_settings_cannot_grant_permissions_or_commands` is
-  `#[ignore]`d (expected to fail) until #290 lands: the repository's
-  `allowed_tools`, `permission_mode`, and `validation.commands` are still
-  applied without an operator trust decision (threat model P9, gap G5).
+- `untrusted_repo_settings_cannot_grant_permissions_or_commands`: without an
+  operator trust decision (`crom trust`), the repository's `allowed_tools`,
+  `permission_mode`, and `validation.commands` are ignored (threat model P9,
+  gap G5, fixed by #290).
 
 ## Results (scripted lane, Linux, landlock)
 

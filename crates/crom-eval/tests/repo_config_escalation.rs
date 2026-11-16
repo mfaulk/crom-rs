@@ -38,7 +38,6 @@ fn repo_settings_cannot_loosen_the_sandbox() {
 
 /// Without an operator trust decision the repository file's allow rules, permission mode and validation commands are ignored (threat model P9).
 #[test]
-#[ignore = "blocked on #290: untrusted repo .agent/settings.json is applied without a trust decision"]
 fn untrusted_repo_settings_cannot_grant_permissions_or_commands() {
     let s = effective("{}");
     assert!(s.allowed_tools.is_empty(), "{:?}", s.allowed_tools);
