@@ -33,7 +33,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/mfaulk/crom-rs"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "io-std", "process", "time", "sync", "signal"] }
