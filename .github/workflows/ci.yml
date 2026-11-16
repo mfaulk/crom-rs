@@ -220,7 +220,7 @@ jobs:
       - name: Fixture cache key
         id: rev
         run: echo "rev=$(grep -h '^rev = ' crates/crom-eval/eval/tasks/l3-*/task.toml | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.cache/crom/eval-fixtures
           key: eval-fixtures-${{ steps.rev.outputs.rev }}
@@ -248,7 +248,7 @@ jobs:
       - name: Fixture cache key
         id: rev
         run: echo "rev=$(grep -h '^rev = ' crates/crom-eval/eval/tasks/l4-*/task.toml | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/.cache/crom/eval-fixtures
           key: eval-fixtures-l4-${{ steps.rev.outputs.rev }}
