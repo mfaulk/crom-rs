@@ -824,13 +824,39 @@ the fixture, so the job needs a working cargo toolchain.
 It uploads the artifact bundle when any offline suite regresses. Live-provider
 evals never run here.
 
-Live evals are available manually via the `Eval (live provider)` workflow
-(`.github/workflows/eval-live.yml`), triggered from the Actions tab with
-`suite`, `provider`, and optional `model` inputs. It sets `CROM_EVAL_LIVE=1`
-and passes the `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, and
-`GEMINI_API_KEY` repository secrets; only the chosen provider's secret is
-needed. Without it every task skips, the CLI exits 3, and the workflow
-reports a warning instead of failing.
+### CI lanes and spend controls (#295)
+
+| Lane | Workflow | Trigger | Spends tokens |
+|---|---|---|---|
+| 1. Offline suites, validate-suite, recorded conformance | `ci.yml` (`eval`, `eval-l3`, `eval-l4`) | push / PR | No |
+| 2. Security enforcement (scripted adversarial suite, sandbox required) | `ci.yml` (`sandbox`) | push / PR | No |
+| 3. Live smoke | `eval-live.yml` (`Eval (live smoke)`) | manual dispatch | Yes, cap <= $5 |
+| 4. Full benchmark (provider/model matrix, repetitions) | `eval-benchmark.yml` (`Eval (benchmark)`) | manual dispatch | Yes, cap <= $50 per cell |
+
+No workflow spends on push, PR, or schedule. Lanes 3 and 4 require a
+`max_run_cost_usd` input and fail closed: `.github/scripts/check-spend-cap.sh`
+rejects a missing, non-numeric, zero, or over-ceiling cap before anything
+builds, and the cap is passed to `crom eval run --max-run-cost-usd`, which
+stops on an unpriced model or unknown usage. `ci.yml` (`lint / workflows`)
+dry-runs that gate (`.github/scripts/test-check-spend-cap.sh`) and runs
+`actionlint` over every workflow.
+
+Both live lanes run in the `eval-live` GitHub environment and read
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, and
+`GEMINI_API_KEY` from it (only the chosen provider's key is needed). Add
+required reviewers to that environment so each dispatch needs maintainer
+approval. Workflow inputs reach the shell only through `env:`.
+
+- **Lane 3** (`suite`, `provider`, `model`, `max_run_cost_usd`; defaults to
+  `provider-conformance` on `deepseek` / `deepseek-flash`). Without the
+  provider's key every task skips, the CLI exits 3, and the job warns
+  instead of failing. The scoreboard goes to the job summary.
+- **Lane 4** (`targets` as space-separated `provider:model` pairs, `suites`,
+  `repetitions`, `max_run_cost_usd`). One job per target; the cap covers all
+  suites in that job, and each suite gets what the previous ones left (read
+  from `summary.json` `total_cost_usd`; unknown spend stops the job). Run
+  directories are uploaded per target and the scoreboard is posted to the
+  job summary. It has no schedule on purpose; add one only with a fixed cap.
 
 ## Known limitations
 

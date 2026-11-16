@@ -1,0 +1,143 @@
+name: Eval (benchmark)
+
+# Lane 4 (#295). Full benchmark over a provider/model matrix with repetitions.
+# Manual only, and deliberately not on a schedule: a schedule would spend
+# without a maintainer action. Each matrix cell is capped by the required
+# max_run_cost_usd input (fail closed, <= BENCHMARK_CEILING_USD per cell).
+# Secrets come from the `eval-live` environment (protect it with required
+# reviewers). Results are uploaded per cell and the scoreboard is posted to
+# the job summary.
+on:
+  workflow_dispatch:
+    inputs:
+      max_run_cost_usd:
+        description: 'Required. Nominal spend cap in USD per provider/model cell (<= 50)'
+        required: true
+        type: string
+      targets:
+        description: 'Space-separated provider:model pairs'
+        required: false
+        default: 'deepseek:deepseek-flash anthropic:claude-opus-5-5'
+      suites:
+        description: 'Space-separated suites'
+        required: false
+        default: 'l1 l2 l3-mini l4'
+      repetitions:
+        description: 'Repetitions per task'
+        required: false
+        default: '3'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-benchmark
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: eval / benchmark plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    env:
+      BENCHMARK_CEILING_USD: '50'
+      TARGETS: ${{ inputs.targets }}
+      REPETITIONS: ${{ inputs.repetitions }}
+      MAX_RUN_COST_USD: ${{ inputs.max_run_cost_usd }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check spend cap
+        run: .github/scripts/check-spend-cap.sh "$MAX_RUN_COST_USD" "$BENCHMARK_CEILING_USD"
+      - name: Validate inputs and build matrix
+        id: matrix
+        run: |
+          if ! [[ "$REPETITIONS" =~ ^[1-9][0-9]?$ ]]; then
+            echo "::error::repetitions must be 1-99"; exit 1
+          fi
+          items=()
+          for t in $TARGETS; do
+            if ! [[ "$t" =~ ^[a-z0-9_-]+:[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::target '$t' is not provider:model"; exit 1
+            fi
+            items+=("{\"provider\":\"${t%%:*}\",\"model\":\"${t#*:}\"}")
+          done
+          if [ "${#items[@]}" -eq 0 ]; then echo "::error::no targets"; exit 1; fi
+          (IFS=,; echo "matrix={\"include\":[${items[*]}]}") >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    name: eval / benchmark (${{ matrix.provider }} ${{ matrix.model }})
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: eval-live
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      CARGO_TERM_COLOR: always
+      PROVIDER: ${{ matrix.provider }}
+      MODEL: ${{ matrix.model }}
+      SUITES: ${{ inputs.suites }}
+      REPETITIONS: ${{ inputs.repetitions }}
+      MAX_RUN_COST_USD: ${{ inputs.max_run_cost_usd }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check spend cap
+        run: .github/scripts/check-spend-cap.sh "$MAX_RUN_COST_USD" 50
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: eval-benchmark
+      - name: Run benchmark suites
+        env:
+          CROM_EVAL_LIVE: '1'
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          # One cap for the whole cell: each suite gets what the previous
+          # suites left, read back from summary.json.
+          remaining="$MAX_RUN_COST_USD"
+          for suite in $SUITES; do
+            if ! awk -v r="$remaining" 'BEGIN { exit !(r > 0) }'; then
+              echo "::warning::spend cap reached; skipping $suite and later suites"
+              break
+            fi
+            set +e
+            cargo run --locked -p crom-cli -- eval run --suite "$suite" \
+              --provider "$PROVIDER" --model "$MODEL" \
+              --repetitions "$REPETITIONS" --max-run-cost-usd "$remaining" \
+              --allow-failures
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then exit "$rc"; fi
+            summary="$(find target/crom-eval/runs -maxdepth 2 -name summary.json -printf '%T@ %p\n' \
+              | sort -n | tail -1 | cut -d' ' -f2-)"
+            spent="$(jq -r '.total_cost_usd // empty' "$summary")"
+            if [ -z "$spent" ]; then
+              echo "::error::$suite spend is unknown; stopping (fail closed)"
+              exit 1
+            fi
+            remaining="$(awk -v r="$remaining" -v s="$spent" 'BEGIN { printf "%.6f", r - s }')"
+            echo "$suite spent \$$spent; \$$remaining left"
+          done
+      - name: Scoreboard
+        if: always()
+        run: |
+          {
+            echo "## $PROVIDER / $MODEL"
+            cargo run --locked -p crom-cli -- eval scoreboard --format md || true
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload eval artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: eval-benchmark-${{ matrix.provider }}-${{ matrix.model }}
+          path: target/crom-eval/runs
+          if-no-files-found: ignore
