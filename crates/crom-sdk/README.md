@@ -19,6 +19,11 @@ explicitly via `AgentRuntimeBuilder`:
 - in-memory or no-op storage
 - patch-only output (`PatchPolicy::ReturnOnly`)
 
+`RunBudgets` caps turns, tool calls, duration, patch size, cumulative
+input/output tokens, and nominal cost (`with_max_cost_usd`, which needs
+`AgentRuntimeBuilder::pricing`). A breach fails the run with a `budget.*`
+diagnostic. See [`docs/sdk/safety.md`](../../docs/sdk/safety.md).
+
 ## Quick start
 
 ```rust

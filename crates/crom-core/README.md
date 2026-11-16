@@ -22,6 +22,12 @@ provider, terminal, or storage backend — those are supplied by other crates.
   unreported, never zero); `UsageTotals` sums round trips strictly (`None` if
   any turn is unknown). The loop emits `AgentEvent::ModelTurnCompleted` per
   round trip. Semantics: [`docs/sdk/events.md`](../../docs/sdk/events.md#token-usage).
+- **Pricing & usage budgets** — `PricingTable` loads the dated, sourced
+  `pricing/prices.toml` (override with `CROM_PRICING_FILE`) and gives a
+  nominal `CostEstimate` or a `CostUnknownReason`. `AgentOptions::usage_budget`
+  (`UsageBudget`) caps input tokens, output tokens, and nominal cost; the
+  loop checks it between turns and fails closed on unknown usage. See
+  [`docs/providers.md`](../../docs/providers.md#cost-semantics).
 - **Tools** — the `Tool` trait, `ToolRegistry`, and `ToolCatalog` for
   exposing local and MCP tools, including tool-search filtering.
 - **Subagents** — `AgentRegistry`, `AgentDefinition`, and the `SubagentRuntime`

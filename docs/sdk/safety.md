@@ -36,7 +36,16 @@ Every layer enforces:
    itself does not support.
 5. Per-tool `PermissionKind` gates approval prompts.
 6. `RunBudgets` caps turns, tool calls, duration, files changed, patch
-   size — independent of the model.
+   size, cumulative input/output tokens, and nominal cost — independent of
+   the model. Token and cost caps are checked after every model turn and
+   stop the run with a `budget.max_input_tokens_exceeded`,
+   `budget.max_output_tokens_exceeded`, or `budget.max_cost_exceeded`
+   diagnostic. They fail closed: if usage is unreported, or a cost cap has
+   no price (`AgentRuntimeBuilder::pricing`), the run stops with
+   `budget.usage_unknown`. Plan modes do not meter usage, so a request
+   that sets a token or cost cap with `PlanOnly`/`PlanThenAct` is rejected
+   with `budget.unsupported_mode`. Cost is nominal list price, not billed
+   spend ([cost semantics](../providers.md#cost-semantics)).
 
 Built-in file and shell tools are bound to the workspace, never to the
 host process cwd: `ReturnOnly`/`RejectMutations` run them in a private
