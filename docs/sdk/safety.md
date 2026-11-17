@@ -63,7 +63,7 @@ interpolation.
 The CLI does read them, under a persisted workspace trust decision (#290):
 untrusted project settings may only tighten policy, repo MCP config is not
 loaded, and repo-sourced MCP config never gets `${VAR}` interpolation. See
-[Workspace trust](../../README.md#workspace-trust). Embedders that want the
+[Workspace trust](../cli.md#workspace-trust). Embedders that want the
 same behaviour can load settings with `crom_core::settings::load` (which
 consults the trust store) or `load_with_trust`, and MCP options with
 `crom_mcp::load_mcp_options(.., workspace_trusted)`; ignored entries are in

@@ -73,7 +73,7 @@ Demos that ship `.agent/settings.json` allow rules, validation commands or
 `.agent/mcp.json` servers (`checkpoint-demo`, `mcp-demo`, `planning-demo`,
 `policy-demo`, `skills-demo`, `subagent-demo`, `tool-search-demo`) need the
 demo directory trusted first, or that config is ignored (see
-[Workspace trust](../README.md#workspace-trust)):
+[Workspace trust](../docs/cli.md#workspace-trust)):
 
 ```sh
 crom trust examples/mcp-demo
