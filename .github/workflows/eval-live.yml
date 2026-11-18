@@ -85,5 +85,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: eval-live-runs
-          path: target/crom-eval/runs
+          # Archived workspaces keep their sources; their cargo build output
+          # was ~98% of a 15 GiB benchmark artifact.
+          path: |
+            target/crom-eval/runs
+            !target/crom-eval/runs/**/workspace/target/**
           if-no-files-found: ignore

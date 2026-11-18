@@ -880,6 +880,11 @@ Both live lanes run in the `eval-live` GitHub environment and read
 required reviewers to that environment so each dispatch needs maintainer
 approval. Workflow inputs reach the shell only through `env:`.
 
+Both live lanes upload `target/crom-eval/runs` minus each archived
+workspace's `target/` (cargo build output, ~98% of the bytes). An M17
+benchmark cell was ~15 GiB with it and ~0.25 GiB without. The per-task
+`result.json`, `patch.diff`, transcripts, and workspace sources are kept.
+
 - **Lane 3** (`suite`, `provider`, `model`, `max_run_cost_usd`; defaults to
   `provider-conformance` on `deepseek` / `deepseek-flash`). Without the
   provider's key every task skips, the CLI exits 3, and the job warns
