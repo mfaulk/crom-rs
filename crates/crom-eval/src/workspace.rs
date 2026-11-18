@@ -54,6 +54,22 @@ impl AgentWorkspace {
     }
 }
 
+/// Move `src` to `dst` (replacing it): rename when possible, else copy and
+/// remove the source (crosses filesystems, e.g. tmpfs `/tmp` to the repo).
+pub fn move_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    if dst.exists() {
+        std::fs::remove_dir_all(dst)?;
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::rename(src, dst).is_err() {
+        copy_tree(src, dst)?;
+        std::fs::remove_dir_all(src)?;
+    }
+    Ok(())
+}
+
 /// Error unless `root` and every existing `protected` path are disjoint
 /// (neither is an ancestor of the other) after canonicalization.
 pub fn ensure_disjoint(root: &Path, protected: &[&Path]) -> io::Result<()> {

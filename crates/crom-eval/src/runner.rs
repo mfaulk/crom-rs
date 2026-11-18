@@ -1056,15 +1056,25 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
         }
     };
 
-    // The agent has exited: move its workspace into the artifact bundle as the
-    // verification copy. Hidden material is overlaid only onto this copy.
-    let workspace_dir = match agent_ws.into_verification_copy(&verification_dir) {
+    // The agent has exited: move its workspace to a verification copy. Hidden
+    // material is overlaid only onto this copy. The copy is staged in a temp
+    // dir, not the artifact bundle: a run dir inside a Cargo workspace (the
+    // crom-rs checkout on CI) would make cargo treat an upstream package
+    // without its own `[workspace]` as a stray member and refuse to build it.
+    let staging = tempfile::Builder::new()
+        .prefix("crom-eval-verify-")
+        .tempdir();
+    let staged_dir = match &staging {
+        Ok(d) => d.path().join("workspace"),
+        Err(_) => verification_dir.clone(),
+    };
+    let workspace_dir = match agent_ws.into_verification_copy(&staged_dir) {
         Ok(p) => p,
         Err(e) => {
             errored = true;
             harness_errored = true;
             summary = format!("{summary}; moving workspace to verification copy failed: {e}");
-            verification_dir
+            staged_dir
         }
     };
 
@@ -1225,7 +1235,24 @@ pub async fn run_task(task: &EvalTask, run_dir: &RunDir, config: &RunConfig) -> 
     } else {
         Some(patch.unified_diff.clone())
     };
-    result.workspace_path = workspace_dir;
+    result.workspace_path = if workspace_dir == verification_dir {
+        workspace_dir
+    } else {
+        match crate::workspace::move_tree(&workspace_dir, &verification_dir) {
+            Ok(()) => verification_dir,
+            Err(e) => {
+                tracing::warn!(
+                    "archiving verified workspace failed: {e}; left at {}",
+                    workspace_dir.display()
+                );
+                // Keep the staged copy instead of deleting it with the temp dir.
+                if let Ok(d) = staging {
+                    let _ = d.keep();
+                }
+                workspace_dir
+            }
+        }
+    };
     result.checks_passed = merged.checks_passed();
     result.checks_total = merged.checks_total();
     result.tool_calls = tool_calls;
