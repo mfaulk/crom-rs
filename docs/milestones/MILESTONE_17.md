@@ -810,8 +810,9 @@ Full report: [docs/benchmarks/M17-baseline.md](../benchmarks/M17-baseline.md).
 - The first L3/L4 runs were invalid. Hidden checks ran inside the crom-rs
   Cargo workspace and failed on 8 upstream tasks. Fixed in #370 and re-run;
   the invalid numbers are recorded in the report.
-- Repair on vs off (L2, DeepSeek): 29/30 vs 28/30. Inconclusive, because the
-  repair loop never triggered in either arm.
+- Repair on vs off (L2, DeepSeek): 29/30 vs 28/30. Inconclusive: the repair
+  loop never triggered, because the Bash tool lacks `pipefail` and piped test
+  runs always report success (#379).
 - Top bottlenecks: finishing without validation or overfitting to the
   public tests (12 of 15 failures); no Anthropic prompt caching (#375);
   usage lost on errored turns, which disables the spend cap (#376).
