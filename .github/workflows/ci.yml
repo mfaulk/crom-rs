@@ -55,15 +55,15 @@ jobs:
             toolchain: beta
             lint: false
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.toolchain }}
-      - uses: taiki-e/install-action@v2.90.3
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest
       # fmt + clippy only need to run once; guard them to the primary lane.
@@ -83,9 +83,9 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings -D rustdoc::broken_intra_doc_links
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Doc
         run: cargo doc --workspace --no-deps --all-features
 
@@ -112,9 +112,9 @@ jobs:
           - tool-search-demo
           - tui-demo
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Isolate the cache per example so the matrix legs don't thrash a
           # single shared key (default key is OS + job name, identical here).
@@ -134,9 +134,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: eval
       # Fast, deterministic, offline lane. Never runs live-provider evals:
@@ -195,7 +195,7 @@ jobs:
       # are debuggable from the CI run.
       - name: Upload eval artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: eval-runs
           path: |
@@ -208,9 +208,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: eval-l3
       # L3 corpus (#289): upstream repos pinned in mfaulk/crom-eval-fixtures.
@@ -220,7 +220,7 @@ jobs:
       - name: Fixture cache key
         id: rev
         run: echo "rev=$(grep -h '^rev = ' crates/crom-eval/eval/tasks/l3-*/task.toml | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/crom/eval-fixtures
           key: eval-fixtures-${{ steps.rev.outputs.rev }}
@@ -238,9 +238,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: eval-l4
       # L4 corpus (#296): real upstream issues pinned in
@@ -248,7 +248,7 @@ jobs:
       - name: Fixture cache key
         id: rev
         run: echo "rev=$(grep -h '^rev = ' crates/crom-eval/eval/tasks/l4-*/task.toml | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/crom/eval-fixtures
           key: eval-fixtures-l4-${{ steps.rev.outputs.rev }}
@@ -269,14 +269,14 @@ jobs:
     # step) non-blocking, so coverage stays purely informational (#21).
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: coverage
-      - uses: taiki-e/install-action@v2.90.3
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-llvm-cov, cargo-nextest
       # Non-gating: measure + track coverage. cargo-llvm-cov drives nextest,
@@ -284,7 +284,7 @@ jobs:
       - name: Collect coverage
         run: cargo llvm-cov nextest --locked --workspace --all-targets --all-features --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
           files: lcov.info
           fail_ci_if_error: false
@@ -297,9 +297,9 @@ jobs:
       # A host that cannot enforce the sandbox fails the lane instead of skipping.
       CROM_REQUIRE_SANDBOX_TESTS: "1"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: sandbox
       # Includes the #[ignore]d fork-bomb/fork-loop/memory containment tests,
@@ -317,7 +317,7 @@ jobs:
         run: cargo test --locked -p crom-eval --test adversarial --test repo_config_escalation -- --nocapture
       - name: Upload adversarial report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: adversarial-report
           path: target/tmp/adversarial/report.json
@@ -328,8 +328,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         with:
           command: check advisories bans sources licenses
 
@@ -338,7 +338,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       # Live eval lanes (#295) must fail closed without a valid spend cap.

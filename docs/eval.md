@@ -876,9 +876,15 @@ dry-runs that gate (`.github/scripts/test-check-spend-cap.sh`) and runs
 
 Both live lanes run in the `eval-live` GitHub environment and read
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, and
-`GEMINI_API_KEY` from it (only the chosen provider's key is needed). Add
-required reviewers to that environment so each dispatch needs maintainer
-approval. Workflow inputs reach the shell only through `env:`.
+`GEMINI_API_KEY` from it (only the chosen provider's key is needed). The
+environment requires a maintainer's approval for each run and deploys only
+from `main`, so a dispatch from any other branch, including one with an
+edited workflow, never receives the keys. Approve a waiting run in the
+Actions UI or with `gh api -X POST
+repos/<owner>/<repo>/actions/runs/<id>/pending_deployments`. Workflow inputs
+reach the shell only through `env:`. Every action in `.github/workflows/` is
+pinned to a commit SHA, with the tag in a comment; Dependabot
+(`github-actions`) updates the pins.
 
 Both live lanes upload `target/crom-eval/runs` minus each archived
 workspace's `target/` (cargo build output, ~98% of the bytes). An M17

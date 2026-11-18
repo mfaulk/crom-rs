@@ -47,13 +47,13 @@ jobs:
       MODEL: ${{ inputs.model }}
       MAX_RUN_COST_USD: ${{ inputs.max_run_cost_usd }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Check spend cap
         run: .github/scripts/check-spend-cap.sh "$MAX_RUN_COST_USD" "$LIVE_SMOKE_CEILING_USD"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: eval-live
       - name: Run live eval suite
@@ -82,7 +82,7 @@ jobs:
           cargo run --locked -p crom-cli -- eval scoreboard --format md >> "$GITHUB_STEP_SUMMARY" || true
       - name: Upload eval artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: eval-live-runs
           # Archived workspaces keep their sources; their cargo build output
