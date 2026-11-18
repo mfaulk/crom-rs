@@ -82,7 +82,8 @@ pub enum ProviderError {
     #[error("timeout: {0}")]
     Timeout(String),
 
-    /// The TCP/TLS connection could not be established.
+    /// The connection could not be established, or was reset or dropped
+    /// before the response completed.
     #[error("connection error: {0}")]
     Connect(String),
 

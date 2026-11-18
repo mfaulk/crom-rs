@@ -70,7 +70,9 @@ fn classify_reqwest_error(context: &str, e: &reqwest::Error) -> ProviderError {
     let message = format!("{context}: {e}");
     if e.is_timeout() {
         ProviderError::Timeout(message)
-    } else if e.is_connect() {
+    } else if e.is_connect() || e.is_request() || e.is_body() || e.is_decode() {
+        // Refused, reset, or dropped mid-body (reqwest reports a truncated
+        // `.text()` body as a decode error): all transient link failures.
         ProviderError::Connect(message)
     } else {
         ProviderError::Http(message)
