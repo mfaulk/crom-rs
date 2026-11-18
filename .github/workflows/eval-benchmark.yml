@@ -26,6 +26,12 @@ on:
         description: 'Repetitions per task'
         required: false
         default: '3'
+      repair:
+        description: 'Repair loop (crom eval run --repair)'
+        required: false
+        type: choice
+        options: [disabled, enabled]
+        default: disabled
 
 permissions:
   contents: read
@@ -82,6 +88,7 @@ jobs:
       MODEL: ${{ matrix.model }}
       SUITES: ${{ inputs.suites }}
       REPETITIONS: ${{ inputs.repetitions }}
+      REPAIR: ${{ inputs.repair }}
       MAX_RUN_COST_USD: ${{ inputs.max_run_cost_usd }}
     steps:
       - uses: actions/checkout@v7
@@ -113,6 +120,7 @@ jobs:
             cargo run --locked -p crom-cli -- eval run --suite "$suite" \
               --provider "$PROVIDER" --model "$MODEL" \
               --repetitions "$REPETITIONS" --max-run-cost-usd "$remaining" \
+              --repair "$REPAIR" \
               --allow-failures
             rc=$?
             set -e

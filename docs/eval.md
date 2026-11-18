@@ -890,7 +890,8 @@ benchmark cell was ~15 GiB with it and ~0.25 GiB without. The per-task
   provider's key every task skips, the CLI exits 3, and the job warns
   instead of failing. The scoreboard goes to the job summary.
 - **Lane 4** (`targets` as space-separated `provider:model` pairs, `suites`,
-  `repetitions`, `max_run_cost_usd`). One job per target; the cap covers all
+  `repetitions`, `max_run_cost_usd`, and `repair` = `disabled` (default) or
+  `enabled`, passed to `crom eval run --repair`). One job per target; the cap covers all
   suites in that job, and each suite gets what the previous ones left (read
   from `summary.json` `total_cost_usd`; unknown spend stops the job). Run
   directories are uploaded per target and the scoreboard is posted to the
