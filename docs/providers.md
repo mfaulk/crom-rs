@@ -256,9 +256,10 @@ statuses and a per-crate `reqwest::Error` classifier for transport failures.
 | Cause | Variant | Retryable |
 | --- | --- | --- |
 | 401, 403, missing credential | `Auth(String)` | no |
+| 402, or 429 with `insufficient_quota` in the body (account out of credits) | `Billing(String)` | no |
 | 400, 404, 413, 422, other 4xx (context too long, bad param, unknown model) | `InvalidRequest { status, message }` | no |
 | 408, client connect/read/total timeout | `Timeout(String)` | yes |
-| 429 | `RateLimited { retry_after, message }` | yes |
+| 429 (rate limit) | `RateLimited { retry_after, message }` | yes |
 | 5xx (including Anthropic 529) | `ServerError { status, message }` | yes |
 | TCP/TLS connection failure | `Connect(String)` | yes |
 | Other transport errors, unexpected status classes | `Http(String)` | no |
