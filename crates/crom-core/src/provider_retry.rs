@@ -204,6 +204,34 @@ mod tests {
         ProviderError::from_status("t", 503, "down", None)
     }
 
+    // 402 and OpenAI's insufficient_quota 429 map to a non-retryable Billing error.
+    #[test]
+    fn from_status_classifies_billing_failures() {
+        use ProviderError as E;
+        let deepseek =
+            r#"{"error":{"message":"Insufficient Balance","type":"insufficient_balance_error"}}"#;
+        let e = E::from_status("openai", 402, deepseek, None);
+        assert!(matches!(e, E::Billing(_)), "{e:?}");
+        assert_eq!(e.kind(), "billing");
+        assert!(!e.is_retryable());
+        assert!(e.to_string().contains("Insufficient Balance"));
+
+        let openai = r#"{"error":{"type":"insufficient_quota","code":"insufficient_quota"}}"#;
+        let e = E::from_status("openai", 429, openai, Some(Duration::from_secs(1)));
+        assert!(matches!(e, E::Billing(_)), "{e:?}");
+        assert!(!e.is_retryable());
+
+        assert!(matches!(
+            E::from_status(
+                "t",
+                429,
+                r#"{"error":{"type":"rate_limit_exceeded"}}"#,
+                None
+            ),
+            E::RateLimited { .. }
+        ));
+    }
+
     // from_status maps each status class to its typed variant.
     #[test]
     fn from_status_classifies_statuses() {

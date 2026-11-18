@@ -55,7 +55,12 @@ pub enum ProviderError {
     #[error("auth error: {0}")]
     Auth(String),
 
-    /// 4xx other than auth/408/429: malformed request, context too long,
+    /// 402, or a 429 whose body says the quota is exhausted
+    /// (`insufficient_quota`): the account needs credits, so retrying is futile.
+    #[error("billing error: {0}")]
+    Billing(String),
+
+    /// 4xx other than auth/402/408/429: malformed request, context too long,
     /// unsupported parameter, unknown model.
     #[error("invalid request (status {status}): {message}")]
     InvalidRequest { status: u16, message: String },
@@ -108,7 +113,9 @@ impl ProviderError {
         let message = format!("{context}: status {status}: {body}");
         match status {
             401 | 403 => Self::Auth(message),
+            402 => Self::Billing(message),
             408 => Self::Timeout(message),
+            429 if body.contains("insufficient_quota") => Self::Billing(message),
             429 => Self::RateLimited {
                 retry_after,
                 message,
@@ -144,6 +151,7 @@ impl ProviderError {
         match self {
             Self::Http(_) => "http",
             Self::Auth(_) => "auth",
+            Self::Billing(_) => "billing",
             Self::InvalidRequest { .. } => "invalid_request",
             Self::InvalidResponse(_) => "invalid_response",
             Self::Stream(_) => "stream",
