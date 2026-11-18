@@ -391,3 +391,46 @@ async fn max_tokens_field_is_configurable() {
     let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
     assert!(body.get("max_tokens").is_none(), "{body}");
 }
+
+/// Answer every connection with `reply` and close it; counts connections.
+fn raw_server(reply: &'static [u8]) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            count.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(reply);
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+// A connection closed before any response is retryable and retried max_retries times.
+#[tokio::test]
+async fn dropped_connection_before_response_is_retried() {
+    let (url, hits) = raw_server(b"");
+    let provider = OpenAiProvider::from_config(cfg_at(url, 2), cred()).unwrap();
+    let err = run(&provider).await.expect_err("connection dropped");
+    assert!(err.is_retryable(), "{err:?}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+// A response body cut short by a dropped connection is retryable and retried.
+#[tokio::test]
+async fn truncated_response_body_is_retried() {
+    let (url, hits) = raw_server(
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n{\"choices\":",
+    );
+    let provider = OpenAiProvider::from_config(cfg_at(url, 2), cred()).unwrap();
+    let err = run(&provider).await.expect_err("body truncated");
+    assert!(err.is_retryable(), "{err:?}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+}

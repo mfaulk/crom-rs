@@ -261,7 +261,7 @@ statuses and a per-crate `reqwest::Error` classifier for transport failures.
 | 408, client connect/read/total timeout | `Timeout(String)` | yes |
 | 429 (rate limit) | `RateLimited { retry_after, message }` | yes |
 | 5xx (including Anthropic 529) | `ServerError { status, message }` | yes |
-| TCP/TLS connection failure | `Connect(String)` | yes |
+| TCP/TLS connection refused, reset, or dropped before the response body completes | `Connect(String)` | yes |
 | Other transport errors, unexpected status classes | `Http(String)` | no |
 | Malformed body | `InvalidResponse(String)` | no |
 | Mid-stream SSE failure (Anthropic) | `Stream(String)` | no (not retried by the provider) |
