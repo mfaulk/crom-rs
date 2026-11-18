@@ -737,7 +737,7 @@ Filled by #275 (offline) and #297 (live).
 |---|---|
 | Planning commit | `bbff6ab` |
 | Offline baseline commit | `d9bd61b` (`main` at the start of #275) |
-| Live baseline | _pending #297_ |
+| Live baseline | L1/L2 `de00616`, L3/L4 `2175c4b` (Opus) and `e180603` (DeepSeek); [M17-baseline.md](../benchmarks/M17-baseline.md) |
 
 ### Offline (L0 harness) baseline — #275
 
@@ -793,3 +793,28 @@ Live runs on 2026-11-16, `max_run_cost_usd = 2` each. DeepSeek ran
   unknown, so `--max-run-cost-usd` could no longer be enforced and the
   remaining three tasks were skipped (fail-closed, as designed). Usage that
   `message_delta` did report is lost when a turn ends in an error.
+
+### Live baseline — #297
+
+Full report: [docs/benchmarks/M17-baseline.md](../benchmarks/M17-baseline.md).
+3 repetitions per task, `sandbox = required`, repair off.
+
+| Level | DeepSeek `deepseek-flash` | Opus `claude-opus-5-5` |
+|---|---|---|
+| L1 (12) | 34/36, $0.13 | 36/36, $3.48 |
+| L2 (10) | 28/30, $0.38 | 28/30, $6.24 |
+| L3 (10) | 27/28 + 2 provider errors, $0.90 | 30/30, $22.94 |
+| L4 (5) | 10/15, $0.56 | 12/15, $15.88 |
+| $ per resolved | $0.020 | $0.458 |
+
+- The first L3/L4 runs were invalid. Hidden checks ran inside the crom-rs
+  Cargo workspace and failed on 8 upstream tasks. Fixed in #370 and re-run;
+  the invalid numbers are recorded in the report.
+- Repair on vs off (L2, DeepSeek): 29/30 vs 28/30. Inconclusive, because the
+  repair loop never triggered in either arm.
+- Top bottlenecks: finishing without validation or overfitting to the
+  public tests (12 of 15 failures); no Anthropic prompt caching (#375);
+  usage lost on errored turns, which disables the spend cap (#376).
+  Dropped connections were not retried (fixed in #374).
+- Still open for #297: human review of the L4 patches. The security suite
+  has no live lane; the scripted lane result stands.
