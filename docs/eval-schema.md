@@ -250,9 +250,13 @@ At run time the agent works in a fresh `$TMPDIR/crom-eval-ws/ws-<random>/`
 holding only the public fixture plus its git baseline. The runner writes
 `task.toml`, `prompt.md`, `normalized-task.json`, and results under
 `runs/<run-id>/tasks/<task-id>/`, which is not under or beside the agent
-workspace. After the agent exits, the workspace is moved to
-`runs/<run-id>/tasks/<task-id>/workspace/` (the verification copy) and the
-hidden fixture is overlaid there. The runner refuses (harness error) a
+workspace. After the agent exits, the workspace is moved to a fresh temp dir
+(`$TMPDIR/crom-eval-verify-*/workspace`, the verification copy), the hidden
+fixture is overlaid and the hidden checks run there, and the copy is then
+archived to `runs/<run-id>/tasks/<task-id>/workspace/`. Verifying outside the
+runs dir matters when the runs dir is inside a Cargo workspace (the crom-rs
+checkout): cargo would otherwise treat an upstream package without its own
+`[workspace]` as a stray member and refuse to build it. The runner refuses (harness error) a
 workspace root that overlaps the runs dir or the tasks dir. See
 [eval-isolation.md](eval-isolation.md#leakage) for what is and is not enforced.
 

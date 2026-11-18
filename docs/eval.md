@@ -816,8 +816,9 @@ target/crom-eval/
       triage.md
       repair.json, repair.md, diagnostics.jsonl, validation-attempts.jsonl
                            # repair-loop artifacts (--repair enabled)
-      workspace/           # verification copy: the agent workspace moved here after the
-                           # agent exits, plus the hidden overlay (preserved)
+      workspace/           # verification copy: the agent workspace plus the hidden
+                           # overlay, archived here after verification (which runs
+                           # in a temp dir outside any enclosing Cargo workspace)
 ```
 
 With `--repetitions k` (k > 1) each repetition writes its own

@@ -113,7 +113,7 @@ Task-authoring rules are in
 |---|---|---|
 | Workspace root | The agent's cwd is `$TMPDIR/crom-eval-ws/ws-<random>/` (mode 0700) with only the public fixture + git baseline. `task.toml`, `prompt.md`, `normalized-task.json`, `hidden/`, `oracle.patch`, and earlier results are not inside it or beside it, so `cat ../task.toml` finds nothing. | runner (`crom_eval::workspace`) |
 | Overlap guard | A workspace root inside (or containing) the runs dir or tasks dir is refused as a harness error. | runner |
-| Hidden overlay | `[hidden].fixture` is copied only into the verification copy (`runs/<id>/tasks/<task>/workspace/`) after the agent exits. | runner |
+| Hidden overlay | `[hidden].fixture` is copied only into the verification copy (a temp dir, archived to `runs/<id>/tasks/<task>/workspace/` afterwards) after the agent exits. | runner |
 | Path tools | `Read`/`Write`/`Edit`/`Glob`/`Grep` reject paths outside the workspace, including absolute paths to the task source or run dir. | `crom-tools` path sandbox |
 | Agent Bash, absolute paths | With `--sandbox required` (default for live providers), Bash cannot read the task source dir or the runs dir by absolute path. With `--sandbox off` it can. | [agent sandbox](#agent-sandbox) (#253) |
 
