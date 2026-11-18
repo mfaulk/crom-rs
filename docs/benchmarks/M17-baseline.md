@@ -108,7 +108,8 @@ the contract they had just implemented, and were failed for it. The scores
 above are unchanged; the task needs its prompt fixed before the next
 baseline (#377).
 
-The scoreboard also flags "unvalidated completions" as a behavior signal on
+Validation-outcome signals are unreliable until #379: piped commands
+report success even when tests fail. The scoreboard also flags "unvalidated completions" as a behavior signal on
 resolved attempts (Opus 40/111, DeepSeek 57/111). The agent often declares
 the task done without a final passing test run, even when the hidden checks
 later pass.
@@ -128,11 +129,13 @@ $3 cap), and `disabled` is the L2 baseline row above.
 | Final answer without validation | 21/30 | 21/30 |
 | Failures | `l2-pipeline-shutdown` ×2 (`unvalidated_completion`) | `l2-expr-test-cascade` ×1 (`forbidden_path_changed`) |
 
-**Inconclusive.** The repair loop never triggered: in neither arm did any
-attempt end a validation run with a parseable failure for the loop to act on.
-The one-attempt difference is noise. Repair can only help once the agent
-validates. In 21 of 30 attempts it gave its final answer without a
-validation after its last edit, which is the bottleneck in finding 1.
+**Inconclusive.** The repair loop never triggered, and the difference of one
+attempt is noise. The cause is a Crom defect (#379): the Bash tool runs
+`bash -c` without `pipefail`, and agents pipe their validation output, for
+example `cargo test 2>&1 | tail -30`. That was 163 of 167 DeepSeek and 29 of 29
+Opus cargo validation calls across the archive. The pipeline's exit status
+is `tail`'s, so every failing test run was recorded as a success, and the
+loop had no failure to repair. Re-run this comparison after #379.
 
 ## Harness defect found and fixed during the baseline
 
@@ -183,7 +186,7 @@ archive.
    ways. The agent stops once public tests pass, or before running them.
    Candidates: require a passing validation after the last edit
    (`--require-validation-after-edit` exists but is off), and prompt for
-   edge-case tests beyond the visible ones.
+   edge-case tests beyond the visible ones (#380).
 2. **No Anthropic prompt caching.** Cache hit rate 0.000 against 0.959 on
    DeepSeek, and input is about 86% of Opus spend. Sending `cache_control`
    on the system prompt, tools, and conversation prefix is the largest
@@ -193,11 +196,14 @@ archive.
    harness skips every remaining task (fail closed). One 402 cost 16 skipped
    attempts. Partial usage from the stream should be kept (#376).
 4. **Transient transport failures were fatal** (fixed in #374).
-5. **Task spec gaps.** `forbidden_paths` should be stated in the prompt, or
+5. **Validation outcomes are invisible to Crom.** Piped commands always
+   exit 0, so the repair loop and the validation signals see no failures
+   (#379).
+6. **Task spec gaps.** `forbidden_paths` should be stated in the prompt, or
    added tests allowed; see `l2-pipeline-shutdown` (#377).
-6. **Statistical power.** 5–12 tasks per level give intervals of ±10–25
+7. **Statistical power.** 5–12 tasks per level give intervals of ±10–25
    points. Distinguishing the models, or measuring an improvement, needs
-   more L3/L4 tasks rather than more repetitions.
+   more L3/L4 tasks rather than more repetitions (#381).
 
 ## Limitations
 
@@ -208,7 +214,7 @@ archive.
 - Costs are nominal list prices from `prices.toml`, not invoiced amounts.
 - The L4 corpus is 5 tasks; one task drives most of the L4 gap.
 - Gemini was not run: the account had no prepaid credit (HTTP 402); #283.
-- No live security measurement (see above).
+- No live security measurement (see above; #382).
 
 ## Reproduce
 
