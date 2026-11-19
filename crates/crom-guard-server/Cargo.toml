@@ -1,0 +1,20 @@
+[package]
+name = "crom-guard-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Local Crom Guard service: MCP Streamable HTTP agent endpoint and admin API."
+publish = false
+
+[[bin]]
+name = "crom-guard"
+path = "src/main.rs"
+# The binary's crate name equals the library's (`crom_guard`); documenting
+# both would collide in target/doc.
+doc = false
+
+# Depends on no crom-* crate other than crom-guard (ADR 0002; checked by
+# scripts/check-guard-deps.sh in CI).
+[dependencies]
+crom-guard = { path = "../crom-guard" }

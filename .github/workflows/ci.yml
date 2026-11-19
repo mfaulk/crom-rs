@@ -323,6 +323,17 @@ jobs:
           path: target/tmp/adversarial/report.json
           if-no-files-found: ignore
 
+  guard-boundary:
+    name: security / guard dependency boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      # ADR 0002: crom-guard and crom-guard-server depend on no other crom-* crate.
+      - name: Guard depends on no other crom-* crate
+        run: scripts/check-guard-deps.sh
+
   deny:
     name: security / cargo-deny
     runs-on: ubuntu-latest

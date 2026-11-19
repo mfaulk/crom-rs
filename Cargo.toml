@@ -14,6 +14,8 @@ members = [
     "crates/crom-provider-gemini",
     "crates/crom-sdk",
     "crates/crom-eval",
+    "crates/crom-guard",
+    "crates/crom-guard-server",
 ]
 exclude = [
     "crates/crom-eval/eval",

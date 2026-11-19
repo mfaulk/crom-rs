@@ -77,7 +77,7 @@ runtime:
 |---|---|---|
 | Purpose | Model integration, agent loop, tools, sessions, coding workflows | Authorization, credential isolation, and audit for agent-initiated operations |
 | Trust | Hosts untrusted model output | Trusted. Small and independently testable |
-| Depends on | `crom-guard` only as one client among others | No `crom-*` crate (enforced by CI, §15 G-3) |
+| Depends on | `crom-guard` only as one client among others | No `crom-*` crate (enforced by CI, §10.4) |
 | Interface | Rust SDK, CLI | Rust library; MCP Streamable HTTP (agents); admin HTTP API (trusted application) |
 
 Crom becomes the reference *client* of Guard. This milestone keeps both in one
@@ -708,9 +708,13 @@ Scope decisions:
 
 ### 10.4 Framework independence (falsifiable)
 
-- CI check: `cargo tree -p crom-guard -e normal` and
-  `cargo tree -p crom-guard-server -e normal` contain no `crom-*` crate other
-  than `crom-guard` ([#344](https://github.com/mfaulk/crom-rs/issues/344) adds the check).
+- CI check: `cargo tree -p crom-guard -e normal,build` and
+  `cargo tree -p crom-guard-server -e normal,build` contain no `crom-*` crate
+  other than `crom-guard` (`scripts/check-guard-deps.sh`, job
+  `security / guard dependency boundary`, added by
+  [#344](https://github.com/mfaulk/crom-rs/issues/344); build dependencies
+  count because build scripts run as code. See
+  [ADR 0002](../security/decisions/0002-guard-architecture.md)).
 - [#358](https://github.com/mfaulk/crom-rs/issues/358): a Python 3 client using only the standard library (`urllib`,
   `json`) performs `initialize`/`tools/list`/`tools/call` against Guard and
   runs the authorized and unauthorized cases in CI. An optional variant uses
