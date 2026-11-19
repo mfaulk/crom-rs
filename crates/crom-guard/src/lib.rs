@@ -23,6 +23,7 @@ mod grant;
 mod handle;
 mod ids;
 mod resource;
+mod store;
 mod time;
 mod traits;
 mod value;
@@ -53,6 +54,7 @@ pub use ids::{
     UserId, MAX_ID_LEN, RESERVED_ID_PREFIX,
 };
 pub use resource::{ResolvedResource, ResourceVersion};
+pub use store::{GrantStoreConfig, MemoryGrantStore, DEFAULT_MAX_TTL_SECONDS};
 pub use time::{Clock, SystemClock, Timestamp};
 pub use traits::{
     BoxFuture, ExecuteError, ExecutionOutput, GrantStore, GrantStoreError, IssuedGrant,

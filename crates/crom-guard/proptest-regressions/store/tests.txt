@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1b60aa1a7853831a5df63c3e1dec4fe0f9186d04b1d86eb8dcb021048e496480 # shrinks to spec = GrantSpec { tenant: TenantId("acme"), delegator: Delegator { id: UserId("acme-agent-operator"), role: "agent-operator", attrs: {"refund_limit_cents": Long(5000)} }, run_id: RunId("run-1"), actions: {ActionId("customer.read")}, constraints: Constraints({"customers": Set({}), "max_refund_cents": AtMost(0)}), ttl_seconds: 3601, max_depth: 0 }
+cc 4438d94a734561cf0fbc7e0a84b217c052e77132c0bd128b31b26f607ad7d8a0 # shrinks to spec = GrantSpec { tenant: TenantId("acme"), delegator: Delegator { id: UserId("acme-agent-operator"), role: "agent-operator", attrs: {"refund_limit_cents": Long(5000)} }, run_id: RunId("run-1"), actions: {ActionId("customer.export")}, constraints: Constraints({"customers": Set({}), "max_refund_cents": AtMost(0)}), ttl_seconds: 1, max_depth: 0 }

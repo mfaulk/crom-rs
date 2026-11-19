@@ -38,7 +38,7 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 
 | Trait | Sealed | Implemented in | Notes |
 |---|---|---|---|
-| `GrantStore` | yes | #348, #353 | Async: `issue`, `delegate`, `authenticate`, `recheck` (just before execution), and `revoke`, which is scoped to the issuing app |
+| `GrantStore` | yes | `MemoryGrantStore` ([grants.md](grants.md)) | Async: `issue`, `delegate`, `authenticate`, `recheck` (just before execution), and `revoke`, which is scoped to the issuing app |
 | `PolicyDecisionPoint` | yes | #349 | Sync, because evaluation is CPU-only. `authorize` returns a `Decision` and cannot return an error. Engine errors become `Deny` |
 | `ResourceResolver` | no | app code, #350 | Async (`BoxFuture`). Not-found and other-tenant both return the same `ResolveError::NotFound` |
 | `ProtectedOperation` | no | app code, #351, #356 | One `ActionId` per MCP tool. Provides the input schema, resolver, Cedar context, and `execute(AuthorizedAction, CredentialLease)` |
