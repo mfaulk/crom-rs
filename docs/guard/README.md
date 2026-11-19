@@ -30,7 +30,7 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | resource | `ResolvedResource`, `ResourceVersion` | Built by the trusted resolver. The version is the executor's precondition |
 | action | `ValidatedArgs`, `AuthorizationContext`, `ApprovalContext`, `AuthorizationRequest`, `AuthorizedAction` | `AuthorizationContext` rejects the Guard-owned keys `grant` and `approval`. `AuthorizationRequest` carries the validated args, so the PDP can compute the approval digest |
 | decision | `Decision`, `DenyReason`, `ApprovalRequirement`, `ActionDigest` | Agents see only `DenyReason::code()`. The full value, including ancestor grant ids, goes to the audit log |
-| credential | `CredentialLease`, `CredentialBroker` | The lease exposes its secret only inside `with_secret(\|s\| ..)` |
+| credential | `CredentialLease`, `CredentialBroker`, `FileCredentialBroker`, `EnvCredentialBroker` | The lease exposes its secret only inside `with_secret(\|s\| ..)` and zeroizes it on drop. See [credentials.md](credentials.md) |
 | audit | `AuditRecord`, `AuditSink`, `AuditReceipt`, `FileAuditSink`, `verify_log`, … | The `guard-audit/v1` fields from §12.1. `FileAuditSink` adds `seq`, `prev_hash` and `hash`, and `verify_log` checks the chain (#352). See [audit.md](audit.md) |
 | time | `Timestamp`, `Clock`, `SystemClock` | Unix milliseconds on Guard's clock |
 
@@ -42,7 +42,7 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | `PolicyDecisionPoint` | yes | #349 | Sync, because evaluation is CPU-only. `authorize` returns a `Decision` and cannot return an error. Engine errors become `Deny` |
 | `ResourceResolver` | no | app code, #350 | Async (`BoxFuture`). Not-found and other-tenant both return the same `ResolveError::NotFound` |
 | `ProtectedOperation` | no | app code, #351, #356 | One `ActionId` per MCP tool. Provides the input schema, resolver, Cedar context, and `execute(AuthorizedAction, CredentialLease)` |
-| `CredentialBroker` | no | #355 | Async. Hands out leases. The agent never receives one |
+| `CredentialBroker` | no | `FileCredentialBroker`, `EnvCredentialBroker` ([credentials.md](credentials.md)) | Async. Hands out leases. The agent never receives one |
 | `AuditSink` | no | #352 (`ChainedAuditSink` / `FileAuditSink`) | Async. `append` must be durable before it resolves. On `Err`, nothing executes |
 
 Sealed traits produce authority, so implementations outside this crate are rejected at compile time.

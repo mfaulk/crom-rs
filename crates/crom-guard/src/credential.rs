@@ -1,9 +1,18 @@
+use zeroize::Zeroizing;
+
 use crate::ids::ActionId;
+
+mod broker;
+pub use broker::{
+    CredentialLoadError, EnvCredential, EnvCredentialBroker, FileCredentialBroker,
+    MAX_CREDENTIALS_FILE_BYTES,
+};
 
 /// A downstream credential lent to one executor call. It never leaves the
 /// Guard process: no `Debug`, `Display`, `Serialize`, or `Clone`, and the
 /// secret is reachable only inside [`with_secret`](Self::with_secret),
-/// which is meant for setting a header on the outgoing request.
+/// which is meant for setting a header on the outgoing request. The
+/// secret is zeroized when the lease is dropped.
 ///
 /// ```compile_fail
 /// fn show(l: &crom_guard::CredentialLease) -> String { format!("{:?}", l) }
@@ -23,7 +32,7 @@ use crate::ids::ActionId;
 #[allow(missing_debug_implementations)] // holds a secret; deliberately not Debug
 pub struct CredentialLease {
     credential_id: String,
-    secret: String,
+    secret: Zeroizing<String>,
 }
 
 impl CredentialLease {
@@ -31,7 +40,7 @@ impl CredentialLease {
     pub fn new(credential_id: impl Into<String>, secret: impl Into<String>) -> Self {
         Self {
             credential_id: credential_id.into(),
-            secret: secret.into(),
+            secret: Zeroizing::new(secret.into()),
         }
     }
 
