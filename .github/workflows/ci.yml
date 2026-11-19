@@ -75,6 +75,12 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo nextest run --locked --workspace --all-targets
+      # nextest does not run doctests. These include the `compile_fail`
+      # checks that Guard's authority types (`AuthorizedAction`,
+      # `ExecutionContext`, sealed traits) cannot be built or cloned outside
+      # crom-guard (GP8).
+      - name: Doc tests
+        run: cargo test --locked --workspace --doc
 
   docs:
     name: docs (rustdoc)

@@ -172,7 +172,7 @@ Generated from archived reports by `crom eval scoreboard --guard-report`. Securi
 | refund.issue other customer (policy_deny) | guard_http | policy_deny | 1000 | 1011.1 | 1170.6 | 1224.2 |
 | customer.export (policy_deny) | guard_http | policy_deny | 1000 | 965.1 | 1132.6 | 1339.4 |
 
-Guard's end-to-end cost on the guarded paths is dominated by the audit sink's per-record fsync: an executed call writes two records (decision, then outcome), a denied call one. Here, in process: mean p50 1589 us over executed calls, 775 us over denied ones. `policy_only` is Cedar evaluation alone, read from the decision records' integer-microsecond `policy_us`; it is not the same span as the end-to-end rows, which are wall-clock per call.
+Inferred, not measured: most of Guard's end-to-end cost on the guarded paths is attributed to the audit sink's per-record fsync, because an executed call writes two records (decision, then outcome) and a denied call one, and `policy_only` is small. E5 has no path without fsync, so this attribution is not a measured breakdown. Here, in process: mean p50 1589 us over executed calls, 775 us over denied ones. `policy_only` is Cedar evaluation alone, read from the decision records' integer-microsecond `policy_us`; it is not the same span as the end-to-end rows, which are wall-clock per call.
 
 ### Sources and reproducibility
 

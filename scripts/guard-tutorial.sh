@@ -6,21 +6,34 @@
 #   scripts/guard-tutorial.sh           run it (from any directory)
 #   scripts/guard-tutorial.sh --print   print the script it would run
 #
-# The doc is the only copy of the commands, so they cannot drift apart.
+# The doc is the only copy of the commands, so they cannot drift apart. It
+# fails before running anything if the doc has a fenced block that is not
+# ```sh, or a number of skipped blocks other than SKIPPED. TUTORIAL_DOC
+# overrides the doc path (used to check that a broken copy fails).
 # Needs Linux with the Crom Bash sandbox, cargo, curl and jq, and free
 # loopback ports 8470 and 8480.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-doc=docs/guard/tutorial.md
+doc=${TUTORIAL_DOC:-docs/guard/tutorial.md}
+# The clone block and the paid live run.
+SKIPPED=2
 
+# Prints the runnable blocks; exits 1 on a fence that is not ```sh.
 extract() {
   awk '
-    /^```sh[[:space:]]*$/ { inblock = 1; run = !skip; skip = 0; n++; if (run) printf "\n# --- block %d ---\n", n; next }
+    !inblock && /^[[:space:]]*```/ {
+      if ($0 !~ /^```sh[[:space:]]*$/) { printf "error: line %d: only ```sh blocks are allowed: %s\n", NR, $0 > "/dev/stderr"; bad = 1; exit 1 }
+      inblock = 1; run = !skip; skip = 0; n++
+      if (run) printf "\n# --- block %d ---\n", n
+      else skipped++
+      next
+    }
     inblock && /^```[[:space:]]*$/ { inblock = 0; next }
     inblock { if (run) print; next }
     /^<!-- tutorial: skip -->[[:space:]]*$/ { skip = 1; next }
     /[^[:space:]]/ { skip = 0 }
+    END { if (!bad) printf "\n# skipped blocks: %d\n", skipped }
   ' "$doc"
 }
 
@@ -32,7 +45,26 @@ checks() {
 # --- checks (scripts/guard-tutorial.sh) ---
 fail() { echo "tutorial check failed: $*" >&2; exit 1; }
 e=$EVIDENCE
-# Step 4: one decision per call, in the order the tutorial makes them.
+# Steps 4 and 5: what the agent saw, call by call.
+want='executed
+resource_not_found
+policy_deny
+invalid_arguments
+policy_deny
+policy_deny
+approval_required
+action_not_granted
+no_grant
+executed
+grant_revoked
+no_grant
+policy_deny
+policy_deny
+executed'
+got=$(jq -r '.code // .status' "$e/calls.log")
+[[ "$got" == "$want" ]] || fail "agent-visible results differ:
+$got"
+# Step 4: one decision record per call, in order.
 want='invoice.list allow -
 invoice.list deny resource_not_found
 invoice.list deny policy_deny
@@ -74,19 +106,25 @@ EVIDENCE=$(mktemp -d)
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$EVIDENCE"' EXIT
 EOF
   extract | awk '
-    /^rm -rf "\$WORK"$/ { print "cp \"$STATE/audit.jsonl\" \"$WORK\"/ledger-*.jsonl \"$WORK\"/check-*.txt \"$EVIDENCE\"/" }
+    /^rm -rf "\$WORK"$/ { print "cp \"$STATE/audit.jsonl\" \"$AGENT/calls.log\" \"$WORK\"/ledger-*.jsonl \"$WORK\"/check-*.txt \"$EVIDENCE\"/" }
     { print }
   '
   checks
 }
 
-blocks=$(extract | grep -c '^# --- block')
+extracted=$(extract) || exit 1
+blocks=$(grep -c '^# --- block' <<<"$extracted" || true)
+skipped=$(sed -n 's/^# skipped blocks: //p' <<<"$extracted")
+if [[ "$skipped" != "$SKIPPED" ]]; then
+  echo "error: $doc has $skipped skipped sh blocks, expected $SKIPPED" >&2
+  exit 1
+fi
 if ((blocks < 20)); then
   echo "error: only $blocks runnable sh blocks found in $doc" >&2
   exit 1
 fi
 # shellcheck disable=SC2016 # a literal $WORK
-if ! extract | grep -q '^rm -rf "\$WORK"$'; then
+if ! grep -q '^rm -rf "\$WORK"$' <<<"$extracted"; then
   echo "error: $doc has no clean-up block (rm -rf \"\$WORK\")" >&2
   exit 1
 fi

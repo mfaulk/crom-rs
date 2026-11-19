@@ -52,8 +52,11 @@ much of it is still planned (see [Limitations and roadmap](#limitations-and-road
   protected operation with Cedar policies, binds approvals to the exact
   action, lets agents delegate only narrower authority to subagents, holds
   the downstream credential itself, and writes a hash-chained audit log
-  (`crom-guard audit verify`). `crom-guard check` refuses deployments outside
-  the isolation profile. Start with the
+  (`crom-guard audit verify`). `crom-guard check` is a static,
+  point-in-time preflight: it fails a deployment that breaks one of the
+  isolation-profile conditions it checks (file ownership and modes, Crom's
+  sandbox and MCP settings), and cannot see changes made after it runs or
+  conditions outside that list. Start with the
   [tutorial](docs/guard/tutorial.md); design and API in
   [docs/guard/](docs/guard/README.md); measured results and their limits in
   [docs/benchmarks/M18-guard.md](docs/benchmarks/M18-guard.md). Crom connects

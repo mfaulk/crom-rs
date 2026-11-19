@@ -1185,7 +1185,9 @@ in [docs/benchmarks/M18-guard.md](../benchmarks/M18-guard.md).
 - [x] Reference deployment preflight and bypass tests in the Linux CI lane.
 - [x] ≥22 adversarial scenarios (G1–G18 plus the 10 M17 scenarios); scripted lane reports `executed = 0` in the
       supported configuration and `> 0` for isolation-dependent scenarios with
-      the sandbox off.
+      the sandbox off. Per §13.3 the 10 M17 scenarios are kept as they were:
+      they exercise Crom's sandbox and policy without Guard and are not
+      scored on the business ledger.
 - [x] Scoreboard with E1–E5 results; `docs/benchmarks/M18-guard.md` published
       with limitations. E3's model-generated lane and E4b (live, optional)
       have not been run.

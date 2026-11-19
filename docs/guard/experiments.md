@@ -124,9 +124,14 @@ Each operation's `policy_only` samples are the decision records appended
 while that operation's timed calls ran (exactly one per call), not a slice
 by position.
 
-What dominates: Guard's end-to-end cost on the guarded paths is mostly the
-audit sink's per-record `fsync`. An executed call writes two records
-(decision, then outcome); a denied call writes one. In the archived run
+What dominates (an inference, not a measured breakdown): Guard's
+end-to-end cost on the guarded paths is attributed mostly to the audit
+sink's per-record `fsync`. An executed call writes two records (decision,
+then outcome); a denied call writes one, and the medians scale roughly with
+that count while `policy_only` stays small. E5 has no path without `fsync`.
+The closest measured comparison is the separate, unarchived
+`pipeline_latency` test (in-memory sink, stub executor,
+[pipeline.md](pipeline.md#tests)), which is a different harness. In the archived run
 (btrfs, release), the in-process p50 is 1.52–1.63 ms for executed calls
 and 0.75–0.80 ms for denied ones, against 45–78 µs for `policy_only`
 ([scoreboard.md](scoreboard.md), E5).

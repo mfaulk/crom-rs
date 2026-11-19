@@ -17,9 +17,11 @@ The pieces: Guard and the synthetic business API run in one process, `crom-guard
 - Rust 1.89 or newer (`rust-version` in the root `Cargo.toml`), `git`, `curl`, and `jq`.
 - Free loopback ports 8470 (Guard's agent endpoint, from `examples/guard-support/guard.toml`) and 8480 (the business API's default) for steps 4–6.
 
-Run every block in one `bash` shell, in order, from the repository root: later blocks use variables that earlier blocks set. The first build takes a few minutes.
+Run every block in one `bash` shell, in order, from the repository root: later blocks use variables that earlier blocks set. The first build takes a few minutes. A few blocks end with `test …` or `grep -q …` lines: they check the result, print nothing when it holds, and are what makes the CI run below fail when the tutorial stops matching Guard.
 
-**Kept in sync by CI.** `scripts/guard-tutorial.sh` extracts every `sh` block on this page, except the ones marked as skipped in the page source (cloning, and the paid live run at the end), runs them in order under `bash -euo pipefail`, and then checks the results (the audit log of step 4, the policy change of step 5, the `check` results of step 6). CI runs it in the `guard / reference app (linux)` job. `scripts/guard-tutorial.sh --print` shows the script it runs.
+**Kept in sync by CI.** `scripts/guard-tutorial.sh` extracts every `sh` block on this page, except the two marked as skipped in the page source (cloning, and the paid live run at the end), runs them in order under `bash -euo pipefail`, and then checks the results (the agent-visible codes and audit log of step 4, the policy change of step 5, the `check` results of step 6). It fails on any other kind of code block, or a different number of skipped ones. CI runs it in the `guard / reference app (linux)` job. `scripts/guard-tutorial.sh --print` shows the script it runs.
+
+**Secrets stay off command lines.** A process's arguments are visible to every local user (`ps`, `/proc/<pid>/cmdline`), so the admin token, the business-API secret and the session handle below live in 0600 files and reach `curl` and `jq` through `-H @file` or stdin, never as arguments.
 
 ## 1. Get the code and build Guard
 
@@ -105,14 +107,19 @@ Now delete one record from a copy and verify again. The deletion breaks the `seq
 ```sh
 WORK=$(mktemp -d)
 sed '2d' "$DEMO/audit.jsonl" >"$WORK/tampered.jsonl"
-if "$GUARD" audit verify "$WORK/tampered.jsonl"; then echo "UNEXPECTED: tampered log verified"; false; fi
+status=0
+"$GUARD" audit verify "$WORK/tampered.jsonl" 2>"$WORK/verify.err" || status=$?
+cat "$WORK/verify.err"
+echo "exit status: $status"
+test "$status" -eq 1
+grep -q 'audit log line 2: expected seq 2, found 3' "$WORK/verify.err"
 ```
 
 `WORK` is a scratch directory for the rest of the tutorial. The chain is tamper evidence, not tamper proofing: a process with Guard's uid could rewrite the whole chain consistently. Only a head hash kept elsewhere (`--anchor <seq>:<hash>`) detects that ([audit.md](audit.md)).
 
 ## 4. Run Guard yourself and trigger denials
 
-Set up a private state directory the way the deployment profile wants it: 0700, with a 0600 admin token and a 0600 credentials file. The agent never sees either file.
+Set up a private state directory the way the deployment profile wants it: 0700, with a 0600 admin token and a 0600 credentials file. The agent never sees either file. The random secrets are generated into files and piped through `jq` on stdin:
 
 ```sh
 STATE="$WORK/state"
@@ -120,8 +127,8 @@ mkdir -m 0700 "$STATE"
 cp examples/guard-support/guard.toml "$STATE/"
 cp -r examples/guard-support/policies "$STATE/"
 (umask 077; head -c 24 /dev/urandom | base64 | tr '+/' '-_' >"$STATE/admin.token")
-(umask 077; jq -n --arg secret "sk-business-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
-  '{credentials: [{id: "business-api", secret: $secret,
+(umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' |
+  jq -Rn '{credentials: [{id: "business-api", secret: ("sk-business-" + input),
     actions: ["customer.read", "invoice.list", "refund.issue", "customer.export"]}]}' \
   >"$STATE/credentials.json")
 ls -l "$STATE"
@@ -134,37 +141,44 @@ CROM_GUARD_SUPPORT_CREDENTIALS="$STATE/credentials.json" \
 CROM_GUARD_SUPPORT_LEDGER="$WORK/ledger-1.jsonl" \
   "$GUARD" serve --config "$STATE/guard.toml" >"$WORK/guard-1.log" 2>&1 &
 GUARD_PID=$!
+APP="$WORK/app"
+mkdir -m 0700 "$APP"
+(umask 077; printf 'Authorization: Bearer %s\n' "$(cat "$STATE/admin.token")" >"$APP/admin.header")
 admin() {
-  curl -sS --unix-socket "$STATE/admin.sock" -H "Authorization: Bearer $(cat "$STATE/admin.token")" "$@"
+  curl -sS --unix-socket "$STATE/admin.sock" -H @"$APP/admin.header" "$@"
 }
 for _ in $(seq 50); do admin http://localhost/admin/health 2>/dev/null && break; sleep 0.2; done
 echo
 ```
 
-The health check prints `{"status":"ok","operations":5}`. `admin` is the trusted application: it holds the admin token and reaches the admin API through the unix socket.
+The health check prints `{"status":"ok","operations":5}`. `admin` is the trusted application: it holds the admin token (in a 0600 header file; `printf` is a shell builtin, so the token is never an argument) and reaches the admin API through the unix socket.
 
-As the trusted app, open a ticket: issue the grant in `examples/guard-support/grants/acme-agent-operator.json` and keep the session handle (`gsh_…`). The handle is the agent's only credential:
+As the trusted app, open a ticket: issue the grant in `examples/guard-support/grants/acme-agent-operator.json` and hand the session handle (`gsh_…`) to the agent, as a 0600 header file in the agent's own directory. The handle is the agent's only credential:
 
 ```sh
+AGENT="$WORK/agent"
+mkdir -m 0700 "$AGENT"
 GRANT=$(admin -H 'Content-Type: application/json' \
   --data @examples/guard-support/grants/acme-agent-operator.json http://localhost/admin/grants)
 echo "$GRANT" | jq '.grant | {grant_id, tenant, delegator, actions, constraints, expires_at}'
-HANDLE=$(echo "$GRANT" | jq -r .handle)
+(umask 077; echo "$GRANT" | jq -r '"Authorization: Bearer " + .handle' >"$AGENT/handle.header")
 GRANT_ID=$(echo "$GRANT" | jq -r .grant.grant_id)
 ```
 
-Now be the agent. Any MCP client works; `curl` is enough, because the endpoint is stateless MCP Streamable HTTP with the handle as a bearer token. `guard_call` sends one `tools/call` and prints `executed` or the stable deny code, with the decision id:
+Now be the agent. Any MCP client works; `curl` is enough, because the endpoint is stateless MCP Streamable HTTP with the handle as a bearer token. `guard_call` sends one `tools/call` with the header file named by `AGENT_HEADER`, prints `executed` or the stable deny code with the decision id, and also appends that line to `$AGENT/calls.log`. It fails if Guard returns no `result` (a JSON-RPC error):
 
 ```sh
+AGENT_HEADER="$AGENT/handle.header"
 guard_call() {
   curl -sS http://127.0.0.1:8470/mcp \
-    -H "Authorization: Bearer ${HANDLE}" \
+    -H @"$AGENT_HEADER" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
     --data "$(jq -cn --arg tool "$1" --argjson args "$2" \
       '{jsonrpc: "2.0", id: 1, method: "tools/call", params: {name: $tool, arguments: $args}}')" |
-    jq -c '.result | {decision_id: ._meta.decision_id} +
-      (if .isError then .structuredContent else {status: "executed"} end)'
+    jq -ec '(.result // error("no result: \(tojson)")) | {decision_id: ._meta.decision_id} +
+      (if .isError then .structuredContent else {status: "executed"} end)' |
+    tee -a "$AGENT/calls.log"
 }
 ```
 
@@ -184,7 +198,8 @@ guard_call customer.export '{"customer_id": "acme-cus-000"}'                    
 guard_call refund.issue '{"invoice_id": "acme-inv-000", "amount_cents": 10001}'    # more than the invoice: policy_deny
 guard_call refund.issue '{"invoice_id": "acme-inv-001", "amount_cents": 7500}'     # above 50.00: approval_required
 guard_call invoice.lst '{"customer_id": "acme-cus-000"}'                           # unknown tool: action_not_granted
-HANDLE=gsh_not-a-real-handle guard_call invoice.list '{"customer_id": "acme-cus-000"}'  # no_grant
+printf 'Authorization: Bearer gsh_not-a-real-handle\n' >"$AGENT/fake.header"
+AGENT_HEADER="$AGENT/fake.header" guard_call invoice.list '{"customer_id": "acme-cus-000"}'  # no_grant
 ```
 
 `approval_required` also returns the `action_digest` the app would approve; [approvals.md](approvals.md) and the demo in step 2 show the full approval round trip.
@@ -198,11 +213,15 @@ guard_call refund.issue '{"invoice_id": "acme-inv-000", "amount_cents": 3000}'
 Try to go around Guard. The business API refuses a call without Guard's credential, and the session handle is not that credential:
 
 ```sh
-curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/json' \
-  --data '{"amount_cents": 100}' http://127.0.0.1:8480/tenants/acme/invoices/acme-inv-000/refunds
-curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer ${HANDLE}" \
-  --data '{"amount_cents": 100}' http://127.0.0.1:8480/tenants/acme/invoices/acme-inv-000/refunds
+REFUND_URL=http://127.0.0.1:8480/tenants/acme/invoices/acme-inv-000/refunds
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  --data '{"amount_cents": 100}' "$REFUND_URL")
+echo "no credential: $code"
+test "$code" = 401
+code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  -H @"$AGENT/handle.header" --data '{"amount_cents": 100}' "$REFUND_URL")
+echo "session handle as bearer: $code"
+test "$code" = 401
 ```
 
 Both print `401`. Here the agent runs unsandboxed on your uid, so it could read `credentials.json` itself; keeping it from doing that is the isolation profile's job (step 6, [deployment.md](deployment.md)).
@@ -238,10 +257,13 @@ cat >>"$WORK/typo.cedar" <<'EOF'
 forbid (principal, action == Support::Action::"refund.issue", resource)
 when { context.amount > 2000 };
 EOF
-if "$GUARD" policy validate --namespace Support \
-  --schema "$STATE/policies/support.cedarschema" --policies "$WORK/typo.cedar"; then
-  echo "UNEXPECTED: typo accepted"; false
-fi
+status=0
+"$GUARD" policy validate --namespace Support \
+  --schema "$STATE/policies/support.cedarschema" --policies "$WORK/typo.cedar" 2>"$WORK/typo.err" || status=$?
+cat "$WORK/typo.err"
+echo "exit status: $status"
+test "$status" -eq 1
+grep -q 'strict validation failed: .*attribute `amount` in context for Support::Action::' "$WORK/typo.err"
 ```
 
 Now the correct policy, appended to the policy file Guard loads:
@@ -275,7 +297,7 @@ Open a new ticket and repeat the refunds from step 4:
 ```sh
 GRANT=$(admin -H 'Content-Type: application/json' \
   --data @examples/guard-support/grants/acme-agent-operator.json http://localhost/admin/grants)
-HANDLE=$(echo "$GRANT" | jq -r .handle)
+(umask 077; echo "$GRANT" | jq -r '"Authorization: Bearer " + .handle' >"$AGENT/handle.header")
 guard_call refund.issue '{"invoice_id": "acme-inv-000", "amount_cents": 3000}'   # was executed, now policy_deny
 guard_call refund.issue '{"invoice_id": "acme-inv-001", "amount_cents": 7500}'   # was approval_required, now policy_deny
 guard_call refund.issue '{"invoice_id": "acme-inv-000", "amount_cents": 1500}'   # still executed
@@ -311,14 +333,15 @@ Give Bash network access and check again. `check` exits 1 and names the failing 
 
 ```sh
 jq '.sandbox.network = true' examples/guard-support/agent/crom-settings.json >"$CROM_HOME/settings.json"
-if CROM_CONFIG_HOME="$CROM_HOME" "$GUARD" check --config "$STATE/guard.toml" \
-  --crom-settings "$CROM_HOME/settings.json" --crom-workspace "$WORK/workspace" >"$WORK/check-network.txt"; then
-  echo "UNEXPECTED: check passed"; false
-fi
+status=0
+CROM_CONFIG_HOME="$CROM_HOME" "$GUARD" check --config "$STATE/guard.toml" \
+  --crom-settings "$CROM_HOME/settings.json" --crom-workspace "$WORK/workspace" >"$WORK/check-network.txt" || status=$?
 grep '^FAIL' "$WORK/check-network.txt"
+echo "exit status: $status"
+test "$status" -eq 1
 ```
 
-`check` reads files and metadata only. It is a point-in-time check and does not prove the kernel enforces the sandbox; the bypass tests do that against a live Guard (`cargo test -p crom-guard-testkit --test bypass`, [deployment.md](deployment.md#bypass-tests)). For an agent under its own uid, use `--agent-user <name>` instead; `docs/guard/deployment.md` has the full setup with a dedicated `crom-guard` user.
+`check` reads files and metadata only and checks only the conditions listed in [deployment.md](deployment.md). It is a point-in-time check and does not prove the kernel enforces the sandbox; the bypass tests do that against a live Guard (`cargo test -p crom-guard-testkit --test bypass`, [deployment.md](deployment.md#bypass-tests)). For an agent under its own uid, use `--agent-user <name>` instead; `docs/guard/deployment.md` has the full setup with a dedicated `crom-guard` user.
 
 ## Clean up
 
