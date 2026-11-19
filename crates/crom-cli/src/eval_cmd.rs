@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use crom_eval::adapter::AdapterRegistry;
@@ -343,6 +343,16 @@ pub struct ScoreboardArgs {
     /// Output format: `text`, `md`, or `json`.
     #[arg(long, default_value = "text")]
     pub format: crom_eval::scoreboard::Format,
+    /// Guard report (`guard-scenarios/v1`, `guard-experiments/v1`,
+    /// `guard-demo/v1`, `m17-adversarial-archive/v1`) or a directory of
+    /// them (repeatable). Adds the Guard section; without `--runs-dir` or
+    /// `--run`, only the Guard section is rendered.
+    #[arg(long)]
+    pub guard_report: Vec<PathBuf>,
+    /// Compare the deterministic Guard facts of `--guard-report` with the
+    /// archived reports in this directory; exit non-zero on a difference.
+    #[arg(long, requires = "guard_report")]
+    pub guard_check: Option<PathBuf>,
 }
 
 fn parse_level(s: &str) -> std::result::Result<crom_eval::schema::Level, String> {
@@ -1097,10 +1107,50 @@ fn cmd_history(args: HistoryArgs) -> Result<()> {
 }
 
 fn cmd_scoreboard(args: ScoreboardArgs) -> Result<()> {
+    use crom_eval::guard_board::{self, GuardBoard};
     use crom_eval::scoreboard::{self, Filters, Scoreboard};
+    let guard = if args.guard_report.is_empty() {
+        None
+    } else {
+        let inputs = guard_board::load_reports(&args.guard_report).map_err(|e| anyhow!(e))?;
+        let board = GuardBoard::build(&inputs).map_err(|e| anyhow!(e))?;
+        Some((inputs, board))
+    };
+    if let (Some(dir), Some((inputs, board))) = (&args.guard_check, &guard) {
+        let archived_inputs =
+            guard_board::load_reports(std::slice::from_ref(dir)).map_err(|e| anyhow!(e))?;
+        let archived = GuardBoard::build(&archived_inputs).map_err(|e| anyhow!(e))?;
+        let fresh_facts = board.deterministic_facts(inputs);
+        let archived_facts = archived.deterministic_facts(&archived_inputs);
+        let diffs = guard_board::compare_facts(&fresh_facts, &archived_facts);
+        for d in &diffs {
+            println!("differs: {d}");
+        }
+        if !diffs.is_empty() {
+            bail!(
+                "{} deterministic Guard facts differ from {}",
+                diffs.len(),
+                dir.display()
+            );
+        }
+        let shared = fresh_facts
+            .keys()
+            .filter(|k| archived_facts.contains_key(*k))
+            .count();
+        println!(
+            "guard check: {shared} deterministic facts match {}",
+            dir.display()
+        );
+        return Ok(());
+    }
+    let guard_only = guard.is_some() && args.runs_dir.is_none() && args.run.is_empty();
     let runs_dir = resolve_runs_dir(args.runs_dir);
-    let (attempts, warnings) = scoreboard::load_attempts(&runs_dir, &args.run)
-        .with_context(|| format!("reading runs under {}", runs_dir.display()))?;
+    let (attempts, warnings) = if guard_only {
+        (Vec::new(), Vec::new())
+    } else {
+        scoreboard::load_attempts(&runs_dir, &args.run)
+            .with_context(|| format!("reading runs under {}", runs_dir.display()))?
+    };
     for w in &warnings {
         eprintln!("warning: skipping unreadable result {w}");
     }
@@ -1114,7 +1164,10 @@ fn cmd_scoreboard(args: ScoreboardArgs) -> Result<()> {
         models: args.model,
         levels: args.level,
     };
-    let board = Scoreboard::build(&attempts, &filters, args.group_by);
+    let mut board = Scoreboard::build(&attempts, &filters, args.group_by);
+    if let Some((_, g)) = guard {
+        board = board.with_guard(g);
+    }
     print!("{}", board.render(args.format));
     Ok(())
 }
@@ -1456,6 +1509,24 @@ mod scoreboard_flag_tests {
         assert_eq!((d.group_by, d.format), (GroupBy::Model, Format::Text));
         assert!(ScoreboardArgs::try_parse_from(["scoreboard", "--level", "L9"]).is_err());
         assert!(ScoreboardArgs::try_parse_from(["scoreboard", "--format", "csv"]).is_err());
+    }
+
+    // scoreboard parses repeatable --guard-report paths; --guard-check needs at least one.
+    #[test]
+    fn scoreboard_guard_flags_parse() {
+        let a = ScoreboardArgs::try_parse_from([
+            "scoreboard",
+            "--guard-report",
+            "docs/guard/results",
+            "--guard-report",
+            "e5.json",
+            "--guard-check",
+            "archive",
+        ])
+        .unwrap();
+        assert_eq!(a.guard_report.len(), 2);
+        assert_eq!(a.guard_check.as_deref(), Some(Path::new("archive")));
+        assert!(ScoreboardArgs::try_parse_from(["scoreboard", "--guard-check", "x"]).is_err());
     }
 }
 
