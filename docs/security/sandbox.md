@@ -23,7 +23,7 @@ the command under `mode = required` before spawning anything.
 | P7 privilege | `NO_NEW_PRIVS`; refuses to run as root. With landlock ABI ≥ 6 the command cannot signal processes outside its domain. |
 
 Each Bash result records the outcome in `metadata.sandbox`:
-`{ "mode": "required", "enforced": true, "backend": "landlock", "landlock_abi": N, "setup_ms": … }`,
+`{ "mode": "required", "enforced": true, "backend": "landlock", "landlock_abi": N, "network": false, "setup_ms": … }`,
 or `{ "mode": "off", "enforced": false }`.
 
 ## Configuration

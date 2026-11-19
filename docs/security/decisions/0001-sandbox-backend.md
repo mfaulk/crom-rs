@@ -157,6 +157,11 @@ compilation; differences there are within noise).
    - Network: deny `AF_INET`/`AF_INET6`/`AF_PACKET` sockets via seccomp by
      default. When policy grants network, lift the filter entirely
      (all-or-nothing). Per-host allowlists are out of scope for M17.
+     *Erratum (#345):* as built (#253), granting network does not lift the
+     filter entirely: `socket(AF_UNIX, …)` stays refused so host unix
+     sockets (D-Bus, docker, agents) remain unreachable; `socketpair(2)` is
+     allowed (`crates/crom-tools/src/sandbox/linux.rs`, `seccomp_program`).
+     The bwrap fallback and per-call cgroup scope below were not built.
    - Process tree: subreaper supervisor + process-group kill on exit, timeout,
      cancel and drop; supervisor sets `PR_SET_PDEATHSIG` so the tree dies with
      the host. `kill_on_drop` targets the supervisor.
