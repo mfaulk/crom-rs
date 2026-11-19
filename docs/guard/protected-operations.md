@@ -29,6 +29,10 @@ A `ProtectedOperation` is trusted application code (ADR 0002 §2.5). Guard check
 
 The downstream API must perform no effect when the condition fails. With that, a change in ownership or state between authorize and execute (TOCTOU) produces no effect. The testkit business API meets this requirement, and its tests check that no ledger entry is written.
 
+**Errors carry no secrets or data.** Guard never emits `ExecuteError::Failed` text: agents see `execution_failed`, and `tracing` gets only the text's length and a SHA-256 prefix. Still, do not put credentials, tokens, response bodies, or resource content in error strings. Operator tooling may log them on the executor's side. Errors such as `reqwest::Error` should go through `without_url()` or an equivalent.
+
+**Run to completion.** Executors should bound their own downstream calls (request timeouts). A host that cancels a `Guard::call` after its decision record latches Guard closed (see [pipeline.md](pipeline.md)).
+
 Non-identifier inputs, such as `amount_cents`, come from `call.args()`. They are the same validated arguments the policy evaluated.
 
 **Resource type must match the effect's scope.** An executor may affect only the resource that was authorized. An operation whose downstream effect is wider than its Cedar resource must not execute. The reference `customer.export` is typed on one `Customer`, but the export is tenant-wide, so its executor always fails closed without a downstream call. Making it executable needs a `Tenant`-typed resource, which is a schema change.

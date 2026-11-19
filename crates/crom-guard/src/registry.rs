@@ -112,12 +112,12 @@ pub struct ToolInfo<'a> {
 /// Lookup is an exact, case-sensitive match on the action id: there is no
 /// normalization and there are no aliases.
 ///
-/// Input schemas are checked at registration: the root and every nested
-/// object schema must be `"type": "object"` with
-/// `"additionalProperties": false`; `$ref` and `$dynamicRef` are refused
-/// (schemas are self-contained, so nothing is fetched); and the schema must
-/// compile as JSON Schema 2020-12 with the linear-time `regex` engine for
-/// `pattern`.
+/// Input schemas are checked at registration against a keyword allowlist
+/// (see `docs/guard/pipeline.md`): every subschema declares one `type`,
+/// objects are closed with `"additionalProperties": false`, arrays have
+/// typed `items`, and nothing is referenced or composed. The schema is then
+/// compiled as JSON Schema 2020-12 with `format` assertion on and the
+/// linear-time `regex` engine for `pattern`.
 #[derive(Default)]
 pub struct OperationRegistry {
     ops: BTreeMap<String, Registered>,
@@ -231,54 +231,153 @@ fn compile(
     jsonschema::options()
         .with_draft(jsonschema::Draft::Draft202012)
         .with_pattern_options(jsonschema::PatternOptions::regex())
+        .should_validate_formats(true)
         .build(schema)
         .map_err(|e| invalid(e.to_string()))
 }
 
-/// The root must be a closed object; so must every nested object schema.
+/// The only `$schema` accepted (at the root only).
+const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
+
+/// Annotation and value keywords allowed on any typed schema.
+const COMMON_KEYWORDS: &[&str] = &[
+    "type",
+    "title",
+    "description",
+    "$comment",
+    "examples",
+    "default",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "enum",
+    "const",
+];
+
+/// `format` values Guard asserts (format assertion is enabled).
+const FORMATS: &[&str] = &[
+    "date-time",
+    "date",
+    "time",
+    "duration",
+    "email",
+    "hostname",
+    "ipv4",
+    "ipv6",
+    "uri",
+    "uri-reference",
+    "uuid",
+];
+
+fn type_keywords(ty: &str) -> Option<&'static [&'static str]> {
+    Some(match ty {
+        "string" => &["minLength", "maxLength", "pattern", "format"],
+        "integer" | "number" => &[
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+        ],
+        "boolean" | "null" => &[],
+        "array" => &["items", "minItems", "maxItems", "uniqueItems"],
+        "object" => &[
+            "properties",
+            "required",
+            "additionalProperties",
+            "minProperties",
+            "maxProperties",
+        ],
+        _ => return None,
+    })
+}
+
+/// Allowlist check. Every reachable subschema is a JSON object with a single
+/// `type` and only that type's keywords: arrays must have an `items`
+/// subschema, and objects `additionalProperties: false`. Boolean and empty
+/// schemas, type unions, composition (`allOf`, `oneOf`, `not`, `if`, ...),
+/// `$ref`, `$defs`, and every other keyword are refused, so nothing in the
+/// arguments escapes validation. The only applicators are `properties` and
+/// `items`, and both are walked.
 fn check_closed(schema: &Value, path: &str) -> Result<(), String> {
     let obj = schema
         .as_object()
-        .ok_or_else(|| format!("{path}: schema must be an object"))?;
-    if path == "#" && obj.get("type") != Some(&Value::from("object")) {
+        .ok_or_else(|| format!("{path}: subschemas must be JSON objects, not booleans"))?;
+    let root = path == "#";
+    let ty = match obj.get("type") {
+        Some(Value::String(t)) => t.as_str(),
+        Some(_) => return Err(format!("{path}: \"type\" must be a single type name")),
+        None => return Err(format!("{path}: every subschema must declare \"type\"")),
+    };
+    if root && ty != "object" {
         return Err("#: root must have \"type\": \"object\"".into());
     }
-    for k in ["$ref", "$dynamicRef"] {
-        if obj.contains_key(k) {
-            return Err(format!("{path}: {k} is not supported"));
+    let allowed = type_keywords(ty).ok_or_else(|| format!("{path}: unknown type {ty:?}"))?;
+    for (k, v) in obj {
+        if root && k == "$schema" {
+            if v != DRAFT_2020_12 {
+                return Err(format!("#: $schema must be {DRAFT_2020_12:?}"));
+            }
+            continue;
+        }
+        if !COMMON_KEYWORDS.contains(&k.as_str()) && !allowed.contains(&k.as_str()) {
+            return Err(format!(
+                "{path}: keyword {k:?} is not allowed for type {ty:?}"
+            ));
         }
     }
-    let is_object = obj.get("type") == Some(&Value::from("object"))
-        || obj.contains_key("properties")
-        || obj.contains_key("patternProperties");
-    if is_object && obj.get("additionalProperties") != Some(&Value::Bool(false)) {
-        return Err(format!(
-            "{path}: object schemas need \"additionalProperties\": false"
-        ));
+    if let Some(f) = obj.get("format") {
+        if !f.as_str().is_some_and(|f| FORMATS.contains(&f)) {
+            return Err(format!("{path}: unsupported format {f}"));
+        }
     }
-    if obj.contains_key("patternProperties") || obj.contains_key("unevaluatedProperties") {
-        return Err(format!(
-            "{path}: patternProperties and unevaluatedProperties are not supported"
-        ));
-    }
-    for key in ["properties", "$defs"] {
-        if let Some(m) = obj.get(key).and_then(Value::as_object) {
-            for (name, sub) in m {
-                check_closed(sub, &format!("{path}/{key}/{name}"))?;
+    match ty {
+        "array" => {
+            let items = obj
+                .get("items")
+                .ok_or_else(|| format!("{path}: arrays need an \"items\" subschema"))?;
+            check_closed(items, &format!("{path}/items"))?;
+        }
+        "object" => {
+            if obj.get("additionalProperties") != Some(&Value::Bool(false)) {
+                return Err(format!(
+                    "{path}: object schemas need \"additionalProperties\": false"
+                ));
+            }
+            if let Some(props) = obj.get("properties") {
+                let props = props
+                    .as_object()
+                    .ok_or_else(|| format!("{path}: \"properties\" must be an object"))?;
+                for (name, sub) in props {
+                    check_closed(sub, &format!("{path}/properties/{name}"))?;
+                }
             }
         }
-    }
-    for key in ["items", "not", "if", "then", "else"] {
-        if let Some(sub) = obj.get(key).filter(|v| v.is_object()) {
-            check_closed(sub, &format!("{path}/{key}"))?;
-        }
-    }
-    for key in ["prefixItems", "allOf", "anyOf", "oneOf"] {
-        if let Some(list) = obj.get(key).and_then(Value::as_array) {
-            for (i, sub) in list.iter().enumerate() {
-                check_closed(sub, &format!("{path}/{key}/{i}"))?;
-            }
-        }
+        _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn compiled(props: Value) -> jsonschema::Validator {
+        let schema = json!({"type": "object", "properties": props, "additionalProperties": false});
+        compile(&ActionId::new("t.op").unwrap(), &schema, &[]).unwrap()
+    }
+
+    /// `format` is asserted, not just annotated: a malformed email or uuid fails validation.
+    #[test]
+    fn formats_are_asserted() {
+        let v = compiled(json!({"e": {"type": "string", "format": "email"},
+                                "u": {"type": "string", "format": "uuid"}}));
+        assert!(
+            v.is_valid(&json!({"e": "a@example.com", "u": "67e55044-10b1-426f-9247-bb680e5fe0c8"}))
+        );
+        assert!(!v.is_valid(&json!({"e": "not-an-email"})));
+        assert!(!v.is_valid(&json!({"u": "not-a-uuid"})));
+    }
 }

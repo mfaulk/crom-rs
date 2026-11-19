@@ -32,7 +32,7 @@ impl TestClock {
     }
 }
 
-type Hook = Box<dyn Fn(&AuditRecord) + Send + Sync>;
+type Hook = Arc<dyn Fn(&AuditRecord) + Send + Sync>;
 
 #[derive(Default)]
 struct MemorySink {
@@ -58,7 +58,9 @@ impl AuditSink for MemorySink {
                 r.push(record.clone());
                 r.len() as u64
             };
-            if let Some(h) = self.hook.lock().unwrap().as_ref() {
+            // Cloned out, so a hook may start another call on this sink.
+            let hook = self.hook.lock().unwrap().clone();
+            if let Some(h) = hook {
                 h(record);
             }
             Ok(AuditReceipt {
@@ -134,7 +136,31 @@ enum Exec {
     Precondition,
     Failed(String),
     Panic,
+    /// Returns success, then panics when its future is dropped.
+    DropPanic,
 }
+
+/// A future whose `Drop` panics.
+struct DropBomb<'a>(BoxFuture<'a, Result<ExecutionOutput, ExecuteError>>);
+
+impl std::future::Future for DropBomb<'_> {
+    type Output = Result<ExecutionOutput, ExecuteError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
+}
+
+impl Drop for DropBomb<'_> {
+    fn drop(&mut self) {
+        panic!("executor future drop bug");
+    }
+}
+
+/// Refunds of this amount hang in `execute`, so a test can cancel mid-execute.
+const HANG_AMOUNT: i64 = 7;
 
 fn uid(ty: &str, id: &str) -> EntityUid {
     EntityUid::new(format!("Support::{ty}"), id).unwrap()
@@ -261,7 +287,7 @@ impl ProtectedOperation for TestOp {
         action: AuthorizedAction,
         credential: CredentialLease,
     ) -> BoxFuture<'a, Result<ExecutionOutput, ExecuteError>> {
-        Box::pin(async move {
+        let fut = Box::pin(async move {
             self.probe.executed.fetch_add(1, Ordering::SeqCst);
             self.probe
                 .exec_decision_ids
@@ -269,8 +295,11 @@ impl ProtectedOperation for TestOp {
                 .unwrap()
                 .push(action.decision_id().as_str().to_owned());
             assert!(credential.with_secret(|s| s == SECRET));
+            if action.args().as_json().get("amount_cents") == Some(&json!(HANG_AMOUNT)) {
+                futures::future::pending::<()>().await;
+            }
             match &self.exec {
-                Exec::Ok => Ok(ExecutionOutput {
+                Exec::Ok | Exec::DropPanic => Ok(ExecutionOutput {
                     content: json!({"resource": action.resource().id()}),
                     downstream_ref: Some("ref-1".into()),
                 }),
@@ -278,7 +307,11 @@ impl ProtectedOperation for TestOp {
                 Exec::Failed(d) => Err(ExecuteError::Failed(d.clone())),
                 Exec::Panic => panic!("executor bug"),
             }
-        })
+        });
+        if self.exec == Exec::DropPanic {
+            return Box::pin(DropBomb(fut));
+        }
+        fut
     }
 }
 
@@ -334,7 +367,7 @@ impl Default for Opts {
 }
 
 struct Fixture {
-    guard: Guard,
+    guard: Arc<Guard>,
     store: Arc<MemoryGrantStore>,
     sink: Arc<MemorySink>,
     clock: Arc<TestClock>,
@@ -422,6 +455,7 @@ fn pdp(policies: &str) -> Arc<CedarPdp> {
 }
 
 fn fixture(o: Opts) -> Fixture {
+    traces();
     let probe = Arc::new(Probe::default());
     let reg = registry(&o, &probe);
     let store = Arc::new(MemoryGrantStore::new(GrantStoreConfig::new(
@@ -446,7 +480,7 @@ fn fixture(o: Opts) -> Fixture {
         guard = guard.with_resolve_timer(|| Box::pin(async {}));
     }
     Fixture {
-        guard,
+        guard: Arc::new(guard),
         store,
         sink,
         clock,
@@ -524,7 +558,7 @@ impl Fixture {
         let store = self.store.clone();
         let grant = self.grant_id.clone();
         let clock = self.clock.clone();
-        *self.sink.hook.lock().unwrap() = Some(Box::new(move |r| {
+        *self.sink.hook.lock().unwrap() = Some(Arc::new(move |r| {
             if r.record == RecordKind::Decision && r.decision == Some(DecisionKind::Allow) {
                 store
                     .revoke(&app(), &grant, clock.now())
@@ -823,7 +857,7 @@ fn presented_approval_without_store_denied() {
     }
 }
 
-/// A sink that cannot write the decision record (disk full) denies with `audit_unavailable`, leases nothing, and executes nothing.
+/// A sink that cannot write the decision record (disk full) denies with a generic `engine_unavailable`, leases nothing, and executes nothing.
 #[test]
 fn audit_decision_failure_denies() {
     let f = fixture(Opts::default());
@@ -832,7 +866,7 @@ fn audit_decision_failure_denies() {
     assert_eq!(
         out.result,
         CallResult::Denied {
-            code: "audit_unavailable"
+            code: "engine_unavailable"
         }
     );
     assert_eq!(out.audit_head, None);
@@ -851,7 +885,7 @@ fn chained_sink_storage_failure_denies() {
     });
     for _ in 0..2 {
         let out = f.call("refund.issue", refund(1_000));
-        assert_eq!(out.code(), Some("audit_unavailable"));
+        assert_eq!(out.code(), Some("engine_unavailable"));
     }
     assert_eq!(f.executed(), 0);
     assert_eq!(f.leased(), 0);
@@ -870,7 +904,7 @@ fn outcome_write_failure_fails_closed() {
     assert_eq!(f.executed(), 1);
     assert!(f.guard.is_failed_closed());
     let next = f.call("refund.issue", refund(1_000));
-    assert_eq!(next.code(), Some("audit_unavailable"));
+    assert_eq!(next.code(), Some("engine_unavailable"));
     assert_eq!(f.executed(), 1);
     assert_eq!(f.leased(), 1);
 }
@@ -902,7 +936,7 @@ fn expiry_between_authorize_and_execute_has_no_effect() {
     let f = fixture(Opts::default());
     f.clock.set_secs_after_start(599);
     let clock = f.clock.clone();
-    *f.sink.hook.lock().unwrap() = Some(Box::new(move |r| {
+    *f.sink.hook.lock().unwrap() = Some(Arc::new(move |r| {
         if r.decision == Some(DecisionKind::Allow) {
             clock.set_secs_after_start(600);
         }
@@ -1027,6 +1061,149 @@ fn call_future_is_send() {
     assert_send(&fut);
 }
 
+/// Dropping the call future while `execute` is pending (no outcome record) fails Guard closed: later calls are denied without executing.
+#[test]
+fn cancel_mid_execute_fails_closed() {
+    let f = fixture(Opts::default());
+    let fut = f.guard.call(
+        &f.handle,
+        "refund.issue",
+        refund(HANG_AMOUNT),
+        CallMeta::default(),
+    );
+    assert!(fut.now_or_never().is_none(), "executor should be pending");
+    assert_eq!(f.executed(), 1);
+    assert!(f.guard.is_failed_closed());
+    let recs = f.records();
+    assert_eq!(recs.len(), 1, "decision record only: {recs:?}");
+    let next = f.call("refund.issue", refund(1_000));
+    assert_eq!(next.code(), Some("engine_unavailable"));
+    assert_eq!(f.executed(), 1);
+}
+
+/// Dropping a call future before its decision record leaves Guard serving.
+#[test]
+fn cancel_before_decision_does_not_latch() {
+    let f = fixture(Opts {
+        resolve: Resolve::Hang,
+        ..Opts::default()
+    });
+    let fut = f.guard.call(
+        &f.handle,
+        "refund.issue",
+        refund(1_000),
+        CallMeta::default(),
+    );
+    assert!(fut.now_or_never().is_none());
+    assert!(!f.guard.is_failed_closed());
+    assert!(f.records().is_empty());
+}
+
+/// An executor future whose `Drop` panics is a failed outcome with an outcome record, not an escaped panic.
+#[test]
+fn panicking_drop_of_executor_future_is_failed() {
+    let f = fixture(Opts {
+        exec: Exec::DropPanic,
+        ..Opts::default()
+    });
+    let out = f.call("refund.issue", refund(1_000));
+    assert_eq!(out.code(), Some(EXECUTION_FAILED));
+    let (_, o) = f.records_for(&out);
+    assert_eq!(o.unwrap().outcome, Some(Outcome::Failed));
+    assert!(!f.guard.is_failed_closed());
+}
+
+/// A latch set by another call after this call's decision record stops this call before lease and execute.
+#[test]
+fn latch_rechecked_before_lease_and_execute() {
+    let f = fixture(Opts::default());
+    let guard = f.guard.clone();
+    let handle = f.handle.clone();
+    let fired = AtomicBool::new(false);
+    *f.sink.hook.lock().unwrap() = Some(Arc::new(move |r| {
+        if r.record == RecordKind::Decision
+            && r.decision == Some(DecisionKind::Allow)
+            && !fired.swap(true, Ordering::SeqCst)
+        {
+            // A concurrent call is cancelled mid-execute, latching Guard.
+            let other = guard.call(
+                &handle,
+                "refund.issue",
+                refund(HANG_AMOUNT),
+                CallMeta::default(),
+            );
+            assert!(other.now_or_never().is_none());
+        }
+    }));
+    let out = f.call("refund.issue", refund(1_000));
+    assert_eq!(out.code(), Some("engine_unavailable"));
+    assert!(f.guard.is_failed_closed());
+    assert_eq!(f.executed(), 1, "only the cancelled call's executor ran");
+    assert_eq!(f.leased(), 1);
+    assert!(!f
+        .probe
+        .exec_decision_ids
+        .lock()
+        .unwrap()
+        .contains(&out.decision_id.as_str().to_owned()));
+}
+
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Every trace event of this test binary, at `TRACE`. A global subscriber,
+/// installed before any call, because a thread-local one races with
+/// callsite-interest caching in parallel tests.
+fn traces() -> &'static Capture {
+    static CAP: std::sync::OnceLock<Capture> = std::sync::OnceLock::new();
+    CAP.get_or_init(|| {
+        let cap = Capture::default();
+        let w = cap.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(move || w.clone())
+                .finish(),
+        )
+        .expect("no other global subscriber in this test binary");
+        cap
+    })
+}
+
+/// Executor error text is never emitted to `tracing`, only its length and a digest prefix.
+#[test]
+fn executor_error_detail_not_traced() {
+    let detail = format!("upstream said {SECRET}");
+    let f = fixture(Opts {
+        exec: Exec::Failed(detail),
+        ..Opts::default()
+    });
+    let out = f.call("refund.issue", refund(1_000));
+    assert_eq!(out.code(), Some(EXECUTION_FAILED));
+    let all = String::from_utf8(traces().0.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = all
+        .lines()
+        .filter(|l| l.contains(out.decision_id.as_str()))
+        .collect();
+    assert!(
+        mine.iter()
+            .any(|l| l.contains("protected operation failed") && l.contains("detail_len")),
+        "{mine:?}"
+    );
+    assert!(!all.contains(SECRET) && !all.contains("upstream said"));
+}
+
 /// Prints in-process end-to-end latency of an allowed and a denied call (metric E5); run with `--release --ignored --nocapture`.
 #[test]
 #[ignore = "measurement"]
@@ -1133,6 +1310,145 @@ fn registry_rejects_unsafe_schemas() {
         reg.register(op_with("customer.read", customer_schema(), &["note"])),
         Err(RegistryError::UnknownLoggedField { .. })
     ));
+}
+
+fn closed(props: Value) -> Value {
+    json!({"type": "object", "properties": props, "additionalProperties": false})
+}
+
+/// Schemas that would accept unvalidated structure are rejected: empty and boolean subschemas, type unions, untyped or open arrays, unwalked applicators, unknown keywords, and unknown formats.
+#[test]
+fn registry_rejects_schema_bypasses() {
+    let s = json!({"type": "string"});
+    let bad = [
+        ("empty subschema", closed(json!({"x": {}}))),
+        ("boolean subschema", closed(json!({"x": true}))),
+        (
+            "type union at root",
+            json!({"type": ["object", "null"], "additionalProperties": false}),
+        ),
+        (
+            "type union",
+            closed(json!({"x": {"type": ["string", "object"]}})),
+        ),
+        ("untyped", closed(json!({"x": {"minLength": 1}}))),
+        (
+            "array without items",
+            closed(json!({"x": {"type": "array"}})),
+        ),
+        (
+            "items true",
+            closed(json!({"x": {"type": "array", "items": true}})),
+        ),
+        (
+            "items empty",
+            closed(json!({"x": {"type": "array", "items": {}}})),
+        ),
+        (
+            "items open object",
+            closed(json!({"x": {"type": "array", "items": {"type": "object"}}})),
+        ),
+        (
+            "additionalProperties schema",
+            json!({"type": "object", "additionalProperties": {"type": "string"}}),
+        ),
+        (
+            "contains",
+            closed(json!({"x": {"type": "array", "items": s, "contains": {}}})),
+        ),
+        (
+            "prefixItems",
+            closed(json!({"x": {"type": "array", "items": s, "prefixItems": [{}]}})),
+        ),
+        (
+            "unevaluatedItems",
+            closed(json!({"x": {"type": "array", "items": s, "unevaluatedItems": {}}})),
+        ),
+        (
+            "dependentSchemas",
+            json!({"type": "object", "additionalProperties": false, "dependentSchemas": {"a": {}}}),
+        ),
+        (
+            "propertyNames",
+            json!({"type": "object", "additionalProperties": false, "propertyNames": {}}),
+        ),
+        (
+            "oneOf",
+            json!({"type": "object", "additionalProperties": false, "oneOf": [{}]}),
+        ),
+        (
+            "anyOf",
+            json!({"type": "object", "additionalProperties": false, "anyOf": [{}]}),
+        ),
+        (
+            "allOf",
+            json!({"type": "object", "additionalProperties": false, "allOf": [{}]}),
+        ),
+        (
+            "not",
+            json!({"type": "object", "additionalProperties": false, "not": {}}),
+        ),
+        (
+            "if",
+            json!({"type": "object", "additionalProperties": false, "if": {}, "then": {}}),
+        ),
+        (
+            "$defs",
+            json!({"type": "object", "additionalProperties": false, "$defs": {"a": {}}}),
+        ),
+        (
+            "unknown keyword",
+            closed(json!({"x": {"type": "string", "x-ui": 1}})),
+        ),
+        (
+            "unknown format",
+            closed(json!({"x": {"type": "string", "format": "no-such-format"}})),
+        ),
+        (
+            "string keyword on integer",
+            closed(json!({"x": {"type": "integer", "pattern": "^1$"}})),
+        ),
+        (
+            "old draft",
+            json!({"$schema": "http://json-schema.org/draft-07/schema#",
+                   "type": "object", "additionalProperties": false}),
+        ),
+    ];
+    for (name, schema) in bad {
+        let mut reg = OperationRegistry::new();
+        assert!(
+            matches!(
+                reg.register(op_with("customer.read", schema.clone(), &[])),
+                Err(RegistryError::InvalidSchema { .. })
+            ),
+            "{name}: {schema}"
+        );
+    }
+}
+
+/// Typed scalars, arrays with typed items, nested closed objects, enums, and a 2020-12 `$schema` are accepted.
+#[test]
+fn registry_accepts_closed_typed_schemas() {
+    let good = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "customer_id": id_schema(),
+            "tags": {"type": "array", "items": {"type": "string", "enum": ["a", "b"]}, "maxItems": 4},
+            "nested": closed(json!({"n": {"type": "number", "minimum": 0}})),
+            "flag": {"type": "boolean", "description": "d"},
+            "email": {"type": "string", "format": "email"}
+        },
+        "required": ["customer_id"],
+        "additionalProperties": false
+    });
+    let mut reg = OperationRegistry::new();
+    reg.register(op_with("customer.read", good, &["customer_id"]))
+        .unwrap();
+    for schema in [refund_schema(), customer_schema()] {
+        let mut reg = OperationRegistry::new();
+        reg.register(op_with("customer.read", schema, &[])).unwrap();
+    }
 }
 
 // --------------------------------------------------------------- proptest

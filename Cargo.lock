@@ -777,6 +777,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 

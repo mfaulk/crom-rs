@@ -4,7 +4,7 @@
 
 This PR freezes the public API. Signature changes after it merges need owner approval.
 
-Pipeline (#351): `authenticate → normalize + validate → resolve → authorize (whole chain) → bind → decision record → recheck → execute → outcome record`. Any failure before execution denies, and a failed decision-record write denies too.
+Pipeline (#351): `authenticate → normalize + validate → resolve → authorize (whole chain) → bind → decision record → recheck → execute → outcome record`. Any failure before execution denies, and a failed decision-record write denies too. Cancelling a call after its decision record latches Guard closed, so hosts must drive calls to completion.
 
 ## Where authority lives
 
@@ -41,7 +41,7 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | resolution | `TimeoutResolver`, `ResolveTimer`; `From<ResolveError> for DenyReason` | Bounds a resolver by a host-supplied timer. A timeout returns `ResolveError::Unavailable`, which maps to `engine_unavailable`. `NotFound` maps to `resource_not_found` (#350) |
 | executor | `ConditionalCall` | The version-condition contract for executors. See [protected-operations.md](protected-operations.md) (#350) |
 | pipeline | `Guard`, `CallMeta`, `CallOutcome`, `CallResult`, `ApprovalVerifier`, `NoApprovals` | MILESTONE_18 §10.2 steps 1–8 with the audit and recheck ordering. Agents see only stable codes. See [pipeline.md](pipeline.md) (#351) |
-| registry | `OperationRegistry`, `RegistryError`, `ToolInfo`, `RESERVED_ACTION_PREFIX`, `MAX_ARGUMENT_BYTES` | One exact tool name per action. Schemas must be closed objects (`additionalProperties: false`) and are compiled at registration (#351) |
+| registry | `OperationRegistry`, `RegistryError`, `ToolInfo`, `RESERVED_ACTION_PREFIX`, `MAX_ARGUMENT_BYTES` | One exact tool name per action. Schemas must pass a keyword allowlist at registration: closed objects, typed arrays, no composition, no `$ref`, and asserted formats (#351) |
 
 ## Traits
 

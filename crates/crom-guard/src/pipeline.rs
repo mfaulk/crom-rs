@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::action::{
     ApprovalContext, AuthorizationContext, AuthorizationRequest, AuthorizedAction, ValidatedArgs,
@@ -147,9 +148,11 @@ pub struct Guard {
     clock: Arc<dyn Clock>,
     approvals: Arc<dyn ApprovalVerifier>,
     resolve_timer: Option<ResolveTimer>,
-    /// Set when an outcome record could not be written after an effect
-    /// (MILESTONE_18 §12.3): every later call is denied until restart.
-    failed: AtomicBool,
+    /// Set when an allowed call may have had an unrecorded effect: its
+    /// outcome record could not be written, or the call was dropped after
+    /// its decision record (MILESTONE_18 §12.3). Every later call is denied
+    /// until restart.
+    failed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Guard {
@@ -180,7 +183,7 @@ impl Guard {
             clock,
             approvals: Arc::new(NoApprovals),
             resolve_timer: None,
-            failed: AtomicBool::new(false),
+            failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -203,8 +206,9 @@ impl Guard {
         &self.registry
     }
 
-    /// True after an outcome record failed to be written; Guard then denies
-    /// every call with `audit_unavailable` until restarted.
+    /// True after an allowed call may have had an unrecorded effect (see
+    /// `docs/guard/pipeline.md`); Guard then denies every call with
+    /// `engine_unavailable` until restarted.
     pub fn is_failed_closed(&self) -> bool {
         self.failed.load(Ordering::SeqCst)
     }
@@ -224,6 +228,7 @@ impl Guard {
                 guard: self,
                 rec: AuditRecord::new(RecordKind::Decision, decision_id.clone(), self.clock.now()),
                 head: None,
+                latch: None,
             }
             .run(bearer, tool, arguments, meta)
             .await;
@@ -242,6 +247,52 @@ struct Call<'g> {
     guard: &'g Guard,
     rec: AuditRecord,
     head: Option<AuditReceipt>,
+    /// Armed from the `Allow` decision record until the outcome record has
+    /// been attempted.
+    latch: Option<CancelLatch>,
+}
+
+/// Fails Guard closed if dropped while armed: the call was cancelled after
+/// its `Allow` decision record, so an effect may have happened with no
+/// outcome record.
+struct CancelLatch {
+    failed: Arc<AtomicBool>,
+    decision_id: DecisionId,
+    armed: bool,
+}
+
+impl Drop for CancelLatch {
+    fn drop(&mut self) {
+        if self.armed {
+            fail_closed(
+                &self.failed,
+                &self.decision_id,
+                "call dropped after its decision record, before its outcome record",
+            );
+        }
+    }
+}
+
+/// Sets the latch and reports it to `tracing` and stderr (§12.3).
+fn fail_closed(failed: &AtomicBool, decision_id: &DecisionId, why: &str) {
+    failed.store(true, Ordering::SeqCst);
+    tracing::error!(
+        decision_id = decision_id.as_str(),
+        "{why}; Guard is failed closed until restart"
+    );
+    eprintln!(
+        "crom-guard: {why} (decision {}); failed closed until restart",
+        decision_id.as_str()
+    );
+}
+
+/// What the agent sees for `reason`. Audit unavailability is reported as
+/// `engine_unavailable` (§12.3), so agents cannot tell the log is down.
+fn agent_code(reason: &DenyReason) -> &'static str {
+    match reason {
+        DenyReason::AuditUnavailable => DenyReason::EngineUnavailable.code(),
+        r => r.code(),
+    }
 }
 
 /// The stage that stopped a call, for the record's `enforcement`.
@@ -274,7 +325,7 @@ impl Call<'_> {
         if g.is_failed_closed() {
             // The log cannot be trusted to record this call; refuse it.
             return self.respond(CallResult::Denied {
-                code: DenyReason::AuditUnavailable.code(),
+                code: agent_code(&DenyReason::AuditUnavailable),
             });
         }
         let now = self.rec.time;
@@ -425,8 +476,14 @@ impl Call<'_> {
         if let Err(r) = self.write_decision().await {
             return *r;
         }
+        self.arm();
 
         // 6. Lease, recheck immediately before execution, execute.
+        if g.is_failed_closed() {
+            return self
+                .blocked_after_decision(DenyReason::AuditUnavailable)
+                .await;
+        }
         let lease = match guarded(|| g.broker.lease(&entry.action)).await {
             Ok(Ok(l)) => l,
             Ok(Err(_)) | Err(Panicked) => {
@@ -437,6 +494,11 @@ impl Call<'_> {
         };
         if let Err(reason) = self.recheck(&ctx).await {
             return self.blocked_after_decision(reason).await;
+        }
+        if g.is_failed_closed() {
+            return self
+                .blocked_after_decision(DenyReason::AuditUnavailable)
+                .await;
         }
         let t = Instant::now();
         let result = guarded(|| op.execute(authorized, lease)).await;
@@ -460,15 +522,35 @@ impl Call<'_> {
         if let Err(r) = self.write_decision().await {
             return *r;
         }
+        self.arm();
         if let Err(reason) = self.recheck(&ctx).await {
             return self.blocked_after_decision(reason).await;
         }
         let g = self.guard;
+        if g.is_failed_closed() {
+            return self
+                .blocked_after_decision(DenyReason::AuditUnavailable)
+                .await;
+        }
         let now = g.clock.now();
         let t = Instant::now();
         let result = guarded(|| op.run(&ctx, g.store.as_ref(), &args, now)).await;
         let execute_us = micros(t);
         self.finish(result, execute_us).await
+    }
+
+    fn arm(&mut self) {
+        self.latch = Some(CancelLatch {
+            failed: self.guard.failed.clone(),
+            decision_id: self.rec.decision_id.clone(),
+            armed: true,
+        });
+    }
+
+    fn disarm(&mut self) {
+        if let Some(mut l) = self.latch.take() {
+            l.armed = false;
+        }
     }
 
     /// Re-reads expiry and revocation on a fresh clock reading
@@ -504,9 +586,13 @@ impl Call<'_> {
                 }
             }
             Ok(Err(ExecuteError::Failed(detail))) => {
+                // The text is never emitted: an executor may have put
+                // downstream data in it. Length and digest prefix only.
+                let digest = hex::encode(Sha256::digest(detail.as_bytes()));
                 tracing::debug!(
                     decision_id = out.decision_id.as_str(),
-                    detail = detail.as_str(),
+                    detail_len = detail.len(),
+                    detail_sha256 = &digest[..16],
                     "protected operation failed"
                 );
                 out.outcome = Some(Outcome::Failed);
@@ -527,12 +613,13 @@ impl Call<'_> {
         };
         if self.append(&out).await.is_err() {
             // The effect may have happened and is unrecorded: stop serving.
-            self.guard.failed.store(true, Ordering::SeqCst);
-            tracing::error!(
-                decision_id = out.decision_id.as_str(),
-                "audit outcome record could not be written; Guard is failed closed until restart"
+            fail_closed(
+                &self.guard.failed,
+                &out.decision_id,
+                "audit outcome record could not be written",
             );
         }
+        self.disarm();
         self.respond(response)
     }
 
@@ -541,15 +628,16 @@ impl Call<'_> {
         let mut out = self.outcome_record();
         out.outcome = Some(Outcome::Blocked);
         out.enforcement = Some(enforcement_for(&reason));
-        let code = reason.code();
+        let code = agent_code(&reason);
         out.reason = Some(reason);
         if self.append(&out).await.is_err() {
-            self.guard.failed.store(true, Ordering::SeqCst);
-            tracing::error!(
-                decision_id = out.decision_id.as_str(),
-                "audit outcome record could not be written; Guard is failed closed until restart"
+            fail_closed(
+                &self.guard.failed,
+                &out.decision_id,
+                "audit outcome record could not be written",
             );
         }
+        self.disarm();
         self.respond(CallResult::Denied { code })
     }
 
@@ -566,7 +654,7 @@ impl Call<'_> {
         self.rec.decision = Some(DecisionKind::Deny);
         self.rec.enforcement = Some(enforcement_for(&reason));
         self.rec.outcome = Some(Outcome::Blocked);
-        let code = reason.code();
+        let code = agent_code(&reason);
         self.rec.reason = Some(reason);
         if let Err(r) = self.write_decision().await {
             return *r;
@@ -587,8 +675,9 @@ impl Call<'_> {
         self.deny(reason).await
     }
 
-    /// Writes the decision record. `Err` carries the `audit_unavailable`
-    /// answer: nothing may execute.
+    /// Writes the decision record. `Err` carries the answer (internally
+    /// `audit_unavailable`, shown as `engine_unavailable`): nothing may
+    /// execute.
     async fn write_decision(&mut self) -> Result<(), Box<CallOutcome>> {
         let rec = self.rec.clone();
         if self.append(&rec).await.is_ok() {
@@ -596,12 +685,13 @@ impl Call<'_> {
         }
         tracing::error!(
             decision_id = rec.decision_id.as_str(),
+            reason = DenyReason::AuditUnavailable.code(),
             "audit decision record could not be written; denying"
         );
         Err(Box::new(CallOutcome {
             decision_id: rec.decision_id,
             result: CallResult::Denied {
-                code: DenyReason::AuditUnavailable.code(),
+                code: agent_code(&DenyReason::AuditUnavailable),
             },
             audit_head: self.head.clone(),
         }))
@@ -637,17 +727,48 @@ fn guarded_sync<T>(f: impl FnOnce() -> T) -> Result<T, Panicked> {
     catch_unwind(AssertUnwindSafe(f)).map_err(|_| Panicked)
 }
 
-/// Builds and polls a component future, turning a panic in either into
-/// `Panicked`. The future is dropped after a panic.
+/// A component future that is always dropped under `catch_unwind`, also
+/// when the call itself is cancelled.
+struct Slot<'a, T>(Option<BoxFuture<'a, T>>);
+
+impl<T> Slot<'_, T> {
+    /// Drops the future; true if its `Drop` panicked.
+    fn clear(&mut self) -> bool {
+        let f = self.0.take();
+        catch_unwind(AssertUnwindSafe(move || drop(f))).is_err()
+    }
+}
+
+impl<T> Drop for Slot<'_, T> {
+    fn drop(&mut self) {
+        let _ = self.clear();
+    }
+}
+
+/// Builds, polls, and drops a component future, turning a panic in any of
+/// them into `Panicked`. A future that completes and then panics in `Drop`
+/// is `Panicked` too: for an executor, a failed outcome.
 async fn guarded<'a, T>(make: impl FnOnce() -> BoxFuture<'a, T>) -> Result<T, Panicked> {
-    let mut fut = guarded_sync(make)?;
-    std::future::poll_fn(
-        move |cx| match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
-            Ok(Poll::Ready(v)) => Poll::Ready(Ok(v)),
+    let mut slot = Slot(Some(guarded_sync(make)?));
+    std::future::poll_fn(move |cx| {
+        let Some(fut) = slot.0.as_mut() else {
+            return Poll::Ready(Err(Panicked));
+        };
+        match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
-            Err(_) => Poll::Ready(Err(Panicked)),
-        },
-    )
+            Ok(Poll::Ready(v)) => {
+                if slot.clear() {
+                    Poll::Ready(Err(Panicked))
+                } else {
+                    Poll::Ready(Ok(v))
+                }
+            }
+            Err(_) => {
+                slot.clear();
+                Poll::Ready(Err(Panicked))
+            }
+        }
+    })
     .await
 }
 
@@ -841,6 +962,36 @@ mod tests {
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].record, RecordKind::Decision);
         assert_eq!(recs[1].outcome, Some(Outcome::Executed));
+    }
+
+    /// Latches Guard when it records a decision, as a concurrent failure would.
+    struct LatchingSink(Arc<AtomicBool>);
+
+    impl AuditSink for LatchingSink {
+        fn append<'a>(
+            &'a self,
+            r: &'a AuditRecord,
+        ) -> BoxFuture<'a, Result<AuditReceipt, AuditError>> {
+            if r.record == RecordKind::Decision {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            Box::pin(async {
+                Ok(AuditReceipt {
+                    seq: 1,
+                    head_hash: String::new(),
+                })
+            })
+        }
+    }
+
+    /// A builtin does not run if Guard failed closed after its decision record.
+    #[test]
+    fn builtin_stops_if_latched_after_decision() {
+        let (mut guard, op, _sink, handle) = setup(true);
+        guard.audit = Arc::new(LatchingSink(guard.failed.clone()));
+        let out = block_on(guard.call(&handle, "guard.echo", json!({}), CallMeta::default()));
+        assert_eq!(out.code(), Some("engine_unavailable"));
+        assert_eq!(op.runs.load(Ordering::SeqCst), 0);
     }
 
     /// A builtin the grant does not list is `action_not_granted` and does not run, and builtins must use the reserved prefix.

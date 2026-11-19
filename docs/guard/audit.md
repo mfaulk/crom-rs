@@ -72,7 +72,7 @@ Appends go through a mutex, so `seq` is strictly increasing with no gaps. The wr
 
 **Failure semantics (§12.3).**
 
-- **Storage error.** Disk full, an I/O error, or a failed fsync returns `AuditError::Io`. The pipeline (#351) then denies with `AuditUnavailable`. The sink is now *failed closed*: every later append returns `AuditError::Unavailable` until the process restarts.
+- **Storage error.** Disk full, an I/O error, or a failed fsync returns `AuditError::Io`. The pipeline (#351) then denies. The internal reason is `AuditUnavailable`, but agents see `engine_unavailable`. The sink is now *failed closed*: every later append returns `AuditError::Unavailable` until the process restarts.
 - **Restart.** `open` re-verifies the log. A torn trailing line left by the failed write makes `open` fail. Guard then stays down until an operator inspects the log.
 - **Recovery.** Use `audit verify`, which names the line, then truncate the file to the last complete line. This is deliberate: silently dropping the fragment would also hide a byte-level truncation. That record was never acknowledged, so no executor ran on it.
 
