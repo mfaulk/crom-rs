@@ -28,6 +28,12 @@ crom-guard-server = { path = "../crom-guard-server" }
 # Bash tool and OS sandbox, and the reference Crom settings must parse.
 crom-core = { workspace = true }
 crom-tools = { workspace = true }
+# The `crom` lane of tests/guard_adversarial.rs: a scripted Crom run per
+# agent call, through `ToolPolicy::guard` and Crom's MCP client (#413).
+crom-sdk = { workspace = true, features = ["fake-provider"] }
+crom-mcp = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
 jsonschema = { version = "0.61", default-features = false }
 # Canary test: captures every trace event.
 tracing = { workspace = true }

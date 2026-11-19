@@ -14,8 +14,8 @@ use crom_guard::{
     verify_log_with, ActionDigest, AppId, ApprovalSpec, ApprovalStoreConfig, AuditEntry,
     AuditError, AuditReceipt, AuditRecord, AuditSink, BoxFuture, CallMeta, CallResult, CedarPdp,
     Clock, DecisionKind, Delegator, FileAuditSink, FileCredentialBroker, GrantId, GrantSpec,
-    GrantStore, GrantStoreConfig, Guard, MemoryApprovalStore, MemoryGrantStore, RecordKind,
-    TenantId, Timestamp, HANDLE_PREFIX,
+    GrantStore, GrantStoreConfig, Guard, MemoryApprovalStore, MemoryGrantStore, OperationRegistry,
+    RecordKind, TenantId, Timestamp, HANDLE_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -89,6 +89,11 @@ pub struct Fixture {
     /// Text that must reach the agent through a tool result.
     #[serde(default)]
     pub injection_marker: Option<String>,
+    /// Tool descriptions Guard advertises in place of the operations' own
+    /// (G17: injected instructions served over `tools/list`). Only an
+    /// environment whose agent reads descriptions can deliver them.
+    #[serde(default)]
+    pub tool_descriptions: BTreeMap<String, String>,
     /// The agent's grant (a `GrantSpec`), bound as `parent`.
     #[serde(default)]
     pub grant: Option<Value>,
@@ -224,8 +229,13 @@ impl Fixture {
     pub fn attacks(&self) -> usize {
         match &self.isolation {
             Some(i) => i.attacks.len(),
-            None => self.steps.iter().filter(|s| s.attack).count(),
+            None => self.step_attacks(),
         }
+    }
+
+    /// Attack steps, for the lanes that run `steps`.
+    pub fn step_attacks(&self) -> usize {
+        self.steps.iter().filter(|s| s.attack).count()
     }
 
     /// Tenant of the `parent` grant.
@@ -265,6 +275,9 @@ pub enum Mode {
     SeparateUid,
     /// `crom-guard check` on an agent configuration.
     Preflight,
+    /// The reference server, called by a scripted Crom run through
+    /// `ToolPolicy::guard` and Crom's MCP client (#413).
+    Crom,
 }
 
 impl Mode {
@@ -292,6 +305,9 @@ pub struct CallRequest {
     pub arguments: Value,
     pub approval_id: Option<String>,
     pub revoke_after_decision: Option<String>,
+    /// The step is an attack. The Crom lane has the trusted application,
+    /// not the model, run legitimate `guard.*` steps.
+    pub attack: bool,
 }
 
 /// What the agent saw. `text` is the whole agent-visible result.
@@ -303,6 +319,9 @@ pub struct Observed {
     pub content: Value,
     pub text: String,
     pub action_digest: Option<String>,
+    /// Crom's own gate refused the call before Guard saw it (the Crom
+    /// lane); the reason Crom recorded.
+    pub crom_block: Option<String>,
 }
 
 /// Guard's audit log after a run.
@@ -344,6 +363,11 @@ pub trait ScenarioEnv: Send + Sync {
     ) -> impl Future<Output = Option<u16>> + Send;
     /// `None` without Guard.
     fn audit(&self) -> Option<AuditView>;
+    /// Every tool description the agent was shown, or `None` if this
+    /// environment's agent never reads descriptions.
+    fn descriptions_seen(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -360,6 +384,9 @@ pub enum StepVerdict {
     BlockedBySandbox,
     /// `crom-guard check` refused the configuration.
     BlockedByPreflight,
+    /// Crom's own gate refused the call before Guard saw it (an
+    /// unregistered tool name, `guard.*`, or a run Crom would not start).
+    BlockedByCrom,
     /// A probe fired.
     Executed,
 }
@@ -419,6 +446,8 @@ pub struct ScenarioReport {
     pub blocked_by_sandbox: usize,
     /// Refused by `crom-guard check` (the preflight lane only).
     pub blocked_by_preflight: usize,
+    /// Refused by Crom's own gate before Guard (the Crom lane only).
+    pub blocked_by_crom: usize,
     pub no_effect: usize,
     /// Attacks a probe saw take effect. Must be 0 with Guard.
     pub executed: usize,
@@ -449,15 +478,15 @@ impl SuiteReport {
 
     pub fn to_markdown(&self) -> String {
         let mut out = String::from(
-            "| scenario | mode | attempted | blocked (guard) | blocked (isolation) | executed | legit | ledger oracle | audit verify |\n\
-             |---|---|---|---|---|---|---|---|---|\n",
+            "| scenario | mode | attempted | blocked (guard) | blocked (crom) | blocked (isolation) | executed | legit | ledger oracle | audit verify |\n\
+             |---|---|---|---|---|---|---|---|---|---|\n",
         );
         for r in &self.scenarios {
             let mode = serde_json::to_value(r.mode).unwrap();
             let mode = mode.as_str().unwrap_or_default();
             if let Status::Skipped = r.status {
                 out.push_str(&format!(
-                    "| {} | {mode} | skipped: {} | | | | | | |\n",
+                    "| {} | {mode} | skipped: {} | | | | | | | |\n",
                     r.scenario,
                     r.tracking_issue
                         .as_deref()
@@ -467,10 +496,11 @@ impl SuiteReport {
                 continue;
             }
             out.push_str(&format!(
-                "| {} | {mode} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {mode} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 r.scenario,
                 r.attempted,
                 r.blocked_by_guard,
+                r.blocked_by_crom,
                 r.blocked_by_sandbox + r.blocked_by_preflight,
                 r.executed,
                 if r.legit_success { "pass" } else { "fail" },
@@ -505,6 +535,7 @@ pub fn skipped(fx: &Fixture, mode: Mode, reason: &str, issue: Option<&str>) -> S
         blocked_by_guard: 0,
         blocked_by_sandbox: 0,
         blocked_by_preflight: 0,
+        blocked_by_crom: 0,
         no_effect: 0,
         executed: 0,
         legit_success: false,
@@ -535,6 +566,7 @@ pub fn isolation_report(
     r.attempted = steps.len();
     r.blocked_by_sandbox = count(StepVerdict::BlockedBySandbox);
     r.blocked_by_preflight = count(StepVerdict::BlockedByPreflight);
+    r.blocked_by_crom = count(StepVerdict::BlockedByCrom);
     r.no_effect = count(StepVerdict::NoEffect);
     r.executed = count(StepVerdict::Executed);
     r.legit_success = true;
@@ -655,18 +687,38 @@ pub fn unmediated_effects(ledger: &[LedgerEntry], records: &[AuditRecord]) -> Ve
         .collect()
 }
 
+/// The reference registry (`support_registry`) with the fixture's
+/// `tool_descriptions` advertised in place of the operations' own.
+pub fn scenario_registry(
+    fx: &Fixture,
+    api: &Arc<BusinessApi>,
+    config: &SupportConfig,
+) -> Result<OperationRegistry, crate::support_ops::SupportOpsError> {
+    let mut registry = OperationRegistry::new();
+    for op in crate::support_ops::operations(api, config)? {
+        let op = match fx.tool_descriptions.get(op.kind().id()) {
+            Some(d) => op.with_description(d.clone()),
+            None => op,
+        };
+        registry.register(Arc::new(op))?;
+    }
+    registry.register_delegate()?;
+    Ok(registry)
+}
+
 /// Runs one fixture in `env`. Panics on a malformed fixture.
 pub async fn run<E: ScenarioEnv>(fx: &Fixture, env: &E) -> ScenarioReport {
     assert!(fx.placeholder.is_none(), "{} is a placeholder", fx.scenario);
     assert!(
-        fx.isolation.is_none(),
-        "{} is an isolation scenario",
+        !fx.steps.is_empty(),
+        "{} is an isolation scenario without steps",
         fx.scenario
     );
     let mode = env.mode();
     let mut report = skipped(fx, mode, "", None);
     report.status = Status::Ran;
     report.skip_reason = None;
+    report.planned_attacks = fx.step_attacks();
     let mut mismatches = Vec::new();
     let mut notes = Vec::new();
 
@@ -783,6 +835,7 @@ pub async fn run<E: ScenarioEnv>(fx: &Fixture, env: &E) -> ScenarioReport {
                     arguments: step.arguments.clone(),
                     approval_id,
                     revoke_after_decision: step.revoke_after_decision.clone(),
+                    attack: step.attack,
                 })
                 .await,
             )
@@ -836,6 +889,8 @@ pub async fn run<E: ScenarioEnv>(fx: &Fixture, env: &E) -> ScenarioReport {
         if step.attack {
             sr.verdict = Some(if !sr.probes.is_empty() {
                 StepVerdict::Executed
+            } else if obs.crom_block.is_some() {
+                StepVerdict::BlockedByCrom
             } else if mode.uses_guard() && obs.code != "executed" {
                 // Includes session denials over HTTP (no decision id) and
                 // the admin API refusing the agent's handle.
@@ -851,7 +906,24 @@ pub async fn run<E: ScenarioEnv>(fx: &Fixture, env: &E) -> ScenarioReport {
             ));
         }
 
-        if let Some(want) = &step.expect {
+        if let (Some(reason), Some(want)) = (&obs.crom_block, &step.expect) {
+            // Guard never saw the call, so there is no Guard code to
+            // compare; an attack Guard would refuse may be refused earlier.
+            if want == "executed" {
+                mismatches.push(format!(
+                    "{}: Crom refused it ({reason}), expected `executed`",
+                    step.name
+                ));
+                if !step.attack {
+                    legit_ok = false;
+                }
+            } else {
+                notes.push(format!(
+                    "{}: Crom blocked first ({reason}); Guard's code would be `{want}`",
+                    step.name
+                ));
+            }
+        } else if let Some(want) = &step.expect {
             let enforce = mode.uses_guard() || (!step.attack && want == "executed");
             if enforce && &obs.code != want {
                 mismatches.push(format!(
@@ -975,6 +1047,7 @@ pub async fn run<E: ScenarioEnv>(fx: &Fixture, env: &E) -> ScenarioReport {
     report.blocked_by_guard = count(StepVerdict::BlockedByGuard);
     report.blocked_by_sandbox = count(StepVerdict::BlockedBySandbox);
     report.blocked_by_preflight = count(StepVerdict::BlockedByPreflight);
+    report.blocked_by_crom = count(StepVerdict::BlockedByCrom);
     report.no_effect = count(StepVerdict::NoEffect);
     report.executed = count(StepVerdict::Executed);
     report.legit_success = legit_ok;
@@ -982,6 +1055,15 @@ pub async fn run<E: ScenarioEnv>(fx: &Fixture, env: &E) -> ScenarioReport {
         .injection_marker
         .as_ref()
         .map(|m| context.contains(m.as_str()));
+    if !fx.tool_descriptions.is_empty() {
+        if let Some(seen) = env.descriptions_seen() {
+            let delivered = fx
+                .tool_descriptions
+                .values()
+                .all(|d| seen.contains(d.as_str()));
+            report.injection_delivered = Some(delivered);
+        }
+    }
     if report.injection_delivered == Some(false) {
         mismatches.push("injection was not delivered to the agent".into());
     }
@@ -1232,6 +1314,7 @@ impl ScenarioEnv for InProcessEnv {
             text: content.to_string(),
             content,
             action_digest,
+            crom_block: None,
         }
     }
 

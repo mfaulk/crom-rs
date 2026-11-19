@@ -813,11 +813,15 @@ dependencies = [
 name = "crom-guard-testkit"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "crom-core",
  "crom-guard",
  "crom-guard-server",
+ "crom-mcp",
+ "crom-sdk",
  "crom-tools",
+ "futures",
  "jsonschema",
  "reqwest",
  "serde",

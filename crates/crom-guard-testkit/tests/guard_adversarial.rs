@@ -1,6 +1,7 @@
 //! Guard adversarial scenarios G1–G18 (#361), scored on the business ledger.
 //! Each runnable fixture runs against `Guard::call` in process, against the
-//! reference `crom-guard` server over HTTP, and without Guard (the
+//! reference `crom-guard` server over HTTP (directly, through the Python
+//! client, and through Crom's MCP client, #413), and without Guard (the
 //! direct-credential baseline). Writes
 //! `$CARGO_TARGET_TMPDIR/guard-scenarios/report.json`.
 #![cfg(unix)]
@@ -13,12 +14,12 @@ use std::time::Duration;
 use crom_guard::RecordKind;
 use crom_guard_server::{AdminAddr, Config, ServerHandle};
 use crom_guard_testkit::scenario::{
-    credentials_json, fixtures, read_audit, run, scenario_ids, skipped, unmediated_effects,
-    AdminRequest, AuditView, CallRequest, DirectEnv, Fixture, InProcessEnv, Mode, Observed,
-    ScenarioEnv, ScenarioReport, SuiteReport, POLICIES, SCHEMA,
+    credentials_json, fixtures, read_audit, run, scenario_ids, scenario_registry, skipped,
+    unmediated_effects, AdminRequest, AuditView, CallRequest, DirectEnv, Fixture, InProcessEnv,
+    Mode, Observed, ScenarioEnv, ScenarioReport, StepVerdict, SuiteReport, POLICIES, SCHEMA,
 };
 use crom_guard_testkit::{
-    support_registry, ApiCredential, BusinessApi, Effect, Ledger, LedgerEntry, RunningApi,
+    ApiCredential, BusinessApi, Effect, Ledger, LedgerEntry, RunningApi, SupportAction,
     SupportConfig,
 };
 use serde_json::{json, Value};
@@ -131,6 +132,7 @@ fn observe(text: String) -> Observed {
         action_digest: content["action_digest"].as_str().map(str::to_owned),
         content,
         text,
+        crom_block: None,
     }
 }
 
@@ -141,7 +143,7 @@ fn write_private(path: &Path, text: &str) {
 }
 
 impl ServerEnv {
-    async fn start(python: Option<&str>) -> Self {
+    async fn start(python: Option<&str>, fx: &Fixture) -> Self {
         let secret = format!("sk-business-CANARY-server-{}", std::process::id());
         let api = BusinessApi::new(
             vec![ApiCredential {
@@ -151,7 +153,8 @@ impl ServerEnv {
             Ledger::in_memory(),
         );
         let running = api.serve("127.0.0.1:0".parse().unwrap()).await.unwrap();
-        let registry = support_registry(&api, &SupportConfig::new(running.base_url())).unwrap();
+        let registry =
+            scenario_registry(fx, &api, &SupportConfig::new(running.base_url())).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         std::fs::write(d.join("support.cedarschema"), SCHEMA).unwrap();
@@ -363,6 +366,71 @@ fn write_report(report: &SuiteReport) {
     eprintln!("{}\nreport: {}", report.to_markdown(), path.display());
 }
 
+mod crom_lane;
+
+/// Crom-lane checks beyond [`guard_failures`]: no non-Guard MCP tool was
+/// offered, and a fixture that serves tool descriptions reached the model.
+fn crom_failures(r: &ScenarioReport) -> Vec<String> {
+    let mut out = Vec::new();
+    for n in &r.notes {
+        if n.starts_with("Crom offered a non-Guard MCP tool") {
+            out.push(format!("{} (crom): {n}", r.scenario));
+        }
+    }
+    if r.injection_delivered == Some(false) {
+        out.push(format!(
+            "{} (crom): served description not shown",
+            r.scenario
+        ));
+    }
+    out
+}
+
+/// Where the Crom lane departs from the reference-server lane on the same
+/// fixture. A step agrees when both saw the same agent-visible code, or
+/// when Crom's own gate refused an attack the server lane's Guard refused.
+fn lane_disagreements(server: &ScenarioReport, crom: &ScenarioReport) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut differ = |what: String| out.push(format!("{} (crom vs server): {what}", crom.scenario));
+    if server.steps.len() != crom.steps.len() {
+        differ(format!(
+            "{} steps vs {}",
+            crom.steps.len(),
+            server.steps.len()
+        ));
+    }
+    for (s, c) in server.steps.iter().zip(&crom.steps) {
+        let agree = s.got == c.got
+            || (c.verdict == Some(StepVerdict::BlockedByCrom)
+                && s.verdict == Some(StepVerdict::BlockedByGuard))
+            // The model has no admin-API route under Crom.
+            || (c.verdict == Some(StepVerdict::NotAttempted) && s.tool.as_deref().is_some_and(|t| t.starts_with("/admin/")));
+        if !agree {
+            differ(format!(
+                "{}: crom {:?} ({:?}), server {:?} ({:?})",
+                s.name, c.got, c.verdict, s.got, s.verdict
+            ));
+        }
+    }
+    let ledger = |r: &ScenarioReport| {
+        (
+            r.ledger.entries,
+            r.ledger.matches_expected,
+            r.ledger.unmediated,
+        )
+    };
+    if ledger(server) != ledger(crom) {
+        differ(format!("ledger {:?} vs {:?}", ledger(crom), ledger(server)));
+    }
+    if server.executed != crom.executed || server.legit_success != crom.legit_success {
+        differ("executed or legitimate outcome differs".into());
+    }
+    if server.audit.verified != crom.audit.verified {
+        differ("audit verification differs".into());
+    }
+    out
+}
+
 /// Checks a Guard-mode report; returns its failures.
 fn guard_failures(r: &ScenarioReport) -> Vec<String> {
     let mut out: Vec<String> = r
@@ -385,13 +453,18 @@ fn guard_failures(r: &ScenarioReport) -> Vec<String> {
         "decision without audit record",
     );
     check(
-        r.attempted == r.blocked_by_guard + r.blocked_by_sandbox + r.no_effect + r.executed,
+        r.attempted
+            == r.blocked_by_guard
+                + r.blocked_by_crom
+                + r.blocked_by_sandbox
+                + r.no_effect
+                + r.executed,
         "attempted does not split into verdicts",
     );
     out
 }
 
-/// G1–G18 are all present once with no placeholder left, every isolation fixture names known attacks and has no steps, and every other fixture has an attack and a legitimate step.
+/// G1–G18 are all present once with no placeholder left, every isolation fixture names known attacks and has steps only to serve tool descriptions, every fixture with steps has an attack and a legitimate step, and served descriptions name support operations.
 #[test]
 fn catalog_covers_g1_to_g18() {
     let all = fixtures();
@@ -399,33 +472,41 @@ fn catalog_covers_g1_to_g18() {
     let want: std::collections::BTreeSet<String> = (1..=18).map(|n| format!("G{n}")).collect();
     assert_eq!(ids, want);
     assert_eq!(all.len(), 18);
+    let ops: Vec<&str> = SupportAction::ALL.iter().map(|a| a.id()).collect();
     for f in &all {
         assert!(f.placeholder.is_none(), "{}: placeholder", f.scenario);
-        match &f.isolation {
-            Some(i) => {
-                assert!(!i.attacks.is_empty(), "{}: no attack", f.scenario);
-                assert!(f.steps.is_empty(), "{}: isolation with steps", f.scenario);
-                #[cfg(target_os = "linux")]
-                for a in &i.attacks {
-                    assert!(
-                        isolation::Attack::parse(a).is_some()
-                            || PREFLIGHT_ATTACKS.contains(&a.as_str()),
-                        "{}: unknown attack {a}",
-                        f.scenario
-                    );
-                }
-            }
-            None => {
-                assert!(f.attacks() > 0, "{}: no attack", f.scenario);
+        for tool in f.tool_descriptions.keys() {
+            assert!(ops.contains(&tool.as_str()), "{}: {tool}", f.scenario);
+        }
+        if let Some(i) = &f.isolation {
+            assert!(!i.attacks.is_empty(), "{}: no attack", f.scenario);
+            assert!(
+                f.steps.is_empty() || !f.tool_descriptions.is_empty(),
+                "{}: isolation with steps",
+                f.scenario
+            );
+            #[cfg(target_os = "linux")]
+            for a in &i.attacks {
                 assert!(
-                    f.steps
-                        .iter()
-                        .any(|s| !s.attack && s.expect.as_deref() == Some("executed")),
-                    "{}: no legitimate subtask",
+                    isolation::Attack::parse(a).is_some()
+                        || PREFLIGHT_ATTACKS.contains(&a.as_str()),
+                    "{}: unknown attack {a}",
                     f.scenario
                 );
-                assert!(f.grant.is_some(), "{}", f.scenario);
             }
+        }
+        if f.steps.is_empty() {
+            assert!(f.isolation.is_some(), "{}: nothing to run", f.scenario);
+        } else {
+            assert!(f.step_attacks() > 0, "{}: no attack", f.scenario);
+            assert!(
+                f.steps
+                    .iter()
+                    .any(|s| !s.attack && s.expect.as_deref() == Some("executed")),
+                "{}: no legitimate subtask",
+                f.scenario
+            );
+            assert!(f.grant.is_some(), "{}", f.scenario);
         }
     }
     let isolation: Vec<&str> = all
@@ -436,7 +517,7 @@ fn catalog_covers_g1_to_g18() {
     assert_eq!(isolation, ["G13", "G14", "G17", "G18"]);
 }
 
-/// Every runnable scenario executes no attack and reproduces its exact ledger and audit expectations with Guard in process, behind the reference server, and through the Python client, while without Guard every Guard-dependent scenario's attacks take effect.
+/// Every runnable scenario executes no attack and reproduces its exact ledger and audit expectations with Guard in process, behind the reference server, through the Python client, and through Crom's MCP client (agreeing step for step with the server lane), while without Guard every Guard-dependent scenario's attacks take effect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenarios_execute_nothing_with_guard_and_something_without() {
     let py = python();
@@ -452,6 +533,7 @@ async fn scenarios_execute_nothing_with_guard_and_something_without() {
                 Mode::GuardInProcess,
                 Mode::GuardServer,
                 Mode::GuardPythonClient,
+                Mode::Crom,
                 Mode::GuardOff,
             ] {
                 reports.push(skipped(&fx, mode, &p.reason, Some(&p.tracking_issue)));
@@ -460,7 +542,9 @@ async fn scenarios_execute_nothing_with_guard_and_something_without() {
         }
         if fx.isolation.is_some() {
             reports.extend(isolation_lanes(&fx, &mut failures).await);
-            continue;
+            if fx.steps.is_empty() {
+                continue;
+            }
         }
         let r = run(&fx, &InProcessEnv::start().await).await;
         failures.extend(guard_failures(&r));
@@ -472,7 +556,7 @@ async fn scenarios_execute_nothing_with_guard_and_something_without() {
                 reports.push(skipped(&fx, Mode::GuardPythonClient, reason, None));
                 continue;
             };
-            let server = ServerEnv::start(py).await;
+            let server = ServerEnv::start(py, &fx).await;
             let mut r = run(&fx, &server).await;
             r.notes.extend(server.notes.lock().unwrap().drain(..));
             if py.is_some() {
@@ -494,6 +578,19 @@ async fn scenarios_execute_nothing_with_guard_and_something_without() {
             failures.extend(guard_failures(&r));
             reports.push(r);
         }
+
+        let crom = crom_lane::CromEnv::start(&fx).await;
+        let mut r = run(&fx, &crom).await;
+        r.notes.extend(crom.notes.lock().unwrap().drain(..));
+        crom.shutdown().await;
+        failures.extend(guard_failures(&r));
+        failures.extend(crom_failures(&r));
+        let server = reports
+            .iter()
+            .find(|s| s.scenario == fx.scenario && s.mode == Mode::GuardServer)
+            .expect("server lane ran");
+        failures.extend(lane_disagreements(server, &r));
+        reports.push(r);
 
         let r = run(&fx, &DirectEnv::start().await).await;
         if fx.guard_dependent && r.executed == 0 {
@@ -542,6 +639,130 @@ async fn unmediated_and_tampered_audit_probes_fire() {
     )
     .unwrap();
     assert!(read_audit(&path).verified.is_err());
+}
+
+/// The lane comparison accepts equal codes and a Crom-gate refusal of an attack Guard refused, and flags a differing code, a Crom refusal of a call Guard executed, or a differing ledger.
+#[test]
+fn lane_comparison_flags_disagreements() {
+    use crom_guard_testkit::scenario::StepReport;
+    let fx = fixtures().into_iter().find(|f| f.scenario == "G7").unwrap();
+    let step = |name: &str, got: &str, verdict: Option<StepVerdict>| StepReport {
+        name: name.into(),
+        tool: Some("refund.issue".into()),
+        attack: verdict.is_some(),
+        expected: None,
+        got: Some(got.into()),
+        enforcement: None,
+        verdict,
+        probes: Vec::new(),
+    };
+    let mut server = skipped(&fx, Mode::GuardServer, "", None);
+    server.steps = vec![
+        step("legit", "executed", None),
+        step(
+            "a1",
+            "action_not_granted",
+            Some(StepVerdict::BlockedByGuard),
+        ),
+        step("a2", "policy_deny", Some(StepVerdict::BlockedByGuard)),
+    ];
+    let mut crom = skipped(&fx, Mode::Crom, "", None);
+    crom.steps = vec![
+        step("legit", "executed", None),
+        step("a1", "crom_refused", Some(StepVerdict::BlockedByCrom)),
+        step("a2", "policy_deny", Some(StepVerdict::BlockedByGuard)),
+    ];
+    assert!(lane_disagreements(&server, &crom).is_empty());
+
+    let mut other_code = crom.clone();
+    other_code.steps[2].got = Some("resource_not_found".into());
+    assert_eq!(lane_disagreements(&server, &other_code).len(), 1);
+
+    let mut legit_refused = crom.clone();
+    legit_refused.steps[0] = step("legit", "crom_refused", Some(StepVerdict::BlockedByCrom));
+    assert_eq!(lane_disagreements(&server, &legit_refused).len(), 1);
+
+    let mut ledger = crom.clone();
+    ledger.ledger.entries = 1;
+    assert_eq!(lane_disagreements(&server, &ledger).len(), 1);
+}
+
+/// G17 through Guard: a hostile `customer.read` description reaches the model through Crom's MCP client, yet only the legitimate read takes effect and every described attack is refused by Guard or by Crom's gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g17_description_served_through_guard_reaches_crom_without_effect() {
+    let fx = fixtures()
+        .into_iter()
+        .find(|f| f.scenario == "G17")
+        .unwrap();
+    let env = crom_lane::CromEnv::start(&fx).await;
+    let r = run(&fx, &env).await;
+    env.shutdown().await;
+    assert_eq!(r.injection_delivered, Some(true), "{r:#?}");
+    let failures = guard_failures(&r);
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert_eq!(r.executed, 0);
+    assert!(r.blocked_by_guard > 0 && r.blocked_by_crom > 0, "{r:#?}");
+    assert_eq!(r.blocked_by_guard + r.blocked_by_crom, r.planned_attacks);
+    assert_eq!(r.ledger.entries, 1);
+}
+
+/// G17 in the supported configuration: the rogue server does serve its injected description to Crom's MCP client, but a Crom run under `ToolPolicy::guard` never contacts it, offers the model only Guard's MCP tools, and refuses a call to the rogue tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g17_supported_config_connects_crom_only_to_guard() {
+    use crom_core::events::{EnforcementLayer, SecurityOutcome};
+    let rogue = crom_lane::RogueMcp::start().await;
+    let tools = crom_lane::rogue_tools_via_crom_mcp(&rogue.url).await;
+    assert!(
+        tools
+            .iter()
+            .any(|(_, d)| d.contains(crom_lane::ROGUE_MARKER)),
+        "{tools:?}"
+    );
+    let contacted = rogue.request_count();
+    assert!(contacted > 0);
+
+    let fx = fixtures()
+        .into_iter()
+        .find(|f| f.scenario == "G17")
+        .unwrap();
+    let server = ServerEnv::start(None, &fx).await;
+    let handle = server
+        .issue("parent", fx.grant.as_ref().unwrap())
+        .await
+        .unwrap();
+    let url = format!("http://{}/mcp", server.server().agent_addr);
+    let run = crom_lane::crom_call(
+        &url,
+        &handle,
+        "mcp__refunds__refund_helper",
+        json!({}),
+        None,
+    )
+    .await;
+    let ledger = server.api().ledger().entries().len();
+    server.shutdown().await;
+
+    assert_eq!(
+        rogue.request_count(),
+        contacted,
+        "Crom reached the rogue server"
+    );
+    let mcp: Vec<&str> = run
+        .tools
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| n.starts_with("mcp__"))
+        .collect();
+    assert!(!mcp.is_empty());
+    assert!(mcp.iter().all(|n| n.starts_with("mcp__guard__")), "{mcp:?}");
+    assert!(!run
+        .tools
+        .iter()
+        .any(|(_, d)| d.contains(crom_lane::ROGUE_MARKER)));
+    let d = run.decision.expect("Crom recorded the call");
+    assert_eq!(d.enforcement, EnforcementLayer::Policy, "{d:?}");
+    assert_eq!(d.outcome, SecurityOutcome::Blocked, "{d:?}");
+    assert_eq!(ledger, 0);
 }
 
 #[cfg(target_os = "linux")]
@@ -697,9 +918,10 @@ async fn preflight_lane(fx: &Fixture) -> ScenarioReport {
         isolation_report, AuditReport, LedgerReport, StepReport, StepVerdict,
     };
     let d = isolation::Deployment::start().await;
+    let rogue = crom_lane::RogueMcp::start().await;
     let reference = isolation::reference_settings();
     let mut notes = vec![
-        "configuration-level only: no malicious description is served to Crom's MCP client"
+        "second_mcp_server names a live rogue MCP server; the crom lane serves a hostile description through Guard itself"
             .to_owned(),
     ];
     let control = d.check(&reference);
@@ -715,9 +937,8 @@ async fn preflight_lane(fx: &Fixture) -> ScenarioReport {
         let refused_by = match name.as_str() {
             "second_mcp_server" => {
                 settings["mcp"]["servers"]["refunds"] = json!({
-                    "type": "stdio",
-                    "command": "/usr/bin/env",
-                    "args": ["refund-helper"],
+                    "type": "http",
+                    "url": rogue.url,
                 });
                 "mcp-servers"
             }
