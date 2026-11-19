@@ -53,6 +53,8 @@ pub struct CallMeta {
 /// carry no internal detail: no ancestor grant id, no downstream error
 /// text, and the same `resource_not_found` for missing and other-tenant
 /// resources.
+///
+/// The `result` may hold a secret; see [`CallResult`] ("Secrets").
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct CallOutcome {
@@ -63,11 +65,21 @@ pub struct CallOutcome {
     pub audit_head: Option<AuditReceipt>,
 }
 
+/// The agent-visible result of one call.
+///
+/// # Secrets
+///
+/// `Executed { content }` can hold a secret: the child session handle
+/// returned by `guard.delegate`. Return it to the calling agent only. Do
+/// not log, trace, or persist a `CallResult` or `CallOutcome`, including
+/// through its `Debug` or `Serialize` output; log [`CallOutcome::code`]
+/// instead.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum CallResult {
-    /// The operation ran; `content` is its structured result.
+    /// The operation ran; `content` is its structured result. For
+    /// `guard.delegate` it holds the child session handle, a secret.
     Executed { content: Value },
     /// Nothing ran. `code` is a [`DenyReason::code`].
     Denied { code: &'static str },
@@ -527,8 +539,9 @@ impl Call<'_> {
         self.finish(result, execute_us).await
     }
 
-    /// Builtins (#353): no resolver and no Cedar evaluation; the decision
-    /// record is still written first and the chain rechecked.
+    /// Builtins (#353): no resolver and no Cedar evaluation. The builtin's
+    /// own `check` decides; the decision record is still written first and
+    /// the chain rechecked.
     async fn run_builtin(
         mut self,
         entry: &Registered,
@@ -538,6 +551,12 @@ impl Call<'_> {
         let OpKind::Builtin(op) = &entry.kind else {
             return self.deny(DenyReason::PolicyError).await;
         };
+        let now = self.rec.time;
+        match guarded_sync(|| op.check(&ctx, &args, now)) {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => return self.deny(reason).await,
+            Err(Panicked) => return self.panicked("builtin check").await,
+        }
         self.rec.decision = Some(DecisionKind::Allow);
         self.rec.enforcement = Some(Enforcement::GuardValidation);
         if let Err(r) = self.write_decision().await {
@@ -553,10 +572,14 @@ impl Call<'_> {
                 .blocked_after_decision(DenyReason::AuditUnavailable)
                 .await;
         }
-        let now = g.clock.now();
         let t = Instant::now();
         let result = guarded(|| op.run(&ctx, g.store.as_ref(), &args, now)).await;
         let execute_us = micros(t);
+        let result = match result {
+            Ok(Err(reason)) => return self.blocked_after_decision(reason).await,
+            Ok(Ok(out)) => Ok(Ok(out)),
+            Err(Panicked) => Err(Panicked),
+        };
         self.finish(result, execute_us).await
     }
 
@@ -884,13 +907,25 @@ mod tests {
         fn input_schema(&self) -> &Value {
             &self.schema
         }
+        fn check(
+            &self,
+            _: &ExecutionContext,
+            args: &ValidatedArgs,
+            _: Timestamp,
+        ) -> Result<(), DenyReason> {
+            match args.as_json().get("check").and_then(Value::as_str) {
+                Some("deny") => Err(DenyReason::PolicyDeny),
+                Some("panic") => panic!("builtin check bug"),
+                _ => Ok(()),
+            }
+        }
         fn run<'a>(
             &'a self,
             ctx: &'a ExecutionContext,
             _store: &'a dyn GrantStore,
             _args: &'a ValidatedArgs,
             _now: Timestamp,
-        ) -> BoxFuture<'a, Result<ExecutionOutput, ExecuteError>> {
+        ) -> BoxFuture<'a, Result<ExecutionOutput, DenyReason>> {
             Box::pin(async move {
                 self.runs.fetch_add(1, Ordering::SeqCst);
                 Ok(ExecutionOutput {
@@ -942,7 +977,8 @@ mod tests {
     fn echo(action: &str) -> Arc<Echo> {
         Arc::new(Echo {
             action: ActionId::new(action).unwrap(),
-            schema: json!({"type": "object", "additionalProperties": false}),
+            schema: json!({"type": "object", "additionalProperties": false,
+                           "properties": {"check": {"type": "string"}}}),
             runs: AtomicUsize::new(0),
         })
     }
@@ -983,6 +1019,30 @@ mod tests {
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].record, RecordKind::Decision);
         assert_eq!(recs[1].outcome, Some(Outcome::Executed));
+    }
+
+    /// A builtin whose `check` denies or panics writes one deny decision record and never runs.
+    #[test]
+    fn builtin_check_decides_before_the_decision_record() {
+        for (mode, code, reason) in [
+            ("deny", "policy_deny", DenyReason::PolicyDeny),
+            ("panic", "engine_unavailable", DenyReason::EngineUnavailable),
+        ] {
+            let (guard, op, sink, handle) = setup(true);
+            let out = block_on(guard.call(
+                &handle,
+                "guard.echo",
+                json!({"check": mode}),
+                CallMeta::default(),
+            ));
+            assert_eq!(out.code(), Some(code), "{mode}");
+            assert_eq!(op.runs.load(Ordering::SeqCst), 0, "{mode}");
+            let recs = sink.0.lock().unwrap();
+            assert_eq!(recs.len(), 1, "{mode}");
+            assert_eq!(recs[0].decision, Some(DecisionKind::Deny), "{mode}");
+            assert_eq!(recs[0].reason, Some(reason), "{mode}");
+            assert!(!guard.is_failed_closed());
+        }
     }
 
     /// Latches Guard when it records a decision, as a concurrent failure would.

@@ -239,6 +239,37 @@ Reasons:
 Cedar could also express it (§3.3). It is not duplicated there, so that one
 source of truth remains.
 
+#### Amendment (2026-11-19, #353): `guard.delegate` is not evaluated by Cedar
+
+`guard.delegate`, the agent-facing attenuation operation, is a Guard
+builtin. It skips the resolver and Cedar. It is gated only by:
+
+- the Rust action check above (`guard.delegate` in every grant of the chain);
+- the grant's `max_depth`;
+- the narrowing rules of MILESTONE_18 §8.3, checked before the decision
+  record and again in the grant store;
+- store quotas (children per grant, descendants per root, grants per tenant).
+
+Rationale:
+
+- Delegation only creates a subset of the caller's authority. Every later
+  request made with a child handle is evaluated by Cedar for every grant in
+  its chain (§4.4), so a child can never be allowed what its parent alone
+  would be denied.
+- Narrowing is a grant invariant, for the same reasons as the action check
+  in this section. It must not depend on operator policy text.
+- A delegation has no resolved resource and no action in the operator
+  schema to evaluate.
+
+Consequence: operator-wide Cedar policy **cannot forbid** delegation. A
+`forbid` on `guard.delegate` would never be consulted. Issuers control it
+per grant: a grant can delegate only if the trusted application lists
+`guard.delegate` in its `actions` and gives it `max_depth ≥ 1`, and a host
+that never calls `OperationRegistry::register_delegate` exposes no such
+tool. This deviates from the wording of #353, which describes `guard.delegate`
+as a protected operation; protected operations are Cedar-evaluated. See
+`docs/guard/grants.md`.
+
 ### 4.4 Evaluation and approval derivation
 
 For each request, after authentication, normalization, the Rust action check,

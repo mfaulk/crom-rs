@@ -43,6 +43,7 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | approval | `MemoryApprovalStore`, `ApprovalSpec`, `PendingApproval`, `IssuedApproval`, `ApprovalStatus`, `ApprovalStoreConfig`, `ApprovalError` | Single-use, expiring approvals of a pending request Guard recorded on `ApprovalRequired`, bound to its digest and resource version (#354). `pending` and `approve` are for the trusted admin path only. See [approvals.md](approvals.md) |
 | pipeline | `Guard`, `CallMeta`, `CallOutcome`, `CallResult`, `ApprovalVerifier`, `NoApprovals` | MILESTONE_18 §10.2 steps 1–8 with the audit and recheck ordering. Agents see only stable codes. See [pipeline.md](pipeline.md) (#351) |
 | registry | `OperationRegistry`, `RegistryError`, `ToolInfo`, `RESERVED_ACTION_PREFIX`, `MAX_ARGUMENT_BYTES` | One exact tool name per action. Schemas must pass a keyword allowlist at registration: closed objects, typed arrays, no composition, no `$ref`, and asserted formats (#351) |
+| delegate | `DELEGATE_ACTION`; `OperationRegistry::register_delegate` | Guard's own `guard.delegate` tool: a grant holder obtains a narrower child handle for a subagent. See [grants.md](grants.md#agent-facing-delegation-guarddelegate) (#353) |
 
 ## Traits
 

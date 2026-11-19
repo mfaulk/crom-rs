@@ -5,9 +5,10 @@ use serde_json::Value;
 
 use crate::action::ValidatedArgs;
 use crate::context::ExecutionContext;
+use crate::decision::DenyReason;
 use crate::ids::ActionId;
 use crate::time::Timestamp;
-use crate::traits::{BoxFuture, ExecuteError, ExecutionOutput, GrantStore, ProtectedOperation};
+use crate::traits::{BoxFuture, ExecutionOutput, GrantStore, ProtectedOperation};
 
 /// Tool names Guard keeps for its own operations (e.g. `guard.delegate`,
 /// #353). Application operations cannot register under it.
@@ -31,13 +32,13 @@ pub enum RegistryError {
 }
 
 /// An operation Guard implements itself, with access to the caller's
-/// execution context and the grant store (extension point for
-/// `guard.delegate`, #353). Registered only from inside this crate under
-/// [`RESERVED_ACTION_PREFIX`]. The pipeline runs authentication, schema
-/// validation, the action-in-every-grant check, the decision record, and
-/// the recheck for it, but no resolver or Cedar evaluation: the operation
-/// must enforce its own rules (for delegation, narrowing in the store).
-#[allow(dead_code)] // first implemented by #353
+/// execution context and the grant store (`guard.delegate`, #353).
+/// Registered only from inside this crate under [`RESERVED_ACTION_PREFIX`].
+/// The pipeline runs authentication, schema validation, the
+/// action-in-every-grant check, `check`, the decision record, the recheck,
+/// and the outcome record for it, but no resolver or Cedar evaluation: the
+/// operation enforces its own rules in `check` (decided before the
+/// decision record) and again in `run`.
 pub(crate) trait BuiltinOperation: Send + Sync {
     fn action(&self) -> &ActionId;
     fn description(&self) -> &str;
@@ -45,18 +46,29 @@ pub(crate) trait BuiltinOperation: Send + Sync {
     fn logged_fields(&self) -> &[&'static str] {
         &[]
     }
+    /// The operation's authorization. `Err` is the deny reason recorded in
+    /// the decision record; `run` is then never called.
+    fn check(
+        &self,
+        ctx: &ExecutionContext,
+        args: &ValidatedArgs,
+        now: Timestamp,
+    ) -> Result<(), DenyReason>;
+    /// `now` is the same reading `check` was given, so a rule that passed
+    /// there (e.g. an expiry bound) is applied at the same instant here.
+    /// `Err` means nothing took effect: the outcome record is `blocked` with
+    /// that reason, and the agent sees its code. A panic is `failed`.
     fn run<'a>(
         &'a self,
         ctx: &'a ExecutionContext,
         store: &'a dyn GrantStore,
         args: &'a ValidatedArgs,
         now: Timestamp,
-    ) -> BoxFuture<'a, Result<ExecutionOutput, ExecuteError>>;
+    ) -> BoxFuture<'a, Result<ExecutionOutput, DenyReason>>;
 }
 
 pub(crate) enum OpKind {
     Protected(Arc<dyn ProtectedOperation>),
-    #[allow(dead_code)] // first constructed by #353
     Builtin(Arc<dyn BuiltinOperation>),
 }
 
@@ -145,7 +157,16 @@ impl OperationRegistry {
         self.insert(action, OpKind::Protected(op), validator)
     }
 
-    #[allow(dead_code)] // first used by #353
+    /// Registers Guard's own [`DELEGATE_ACTION`] operation, the agent-facing
+    /// attenuation call (#353, `docs/guard/grants.md`). Call it before
+    /// building `GrantStoreConfig` from [`action_ids`](Self::action_ids), so
+    /// grants may list it.
+    ///
+    /// [`DELEGATE_ACTION`]: crate::DELEGATE_ACTION
+    pub fn register_delegate(&mut self) -> Result<(), RegistryError> {
+        self.register_builtin(Arc::new(crate::delegate::Delegate::new()))
+    }
+
     pub(crate) fn register_builtin(
         &mut self,
         op: Arc<dyn BuiltinOperation>,
