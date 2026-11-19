@@ -8,12 +8,15 @@ description = "Controlled business API, synthetic tenants, and effect ledger for
 publish = false
 
 [dependencies]
+# For support_ops only; the HTTP API and ledger do not use it.
+crom-guard = { path = "../crom-guard" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
+reqwest = { workspace = true }
 
 [dev-dependencies]
-reqwest = { workspace = true }
+jsonschema = { version = "0.61", default-features = false }
 tempfile = { workspace = true }

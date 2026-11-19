@@ -36,6 +36,8 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | audit | `AuditRecord`, `AuditSink`, `AuditReceipt`, `FileAuditSink`, `verify_log`, … | The `guard-audit/v1` fields from §12.1. `FileAuditSink` adds `seq`, `prev_hash` and `hash`, and `verify_log` checks the chain (#352). See [audit.md](audit.md) |
 | time | `Timestamp`, `Clock`, `SystemClock` | Unix milliseconds on Guard's clock |
 | pdp | `CedarPdp`, `Evaluation`, `GrantEvaluation`, `PdpLoadError` | The Cedar PDP (#349): load-time checks, per-grant evaluation, the approval probe, and `ActionDigest::compute`. See [policies.md](policies.md) |
+| resolution | `TimeoutResolver`, `ResolveTimer`; `From<ResolveError> for DenyReason` | Bounds a resolver by a host-supplied timer. A timeout returns `ResolveError::Unavailable`, which maps to `engine_unavailable`. `NotFound` maps to `resource_not_found` (#350) |
+| executor | `ConditionalCall` | The version-condition contract for executors. See [protected-operations.md](protected-operations.md) (#350) |
 
 ## Traits
 
@@ -43,8 +45,8 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 |---|---|---|---|
 | `GrantStore` | yes | `MemoryGrantStore` ([grants.md](grants.md)) | Async: `issue`, `delegate`, `authenticate`, `recheck` (just before execution), and `revoke`, which is scoped to the issuing app |
 | `PolicyDecisionPoint` | yes | `CedarPdp` ([policies.md](policies.md)) | Sync, because evaluation is CPU-only. `authorize` returns a `Decision` and cannot return an error. Engine errors become `Deny` |
-| `ResourceResolver` | no | app code, #350 | Async (`BoxFuture`). Not-found and other-tenant both return the same `ResolveError::NotFound` |
-| `ProtectedOperation` | no | app code, #351, #356 | One `ActionId` per MCP tool. Provides the input schema, resolver, Cedar context, and `execute(AuthorizedAction, CredentialLease)` |
+| `ResourceResolver` | no | app code; reference: `crom_guard_testkit::SupportResolver` (#350) | Async (`BoxFuture`). Not-found and other-tenant both return the same `ResolveError::NotFound`. See [protected-operations.md](protected-operations.md) |
+| `ProtectedOperation` | no | app code; reference: `crom_guard_testkit::support_ops` (#350, #356) | One `ActionId` per MCP tool. Provides the input schema, resolver, Cedar context, and `execute(AuthorizedAction, CredentialLease)`. Executors follow `ConditionalCall` |
 | `CredentialBroker` | no | `FileCredentialBroker`, `EnvCredentialBroker` ([credentials.md](credentials.md)) | Async. Hands out leases. The agent never receives one |
 | `AuditSink` | no | #352 (`ChainedAuditSink` / `FileAuditSink`) | Async. `append` must be durable before it resolves. On `Err`, nothing executes |
 
@@ -72,6 +74,7 @@ Sealed traits produce authority, so implementations outside this crate are rejec
 
 ```sh
 cargo test -p crom-guard          # unit tests, compile_fail doctests, tests/audit.rs (tamper, durability, schema)
+cargo test -p crom-guard-testkit  # business API, ledger, support_ops resolvers and executors
 cargo test -p crom-guard-server   # `crom-guard audit verify` CLI
 scripts/check-guard-deps.sh       # no other crom-* dependency
 # PDP latency on the support set (release build, prints p50/p95/p99)

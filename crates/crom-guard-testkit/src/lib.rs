@@ -5,10 +5,14 @@
 pub mod api;
 pub mod data;
 pub mod ledger;
+pub mod support_ops;
 
 pub use api::{
     ApiCredential, BusinessApi, ErrorBody, RefundRequest, RefundResponse, RunningApi,
-    DECISION_ID_HEADER,
+    DECISION_ID_HEADER, RESOURCE_NOT_FOUND_HEADER,
 };
 pub use data::{canary, seed, Customer, Dataset, Invoice, User};
 pub use ledger::{Effect, Ledger, LedgerEntry, LedgerError};
+pub use support_ops::{
+    operations, SupportAction, SupportConfig, SupportOperation, SupportOpsError, SupportResolver,
+};
