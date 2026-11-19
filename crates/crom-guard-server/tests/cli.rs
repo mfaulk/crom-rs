@@ -261,13 +261,31 @@ fn reference_state(root: &Path) -> std::path::PathBuf {
 fn check_passes_reference_profile() {
     let dir = tempfile::tempdir().unwrap();
     let state = reference_state(dir.path());
-    let out = guard(&[
-        "check",
-        "--config",
-        state.join("guard.toml").to_str().unwrap(),
-        "--crom-settings",
-        example("agent/crom-settings.json").to_str().unwrap(),
-    ]);
+    let crom = dir.path().join("crom");
+    let ws = dir.path().join("workspace");
+    std::fs::create_dir(&crom).unwrap();
+    std::fs::create_dir(&ws).unwrap();
+    std::fs::copy(
+        example("agent/crom-settings.json"),
+        crom.join("settings.json"),
+    )
+    .unwrap();
+    let run = |settings: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_crom-guard"))
+            .args([
+                "check",
+                "--config",
+                state.join("guard.toml").to_str().unwrap(),
+                "--crom-settings",
+                settings.to_str().unwrap(),
+                "--crom-workspace",
+                ws.to_str().unwrap(),
+            ])
+            .env("CROM_CONFIG_HOME", &crom)
+            .output()
+            .unwrap()
+    };
+    let out = run(&crom.join("settings.json"));
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(out.status.code(), Some(0), "{stdout}");
     assert!(
@@ -275,6 +293,13 @@ fn check_passes_reference_profile() {
         "{stdout}"
     );
     assert!(!stdout.contains("adm_cli_"), "{stdout}");
+
+    // The same settings at a path Crom would not read fail.
+    let out = run(&example("agent/crom-settings.json"));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .contains("FAIL: crom-settings"));
 }
 
 /// `check` exits 1 and names the failed check when no agent isolation is declared or the state directory is open to others.

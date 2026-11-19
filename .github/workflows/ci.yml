@@ -390,15 +390,22 @@ jobs:
     name: guard / adversarial (linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      # G13, G14, G18 (#360) run from sandboxed agent Bash and as user
+      # `nobody`; neither may turn into a skip here.
+      CROM_REQUIRE_SANDBOX_TESTS: "1"
+      CROM_REQUIRE_SEPARATE_UID_TESTS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: guard-adversarial
-      # #361: G1–G18 in process, through the reference server, through the
-      # stdlib Python client (runner python3), and without Guard; scored on
-      # the business ledger. Placeholders (#360) are reported as skipped.
+      # #361: G1–G12, G15, G16 in process, through the reference server,
+      # through the stdlib Python client (runner python3), and without
+      # Guard; scored on the business ledger. #360: G13, G14, G18 from agent
+      # Bash (sandbox required, required + network, off, separate uid) and
+      # G17 against `crom-guard check`.
       - name: Guard adversarial scenarios (ledger-scored)
         run: cargo test --locked -p crom-guard-testkit --test guard_adversarial -- --nocapture
       - name: Upload Guard scenario report

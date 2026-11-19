@@ -244,6 +244,8 @@ fn check(args: &[String]) -> ExitCode {
         crom_mcp_config: get("--crom-mcp-config").map(Into::into),
         crom_workspace: get("--crom-workspace").map(Into::into),
         agent_uid,
+        crom_config_dir: None,
+        sandbox_read_paths: None,
     });
     for f in &report.findings {
         let status = if f.passed { "ok" } else { "FAIL" };

@@ -11,7 +11,8 @@
         "url": "http://127.0.0.1:8470/mcp",
         "headers": {
           "Authorization": "Bearer ${CROM_GUARD_HANDLE}"
-        }
+        },
+        "guard": true
       }
     }
   },

@@ -1,8 +1,11 @@
 //! `crom-guard check`: the isolation-profile preflight
 //! (`docs/guard/deployment.md`). It reads files and metadata only: it binds
-//! nothing, runs no agent, and never prints a secret. Crom's settings are
-//! read as plain JSON so this crate stays free of other `crom-*` crates.
+//! nothing, runs no agent, and never prints a secret. Crom's settings, trust
+//! store and sandbox read set are modelled here rather than imported, so this
+//! crate stays free of other `crom-*` crates; `crom-guard-testkit` pins the
+//! copies against Crom's own code.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -13,14 +16,21 @@ use crate::config::{AdminListen, Config};
 #[derive(Debug, Clone, Default)]
 pub struct CheckOptions {
     pub config: PathBuf,
-    /// Crom's settings file for an agent sandboxed by Crom on Guard's uid.
+    /// Crom's user settings file, for an agent sandboxed by Crom on Guard's uid.
     pub crom_settings: Option<PathBuf>,
     /// An MCP config file Crom is started with (`--mcp-config`).
     pub crom_mcp_config: Option<PathBuf>,
     /// The directory Crom's agent works in (read-write inside the sandbox).
+    /// Required with `crom_settings`.
     pub crom_workspace: Option<PathBuf>,
     /// Uid of an agent running under its own user.
     pub agent_uid: Option<u32>,
+    /// Crom's config directory. `None`: resolved from the environment as
+    /// Crom does ([`crom_config_dir`]).
+    pub crom_config_dir: Option<PathBuf>,
+    /// The sandbox's built-in read set. `None`: computed from the
+    /// environment as Crom does ([`sandbox_builtin_read_paths`]).
+    pub sandbox_read_paths: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,13 +51,15 @@ impl Report {
         self.findings.iter().all(|f| f.passed)
     }
 
-    /// Findings that failed, by check id.
+    /// Ids of failed checks, in order, without repeats.
     pub fn failed(&self) -> Vec<&'static str> {
-        self.findings
-            .iter()
-            .filter(|f| !f.passed)
-            .map(|f| f.check)
-            .collect()
+        let mut out: Vec<&'static str> = Vec::new();
+        for f in self.findings.iter().filter(|f| !f.passed) {
+            if !out.contains(&f.check) {
+                out.push(f.check);
+            }
+        }
+        out
     }
 
     fn ok(&mut self, check: &'static str, detail: impl Into<String>) {
@@ -56,6 +68,16 @@ impl Report {
 
     fn fail(&mut self, check: &'static str, detail: impl Into<String>) {
         self.push(check, false, detail);
+    }
+
+    /// One finding: ok with `ok_detail` when `problems` is empty, else a
+    /// failure listing them.
+    fn all(&mut self, check: &'static str, problems: Vec<String>, ok_detail: &str) {
+        if problems.is_empty() {
+            self.ok(check, ok_detail);
+        } else {
+            self.fail(check, problems.join("; "));
+        }
     }
 
     fn push(&mut self, check: &'static str, passed: bool, detail: impl Into<String>) {
@@ -72,16 +94,137 @@ pub fn resolve_user(user: &str) -> Result<u32, String> {
     if let Ok(uid) = user.parse() {
         return Ok(uid);
     }
-    let passwd = std::fs::read_to_string("/etc/passwd").map_err(|e| format!("/etc/passwd: {e}"))?;
-    passwd
-        .lines()
-        .filter_map(|l| {
-            let mut f = l.split(':');
-            Some((f.next()?, f.nth(1)?))
-        })
-        .find(|(name, _)| *name == user)
-        .and_then(|(_, uid)| uid.parse().ok())
+    passwd_field(|name, _| name == user, 2)
+        .and_then(|uid| uid.parse().ok())
         .ok_or_else(|| format!("no user {user:?} in /etc/passwd"))
+}
+
+/// Field `n` of the first `/etc/passwd` entry matching `(name, uid)`.
+fn passwd_field(matches: impl Fn(&str, &str) -> bool, n: usize) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        (f.len() > n && matches(f[0], f[2])).then(|| f[n].to_owned())
+    })
+}
+
+/// The sandbox's built-in read set, mirroring
+/// `crom_tools::sandbox::builtin_read_paths` (pinned by a test there).
+pub fn sandbox_builtin_read_paths() -> Vec<PathBuf> {
+    builtin_read_paths_with(|k| std::env::var_os(k))
+}
+
+const BUILTIN_READ_ROOTS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/etc",
+    "/proc",
+    "/sys/devices/system/cpu",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/nix/store",
+];
+
+fn builtin_read_paths_with(var: impl Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
+    let home = var("HOME").map(PathBuf::from);
+    let env_path = |name: &str, rel: &str| {
+        var(name)
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(rel)))
+            .filter(|p| p.exists())
+    };
+    let mut ro: Vec<PathBuf> = BUILTIN_READ_ROOTS.iter().map(PathBuf::from).collect();
+    if let Some(ch) = env_path("CARGO_HOME", ".cargo") {
+        for sub in ["bin", "registry", "git", "config.toml", "config"] {
+            ro.push(ch.join(sub));
+        }
+    }
+    ro.extend(env_path("RUSTUP_HOME", ".rustup"));
+    if let Some(path) = var("PATH") {
+        for name in ["cargo", "rustc", "rustup"] {
+            if let Some(bin) = std::env::split_paths(&path)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+            {
+                ro.extend(bin.parent().map(Path::to_path_buf));
+                if let Some(dir) = bin
+                    .canonicalize()
+                    .ok()
+                    .and_then(|c| c.parent().map(Path::to_path_buf))
+                {
+                    ro.push(dir);
+                }
+            }
+        }
+    }
+    ro
+}
+
+/// Crom's user config directory, resolved as `crom_core::settings::user_settings_path`
+/// does: `$CROM_CONFIG_HOME` (or legacy `$CODE_AGENT_CONFIG_HOME`), else
+/// `${XDG_CONFIG_HOME:-$HOME/.config}/crom` (or the legacy `code-agent`
+/// directory when only that exists).
+pub fn crom_config_dir() -> Option<PathBuf> {
+    let env = |k: &str| std::env::var(k).ok();
+    if let Some(p) = env("CROM_CONFIG_HOME").or_else(|| env("CODE_AGENT_CONFIG_HOME")) {
+        return Some(PathBuf::from(p));
+    }
+    let parent = env("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    let (new, old) = (parent.join("crom"), parent.join("code-agent"));
+    Some(if !new.exists() && old.is_dir() {
+        old
+    } else {
+        new
+    })
+}
+
+/// Crom's trust store (`crom_core::trust::trust_store_path`; no legacy
+/// directory fallback).
+fn crom_trust_store() -> Option<PathBuf> {
+    let env = |k: &str| std::env::var(k).ok();
+    if let Some(p) = env("CROM_CONFIG_HOME").or_else(|| env("CODE_AGENT_CONFIG_HOME")) {
+        return Some(PathBuf::from(p).join(TRUST_STORE_FILE));
+    }
+    let parent = env("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(parent.join("crom").join(TRUST_STORE_FILE))
+}
+
+const TRUST_STORE_FILE: &str = "trusted-workspaces.json";
+
+/// `p` made absolute against the current directory, with the longest
+/// existing prefix resolved through symlinks.
+fn canon(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    let mut existing = abs.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(c) = existing.canonicalize() {
+            let mut out = c;
+            out.extend(rest.iter().rev());
+            return out;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return abs,
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -128,9 +271,43 @@ mod unix {
                 return r;
             }
         };
-        not_writable_by_others(&mut r, "config-file", &opts.config, euid);
-        guard_files(&mut r, &config, euid);
+        if config.agent.listen.port() == 0 {
+            r.fail(
+                "agent-listen",
+                "agent.listen has port 0: an agent cannot be pointed at a fixed Guard endpoint",
+            );
+        } else {
+            r.ok(
+                "agent-listen",
+                format!("agent endpoint {}", config.agent.listen),
+            );
+        }
+        r.all(
+            "config-file",
+            unsafe_components(&opts.config, euid),
+            "guard.toml and its directories are owned by Guard or root and not writable by others",
+        );
+        let mut policy = unsafe_components(&config.policy.schema, euid);
+        policy.extend(unsafe_components(&config.policy.policies, euid));
+        r.all(
+            "policy-files",
+            policy,
+            "schema, policies and their directories are owned by Guard or root and not \
+             writable by others",
+        );
         let private = private_paths(&config);
+        let mut state = Vec::new();
+        for p in &private {
+            state.extend(unsafe_components(p, euid));
+        }
+        state.dedup();
+        r.all(
+            "state-path",
+            state,
+            "every component of Guard's state paths is owned by Guard or root and not \
+             writable by others",
+        );
+        guard_files(&mut r, &config, euid);
         private_dirs(&mut r, &private, euid);
         admin_listener(&mut r, &config, opts, euid);
 
@@ -146,13 +323,13 @@ mod unix {
             agent_uid(&mut r, uid, euid);
         }
         if let Some(path) = &opts.crom_settings {
-            super::crom::check(&mut r, path, opts, &config, &private);
+            super::crom::check(&mut r, path, opts, &config, &private, euid);
         }
         r
     }
 
-    /// Files and directories an agent must not read, write, or connect to.
-    fn private_paths(c: &Config) -> Vec<PathBuf> {
+    /// Files an agent must not read, write, or connect to.
+    pub(super) fn private_paths(c: &Config) -> Vec<PathBuf> {
         let mut out = vec![c.audit.path.clone()];
         out.extend(c.credentials.file.clone());
         out.extend(c.admin.token_file.clone());
@@ -160,6 +337,54 @@ mod unix {
             out.push(p.clone());
         }
         out
+    }
+
+    /// Every existing component of `p` (as given and fully resolved), up to
+    /// `/`, must be owned by `euid` or root; a component other than a
+    /// symlink must not be group/world-writable unless it is a sticky
+    /// directory. Otherwise another user could replace it after the check.
+    pub(super) fn unsafe_components(p: &Path, euid: u32) -> Vec<String> {
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(p)
+        };
+        let mut out = Vec::new();
+        for path in [abs, canon(p)] {
+            for c in path.ancestors() {
+                let Ok(m) = std::fs::symlink_metadata(c) else {
+                    continue;
+                };
+                let owner_ok = m.uid() == euid || m.uid() == 0;
+                let sticky_dir = m.is_dir() && m.mode() & 0o1000 != 0;
+                let writable = !m.file_type().is_symlink() && m.mode() & 0o022 != 0;
+                if !owner_ok || (writable && !sticky_dir) {
+                    let msg = format!(
+                        "{}: mode {:o} owner {}; must be owned by uid {euid} or root and not \
+                         group/world-writable",
+                        c.display(),
+                        m.mode() & 0o7777,
+                        m.uid()
+                    );
+                    if !out.contains(&msg) {
+                        out.push(msg);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A secret file with a second name could be read through that name.
+    fn single_link(path: &Path) -> Result<(), String> {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.nlink() > 1 => Err(format!(
+                "{}: has {} hard links; a secret file must have exactly one name",
+                path.display(),
+                m.nlink()
+            )),
+            _ => Ok(()),
+        }
     }
 
     fn guard_files(r: &mut Report, c: &Config, euid: u32) {
@@ -171,14 +396,11 @@ mod unix {
             Ok(_) => r.ok("policy", "policies validate against the schema"),
             Err(e) => r.fail("policy", e.to_string()),
         }
-        for p in [&c.policy.schema, &c.policy.policies] {
-            not_writable_by_others(r, "policy-files", p, euid);
-            if let Some(dir) = p.parent() {
-                not_writable_by_others(r, "policy-files", dir, euid);
-            }
-        }
         match &c.credentials.file {
-            Some(path) => match crom_guard::FileCredentialBroker::open(path) {
+            Some(path) => match crom_guard::FileCredentialBroker::open(path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| single_link(path).map(|()| b))
+            {
                 Ok(b) => r.ok(
                     "credentials",
                     format!(
@@ -187,7 +409,7 @@ mod unix {
                         b.credential_ids().len()
                     ),
                 ),
-                Err(e) => r.fail("credentials", e.to_string()),
+                Err(e) => r.fail("credentials", e),
             },
             None => {
                 let vars: Vec<&str> = c.credentials.env.iter().map(|e| e.var.as_str()).collect();
@@ -201,13 +423,17 @@ mod unix {
             }
         }
         let token = match (&c.admin.token_file, &c.admin.token_env) {
-            (Some(p), _) => crate::AdminToken::from_file(p),
-            (None, Some(v)) => crate::AdminToken::from_env(v),
+            (Some(p), _) => crate::AdminToken::from_file(p)
+                .map_err(|e| e.to_string())
+                .and_then(|_| single_link(p)),
+            (None, Some(v)) => crate::AdminToken::from_env(v)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
             (None, None) => unreachable!("validated"),
         };
         match token {
-            Ok(_) => r.ok("admin-token", "admin token loads"),
-            Err(e) => r.fail("admin-token", e.to_string()),
+            Ok(()) => r.ok("admin-token", "admin token loads"),
+            Err(e) => r.fail("admin-token", e),
         }
         let audit = &c.audit.path;
         match std::fs::symlink_metadata(audit) {
@@ -233,12 +459,14 @@ mod unix {
                     m.uid()
                 ),
             ),
-            Ok(_) => match crom_guard::verify_file(audit, &[]) {
+            Ok(_) => match single_link(audit).and_then(|()| {
+                crom_guard::verify_file(audit, &[]).map_err(|e| format!("{}: {e}", audit.display()))
+            }) {
                 Ok(s) => r.ok(
                     "audit-log",
                     format!("chain verifies ({} records)", s.records),
                 ),
-                Err(e) => r.fail("audit-log", format!("{}: {e}", audit.display())),
+                Err(e) => r.fail("audit-log", e),
             },
         }
     }
@@ -334,23 +562,6 @@ mod unix {
         }
     }
 
-    pub(super) fn not_writable_by_others(r: &mut Report, check: &'static str, p: &Path, euid: u32) {
-        match std::fs::metadata(p) {
-            Ok(m) if (m.uid() == euid || m.uid() == 0) && m.mode() & 0o022 == 0 => {}
-            Ok(m) => r.fail(
-                check,
-                format!(
-                    "{}: mode {:o} owner {}; must be owned by Guard or root and not \
-                     group/world-writable",
-                    p.display(),
-                    m.mode() & 0o777,
-                    m.uid()
-                ),
-            ),
-            Err(e) => r.fail(check, format!("{}: {e}", p.display())),
-        }
-    }
-
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn run_as(opts: &CheckOptions, euid: u32) -> Report {
         run(opts, euid)
@@ -358,7 +569,9 @@ mod unix {
 }
 
 /// Checks on Crom's own configuration for an agent sandboxed on Guard's uid.
+#[cfg(unix)]
 mod crom {
+    use super::unix::unsafe_components;
     use super::*;
 
     pub(super) fn check(
@@ -367,18 +580,22 @@ mod crom {
         opts: &CheckOptions,
         config: &Config,
         private: &[PathBuf],
+        euid: u32,
     ) {
-        let settings = match read_json(path) {
-            Ok(v) => v,
-            Err(e) => return r.fail("crom-settings", e),
-        };
-        r.ok("crom-settings", format!("{} parses", path.display()));
         if !cfg!(target_os = "linux") {
             r.fail(
                 "platform",
                 "the Bash sandbox is Linux-only; bypass guarantees do not hold here",
             );
         }
+        let Some(ws) = workspace(r, opts, config, private, euid) else {
+            return;
+        };
+        let config_dir = opts.crom_config_dir.clone().or_else(crom_config_dir);
+        let settings = match settings_file(r, path, config_dir.as_deref(), &ws, euid) {
+            Some(v) => v,
+            None => return,
+        };
         let sandbox = &settings["sandbox"];
         match sandbox["mode"].as_str() {
             Some("required") => r.ok("sandbox-mode", "sandbox.mode = \"required\""),
@@ -398,7 +615,17 @@ mod crom {
         } else {
             r.ok("sandbox-network", "agent Bash has no network");
         }
-        read_paths(r, sandbox, opts, private);
+        let read_paths: Vec<PathBuf> = sandbox["read_paths"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        read_path_entries(r, &read_paths, &ws, euid);
+        exposure(r, opts, &read_paths, private);
         env_allow(r, sandbox, config);
 
         let mut servers = Vec::new();
@@ -410,6 +637,15 @@ mod crom {
             files.push(PathBuf::from(f));
         }
         for f in files {
+            if canon(&f).starts_with(&ws) {
+                r.fail(
+                    "mcp-servers",
+                    format!("{}: MCP config inside the agent's workspace", f.display()),
+                );
+            }
+            for p in unsafe_components(&f, euid) {
+                r.fail("mcp-servers", p);
+            }
             match read_json(&f) {
                 Ok(v) => {
                     if let Some(Value::Object(m)) = v.get("mcpServers") {
@@ -446,48 +682,213 @@ mod crom {
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    fn absolute(p: &Path) -> PathBuf {
-        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    /// Guard's home directory: its `/etc/passwd` entry, else `$HOME`.
+    fn guard_home(euid: u32) -> Option<PathBuf> {
+        passwd_field(|_, uid| uid == euid.to_string(), 5)
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
     }
 
-    /// True when either path contains the other.
-    fn overlaps(a: &Path, b: &Path) -> bool {
-        let (a, b) = (absolute(a), absolute(b));
-        a.starts_with(&b) || b.starts_with(&a)
+    /// The agent's workspace (required): it exists, is not trusted by Crom
+    /// (a trusted `.agent/settings.json` or `.agent/mcp.json` could add
+    /// servers and allow rules), and the sandbox's read-write grant on it
+    /// reaches none of Guard's files, Guard's home, or Crom's own config.
+    fn workspace(
+        r: &mut Report,
+        opts: &CheckOptions,
+        config: &Config,
+        private: &[PathBuf],
+        euid: u32,
+    ) -> Option<PathBuf> {
+        let Some(given) = &opts.crom_workspace else {
+            r.fail(
+                "crom-workspace",
+                "--crom-workspace is required with --crom-settings: the sandbox makes the \
+                 workspace read-write",
+            );
+            return None;
+        };
+        let ws = match given.canonicalize() {
+            Ok(w) => w,
+            Err(e) => {
+                r.fail("crom-workspace", format!("{}: {e}", given.display()));
+                return None;
+            }
+        };
+        let mut problems = Vec::new();
+        let store = match &opts.crom_config_dir {
+            Some(d) => Some(d.join(TRUST_STORE_FILE)),
+            None => crom_trust_store(),
+        };
+        if let Some(store) = store {
+            let trusted = std::fs::read(&store)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|v| v["workspaces"].as_array().cloned())
+                .unwrap_or_default();
+            if trusted
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|p| Path::new(p) == ws)
+            {
+                problems.push(format!(
+                    "{} is trusted in {}; its .agent/settings.json and .agent/mcp.json \
+                     would apply (crom trust --revoke)",
+                    ws.display(),
+                    store.display()
+                ));
+            }
+        }
+        // Either containing the other is unsafe for these.
+        let mut two_way: Vec<PathBuf> = private.iter().map(|p| canon(p)).collect();
+        two_way.extend(
+            private
+                .iter()
+                .filter_map(|p| canon(p).parent().map(Path::to_path_buf)),
+        );
+        for p in [&opts.config, &config.policy.schema, &config.policy.policies] {
+            two_way.extend(canon(p).parent().map(Path::to_path_buf));
+        }
+        let config_dir = opts.crom_config_dir.clone().or_else(crom_config_dir);
+        two_way.extend(config_dir.map(|d| canon(&d)));
+        for g in two_way {
+            if g.starts_with(&ws) || ws.starts_with(&g) {
+                problems.push(format!(
+                    "the agent workspace {} (read-write in the sandbox) overlaps {}",
+                    ws.display(),
+                    g.display()
+                ));
+            }
+        }
+        if let Some(home) = guard_home(euid).map(|h| canon(&h)) {
+            if home.starts_with(&ws) {
+                problems.push(format!(
+                    "the agent workspace {} contains Guard's home {}",
+                    ws.display(),
+                    home.display()
+                ));
+            }
+        }
+        r.all(
+            "crom-workspace",
+            problems,
+            "the workspace is untrusted and reaches none of Guard's files",
+        );
+        Some(ws)
     }
 
-    fn read_paths(r: &mut Report, sandbox: &Value, opts: &CheckOptions, private: &[PathBuf]) {
+    /// The settings file must be the one Crom reads (its user settings
+    /// path), owned safely, and outside the workspace.
+    fn settings_file(
+        r: &mut Report,
+        path: &Path,
+        config_dir: Option<&Path>,
+        ws: &Path,
+        euid: u32,
+    ) -> Option<Value> {
+        let settings = match read_json(path) {
+            Ok(v) => v,
+            Err(e) => {
+                r.fail("crom-settings", e);
+                return None;
+            }
+        };
+        let mut problems = unsafe_components(path, euid);
+        let given = canon(path);
+        match config_dir.map(|d| canon(&d.join("settings.json"))) {
+            Some(expected) if expected == given => {}
+            Some(expected) => problems.push(format!(
+                "{} is not Crom's user settings file {}; check the file Crom will read \
+                 (CROM_CONFIG_HOME / XDG_CONFIG_HOME / HOME as the agent sees them)",
+                path.display(),
+                expected.display()
+            )),
+            None => problems.push("cannot resolve Crom's config directory".into()),
+        }
+        if given.starts_with(ws) {
+            problems.push(format!(
+                "{} is inside the agent's workspace",
+                path.display()
+            ));
+        }
+        r.all("crom-settings", problems, "Crom's user settings file");
+        Some(settings)
+    }
+
+    /// Crom re-resolves `read_paths` on every Bash call, following
+    /// symlinks, so each entry must be a real path no one but Guard or root
+    /// can change.
+    fn read_path_entries(r: &mut Report, entries: &[PathBuf], ws: &Path, euid: u32) {
+        let mut problems = Vec::new();
+        for p in entries {
+            match std::fs::symlink_metadata(p) {
+                Err(e) => problems.push(format!("sandbox.read_paths {}: {e}", p.display())),
+                Ok(m) if m.file_type().is_symlink() => {
+                    problems.push(format!("sandbox.read_paths {} is a symlink", p.display()))
+                }
+                Ok(_) => {}
+            }
+            if !p.is_absolute() {
+                problems.push(format!("sandbox.read_paths {} is relative", p.display()));
+            }
+            if canon(p).starts_with(ws) {
+                problems.push(format!(
+                    "sandbox.read_paths {} is inside the agent's workspace",
+                    p.display()
+                ));
+            }
+            problems.extend(
+                unsafe_components(p, euid)
+                    .into_iter()
+                    .map(|m| format!("sandbox.read_paths {}: {m}", p.display())),
+            );
+        }
+        r.all(
+            "sandbox-read-paths",
+            problems,
+            "every sandbox.read_paths entry is a fixed path only Guard or root can change",
+        );
+    }
+
+    /// Nothing the sandbox can read (built-in set or `read_paths`) covers
+    /// Guard's secret files or the directories holding them.
+    fn exposure(r: &mut Report, opts: &CheckOptions, read_paths: &[PathBuf], private: &[PathBuf]) {
+        let builtin = opts
+            .sandbox_read_paths
+            .clone()
+            .unwrap_or_else(sandbox_builtin_read_paths);
+        let secrets: Vec<PathBuf> = private.iter().map(|p| canon(p)).collect();
         let mut exposed = Vec::new();
-        let extra = sandbox["read_paths"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        for p in extra.iter().filter_map(Value::as_str) {
-            for g in private {
-                if overlaps(Path::new(p), g) {
+        for root in &builtin {
+            let root = canon(root);
+            for s in &secrets {
+                if s.starts_with(&root) {
                     exposed.push(format!(
-                        "sandbox.read_paths entry {p} exposes {}",
-                        g.display()
+                        "{} is under {}, which the sandbox always lets Bash read",
+                        s.display(),
+                        root.display()
                     ));
                 }
             }
         }
-        if let Some(ws) = &opts.crom_workspace {
-            for g in private {
-                if overlaps(ws, g) {
+        for p in read_paths {
+            let root = canon(p);
+            for s in &secrets {
+                let dir = s.parent().unwrap_or(s);
+                if s.starts_with(&root) || root.starts_with(dir) {
                     exposed.push(format!(
-                        "the agent workspace {} (read-write) overlaps {}",
-                        ws.display(),
-                        g.display()
+                        "sandbox.read_paths entry {} exposes {}",
+                        p.display(),
+                        s.display()
                     ));
                 }
             }
         }
-        if exposed.is_empty() {
-            r.ok("sandbox-paths", "no sandbox path reaches Guard's state");
-        } else {
-            r.fail("sandbox-paths", exposed.join("; "));
-        }
+        r.all(
+            "sandbox-paths",
+            exposed,
+            "no sandbox read path reaches Guard's state",
+        );
     }
 
     fn env_allow(r: &mut Report, sandbox: &Value, config: &Config) {
@@ -522,8 +923,8 @@ mod crom {
         }
     }
 
-    /// Exactly one MCP server, Streamable HTTP, at Guard's agent endpoint.
-    /// Returns its name when that holds.
+    /// Exactly one MCP server: Streamable HTTP, `guard: true`, at Guard's
+    /// agent endpoint. Returns its name when that holds.
     fn mcp_servers(r: &mut Report, servers: &[(String, Value)], config: &Config) -> Option<String> {
         let [(name, server)] = servers else {
             let names: Vec<&str> = servers.iter().map(|(n, _)| n.as_str()).collect();
@@ -542,6 +943,13 @@ mod crom {
             r.fail(
                 "mcp-servers",
                 format!("MCP server {name:?} has type {kind:?}; only Guard over http is allowed"),
+            );
+            return None;
+        }
+        if server["guard"].as_bool() != Some(true) {
+            r.fail(
+                "mcp-servers",
+                format!("MCP server {name:?} is not marked \"guard\": true (docs/sdk/guard.md)"),
             );
             return None;
         }
@@ -580,8 +988,10 @@ mod crom {
             || host
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback());
-        let port_ok = listen.port() == 0 || port.parse() == Ok(listen.port());
-        loopback && port_ok && listen.ip().is_loopback()
+        listen.port() != 0
+            && port.parse() == Ok(listen.port())
+            && loopback
+            && listen.ip().is_loopback()
     }
 
     fn allow_rule(r: &mut Report, settings: &Value, server: &str) {
@@ -621,6 +1031,7 @@ mod tests {
 
     struct Fixture {
         dir: tempfile::TempDir,
+        state: PathBuf,
         opts: CheckOptions,
     }
 
@@ -639,21 +1050,22 @@ mod tests {
             "mcp": {"enabled": true, "servers": {"guard": {
                 "type": "http",
                 "url": "http://127.0.0.1:8470/mcp",
-                "headers": {"Authorization": "Bearer ${CROM_GUARD_HANDLE}"}
+                "headers": {"Authorization": "Bearer ${CROM_GUARD_HANDLE}"},
+                "guard": true
             }}},
             "plugins": {"allow_plugin_mcp": false},
             "allowed_tools": ["mcp__guard__*"]
         })
     }
 
-    /// The reference isolation profile: a 0700 state directory with the
-    /// support config, and a Crom agent sandboxed on Guard's uid.
-    fn fixture() -> Fixture {
+    /// The reference isolation profile: Guard's state in `<tmp>/<parent>/state`
+    /// (0700), Crom's config in `<tmp>/crom`, the workspace in
+    /// `<tmp>/workspace`, and the sandbox reading only `/usr` and `/etc`.
+    fn fixture_at(parent: &str) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("state");
-        std::fs::create_dir(&state).unwrap();
+        let state = dir.path().join(parent).join("state");
+        std::fs::create_dir_all(state.join("policies")).unwrap();
         mode(&state, 0o700);
-        std::fs::create_dir(state.join("policies")).unwrap();
         write(&state.join("policies/support.cedarschema"), SCHEMA, 0o644);
         write(&state.join("policies/support.cedar"), POLICIES, 0o644);
         write(
@@ -667,22 +1079,29 @@ mod tests {
             r#"{"credentials": [{"id": "business-api", "secret": "sk-x", "actions": ["refund.issue"]}]}"#,
             0o600,
         );
-        let settings_path = dir.path().join("settings.json");
-        std::fs::write(&settings_path, settings().to_string()).unwrap();
+        let crom = dir.path().join("crom");
+        std::fs::create_dir(&crom).unwrap();
+        std::fs::write(crom.join("settings.json"), settings().to_string()).unwrap();
         let ws = dir.path().join("workspace");
         std::fs::create_dir(&ws).unwrap();
         let opts = CheckOptions {
             config: state.join("guard.toml"),
-            crom_settings: Some(settings_path),
+            crom_settings: Some(crom.join("settings.json")),
             crom_workspace: Some(ws),
+            crom_config_dir: Some(crom),
+            sandbox_read_paths: Some(vec!["/usr".into(), "/etc".into()]),
             ..CheckOptions::default()
         };
-        Fixture { dir, opts }
+        Fixture { dir, state, opts }
+    }
+
+    fn fixture() -> Fixture {
+        fixture_at("srv")
     }
 
     impl Fixture {
         fn state(&self) -> PathBuf {
-            self.dir.path().join("state")
+            self.state.clone()
         }
 
         fn run(&self) -> Report {
@@ -693,12 +1112,16 @@ mod tests {
             std::fs::write(self.opts.crom_settings.as_ref().unwrap(), v.to_string()).unwrap();
         }
 
+        fn set_config(&self, from: &str, to: &str) {
+            let text = std::fs::read_to_string(&self.opts.config).unwrap();
+            assert!(text.contains(from), "{from}");
+            std::fs::write(&self.opts.config, text.replace(from, to)).unwrap();
+        }
+
         /// Asserts that exactly the `expected` checks fail.
         fn fails_with(&self, expected: &[&str]) {
             let r = self.run();
-            let mut failed = r.failed();
-            failed.dedup();
-            assert_eq!(failed, expected, "{:#?}", r.findings);
+            assert_eq!(r.failed(), expected, "{:#?}", r.findings);
         }
     }
 
@@ -706,6 +1129,15 @@ mod tests {
     #[test]
     fn reference_profile_passes() {
         let f = fixture();
+        let r = f.run();
+        assert!(r.passed(), "{:#?}", r.findings);
+    }
+
+    /// The reference profile also passes with the sandbox read set computed from this environment.
+    #[test]
+    fn reference_profile_passes_with_computed_read_set() {
+        let mut f = fixture();
+        f.opts.sandbox_read_paths = None;
         let r = f.run();
         assert!(r.passed(), "{:#?}", r.findings);
     }
@@ -726,12 +1158,44 @@ mod tests {
         f.fails_with(&["config"]);
     }
 
+    /// An agent endpoint on port 0 fails `agent-listen`, and no MCP URL matches it.
+    #[test]
+    fn agent_port_zero_fails() {
+        let f = fixture();
+        f.set_config("listen = \"127.0.0.1:8470\"", "listen = \"127.0.0.1:0\"");
+        f.fails_with(&["agent-listen", "mcp-servers"]);
+    }
+
     /// A group-writable config file fails `config-file`.
     #[test]
     fn writable_config_file_fails() {
         let f = fixture();
         mode(&f.opts.config, 0o664);
         f.fails_with(&["config-file"]);
+    }
+
+    /// A non-sticky world-writable ancestor of Guard's state fails `config-file`, `policy-files` and `state-path`; a sticky one passes.
+    #[test]
+    fn writable_ancestor_fails_unless_sticky() {
+        let f = fixture();
+        let srv = f.dir.path().join("srv");
+        mode(&srv, 0o777);
+        f.fails_with(&["config-file", "policy-files", "state-path"]);
+        mode(&srv, 0o1777);
+        f.fails_with(&[]);
+    }
+
+    /// A symlinked state directory is checked along its resolved path too.
+    #[test]
+    fn symlinked_state_is_resolved() {
+        let f = fixture();
+        let open = f.dir.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::rename(f.state(), open.join("state")).unwrap();
+        std::os::unix::fs::symlink(open.join("state"), f.state()).unwrap();
+        f.fails_with(&[]);
+        mode(&open, 0o777);
+        f.fails_with(&["config-file", "policy-files", "state-path"]);
     }
 
     /// A policy set that does not validate against the schema fails `policy`.
@@ -762,15 +1226,26 @@ mod tests {
         f.fails_with(&["credentials"]);
     }
 
+    /// A credentials file with a second hard link fails `credentials`.
+    #[test]
+    fn hard_linked_credentials_fail() {
+        let f = fixture();
+        std::fs::hard_link(
+            f.state().join("credentials.json"),
+            f.dir.path().join("copy.json"),
+        )
+        .unwrap();
+        f.fails_with(&["credentials"]);
+    }
+
     /// An env credential whose variable is unset fails `credentials`.
     #[test]
     fn missing_env_credential_fails() {
         let f = fixture();
-        let text = std::fs::read_to_string(&f.opts.config).unwrap().replace(
+        f.set_config(
             "[credentials]\nfile = \"credentials.json\"",
             "[[credentials.env]]\nid = \"business-api\"\nvar = \"CROM_GUARD_CHECK_TEST_UNSET\"\nactions = [\"refund.issue\"]",
         );
-        std::fs::write(&f.opts.config, text).unwrap();
         f.fails_with(&["credentials"]);
     }
 
@@ -813,10 +1288,7 @@ mod tests {
     #[test]
     fn tcp_admin_with_separate_uid_fails() {
         let mut f = fixture();
-        let text = std::fs::read_to_string(&f.opts.config)
-            .unwrap()
-            .replace("unix:admin.sock", "127.0.0.1:8471");
-        std::fs::write(&f.opts.config, text).unwrap();
+        f.set_config("unix:admin.sock", "127.0.0.1:8471");
         let r = f.run();
         assert!(
             r.passed(),
@@ -858,6 +1330,74 @@ mod tests {
         f.fails_with(&["crom-settings"]);
     }
 
+    /// A settings file other than Crom's user settings path fails `crom-settings`.
+    #[test]
+    fn settings_outside_crom_config_dir_fail() {
+        let mut f = fixture();
+        let other = f.dir.path().join("other.json");
+        std::fs::write(&other, settings().to_string()).unwrap();
+        f.opts.crom_settings = Some(other);
+        f.fails_with(&["crom-settings"]);
+    }
+
+    /// Omitting `--crom-workspace` with `--crom-settings` fails `crom-workspace`.
+    #[test]
+    fn workspace_is_required() {
+        let mut f = fixture();
+        f.opts.crom_workspace = None;
+        f.fails_with(&["crom-workspace"]);
+    }
+
+    /// A workspace containing Guard's state, inside it, or containing Crom's config fails `crom-workspace`.
+    #[test]
+    fn workspace_overlap_fails() {
+        let mut f = fixture();
+        for ws in [
+            f.dir.path().to_path_buf(),
+            f.dir.path().join("srv"),
+            f.state().join("policies"),
+        ] {
+            f.opts.crom_workspace = Some(ws.clone());
+            let r = f.run();
+            assert!(
+                r.failed().contains(&"crom-workspace"),
+                "{ws:?}: {:#?}",
+                r.findings
+            );
+        }
+        f.opts.crom_workspace = Some(f.dir.path().join("crom"));
+        let r = f.run();
+        assert!(r.failed().contains(&"crom-workspace"), "{:#?}", r.findings);
+    }
+
+    /// A workspace that is an ancestor of Guard's home fails `crom-workspace`.
+    #[test]
+    fn workspace_containing_guard_home_fails() {
+        let mut f = fixture();
+        f.opts.crom_workspace = Some("/".into());
+        let r = f.run();
+        assert!(r.failed().contains(&"crom-workspace"), "{:#?}", r.findings);
+    }
+
+    /// A workspace Crom trusts fails `crom-workspace`.
+    #[test]
+    fn trusted_workspace_fails() {
+        let f = fixture();
+        let ws = f
+            .opts
+            .crom_workspace
+            .clone()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            f.dir.path().join("crom").join(TRUST_STORE_FILE),
+            json!({"workspaces": [ws]}).to_string(),
+        )
+        .unwrap();
+        f.fails_with(&["crom-workspace"]);
+    }
+
     /// A sandbox mode other than `required` (including unset) fails `sandbox-mode`.
     #[test]
     fn sandbox_not_required_fails() {
@@ -881,33 +1421,88 @@ mod tests {
         f.fails_with(&["sandbox-network"]);
     }
 
+    /// Guard state under a built-in sandbox read root (an /etc-like root) fails `sandbox-paths`.
+    #[test]
+    fn state_under_builtin_root_fails() {
+        let mut f = fixture_at("etc");
+        f.opts.sandbox_read_paths = Some(vec!["/usr".into(), f.dir.path().join("etc")]);
+        f.fails_with(&["sandbox-paths"]);
+    }
+
+    /// Guard state under `$CARGO_HOME/registry`, which the sandbox reads, fails `sandbox-paths`.
+    #[test]
+    fn state_under_cargo_home_fails() {
+        let mut f = fixture_at("cargo/registry");
+        let cargo = f.dir.path().join("cargo");
+        let read = builtin_read_paths_with(|k| match k {
+            "CARGO_HOME" => Some(cargo.clone().into_os_string()),
+            _ => None,
+        });
+        assert!(read.contains(&cargo.join("registry")), "{read:?}");
+        f.opts.sandbox_read_paths = Some(read);
+        f.fails_with(&["sandbox-paths"]);
+    }
+
     /// A sandbox read path covering Guard's state directory fails `sandbox-paths`.
     #[test]
     fn read_path_over_state_fails() {
         let f = fixture();
         let mut s = settings();
-        s["sandbox"]["read_paths"] = json!([f.dir.path()]);
+        s["sandbox"]["read_paths"] = json!([f.dir.path().join("srv")]);
         f.set_settings(s);
         f.fails_with(&["sandbox-paths"]);
     }
 
-    /// An agent workspace that contains Guard's state directory fails `sandbox-paths`.
+    /// A safe, Guard-owned read path passes.
     #[test]
-    fn workspace_over_state_fails() {
-        let mut f = fixture();
-        f.opts.crom_workspace = Some(f.dir.path().to_path_buf());
-        f.fails_with(&["sandbox-paths"]);
+    fn safe_read_path_passes() {
+        let f = fixture();
+        let data = f.dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let mut s = settings();
+        s["sandbox"]["read_paths"] = json!([data]);
+        f.set_settings(s);
+        f.fails_with(&[]);
+    }
+
+    /// A read path that is missing, a symlink, relative, inside the workspace, or under a writable directory fails `sandbox-read-paths`.
+    #[test]
+    fn unsafe_read_paths_fail() {
+        let f = fixture();
+        let open = f.dir.path().join("open");
+        std::fs::create_dir_all(open.join("data")).unwrap();
+        mode(&open, 0o777);
+        let link = f.dir.path().join("link");
+        std::os::unix::fs::symlink(f.dir.path().join("crom"), &link).unwrap();
+        let in_ws = f.opts.crom_workspace.clone().unwrap().join("d");
+        std::fs::create_dir(&in_ws).unwrap();
+        for p in [
+            json!(f.dir.path().join("missing")),
+            json!(link),
+            json!("relative/dir"),
+            json!(in_ws),
+            json!(open.join("data")),
+        ] {
+            let mut s = settings();
+            s["sandbox"]["read_paths"] = json!([p.clone()]);
+            f.set_settings(s);
+            let r = f.run();
+            assert!(
+                r.failed().contains(&"sandbox-read-paths"),
+                "{p}: {:#?}",
+                r.findings
+            );
+        }
     }
 
     /// Passing Guard's admin-token variable into the sandbox fails `sandbox-env`.
     #[test]
     fn env_allow_of_guard_secret_fails() {
         let f = fixture();
-        let text = std::fs::read_to_string(&f.opts.config).unwrap().replace(
+        f.set_config(
             "token_file = \"admin.token\"",
             "token_env = \"CROM_GUARD_CHECK_TOKEN\"",
         );
-        std::fs::write(&f.opts.config, text).unwrap();
         let mut s = settings();
         s["sandbox"]["env_allow"] = json!(["CROM_GUARD_CHECK_TOKEN"]);
         f.set_settings(s);
@@ -936,12 +1531,35 @@ mod tests {
         f.fails_with(&["mcp-servers"]);
     }
 
+    /// An MCP config file inside the agent's workspace fails `mcp-servers`.
+    #[test]
+    fn mcp_config_in_workspace_fails() {
+        let mut f = fixture();
+        let file = f.opts.crom_workspace.clone().unwrap().join("mcp.json");
+        std::fs::write(&file, json!({"mcpServers": {}}).to_string()).unwrap();
+        f.opts.crom_mcp_config = Some(file);
+        f.fails_with(&["mcp-servers"]);
+    }
+
     /// A stdio MCP server, even as the only one, fails `mcp-servers`.
     #[test]
     fn stdio_server_fails() {
         let f = fixture();
         let mut s = settings();
         s["mcp"]["servers"] = json!({"guard": {"type": "stdio", "command": "crom-guard"}});
+        f.set_settings(s);
+        f.fails_with(&["mcp-servers"]);
+    }
+
+    /// A Guard server not marked `"guard": true` fails `mcp-servers`.
+    #[test]
+    fn unmarked_guard_server_fails() {
+        let f = fixture();
+        let mut s = settings();
+        s["mcp"]["servers"]["guard"]
+            .as_object_mut()
+            .unwrap()
+            .remove("guard");
         f.set_settings(s);
         f.fails_with(&["mcp-servers"]);
     }

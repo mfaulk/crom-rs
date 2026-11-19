@@ -135,4 +135,4 @@ cargo test -p crom-guard-testkit
 - `DirectEnv`: the unguarded baseline, a direct business-API tool holding the full credential;
 - the driver adds the reference server, and the server with the Python client.
 
-G13, G14, G17 and G18 are placeholders for #360 (OS isolation and client preflight): they are reported as skipped, never as passing. The fixture format, probes, verdicts and `report.json` schema are in [docs/guard/scenarios.md](../../docs/guard/scenarios.md).
+G13, G14 and G18 run from agent Bash in the Linux isolation lanes (sandbox required, required with network, off, and a separate uid; harness in `tests/isolation/mod.rs`), and G17 against `crom-guard check` (#360). A lane that cannot run is reported as skipped, never as passing. The fixture format, probes, verdicts and `report.json` schema are in [docs/guard/scenarios.md](../../docs/guard/scenarios.md).

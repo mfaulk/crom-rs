@@ -78,6 +78,10 @@ pub struct Fixture {
     /// as skipped with the reason, never as passing.
     #[serde(default)]
     pub placeholder: Option<Placeholder>,
+    /// Set for the OS-isolation and preflight scenarios (#360): attacks run
+    /// from agent Bash, or against `crom-guard check`, instead of `steps`.
+    #[serde(default)]
+    pub isolation: Option<Isolation>,
     /// Without Guard (the direct-credential baseline), at least one attack
     /// must execute. False when the vector does not exist without Guard.
     #[serde(default)]
@@ -97,6 +101,14 @@ pub struct Fixture {
     /// `LedgerEntry` objects. Empty means none.
     #[serde(default)]
     pub expected_ledger_effects: Vec<serde_json::Map<String, Value>>,
+}
+
+/// Attacks by name, run by `tests/isolation/mod.rs` (Bash attacks) or
+/// against `crom-guard check` (preflight attacks).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Isolation {
+    pub attacks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -210,7 +222,10 @@ impl Fixture {
     }
 
     pub fn attacks(&self) -> usize {
-        self.steps.iter().filter(|s| s.attack).count()
+        match &self.isolation {
+            Some(i) => i.attacks.len(),
+            None => self.steps.iter().filter(|s| s.attack).count(),
+        }
     }
 
     /// Tenant of the `parent` grant.
@@ -238,11 +253,34 @@ pub enum Mode {
     GuardPythonClient,
     /// No Guard: the agent's tool holds the full business-API credential.
     GuardOff,
+    /// Guard in its own process; agent Bash with `sandbox.mode = required`
+    /// and no network (the isolation profile).
+    SandboxRequired,
+    /// As `SandboxRequired` with network granted: the negative control
+    /// (outside the profile; the business API's 401 is the only control).
+    SandboxRequiredNetwork,
+    /// Agent Bash unsandboxed on Guard's uid: the probes must fire.
+    SandboxOff,
+    /// Agent Bash as another uid (`nobody`), no sandbox.
+    SeparateUid,
+    /// `crom-guard check` on an agent configuration.
+    Preflight,
 }
 
 impl Mode {
     pub fn uses_guard(self) -> bool {
         self != Self::GuardOff
+    }
+
+    /// Lanes whose isolation must hold (`executed = 0`).
+    pub fn isolated(self) -> bool {
+        matches!(
+            self,
+            Self::SandboxRequired
+                | Self::SandboxRequiredNetwork
+                | Self::SeparateUid
+                | Self::Preflight
+        )
     }
 }
 
@@ -317,6 +355,11 @@ pub enum StepVerdict {
     /// No probe fired, without a Guard decision (e.g. the baseline API
     /// returned 404, or the transport rejected the request).
     NoEffect,
+    /// The OS refused the step (Crom's sandbox, or a separate uid's
+    /// permissions) and no probe fired.
+    BlockedBySandbox,
+    /// `crom-guard check` refused the configuration.
+    BlockedByPreflight,
     /// A probe fired.
     Executed,
 }
@@ -372,8 +415,10 @@ pub struct ScenarioReport {
     pub planned_attacks: usize,
     pub attempted: usize,
     pub blocked_by_guard: usize,
-    /// Always 0 here; kept for parity with the M17 report.
+    /// Stopped by OS isolation (the isolation lanes only).
     pub blocked_by_sandbox: usize,
+    /// Refused by `crom-guard check` (the preflight lane only).
+    pub blocked_by_preflight: usize,
     pub no_effect: usize,
     /// Attacks a probe saw take effect. Must be 0 with Guard.
     pub executed: usize,
@@ -404,25 +449,29 @@ impl SuiteReport {
 
     pub fn to_markdown(&self) -> String {
         let mut out = String::from(
-            "| scenario | mode | attempted | blocked (guard) | executed | legit | ledger oracle | audit verify |\n\
-             |---|---|---|---|---|---|---|---|\n",
+            "| scenario | mode | attempted | blocked (guard) | blocked (isolation) | executed | legit | ledger oracle | audit verify |\n\
+             |---|---|---|---|---|---|---|---|---|\n",
         );
         for r in &self.scenarios {
             let mode = serde_json::to_value(r.mode).unwrap();
             let mode = mode.as_str().unwrap_or_default();
             if let Status::Skipped = r.status {
                 out.push_str(&format!(
-                    "| {} | {mode} | skipped: {} | | | | | |\n",
+                    "| {} | {mode} | skipped: {} | | | | | | |\n",
                     r.scenario,
-                    r.tracking_issue.as_deref().unwrap_or("")
+                    r.tracking_issue
+                        .as_deref()
+                        .or(r.skip_reason.as_deref())
+                        .unwrap_or("")
                 ));
                 continue;
             }
             out.push_str(&format!(
-                "| {} | {mode} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {mode} | {} | {} | {} | {} | {} | {} | {} |\n",
                 r.scenario,
                 r.attempted,
                 r.blocked_by_guard,
+                r.blocked_by_sandbox + r.blocked_by_preflight,
                 r.executed,
                 if r.legit_success { "pass" } else { "fail" },
                 if r.ledger.matches_expected {
@@ -455,6 +504,7 @@ pub fn skipped(fx: &Fixture, mode: Mode, reason: &str, issue: Option<&str>) -> S
         attempted: 0,
         blocked_by_guard: 0,
         blocked_by_sandbox: 0,
+        blocked_by_preflight: 0,
         no_effect: 0,
         executed: 0,
         legit_success: false,
@@ -465,6 +515,34 @@ pub fn skipped(fx: &Fixture, mode: Mode, reason: &str, issue: Option<&str>) -> S
         notes: Vec::new(),
         steps: Vec::new(),
     }
+}
+
+/// The report for an isolation or preflight lane (#360), from its attack
+/// steps. Every planned attack is attempted. Isolation lanes have no
+/// legitimate subtask, so `legit_success` is true.
+pub fn isolation_report(
+    fx: &Fixture,
+    mode: Mode,
+    steps: Vec<StepReport>,
+    ledger: LedgerReport,
+    audit: AuditReport,
+    notes: Vec<String>,
+) -> ScenarioReport {
+    let mut r = skipped(fx, mode, "", None);
+    r.status = Status::Ran;
+    r.skip_reason = None;
+    let count = |v: StepVerdict| steps.iter().filter(|s| s.verdict == Some(v)).count();
+    r.attempted = steps.len();
+    r.blocked_by_sandbox = count(StepVerdict::BlockedBySandbox);
+    r.blocked_by_preflight = count(StepVerdict::BlockedByPreflight);
+    r.no_effect = count(StepVerdict::NoEffect);
+    r.executed = count(StepVerdict::Executed);
+    r.legit_success = true;
+    r.ledger = ledger;
+    r.audit = audit;
+    r.notes = notes;
+    r.steps = steps;
+    r
 }
 
 /// Canary prefixes of every tenant other than `tenant`.
@@ -580,6 +658,11 @@ pub fn unmediated_effects(ledger: &[LedgerEntry], records: &[AuditRecord]) -> Ve
 /// Runs one fixture in `env`. Panics on a malformed fixture.
 pub async fn run<E: ScenarioEnv>(fx: &Fixture, env: &E) -> ScenarioReport {
     assert!(fx.placeholder.is_none(), "{} is a placeholder", fx.scenario);
+    assert!(
+        fx.isolation.is_none(),
+        "{} is an isolation scenario",
+        fx.scenario
+    );
     let mode = env.mode();
     let mut report = skipped(fx, mode, "", None);
     report.status = Status::Ran;
@@ -890,6 +973,8 @@ pub async fn run<E: ScenarioEnv>(fx: &Fixture, env: &E) -> ScenarioReport {
     let count = |v: StepVerdict| report.steps.iter().filter(|s| s.verdict == Some(v)).count();
     report.attempted = report.planned_attacks - count(StepVerdict::NotAttempted);
     report.blocked_by_guard = count(StepVerdict::BlockedByGuard);
+    report.blocked_by_sandbox = count(StepVerdict::BlockedBySandbox);
+    report.blocked_by_preflight = count(StepVerdict::BlockedByPreflight);
     report.no_effect = count(StepVerdict::NoEffect);
     report.executed = count(StepVerdict::Executed);
     report.legit_success = legit_ok;
