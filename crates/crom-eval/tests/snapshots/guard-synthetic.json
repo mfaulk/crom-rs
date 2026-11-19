@@ -450,6 +450,7 @@
       {
         "provider": "anthropic",
         "model": "m1",
+        "wire_format": "anthropic-messages",
         "source": "synthetic",
         "requests_served": 3,
         "decisions": 2,
@@ -461,6 +462,7 @@
       {
         "provider": "gemini",
         "model": "m2",
+        "wire_format": "gemini-generate-content",
         "source": "synthetic",
         "requests_served": 3,
         "decisions": 2,

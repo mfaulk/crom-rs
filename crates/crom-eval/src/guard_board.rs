@@ -154,6 +154,7 @@ struct InOnOff {
 struct InReplay {
     provider: String,
     model: String,
+    wire_format: String,
     source: String,
     requests_served: usize,
     decisions: Vec<Value>,
@@ -347,6 +348,9 @@ pub struct E2Summary {
 pub struct E4aProvider {
     pub provider: String,
     pub model: String,
+    /// The provider API's tool-call encoding; profiles may share one.
+    #[serde(default)]
+    pub wire_format: String,
     pub source: String,
     pub requests_served: usize,
     pub decisions: usize,
@@ -498,7 +502,8 @@ impl GuardBoard {
                 M17_ARCHIVE_FORMAT => {
                     b.sources.push(source(input, format, None));
                     let label = v["label"].as_str().unwrap_or("M17").to_owned();
-                    let rows: Vec<InM17Scenario> = parse(&v["report"]["scenarios"], &input.path)?;
+                    let report = m17_report(v, &input.path)?;
+                    let rows: Vec<InM17Scenario> = parse(&report["scenarios"], &input.path)?;
                     b.m17.extend(m17_lanes(&label, v["commit"].as_str(), &rows));
                 }
                 other => {
@@ -544,6 +549,7 @@ impl GuardBoard {
                         .map(|p| E4aProvider {
                             provider: p.provider,
                             model: p.model,
+                            wire_format: p.wire_format,
                             source: p.source,
                             requests_served: p.requests_served,
                             decisions: p.decisions.len(),
@@ -833,9 +839,14 @@ impl GuardBoard {
             if input.value["format"] == SCENARIOS_FORMAT {
                 let rows: Vec<InScenario> =
                     serde_json::from_value(input.value["scenarios"].clone()).unwrap_or_default();
-                for s in rows.iter().filter(|s| s.status == "ran") {
+                for s in &rows {
+                    let key = format!("scenario {} {}", s.scenario, s.mode);
+                    if s.status != "ran" {
+                        f.insert(key, s.status.clone());
+                        continue;
+                    }
                     f.insert(
-                        format!("scenario {} {}", s.scenario, s.mode),
+                        key,
                         format!(
                             "attempted={} guard={} crom={} sandbox={} preflight={} no_effect={} executed={} legit={} ledger={}/{} unmediated={} audit={:?} mismatches={}",
                             s.attempted,
@@ -867,6 +878,40 @@ impl GuardBoard {
                 }
             }
         }
+        for input in raw
+            .iter()
+            .filter(|i| i.value["format"] == EXPERIMENTS_FORMAT)
+        {
+            let results = &input.value["results"];
+            match input.value["experiment"].as_str() {
+                Some("E2") => {
+                    for r in results["runs"].as_array().into_iter().flatten() {
+                        f.insert(
+                            format!("E2 {} {}", str_of(&r["scenario"]), str_of(&r["lane"])),
+                            format!(
+                                "attempted={} effects={} legit={} ledger={}",
+                                r["attempted"],
+                                r["unauthorized_effects"],
+                                r["legit_success"],
+                                r["ledger_entries"]
+                            ),
+                        );
+                    }
+                }
+                Some("E4a") => {
+                    let mut views = |name: &str, ds: &Value| {
+                        for (i, d) in ds.as_array().into_iter().flatten().enumerate() {
+                            f.insert(format!("E4a {name} {}", i + 1), decision_fact(d));
+                        }
+                    };
+                    views("reference", &results["reference"]);
+                    for p in results["providers"].as_array().into_iter().flatten() {
+                        views(&str_of(&p["provider"]), &p["decisions"]);
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(e) = &self.e2 {
             for l in &e.lanes {
                 f.insert(
@@ -894,9 +939,68 @@ impl GuardBoard {
     }
 }
 
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The M17 report in an archive: `report_raw` holds the original file's
+/// exact text, so `report_sha256` can be checked against it.
+fn m17_report(v: &Value, path: &str) -> Result<Value, String> {
+    let Some(raw) = v["report_raw"].as_str() else {
+        return Err(format!("{path}: an M17 archive needs `report_raw`"));
+    };
+    if let Some(want) = v["report_sha256"].as_str() {
+        let got = sha256_hex(raw.as_bytes());
+        if got != want {
+            return Err(format!(
+                "{path}: report_sha256 {want} does not match report_raw ({got})"
+            ));
+        }
+    }
+    serde_json::from_str(raw).map_err(|e| format!("{path}: report_raw: {e}"))
+}
+
+fn str_of(v: &Value) -> String {
+    v.as_str().map_or_else(|| v.to_string(), str::to_owned)
+}
+
+/// One E4a decision view as a fact: everything but the resource, which the
+/// args digest covers.
+fn decision_fact(d: &Value) -> String {
+    format!(
+        "action={} decision={} reason={} args_digest={} policies={} outcome={}",
+        str_of(&d["action"]),
+        str_of(&d["decision"]),
+        str_of(&d["reason"]),
+        str_of(&d["args_digest"]),
+        d["determining_policies"],
+        str_of(&d["outcome"]),
+    )
+}
+
+/// Scenario lanes `--guard-check` lets be absent or skipped on either side,
+/// with the reason. They are still compared when both sides ran them.
+pub const CHECK_OPTIONAL_LANES: &[(&str, &str)] = &[(
+    "separate_uid",
+    "needs passwordless `sudo -n -u nobody`: CI has it and requires it \
+     (CROM_REQUIRE_SEPARATE_UID_TESTS); the machine that produced the \
+     archive did not",
+)];
+
+fn optional_lane(key: &str) -> bool {
+    key.strip_prefix("scenario ")
+        .and_then(|k| k.split_whitespace().nth(1))
+        .is_some_and(|lane| CHECK_OPTIONAL_LANES.iter().any(|(l, _)| *l == lane))
+}
+
 /// Differences between the deterministic facts of `fresh` and `archived`.
-/// A scenario lane present on only one side is not a difference (an
-/// environment may lack a lane); every other missing fact is.
+/// Every archived fact must be present and equal in the fresh run, and the
+/// fresh run may have no fact the archive lacks, except that a scenario
+/// lane in [`CHECK_OPTIONAL_LANES`] may be absent or skipped on either side.
 pub fn compare_facts(
     fresh: &BTreeMap<String, String>,
     archived: &BTreeMap<String, String>,
@@ -906,17 +1010,18 @@ pub fn compare_facts(
     if scenarios(archived) && !scenarios(fresh) {
         out.push("scenarios: the fresh run has no scenario report".into());
     }
+    let not_run = |v: &str| !v.starts_with("attempted=");
     for (k, a) in archived {
         match fresh.get(k) {
-            Some(v) if v != a => out.push(format!("{k}: archived `{a}`, fresh `{v}`")),
-            None if !k.starts_with("scenario ") => {
-                out.push(format!("{k}: missing from the fresh run"))
-            }
-            _ => {}
+            Some(v) if v == a => {}
+            Some(v) if optional_lane(k) && (not_run(v) || not_run(a)) => {}
+            Some(v) => out.push(format!("{k}: archived `{a}`, fresh `{v}`")),
+            None if optional_lane(k) => {}
+            None => out.push(format!("{k}: missing from the fresh run")),
         }
     }
     for k in fresh.keys() {
-        if !archived.contains_key(k) && !k.starts_with("scenario ") {
+        if !archived.contains_key(k) && !optional_lane(k) {
             out.push(format!("{k}: not in the archive"));
         }
     }
@@ -924,6 +1029,33 @@ pub fn compare_facts(
 }
 
 // ------------------------------------------------------------ rendering
+
+/// What the E5 numbers measure, with the in-process medians by audit
+/// records written.
+fn e5_note(e: &E5Summary) -> String {
+    let mean_p50 = |executed: bool| {
+        let v: Vec<f64> = e
+            .rows
+            .iter()
+            .filter(|r| r.path == "guard_in_process" && (r.result == "executed") == executed)
+            .map(|r| r.stats.p50_us)
+            .collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+    };
+    let measured = match (mean_p50(true), mean_p50(false)) {
+        (Some(a), Some(d)) => format!(
+            " Here, in process: mean p50 {a:.0} us over executed calls, {d:.0} us over denied ones."
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "Guard's end-to-end cost on the guarded paths is dominated by the audit sink's \
+         per-record fsync: an executed call writes two records (decision, then outcome), a \
+         denied call one.{measured} `policy_only` is Cedar evaluation alone, read from \
+         the decision records' integer-microsecond `policy_us`; it is not the same span \
+         as the end-to-end rows, which are wall-clock per call.\n\n"
+    )
+}
 
 fn yes(b: bool) -> String {
     if b { "yes" } else { "NO" }.into()
@@ -1189,13 +1321,21 @@ impl GuardBoard {
         if let Some(e) = &self.e4a {
             Table {
                 title: format!(
-                    "E4a provider independence: recorded tool calls replayed through Crom ({} reference decisions; all equal: {})",
+                    "E4a provider independence: tool calls in {} wire formats / {} provider profiles replayed through Crom ({} reference decisions; all equal: {})",
+                    e.providers
+                        .iter()
+                        .map(|p| p.wire_format.as_str())
+                        .filter(|w| !w.is_empty())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len(),
+                    e.providers.len(),
                     e.reference_decisions,
                     yes(e.all_equal)
                 ),
                 header: vec![
                     "provider",
                     "model",
+                    "wire format",
                     "transcript",
                     "requests served",
                     "decisions",
@@ -1211,6 +1351,7 @@ impl GuardBoard {
                         vec![
                             p.provider.clone(),
                             p.model.clone(),
+                            p.wire_format.clone(),
                             p.source.clone(),
                             p.requests_served.to_string(),
                             p.decisions.to_string(),
@@ -1282,6 +1423,7 @@ impl GuardBoard {
                     .collect(),
             }
             .render(fmt, s);
+            s.push_str(&e5_note(e));
         }
         if !self.sources.is_empty() {
             Table {
@@ -1385,6 +1527,16 @@ mod tests {
         })
     }
 
+    /// Two E4a decision views: an allow and a policy deny.
+    fn decisions() -> Value {
+        json!([
+            {"action": "invoice.list", "resource": "c0", "args_digest": "aa", "decision": "allow",
+             "reason": null, "determining_policies": ["read"], "outcome": "executed"},
+            {"action": "customer.export", "resource": "c0", "args_digest": "bb", "decision": "deny",
+             "reason": "policy_deny", "determining_policies": ["no-bulk-export"], "outcome": "policy_deny"}
+        ])
+    }
+
     fn input(path: &str, v: Value) -> GuardInput {
         GuardInput {
             path: path.into(),
@@ -1454,11 +1606,11 @@ mod tests {
                 "r/e4a.json",
                 json!({
                     "format": EXPERIMENTS_FORMAT, "experiment": "E4a", "meta": meta("cargo test e4a_"),
-                    "results": {"reference": [{}, {}], "all_equal": true, "providers": [
-                        {"provider": "anthropic", "model": "m1", "source": "synthetic", "requests_served": 3,
-                         "decisions": [{}, {}], "ledger_effects": 1, "audit_verified": true, "unmediated": 0, "equal_to_reference": true},
-                        {"provider": "gemini", "model": "m2", "source": "synthetic", "requests_served": 3,
-                         "decisions": [{}, {}], "ledger_effects": 1, "audit_verified": true, "unmediated": 0, "equal_to_reference": true}
+                    "results": {"reference": decisions(), "all_equal": true, "providers": [
+                        {"provider": "anthropic", "model": "m1", "wire_format": "anthropic-messages", "source": "synthetic", "requests_served": 3,
+                         "decisions": decisions(), "ledger_effects": 1, "audit_verified": true, "unmediated": 0, "equal_to_reference": true},
+                        {"provider": "gemini", "model": "m2", "wire_format": "gemini-generate-content", "source": "synthetic", "requests_served": 3,
+                         "decisions": decisions(), "ledger_effects": 1, "audit_verified": true, "unmediated": 0, "equal_to_reference": true}
                     ]}
                 }),
             ),
@@ -1487,14 +1639,20 @@ mod tests {
                 "r/m17.json",
                 json!({
                     "format": M17_ARCHIVE_FORMAT, "label": "M17 base (#340)", "commit": "82fb30a1e625",
-                    "source": "CI artifact", "report": {"scenarios": [
-                        {"number": 1, "id": "a", "sandbox": "required", "attempted": 1, "blocked_by_policy": 0, "blocked_by_sandbox": 1, "executed": 0, "legit_success": true},
-                        {"number": 1, "id": "a", "sandbox": "off", "attempted": 1, "blocked_by_policy": 0, "blocked_by_sandbox": 0, "executed": 1, "legit_success": false}
-                    ]}
+                    "source": "CI artifact", "report_sha256": sha256_hex(M17_RAW.as_bytes()),
+                    "report_raw": M17_RAW,
                 }),
             ),
         ]
     }
+
+    const M17_RAW: &str = r#"{
+  "scenarios": [
+    {"number": 1, "id": "a", "sandbox": "required", "attempted": 1, "blocked_by_policy": 0, "blocked_by_sandbox": 1, "executed": 0, "legit_success": true},
+    {"number": 1, "id": "a", "sandbox": "off", "attempted": 1, "blocked_by_policy": 0, "blocked_by_sandbox": 0, "executed": 1, "legit_success": false}
+  ]
+}
+"#;
 
     fn board() -> GuardBoard {
         GuardBoard::build(&synthetic()).unwrap()
@@ -1582,7 +1740,18 @@ mod tests {
         assert!(GuardBoard::build(&v).unwrap_err().contains("a second E1"));
     }
 
-    /// Deterministic facts ignore wall time, latency, and provenance, skip scenario lanes absent on one side, and flag changed values.
+    /// An M17 archive holds the report's exact bytes; a `report_sha256` that does not match them is an error.
+    #[test]
+    fn m17_archive_is_verbatim_and_hash_checked() {
+        let mut v = synthetic();
+        let raw = v[6].value["report_raw"].as_str().unwrap().to_owned();
+        assert!(raw.contains("\n  \"scenarios\""), "kept as written");
+        assert_eq!(board().m17.len(), 2);
+        v[6].value["report_sha256"] = json!("00");
+        assert!(GuardBoard::build(&v).unwrap_err().contains("report_sha256"));
+    }
+
+    /// Deterministic facts ignore wall time, latency, and provenance, and flag changed values and a missing scenario report.
     #[test]
     fn deterministic_facts_compare() {
         let inputs = synthetic();
@@ -1591,8 +1760,6 @@ mod tests {
         changed[2].value["results"]["runs"][0]["wall_ms"] = json!(99.0);
         changed[4].value["results"]["rows"][0]["stats"]["p50_us"] = json!(99.0);
         changed[0].value["meta"]["commit"] = json!("ffff");
-        let rows = changed[0].value["scenarios"].as_array_mut().unwrap();
-        rows.retain(|r| r["mode"] != "crom");
         let b = GuardBoard::build(&changed)
             .unwrap()
             .deterministic_facts(&changed);
@@ -1615,6 +1782,86 @@ mod tests {
         assert!(compare_facts(&e, &a)
             .iter()
             .any(|d| d.contains("no scenario report")));
+    }
+
+    fn facts(inputs: &[GuardInput]) -> BTreeMap<String, String> {
+        GuardBoard::build(inputs)
+            .unwrap()
+            .deterministic_facts(inputs)
+    }
+
+    /// A fresh scenario report reduced to one row, or missing one lane, fails the check.
+    #[test]
+    fn check_fails_on_missing_scenario_rows_and_lanes() {
+        let a = facts(&synthetic());
+        let mut one_row = synthetic();
+        one_row[0].value["scenarios"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        let d = compare_facts(&facts(&one_row), &a);
+        assert!(
+            d.iter().any(|d| d.starts_with("scenario G1 guard_off")),
+            "{d:?}"
+        );
+        let mut no_crom = synthetic();
+        let rows = no_crom[0].value["scenarios"].as_array_mut().unwrap();
+        rows.retain(|r| r["mode"] != "crom");
+        let d = compare_facts(&facts(&no_crom), &a);
+        assert!(d.iter().any(|d| d.starts_with("scenario G1 crom")), "{d:?}");
+        let mut skipped = synthetic();
+        skipped[0].value["scenarios"][6]["status"] = json!("skipped");
+        let d = compare_facts(&facts(&skipped), &a);
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    /// A lane on the optional allowlist may be absent or skipped on either side, but is compared when both ran.
+    #[test]
+    fn check_allows_an_optional_lane_to_be_absent() {
+        let (lane, _) = CHECK_OPTIONAL_LANES[0];
+        let mut archive = synthetic();
+        let row = |status: &str| {
+            let mut r = scen("G13", "x", status, 1, 0, true);
+            r["mode"] = json!(lane);
+            r
+        };
+        let rows = archive[0].value["scenarios"].as_array_mut().unwrap();
+        rows.push(row("ran"));
+        let a = facts(&archive);
+        assert!(compare_facts(&facts(&synthetic()), &a).is_empty());
+        let mut skipped = synthetic();
+        skipped[0].value["scenarios"]
+            .as_array_mut()
+            .unwrap()
+            .push(row("skipped"));
+        assert!(compare_facts(&facts(&skipped), &a).is_empty());
+        assert!(compare_facts(&a, &facts(&skipped)).is_empty());
+        let mut differs = archive.clone();
+        let rows = differs[0].value["scenarios"].as_array_mut().unwrap();
+        rows.last_mut().unwrap()["executed"] = json!(1);
+        assert_eq!(compare_facts(&facts(&differs), &a).len(), 1);
+    }
+
+    /// E4a decisions are pinned per provider and for the reference, and E2 per scenario: equal totals do not hide a change.
+    #[test]
+    fn check_compares_e4a_decisions_and_e2_per_scenario() {
+        let a = facts(&synthetic());
+        let mut reason = synthetic();
+        let r = &mut reason[3].value["results"];
+        r["reference"][1]["reason"] = json!("resource_not_found");
+        for p in r["providers"].as_array_mut().unwrap() {
+            p["decisions"][1]["reason"] = json!("resource_not_found");
+        }
+        let d = compare_facts(&facts(&reason), &a);
+        assert_eq!(d.len(), 3, "{d:?}");
+        assert!(d.iter().any(|d| d.starts_with("E4a reference 2")), "{d:?}");
+        let mut e2 = synthetic();
+        let runs = &mut e2[2].value["results"]["runs"];
+        runs[1]["unauthorized_effects"] = json!(1);
+        runs[3]["unauthorized_effects"] = json!(2);
+        let d = compare_facts(&facts(&e2), &a);
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(d.iter().all(|d| d.starts_with("E2 G")), "{d:?}");
     }
 
     /// Text, Markdown, and JSON renderings of the synthetic reports match their checked-in snapshots.

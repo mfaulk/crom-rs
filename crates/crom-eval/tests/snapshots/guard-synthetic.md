@@ -53,12 +53,12 @@ Generated from archived reports by `crom eval scoreboard --guard-report`. Securi
 | at least one unauthorized effect | guard_in_process vs guard_off | 2 | 0 | 2 | 0.500 |
 | legitimate task completed | guard_in_process vs guard_off | 2 | 1 | 0 | 1.000 |
 
-### E4a provider independence: recorded tool calls replayed through Crom (2 reference decisions; all equal: yes)
+### E4a provider independence: tool calls in 2 wire formats / 2 provider profiles replayed through Crom (2 reference decisions; all equal: yes)
 
-| provider | model | transcript | requests served | decisions | ledger effects | unmediated | audit verify | equal to reference |
-|---|---|---|---|---|---|---|---|---|
-| anthropic | m1 | synthetic | 3 | 2 | 1 | 0 | yes | yes |
-| gemini | m2 | synthetic | 3 | 2 | 1 | 0 | yes | yes |
+| provider | model | wire format | transcript | requests served | decisions | ledger effects | unmediated | audit verify | equal to reference |
+|---|---|---|---|---|---|---|---|---|---|
+| anthropic | m1 | anthropic-messages | synthetic | 3 | 2 | 1 | 0 | yes | yes |
+| gemini | m2 | gemini-generate-content | synthetic | 3 | 2 | 1 | 0 | yes | yes |
 
 ### Reference application runs (examples/guard-support)
 
@@ -72,6 +72,8 @@ Generated from archived reports by `crom eval scoreboard --guard-report`. Securi
 |---|---|---|---|---|---|---|
 | customer.read | direct | executed | 10 | 1.5 | 2.0 | 3.2 |
 | customer.read | guard_in_process | executed | 10 | 10.0 | 12.0 | 15.0 |
+
+Guard's end-to-end cost on the guarded paths is dominated by the audit sink's per-record fsync: an executed call writes two records (decision, then outcome), a denied call one. `policy_only` is Cedar evaluation alone, read from the decision records' integer-microsecond `policy_us`; it is not the same span as the end-to-end rows, which are wall-clock per call.
 
 ### Sources and reproducibility
 
