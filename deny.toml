@@ -33,6 +33,8 @@ version = 2
 # workspace's own `Apache-2.0 OR MIT` publish license.
 allow = [
     "MIT",
+    # MIT without the attribution clause (`borrow-or-share`, via jsonschema).
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
