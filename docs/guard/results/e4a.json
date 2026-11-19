@@ -3,7 +3,7 @@
   "experiment": "E4a",
   "title": "Provider independence (offline replay)",
   "meta": {
-    "commit": "ef7bfeb475d5c3f8ddf07f4edabab7edbc21e579",
+    "commit": "9c41948de46858d6ce0b38cd87db311c94091d0a",
     "dirty": false,
     "policy_set_hash": "fb613aee4b6ba7b39e27aba7fc9b06ac1f864c2b44bacba8fd331ff04362d768",
     "schema_hash": "651db5dc9cb1bfab60c434df84dd9a8ae05a3bbae53aa228785393577a460405",
@@ -103,6 +103,7 @@
       {
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
+        "wire_format": "anthropic-messages",
         "transcript": "fixtures/experiments/e4a/anthropic.json",
         "source": "synthetic",
         "requests_served": 8,
@@ -187,6 +188,7 @@
       {
         "provider": "openai",
         "model": "gpt-4.1",
+        "wire_format": "openai-chat-completions",
         "transcript": "fixtures/experiments/e4a/openai.json",
         "source": "synthetic",
         "requests_served": 8,
@@ -271,6 +273,7 @@
       {
         "provider": "deepseek",
         "model": "deepseek-chat",
+        "wire_format": "openai-chat-completions",
         "transcript": "fixtures/experiments/e4a/deepseek.json",
         "source": "synthetic",
         "requests_served": 8,
@@ -355,6 +358,7 @@
       {
         "provider": "gemini",
         "model": "gemini-2.5-pro",
+        "wire_format": "gemini-generate-content",
         "transcript": "fixtures/experiments/e4a/gemini.json",
         "source": "synthetic",
         "requests_served": 8,

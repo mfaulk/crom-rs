@@ -127,8 +127,8 @@ by position.
 What dominates: Guard's end-to-end cost on the guarded paths is mostly the
 audit sink's per-record `fsync`. An executed call writes two records
 (decision, then outcome); a denied call writes one. In the archived run
-(btrfs, release), the in-process p50 is about 1.5–1.6 ms for executed calls
-and 0.76–0.81 ms for denied ones, against 43–77 µs for `policy_only`
+(btrfs, release), the in-process p50 is 1.56–1.66 ms for executed calls
+and 0.78–0.80 ms for denied ones, against 46–79 µs for `policy_only`
 ([scoreboard.md](scoreboard.md), E5).
 `policy_only` is Cedar evaluation alone, as Guard records it in integer
 microseconds (`policy_us`); it is not the same span as the end-to-end rows,
