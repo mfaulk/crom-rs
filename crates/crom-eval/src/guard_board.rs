@@ -896,6 +896,10 @@ pub fn compare_facts(
     archived: &BTreeMap<String, String>,
 ) -> Vec<String> {
     let mut out = Vec::new();
+    let scenarios = |m: &BTreeMap<String, String>| m.keys().any(|k| k.starts_with("scenario "));
+    if scenarios(archived) && !scenarios(fresh) {
+        out.push("scenarios: the fresh run has no scenario report".into());
+    }
     for (k, a) in archived {
         match fresh.get(k) {
             Some(v) if v != a => out.push(format!("{k}: archived `{a}`, fresh `{v}`")),
@@ -1592,6 +1596,13 @@ mod tests {
         let d = compare_facts(&c, &a);
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(d[0].starts_with("E1 E1-01 guard_in_process"));
+        let no_scenarios: Vec<GuardInput> = changed[1..].to_vec();
+        let e = GuardBoard::build(&no_scenarios)
+            .unwrap()
+            .deterministic_facts(&no_scenarios);
+        assert!(compare_facts(&e, &a)
+            .iter()
+            .any(|d| d.contains("no scenario report")));
     }
 
     /// Text, Markdown, and JSON renderings of the synthetic reports match their checked-in snapshots.
