@@ -17,8 +17,15 @@ all-features = true
 version = 2
 yanked = "deny"
 # Specific advisories to ignore go here, each with a justifying comment.
-# (None currently — the tree is clean as of the last local `cargo deny check`.)
-ignore = []
+ignore = [
+    # chrono is unmaintained (not a vulnerability). It is reached only via
+    # cedar-policy-core 4.15's default `datetime` extension, which
+    # cedar-policy and cedar-policy-formatter enable unconditionally, so it
+    # cannot be feature-gated off. Guard's policies use no extension
+    # functions. Revisit when Cedar drops chrono or on the next Cedar bump
+    # (ADR 0003 pins `=4.15.0`).
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained chrono via cedar-policy-core; no maintained alternative upstream" },
+]
 
 [licenses]
 version = 2
