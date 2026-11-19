@@ -27,7 +27,7 @@ pub use definition::{
 pub use errors::AgentDefinitionError;
 pub use loader::{
     filesystem_agents_dir, load_filesystem_agents, load_filesystem_agents_strict,
-    parse_definition_file, MAX_AGENT_FILE_BYTES,
+    parse_definition_file, untrusted_project_agent_denials, MAX_AGENT_FILE_BYTES,
 };
 pub use registry::AgentRegistry;
 pub use runtime::{

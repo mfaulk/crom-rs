@@ -1501,3 +1501,121 @@ async fn subagent_timeout_aborts_runaway_child() {
         .iter()
         .any(|e| matches!(e, AgentEvent::SubagentTimedOut(_))));
 }
+
+struct EffectTool {
+    ran: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl crom_core::Tool for EffectTool {
+    fn name(&self) -> &str {
+        "Effect"
+    }
+    fn description(&self) -> &str {
+        "records that it ran"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {}})
+    }
+    fn permission_kind(&self) -> crom_core::PermissionKind {
+        crom_core::PermissionKind::Mutating
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<crom_core::ToolResult, crom_core::ToolError> {
+        self.ran.store(true, Ordering::SeqCst);
+        Ok(crom_core::ToolResult::ok_text("ran"))
+    }
+}
+
+/// Approves only the `Agent` spawn; denies everything else.
+struct AllowAgentOnly;
+
+#[async_trait]
+impl PermissionCallback for AllowAgentOnly {
+    async fn approve(&self, req: PermissionRequest) -> PermissionDecision {
+        if req.tool_name == "Agent" {
+            PermissionDecision::AllowOnce
+        } else {
+            PermissionDecision::Deny {
+                reason: "test denies".into(),
+            }
+        }
+    }
+}
+
+/// Parent spawns subagent `sub`; the child then calls `Effect`. Returns
+/// whether `Effect` executed.
+async fn spawn_child_calling_effect(sub: AgentDefinition, parent: AgentOptions) -> bool {
+    let call = |id: &str, name: &str, input: serde_json::Value| {
+        vec![
+            ModelEvent::ToolCall(ToolCall {
+                id: id.into(),
+                name: name.into(),
+                input,
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ]
+    };
+    let provider = Arc::new(RoutingProvider::new(
+        vec![call("p1", "Agent", json!({"agent": "sub", "task": "go"}))],
+        vec![call("c1", "Effect", json!({}))],
+    ));
+    let ran = Arc::new(AtomicBool::new(false));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EffectTool { ran: ran.clone() }));
+    let mut registry = AgentRegistry::new();
+    registry.register(sub).unwrap();
+    let opts = AgentOptions {
+        max_turns: Some(3),
+        agents: registry,
+        ..parent
+    };
+    let _ = run_with(provider, opts, tools, "delegate").await;
+    ran.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+// A definition's `tools` list does not auto-allow a tool the parent would send to a denying callback.
+async fn definition_tools_do_not_auto_allow() {
+    let mut sub = def("sub");
+    sub.tools = Some(vec![ToolRule::ExactTool("Effect".into())]);
+    let parent = AgentOptions {
+        allowed_tools: vec!["Agent".into(), "Effect".into()],
+        permission_mode: PermissionMode::Default,
+        permission_callback: Some(Arc::new(AllowAgentOnly)),
+        ..AgentOptions::default()
+    };
+    assert!(!spawn_child_calling_effect(sub, parent).await);
+}
+
+#[tokio::test]
+// A child cannot call a tool that the parent's `allowed_tools` name filter removed.
+async fn child_registry_is_parent_filtered_registry() {
+    let parent = AgentOptions {
+        allowed_tools: vec!["Agent".into(), "Read".into()],
+        permission_mode: PermissionMode::Default,
+        permission_callback: Some(Arc::new(AlwaysAllow)),
+        ..AgentOptions::default()
+    };
+    assert!(!spawn_child_calling_effect(def("sub"), parent).await);
+}
+
+#[tokio::test]
+// Control: when the parent permits `Effect`, the same child call executes.
+async fn child_effect_executes_when_parent_permits() {
+    let mut sub = def("sub");
+    sub.tools = Some(vec![ToolRule::ExactTool("Effect".into())]);
+    let parent = AgentOptions {
+        allowed_tools: vec!["Agent".into(), "Effect".into()],
+        permission_mode: PermissionMode::Default,
+        permission_callback: Some(Arc::new(AlwaysAllow)),
+        ..AgentOptions::default()
+    };
+    assert!(spawn_child_calling_effect(sub, parent).await);
+}

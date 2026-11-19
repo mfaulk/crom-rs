@@ -950,6 +950,13 @@ fn restrict_untrusted_project(
             );
             a.inherit_permissions = None;
         }
+        if a.path.is_some() {
+            deny(
+                "agents.path",
+                "untrusted workspace cannot choose the subagent definitions directory",
+            );
+            a.path = None;
+        }
     }
 
     if let Some(pl) = &mut p.plugins {

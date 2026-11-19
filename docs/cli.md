@@ -171,11 +171,21 @@ Until you trust the workspace, crom treats both as untrusted:
   `validation.commands`, `checkpointing.enabled: false`, a looser
   `checkpointing.bash_policy`, `mcp.enabled: true`, `mcp.config_file`,
   `mcp.servers`, `mcp.external_effect_policy`, `mcp.load_resources`/`load_prompts: true`,
-  `agents.inherit_permissions: false`, `plugins.allow_*: true`,
+  `agents.inherit_permissions: false`, `agents.path`, `plugins.allow_*: true`,
   `plugins.marketplaces`, and `providers`. Everything else (model, disallow
   rules, UI, limits, a tighter sandbox) still applies.
 - `.agent/mcp.json` (or any MCP config file under the workspace that was not
   passed with `--mcp-config`) is not read, so no repo server starts.
+- Subagent definitions in `.agent/agents/*.md` are not loaded; each file is
+  reported as `.agent/agents/<file>#subagent_definition`. `--agents <dir>` and
+  a user-level `agents.path` are operator choices and still load.
+
+A subagent never gets more authority than its parent, trusted or not: a
+definition's `tools` list only narrows which of the parent's tools the child
+can see (it never pre-approves them), the child inherits the parent's allow
+and disallow rules, and its mode is capped at the parent's. With
+`agents.inherit_permissions: false` the child starts in `default` mode but
+still keeps the parent's disallow rules.
 
 Each ignored key is reported: a `[trust] ignored …` line on stderr, or a
 blocked `security_decision` event (`policy_source: workspace_trust`) under

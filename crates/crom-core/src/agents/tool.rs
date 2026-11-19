@@ -1119,7 +1119,7 @@ fn build_child_options(
 ) -> AgentOptions {
     // A definition (possibly repo-supplied) can never run looser than the
     // parent's mode. `inherit_permissions` controls only whether the parent's
-    // mode is the child's default and whether parent disallow rules carry over.
+    // mode is the child's default.
     let inherit = runtime_options.context_policy.inherit_permissions;
     let requested_mode = def.permission_mode.unwrap_or(if inherit {
         parent.permission_mode
@@ -1127,16 +1127,24 @@ fn build_child_options(
         PermissionMode::Default
     });
     let child_mode = requested_mode.capped_at(parent.permission_mode);
-    let mut child_disallow_rules = Vec::new();
-    if inherit {
-        child_disallow_rules.extend(parent.disallowed_tool_rules.iter().cloned());
-    }
+    // A child's decision must never exceed the parent's (#342): parent
+    // disallow rules always carry over and the child's allow rules are the
+    // parent's. `def.tools` only narrows the registry (`scope_child_tools`);
+    // it never grants an allow. The simple-name list auto-allows only in
+    // dontAsk, so a child that lowers itself to dontAsk under a prompting
+    // parent must not inherit it (the registry is already parent-filtered).
+    let mut child_disallow_rules = parent.disallowed_tool_rules.clone();
     child_disallow_rules.extend(def.disallowed_tools.iter().cloned());
+    let child_allowed_names = if parent.permission_mode == PermissionMode::DontAsk {
+        parent.allowed_tools.clone()
+    } else {
+        Vec::new()
+    };
     let mut opts = AgentOptions {
         cwd: cwd.clone(),
         model: def.model.clone().unwrap_or_else(|| parent.model.clone()),
-        allowed_tools: Vec::new(),
-        allowed_tool_rules: def.tools.clone().unwrap_or_default(),
+        allowed_tools: child_allowed_names,
+        allowed_tool_rules: parent.allowed_tool_rules.clone(),
         disallowed_tool_rules: child_disallow_rules,
         permission_mode: child_mode,
         // The invocation may *lower* max_turns but cannot *raise* it past
@@ -1797,19 +1805,192 @@ mod child_permission_tests {
     }
 
     #[test]
-    // With inherit_permissions off, the child starts from Default mode and its own disallow rules,
-    // but still cannot exceed the parent's mode.
-    fn no_inherit_permissions_starts_clean_but_stays_capped() {
+    // With inherit_permissions off, the child starts from Default mode but keeps the parent's
+    // disallow rules and still cannot exceed the parent's mode.
+    fn no_inherit_permissions_resets_mode_but_keeps_parent_disallow() {
         let mut rt = AgentRuntimeOptions::default();
         rt.context_policy.inherit_permissions = false;
         let c = child(&parent(PermissionMode::AcceptEdits), &rt, &def(None));
         assert_eq!(c.permission_mode, PermissionMode::Default);
-        assert!(!has_exact(&c.disallowed_tool_rules, "Bash"));
+        assert!(has_exact(&c.disallowed_tool_rules, "Bash"));
         let c = child(
             &parent(PermissionMode::Default),
             &rt,
             &def(Some(PermissionMode::AcceptEdits)),
         );
         assert_eq!(c.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
+    // A definition's `tools` list never becomes child allow rules; the child carries only the parent's.
+    fn definition_tools_are_not_allow_rules() {
+        let rt = AgentRuntimeOptions::default();
+        let mut p = parent(PermissionMode::Default);
+        p.allowed_tool_rules = vec![ToolRule::ExactTool("Read".into())];
+        p.allowed_tools = vec!["Agent".into(), "Grep".into()];
+        let mut d = def(None);
+        d.tools = Some(vec![ToolRule::ExactTool("Write".into())]);
+        let c = child(&p, &rt, &d);
+        assert!(!has_exact(&c.allowed_tool_rules, "Write"));
+        assert!(has_exact(&c.allowed_tool_rules, "Read"));
+        // Names auto-allow only in dontAsk, so a Default parent passes none down.
+        assert!(c.allowed_tools.is_empty());
+        p.permission_mode = PermissionMode::DontAsk;
+        assert_eq!(child(&p, &rt, &d).allowed_tools, p.allowed_tools);
+    }
+
+    use crate::permission::{PermissionCallback, PermissionDecision, PermissionRequest};
+    use crate::policy::{PolicyConfig, PolicyDecisionSource, PolicyEngine, PolicyOutcome};
+
+    struct ApproveAll;
+
+    #[async_trait::async_trait]
+    impl PermissionCallback for ApproveAll {
+        async fn approve(&self, _: PermissionRequest) -> PermissionDecision {
+            PermissionDecision::AllowOnce
+        }
+    }
+
+    /// 0 = deny, 1 = ask (callback consulted), 2 = auto-allow.
+    async fn level(o: &AgentOptions, tool: &str, kind: PermissionKind, input: &Value) -> u8 {
+        let engine = PolicyEngine::new(
+            PolicyConfig {
+                allowed_tools: o.allowed_tool_rules.clone(),
+                allowed_tool_names: o.allowed_tools.clone(),
+                disallowed_tools: o.disallowed_tool_rules.clone(),
+                permission_mode: o.permission_mode,
+                callback: Some(Arc::new(ApproveAll)),
+                mcp_external_effect_policy: o.mcp.external_effect_policy,
+                ..PolicyConfig::default()
+            },
+            crate::hooks::Hooks::new(),
+        );
+        let sid = SessionId::new();
+        let rid = crate::run_id::RunId::new();
+        let d = engine
+            .evaluate_tool(crate::policy::PolicyToolContext {
+                session_id: &sid,
+                run_id: &rid,
+                turn_index: 0,
+                cwd: std::path::Path::new("/w"),
+                tool_name: tool,
+                permission_kind: kind,
+                tool_input: input.clone(),
+                tool_summary: String::new(),
+                metadata: Value::Null,
+            })
+            .await;
+        match (d.outcome, d.source) {
+            (PolicyOutcome::Allow, PolicyDecisionSource::ApprovalCallback) => 1,
+            (PolicyOutcome::Allow, _) => 2,
+            _ => 0,
+        }
+    }
+
+    #[tokio::test]
+    // Exhaustively over small parent configs and definitions, a child's policy decision is never
+    // looser than the parent's (deny < ask < allow) on a fixed corpus of tool calls.
+    async fn child_decision_never_exceeds_parent() {
+        let calls: Vec<(&str, PermissionKind, Value)> = vec![
+            (
+                "Read",
+                PermissionKind::ReadOnly,
+                serde_json::json!({"file_path": "a.rs"}),
+            ),
+            (
+                "Write",
+                PermissionKind::Mutating,
+                serde_json::json!({"file_path": "a.rs"}),
+            ),
+            (
+                "Bash",
+                PermissionKind::Execution,
+                serde_json::json!({"command": "git push"}),
+            ),
+            (
+                "Bash",
+                PermissionKind::Execution,
+                serde_json::json!({"command": "rm -rf /"}),
+            ),
+            (
+                "mcp__x__write",
+                PermissionKind::External,
+                serde_json::json!({}),
+            ),
+        ];
+        let rule_sets: Vec<Vec<ToolRule>> = vec![
+            vec![],
+            vec![ToolRule::ExactTool("Bash".into())],
+            vec![ToolRule::BashCommandRegex("^git ".into())],
+            vec![ToolRule::ToolGlob("*".into())],
+            vec![ToolRule::McpServerGlob {
+                server: "x".into(),
+                tool_glob: "*".into(),
+            }],
+            vec![ToolRule::FilePathGlob {
+                tool: "Write".into(),
+                pattern: "*.rs".into(),
+            }],
+        ];
+        let name_sets: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["Bash".into(), "Write".into()],
+            vec!["mcp__x__write".into()],
+        ];
+        let modes = [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Plan,
+            PermissionMode::DontAsk,
+        ];
+        let def_modes = [
+            None,
+            Some(PermissionMode::AcceptEdits),
+            Some(PermissionMode::DontAsk),
+        ];
+        let mut checked = 0usize;
+        for inherit in [true, false] {
+            let mut rt = AgentRuntimeOptions::default();
+            rt.context_policy.inherit_permissions = inherit;
+            for mode in modes {
+                for p_allow in &rule_sets {
+                    for p_deny in &rule_sets {
+                        for p_names in &name_sets {
+                            let p = AgentOptions {
+                                permission_mode: mode,
+                                allowed_tool_rules: p_allow.clone(),
+                                disallowed_tool_rules: p_deny.clone(),
+                                allowed_tools: p_names.clone(),
+                                ..AgentOptions::default()
+                            };
+                            for d_tools in &rule_sets {
+                                for d_mode in def_modes {
+                                    let d = AgentDefinition {
+                                        name: "c".into(),
+                                        permission_mode: d_mode,
+                                        tools: Some(d_tools.clone()),
+                                        ..AgentDefinition::default()
+                                    };
+                                    let c = child(&p, &rt, &d);
+                                    for (tool, kind, input) in &calls {
+                                        let pl = level(&p, tool, *kind, input).await;
+                                        let cl = level(&c, tool, *kind, input).await;
+                                        assert!(
+                                            cl <= pl,
+                                            "child {cl} > parent {pl} for {tool} {input}: \
+                                             inherit={inherit} mode={mode:?} p_allow={p_allow:?} \
+                                             p_deny={p_deny:?} names={p_names:?} \
+                                             d_tools={d_tools:?} d_mode={d_mode:?}"
+                                        );
+                                        checked += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "{checked}");
     }
 }

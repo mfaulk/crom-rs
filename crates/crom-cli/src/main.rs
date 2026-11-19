@@ -2074,23 +2074,29 @@ fn load_agent_registry_and_runtime(
         }
     }
 
-    // Filesystem definitions.
+    // Filesystem definitions. The project-local default directory is repo
+    // content, so it loads only in a trusted workspace; `--agents` and
+    // `agents.path` (stripped from untrusted repo settings) are operator choices.
     if allow_filesystem {
         let dir = if let Some(p) = &common.agents {
-            p.clone()
+            Some(p.clone())
         } else if let Some(p) = settings.agents.as_ref().and_then(|s| s.path.clone()) {
-            cwd.join(p)
+            Some(cwd.join(p))
+        } else if workspace_trusted(cwd, settings) {
+            Some(crom_core::filesystem_agents_dir(cwd))
         } else {
-            crom_core::filesystem_agents_dir(cwd)
+            None
         };
-        let (defs, errors) = crom_core::load_filesystem_agents(&dir);
-        for d in defs {
-            if let Err(e) = registry.register_filesystem(d) {
+        if let Some(dir) = dir {
+            let (defs, errors) = crom_core::load_filesystem_agents(&dir);
+            for d in defs {
+                if let Err(e) = registry.register_filesystem(d) {
+                    eprintln!("[agents] {e}");
+                }
+            }
+            for e in errors {
                 eprintln!("[agents] {e}");
             }
-        }
-        for e in errors {
-            eprintln!("[agents] {e}");
         }
     }
 
@@ -8089,8 +8095,12 @@ fn load_agent_registry_for_tui(
         } else {
             cwd.join(p)
         }
-    } else {
+    } else if workspace_trusted(cwd, settings) {
         crom_core::filesystem_agents_dir(cwd)
+    } else {
+        // Project definitions are repo content (threat model P9); the
+        // trust denials reported at startup list what was skipped.
+        return;
     };
     if !dir.is_dir() {
         return;
