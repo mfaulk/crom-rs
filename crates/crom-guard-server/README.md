@@ -10,7 +10,8 @@ crate other than `crom-guard` (`scripts/check-guard-deps.sh`). Not published.
   operations the caller's grant chain allows. `tools/call` runs
   `crom_guard::Guard::call` to completion even if the client disconnects.
 - **Admin API.** A separate listener (0600 unix socket or loopback TCP) with
-  its own token: issue and revoke grants, reload downstream credentials, audit
+  its own token: issue and revoke grants, view and approve pending approval
+  requests, reload downstream credentials, audit
   head, health. Session handles are never accepted there.
 
 ```sh

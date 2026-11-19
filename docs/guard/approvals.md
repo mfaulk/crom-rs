@@ -8,7 +8,7 @@
 
 1. The agent calls a protected tool. Cedar's approval probe returns `CallResult::ApprovalRequired { role, action_digest }`. Nothing runs.
 2. After writing that decision record, the pipeline calls `ApprovalVerifier::record_pending`. The store keeps a **pending request** keyed by (issuer of the grant, action digest): tenant, leaf grant, action, resource uid, resource version, validated args, the operation's Cedar context fields, the required role, and `created_at`/`expires_at` on Guard's clock.
-3. The trusted application's admin path (the HTTP route is #357) shows a human exactly that request:
+3. The trusted application's admin path (over HTTP: `GET /admin/approvals/{digest}` and `POST /admin/approvals`, [server.md](server.md)) shows a human exactly that request:
 
    ```rust
    let view: PendingApproval = store.pending(&issuer_app_id, &action_digest, now)?;
@@ -79,7 +79,7 @@ All fields are on `ApprovalStoreConfig`. The store is in memory only: a restart 
 
 ## Not in scope
 
-The approval UI and admin HTTP route (#357), multi-party approvals, and Crom's `ApprovalCallback`, which is not a Guard approval source. The audit record carries `approval_id` but not the approver; adding the approver to audit (a `guard-audit/v1` format change) is tracked in a follow-up issue. Until then, join on `approval_id` with the application's own record of the admin action.
+An approval UI, multi-party approvals, and Crom's `ApprovalCallback`, which is not a Guard approval source. The audit record carries `approval_id` but not the approver; adding the approver to audit (a `guard-audit/v1` format change) is tracked in a follow-up issue. Until then, join on `approval_id` with the application's own record of the admin action.
 
 ## Tests
 

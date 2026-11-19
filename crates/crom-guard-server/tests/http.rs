@@ -348,17 +348,6 @@ async fn admin_grant_errors() {
     assert_eq!(status, 404);
 }
 
-/// Approvals are an explicit not-implemented stub until #354.
-#[tokio::test]
-async fn approvals_route_is_a_stub() {
-    let f = Fixture::start().await;
-    let (status, body) = f
-        .admin("/admin/approvals", ADMIN_TOKEN, Some(json!({})))
-        .await;
-    assert_eq!(status, 501);
-    assert_eq!(body["error"], "not_implemented");
-}
-
 /// Reload swaps in new downstream credentials; a rejected file keeps the old ones.
 #[tokio::test]
 async fn credentials_reload() {

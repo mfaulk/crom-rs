@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use axum::Router;
 use crom_guard::{
-    AppId, AuditError, CedarPdp, Clock, CredentialBroker, CredentialLoadError, EnvCredential,
-    EnvCredentialBroker, FileAuditSink, FileCredentialBroker, GrantStoreConfig, Guard,
-    MemoryGrantStore, OperationRegistry, PdpLoadError, SystemClock,
+    AppId, ApprovalStoreConfig, AuditError, CedarPdp, Clock, CredentialBroker, CredentialLoadError,
+    EnvCredential, EnvCredentialBroker, FileAuditSink, FileCredentialBroker, GrantStoreConfig,
+    Guard, MemoryApprovalStore, MemoryGrantStore, OperationRegistry, PdpLoadError, SystemClock,
 };
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
@@ -70,6 +70,7 @@ pub(crate) struct Shared {
     clock: Arc<dyn Clock>,
     /// Every in-flight `Guard::call`; shutdown waits for all of them.
     calls: TaskTracker,
+    approvals: Arc<MemoryApprovalStore>,
     limiter: limiter::DenyLimiter,
 }
 
@@ -190,6 +191,11 @@ pub async fn start(
     let store = Arc::new(MemoryGrantStore::new(store_config));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let resolve_timeout = Duration::from_millis(config.limits.resolve_timeout_ms);
+    let approvals = Arc::new(MemoryApprovalStore::new(ApprovalStoreConfig {
+        max_ttl_seconds: config.approvals.max_ttl_seconds,
+        pending_ttl_seconds: config.approvals.pending_ttl_seconds,
+        ..ApprovalStoreConfig::default()
+    }));
     let guard = Guard::new(
         registry,
         store.clone(),
@@ -198,7 +204,8 @@ pub async fn start(
         audit.clone(),
         clock.clone(),
     )
-    .with_resolve_timer(move || Box::pin(tokio::time::sleep(resolve_timeout)));
+    .with_resolve_timer(move || Box::pin(tokio::time::sleep(resolve_timeout)))
+    .with_approval_verifier(approvals.clone());
 
     let shared = Arc::new(Shared {
         guard: Arc::new(guard),
@@ -209,6 +216,7 @@ pub async fn start(
         app_id: config.admin.app_id.clone(),
         clock,
         calls: TaskTracker::new(),
+        approvals,
         limiter: limiter::DenyLimiter::new(
             config.limits.deny_burst,
             config.limits.deny_refill_per_second,

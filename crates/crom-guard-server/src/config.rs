@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(default)]
     pub grants: GrantsConfig,
     #[serde(default)]
+    pub approvals: ApprovalsConfig,
+    #[serde(default)]
     pub limits: LimitsConfig,
 }
 
@@ -72,7 +74,7 @@ pub struct AdminConfig {
     /// Environment variable holding the admin token.
     pub token_env: Option<String>,
     /// The application the admin credential authenticates as; recorded as
-    /// the issuer of every grant created through this listener.
+    /// the issuer of every grant and approval created through this listener.
     pub app_id: AppId,
 }
 
@@ -162,6 +164,26 @@ impl Default for GrantsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ApprovalsConfig {
+    /// Longest approval lifetime the admin may request.
+    #[serde(default = "default_approval_ttl")]
+    pub max_ttl_seconds: u64,
+    /// How long an `approval_required` request stays approvable.
+    #[serde(default = "default_pending_ttl")]
+    pub pending_ttl_seconds: u64,
+}
+
+impl Default for ApprovalsConfig {
+    fn default() -> Self {
+        Self {
+            max_ttl_seconds: default_approval_ttl(),
+            pending_ttl_seconds: default_pending_ttl(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Agent endpoint request body cap; larger bodies get 413.
     #[serde(default = "default_max_request_bytes")]
@@ -223,6 +245,12 @@ fn default_read_timeout() -> u64 {
 }
 fn default_resolve_timeout() -> u64 {
     DEFAULT_RESOLVE_TIMEOUT_MS
+}
+fn default_approval_ttl() -> u64 {
+    crom_guard::DEFAULT_APPROVAL_MAX_TTL_SECONDS
+}
+fn default_pending_ttl() -> u64 {
+    crom_guard::DEFAULT_PENDING_TTL_SECONDS
 }
 fn default_max_connections() -> usize {
     DEFAULT_MAX_CONNECTIONS
@@ -334,6 +362,10 @@ impl Config {
                 "grants.max_ttl_seconds must be between 1 and {}",
                 crom_guard::DEFAULT_MAX_TTL_SECONDS
             )));
+        }
+        let a = &self.approvals;
+        if a.max_ttl_seconds == 0 || a.pending_ttl_seconds == 0 {
+            return invalid("approval TTLs must be positive");
         }
         Ok(())
     }

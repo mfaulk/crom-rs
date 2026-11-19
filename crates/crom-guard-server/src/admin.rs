@@ -10,7 +10,11 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use crom_guard::{GrantId, GrantSpec, GrantStore, GrantStoreError};
+use crom_guard::{
+    ActionDigest, ApprovalError, ApprovalSpec, Delegator, GrantId, GrantSpec, GrantStore,
+    GrantStoreError, TenantId,
+};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::net::Peer;
@@ -23,8 +27,8 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/admin/grants/{id}/revoke", post(revoke_grant))
         .route("/admin/credentials/reload", post(reload_credentials))
         .route("/admin/audit/head", get(audit_head))
-        // Extension point for authenticated approvals (#354).
-        .route("/admin/approvals", post(not_implemented))
+        .route("/admin/approvals", post(approve))
+        .route("/admin/approvals/{digest}", get(pending_approval))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(shared.clone(), authenticate))
         .with_state(shared)
@@ -168,12 +172,71 @@ async fn audit_head(State(s): State<Arc<Shared>>) -> Response {
     Json(json!({ "head": s.audit.head() })).into_response()
 }
 
-async fn not_implemented() -> Response {
-    error(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented",
-        Some("approvals arrive with #354".into()),
-    )
+/// What the human approves. The admin is trusted to name the approver;
+/// what is approved comes from Guard's pending request for the digest.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveRequest {
+    action_digest: ActionDigest,
+    approver: Delegator,
+    approver_tenant: TenantId,
+    ttl_seconds: u64,
+}
+
+/// The pending `approval_required` request for `digest` from this app's
+/// grants. Holds the agent-supplied arguments, never secrets.
+async fn pending_approval(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -> Response {
+    let Some(digest) = ActionDigest::from_hex(&digest) else {
+        return error(StatusCode::NOT_FOUND, "unknown_request", None);
+    };
+    let Some(p) = s.approvals.pending(&s.app_id, &digest, s.clock.now()) else {
+        return error(StatusCode::NOT_FOUND, "unknown_request", None);
+    };
+    Json(json!({
+        "action_digest": p.action_digest,
+        "tenant": p.tenant,
+        "grant_id": p.grant_id,
+        "action": p.action,
+        "resource": p.resource,
+        "resource_version": p.resource_version,
+        "args": p.args,
+        "fields": p.fields,
+        "role": p.role,
+        "created_at": p.created_at,
+        "expires_at": p.expires_at,
+    }))
+    .into_response()
+}
+
+async fn approve(
+    State(s): State<Arc<Shared>>,
+    req: Result<Json<ApproveRequest>, JsonRejection>,
+) -> Response {
+    let req = match req {
+        Ok(Json(r)) => r,
+        Err(e) => return error(e.status(), "invalid_request", Some(e.body_text())),
+    };
+    let spec = ApprovalSpec {
+        action_digest: req.action_digest,
+        approver: req.approver,
+        approver_tenant: req.approver_tenant,
+        ttl_seconds: req.ttl_seconds,
+    };
+    match s.approvals.approve(&s.app_id, spec, s.clock.now()) {
+        Ok(issued) => {
+            tracing::info!(approval_id = issued.approval_id.as_str(), "approval issued");
+            let body = json!({
+                "approval_id": issued.approval_id,
+                "expires_at": issued.expires_at,
+            });
+            (StatusCode::CREATED, Json(body)).into_response()
+        }
+        Err(ApprovalError::InvalidSpec(m)) => {
+            error(StatusCode::BAD_REQUEST, "invalid_spec", Some(m))
+        }
+        Err(ApprovalError::UnknownRequest) => error(StatusCode::NOT_FOUND, "unknown_request", None),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "store_unavailable", None),
+    }
 }
 
 async fn not_found() -> Response {
