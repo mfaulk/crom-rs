@@ -19,10 +19,12 @@ mod context;
 mod credential;
 mod decision;
 mod error;
+mod executor;
 mod grant;
 mod handle;
 mod ids;
 mod pdp;
+mod resolution;
 mod resource;
 mod store;
 mod time;
@@ -48,6 +50,7 @@ pub use credential::{
 };
 pub use decision::{ActionDigest, ApprovalRequirement, Decision, DenyReason};
 pub use error::GuardError;
+pub use executor::ConditionalCall;
 pub use grant::{
     Constraint, ConstraintError, Constraints, DelegationSpec, Delegator, Grant, GrantSpec,
     ReservedUserAttr, GRANT_SCHEMA_VERSION, RESERVED_USER_ATTRS,
@@ -61,6 +64,7 @@ pub use pdp::{
     CedarPdp, Evaluation, GrantEvaluation, PdpLoadError, ACTION_DIGEST_DOMAIN,
     APPROVAL_PLACEHOLDER_ID, MAX_POLICY_SOURCE_BYTES,
 };
+pub use resolution::{ResolveTimer, TimeoutResolver};
 pub use resource::{ResolvedResource, ResourceVersion};
 pub use store::{GrantStoreConfig, MemoryGrantStore, DEFAULT_MAX_TTL_SECONDS};
 pub use time::{Clock, SystemClock, Timestamp};
