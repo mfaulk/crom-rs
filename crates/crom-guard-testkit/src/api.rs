@@ -82,6 +82,54 @@ impl BusinessApi {
         self.data.lock().unwrap().dataset.clone()
     }
 
+    /// Trusted, in-process lookup for resolvers (#350): the application's
+    /// own data access, scoped to `tenant`. Not an agent-visible read, so it
+    /// is not ledgered and not reachable over HTTP.
+    pub fn lookup_customer(&self, tenant: &str, id: &str) -> Option<Customer> {
+        find_customer(&self.data.lock().unwrap().dataset, tenant, id)
+            .ok()
+            .cloned()
+    }
+
+    /// Like [`lookup_customer`](Self::lookup_customer), for invoices.
+    pub fn lookup_invoice(&self, tenant: &str, id: &str) -> Option<Invoice> {
+        let data = self.data.lock().unwrap();
+        invoice_index(&data.dataset, tenant, id)
+            .ok()
+            .map(|i| data.dataset.invoices[i].clone())
+    }
+
+    /// Changes a customer out of band, as the application itself would
+    /// (e.g. between authorize and execute in TOCTOU tests), and bumps its
+    /// version. Not ledgered. Returns `false` if `tenant` has no such
+    /// customer.
+    pub fn update_customer(&self, tenant: &str, id: &str, f: impl FnOnce(&mut Customer)) -> bool {
+        let mut data = self.data.lock().unwrap();
+        let Some(c) = data
+            .dataset
+            .customers
+            .iter_mut()
+            .find(|c| c.tenant == tenant && c.id == id)
+        else {
+            return false;
+        };
+        f(c);
+        c.version += 1;
+        true
+    }
+
+    /// Like [`update_customer`](Self::update_customer), for invoices.
+    pub fn update_invoice(&self, tenant: &str, id: &str, f: impl FnOnce(&mut Invoice)) -> bool {
+        let mut data = self.data.lock().unwrap();
+        let Ok(i) = invoice_index(&data.dataset, tenant, id) else {
+            return false;
+        };
+        let inv = &mut data.dataset.invoices[i];
+        f(inv);
+        inv.version += 1;
+        true
+    }
+
     /// Restores the seed data and empties the ledger.
     pub fn reset(&self) -> Result<(), LedgerError> {
         let mut data = self.data.lock().unwrap();
@@ -230,14 +278,30 @@ fn etag(version: u64) -> HeaderValue {
     HeaderValue::from_str(&format!("\"{version}\"")).expect("etag is ascii")
 }
 
+fn if_match(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().trim_matches('"').to_owned())
+}
+
+/// Reads accept an optional `If-Match`; a stale one fails with 412.
+fn check_optional_if_match(headers: &HeaderMap, version: u64) -> Result<(), ApiError> {
+    match if_match(headers) {
+        Some(v) if v != version.to_string() => Err(ApiError::VersionMismatch),
+        _ => Ok(()),
+    }
+}
+
 async fn customer_read(
     State(api): Api,
     Path((tenant, id)): Path<(String, String)>,
     headers: HeaderMap,
-) -> Result<Json<Customer>, ApiError> {
+) -> Result<Response, ApiError> {
     let cred = api.authenticate(&headers)?;
     let data = api.data.lock().unwrap();
     let c = find_customer(&data.dataset, &tenant, &id)?.clone();
+    check_optional_if_match(&headers, c.version)?;
     api.record(
         &tenant,
         &cred,
@@ -246,17 +310,18 @@ async fn customer_read(
             customer_id: c.id.clone(),
         },
     )?;
-    Ok(Json(c))
+    Ok(([(header::ETAG, etag(c.version))], Json(c)).into_response())
 }
 
 async fn invoice_list(
     State(api): Api,
     Path((tenant, id)): Path<(String, String)>,
     headers: HeaderMap,
-) -> Result<Json<Vec<Invoice>>, ApiError> {
+) -> Result<Response, ApiError> {
     let cred = api.authenticate(&headers)?;
     let data = api.data.lock().unwrap();
     let c = find_customer(&data.dataset, &tenant, &id)?;
+    check_optional_if_match(&headers, c.version)?;
     let invoices: Vec<Invoice> = data
         .dataset
         .invoices
@@ -273,7 +338,7 @@ async fn invoice_list(
             invoice_ids: invoices.iter().map(|i| i.id.clone()).collect(),
         },
     )?;
-    Ok(Json(invoices))
+    Ok(([(header::ETAG, etag(c.version))], Json(invoices)).into_response())
 }
 
 async fn invoice_read(
@@ -284,6 +349,7 @@ async fn invoice_read(
     let cred = api.authenticate(&headers)?;
     let data = api.data.lock().unwrap();
     let inv = data.dataset.invoices[invoice_index(&data.dataset, &tenant, &id)?].clone();
+    check_optional_if_match(&headers, inv.version)?;
     api.record(
         &tenant,
         &cred,
@@ -304,11 +370,7 @@ async fn refund_issue(
     let cred = api.authenticate(&headers)?;
     let mut data = api.data.lock().unwrap();
     let idx = invoice_index(&data.dataset, &tenant, &id)?;
-    let expected = headers
-        .get(header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().trim_matches('"').to_owned())
-        .ok_or(ApiError::PreconditionRequired)?;
+    let expected = if_match(&headers).ok_or(ApiError::PreconditionRequired)?;
     let current = &data.dataset.invoices[idx];
     if expected != current.version.to_string() {
         return Err(ApiError::VersionMismatch);

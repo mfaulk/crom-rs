@@ -23,6 +23,8 @@ pub struct Customer {
     pub email: String,
     /// Untrusted free text (threat T9). Carries a per-record canary.
     pub notes: String,
+    /// Bumped on every change; sent as the `ETag` of customer reads.
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +85,7 @@ pub fn seed() -> Dataset {
                 name: format!("{tenant} customer {c}"),
                 email: format!("customer{c}@{tenant}.example"),
                 notes: format!("Account notes. {}", canary(tenant, &id)),
+                version: 1,
             });
             for i in 0..INVOICES_PER_CUSTOMER {
                 let n = c * INVOICES_PER_CUSTOMER + i;

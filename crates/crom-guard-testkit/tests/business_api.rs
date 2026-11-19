@@ -373,3 +373,53 @@ async fn ledger_failure_blocks_the_effect() {
 fn c() -> Client {
     Client::new()
 }
+
+/// Reads honour an optional `If-Match`: a stale one is 412 with no ledger entry, a current one succeeds with an `ETag`.
+#[tokio::test]
+async fn reads_honour_if_match() {
+    let (api, running) = start(Ledger::in_memory()).await;
+    let base = running.base_url();
+    for path in [
+        "/tenants/acme/customers/acme-cus-000",
+        "/tenants/acme/customers/acme-cus-000/invoices",
+        "/tenants/acme/invoices/acme-inv-000",
+    ] {
+        let stale = authed(&c(), reqwest::Method::GET, format!("{base}{path}"))
+            .header("if-match", "\"7\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED, "{path}");
+        let ok = authed(&c(), reqwest::Method::GET, format!("{base}{path}"))
+            .header("if-match", "\"1\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK, "{path}");
+        assert_eq!(ok.headers()["etag"], "\"1\"", "{path}");
+    }
+    assert_eq!(api.ledger().entries().len(), 3);
+}
+
+/// Out-of-band updates bump the version, and trusted lookups are tenant-scoped and leave no ledger entry.
+#[tokio::test]
+async fn updates_bump_version_and_lookups_are_unledgered() {
+    let (api, _running) = start(Ledger::in_memory()).await;
+    assert!(api.update_invoice("acme", "acme-inv-000", |i| {
+        i.customer_id = "acme-cus-001".into()
+    }));
+    let inv = api.lookup_invoice("acme", "acme-inv-000").unwrap();
+    assert_eq!((inv.customer_id.as_str(), inv.version), ("acme-cus-001", 2));
+    assert!(api.update_customer("acme", "acme-cus-000", |c| c.notes.clear()));
+    assert_eq!(
+        api.lookup_customer("acme", "acme-cus-000").unwrap().version,
+        2
+    );
+
+    assert!(!api.update_invoice("acme", "globex-inv-000", |_| {}));
+    assert!(!api.update_customer("acme", "globex-cus-000", |_| {}));
+    assert!(api.lookup_invoice("acme", "globex-inv-000").is_none());
+    assert!(api.lookup_customer("acme", "globex-cus-000").is_none());
+    assert!(api.lookup_customer("acme", "acme-cus-999").is_none());
+    assert!(api.ledger().entries().is_empty());
+}
