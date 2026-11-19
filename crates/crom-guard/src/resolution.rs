@@ -27,6 +27,14 @@ pub type ResolveTimer = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 /// Bounds a resolver by a timer. If the timer fires first, resolution fails
 /// with [`ResolveError::Unavailable`], which the pipeline denies as
 /// `engine_unavailable` (#350: resolver timeout ⇒ deny).
+///
+/// It bounds only work done while the resolver's future is polled and
+/// yields: work done synchronously in `resolve` before the future is
+/// returned, or blocking inside `poll`, cannot be cut off. Resolvers must do
+/// their lookups inside the future, and move blocking work off the executor
+/// (e.g. `tokio::task::spawn_blocking`). A panicking resolver or executor
+/// is not caught here; the pipeline (#351) must treat a panicked task as a
+/// deny.
 pub struct TimeoutResolver<R> {
     inner: R,
     timer: ResolveTimer,

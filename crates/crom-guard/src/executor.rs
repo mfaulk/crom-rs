@@ -18,10 +18,12 @@ use crate::traits::ExecuteError;
 /// 4. **Correlated.** Send [`decision_id`](Self::decision_id) as
 ///    `X-Guard-Decision-Id`.
 /// 5. **Fail closed.** Map the response with
-///    [`check_status`](Self::check_status): `412` and `404` mean the bound
-///    resource changed or left the tenant, reported as
+///    [`check_status`](Self::check_status): `412`, and a `404` the
+///    downstream explicitly marks as "no such resource in this tenant", mean
+///    the bound resource changed or left the tenant, reported as
 ///    [`ExecuteError::Precondition`]; the downstream must not have
-///    performed the effect in either case.
+///    performed the effect in either case. An unmarked `404` (e.g. a wrong
+///    route) is a plain failure.
 ///
 /// The credential comes from the `CredentialLease` passed to
 /// `ProtectedOperation::execute`.
@@ -32,10 +34,11 @@ pub struct ConditionalCall<'a> {
 }
 
 impl<'a> ConditionalCall<'a> {
-    /// Fails if the bound resource is not of `entity_type` (an operation
-    /// wired to the wrong resolver) or its version cannot be sent as an
-    /// entity-tag; both are reported as [`ExecuteError::Failed`] before any
-    /// downstream call.
+    /// Fails with [`ExecuteError::Failed`], before any downstream call, if
+    /// the bound resource is not of `entity_type` (an operation wired to the
+    /// wrong resolver), its version cannot be sent as an entity-tag, or the
+    /// resource id or tenant is `.` or `..` (URL path building would drop or
+    /// resolve such a segment, retargeting the call).
     pub fn new(action: &'a AuthorizedAction, entity_type: &str) -> Result<Self, ExecuteError> {
         let uid = action.resource();
         if uid.entity_type() != entity_type {
@@ -43,6 +46,12 @@ impl<'a> ConditionalCall<'a> {
                 "operation expects a {entity_type} resource, bound to {}",
                 uid.entity_type()
             )));
+        }
+        let tenant = action.principal().tenant().as_str();
+        if [uid.id(), tenant].iter().any(|s| matches!(*s, "." | "..")) {
+            return Err(ExecuteError::Failed(
+                "resource id or tenant is a dot path segment".into(),
+            ));
         }
         let v = action.resource_version().as_str();
         // RFC 9110 etagc: %x21 / %x23-7E. Rejects quotes, whitespace, and
@@ -81,13 +90,16 @@ impl<'a> ConditionalCall<'a> {
     }
 
     /// Maps a downstream HTTP status: 2xx succeeds; `412 Precondition
-    /// Failed` and `404 Not Found` (the resource changed or is no longer in
-    /// the tenant) are [`ExecuteError::Precondition`]; anything else,
-    /// including `428 Precondition Required`, is [`ExecuteError::Failed`].
-    pub fn check_status(status: u16) -> Result<(), ExecuteError> {
+    /// Failed` is [`ExecuteError::Precondition`], and so is `404` when
+    /// `resource_missing` is set, i.e. the downstream marked the response as
+    /// "no such resource in this tenant" (the resource left the tenant after
+    /// authorization). Anything else, including an unmarked `404` and
+    /// `428 Precondition Required`, is [`ExecuteError::Failed`].
+    pub fn check_status(status: u16, resource_missing: bool) -> Result<(), ExecuteError> {
         match status {
             200..=299 => Ok(()),
-            404 | 412 => Err(ExecuteError::Precondition),
+            412 => Err(ExecuteError::Precondition),
+            404 if resource_missing => Err(ExecuteError::Precondition),
             s => Err(ExecuteError::Failed(format!("downstream status {s}"))),
         }
     }
@@ -125,15 +137,16 @@ mod tests {
             db
         }
 
-        /// A downstream that honours `If-Match` and tenant-scoped paths.
-        fn refund(&self, tenant: &str, id: &str, if_match: &str) -> u16 {
+        /// A downstream that honours `If-Match` and tenant-scoped paths, and
+        /// marks a 404 as "no such resource in this tenant".
+        fn refund(&self, tenant: &str, id: &str, if_match: &str) -> (u16, bool) {
             match self.rows.lock().unwrap().get(id) {
-                Some((t, _, _)) if t != tenant => 404,
-                None => 404,
-                Some((_, _, v)) if format!("\"{v}\"") != if_match => 412,
+                Some((t, _, _)) if t != tenant => (404, true),
+                None => (404, true),
+                Some((_, _, v)) if format!("\"{v}\"") != if_match => (412, false),
                 Some(_) => {
                     self.effects.lock().unwrap().push(id.into());
-                    201
+                    (201, false)
                 }
             }
         }
@@ -171,11 +184,9 @@ mod tests {
 
     fn execute(db: &Db, action: &AuthorizedAction) -> Result<(), ExecuteError> {
         let call = ConditionalCall::new(action, "Support::Invoice")?;
-        ConditionalCall::check_status(db.refund(
-            call.tenant().as_str(),
-            call.resource_id(),
-            call.if_match(),
-        ))
+        let (status, missing) =
+            db.refund(call.tenant().as_str(), call.resource_id(), call.if_match());
+        ConditionalCall::check_status(status, missing)
     }
 
     /// Resolves with `db` and binds an `Allow` for the principal of the test grant (tenant `acme`).
@@ -270,23 +281,58 @@ mod tests {
         }
     }
 
-    /// 2xx succeeds, 404 and 412 are precondition failures, and every other status is a plain failure.
+    /// 2xx succeeds; 412 and a 404 the downstream marks as resource-not-found are precondition failures; an unmarked 404 and every other status are plain failures.
     #[test]
     fn status_mapping() {
         for s in [200, 201, 204] {
-            assert_eq!(ConditionalCall::check_status(s), Ok(()));
+            assert_eq!(ConditionalCall::check_status(s, false), Ok(()));
         }
-        for s in [404, 412] {
-            assert_eq!(
-                ConditionalCall::check_status(s),
-                Err(ExecuteError::Precondition)
-            );
-        }
-        for s in [301, 400, 401, 403, 422, 428, 500, 503] {
+        assert_eq!(
+            ConditionalCall::check_status(412, false),
+            Err(ExecuteError::Precondition)
+        );
+        assert_eq!(
+            ConditionalCall::check_status(404, true),
+            Err(ExecuteError::Precondition)
+        );
+        for s in [301, 400, 401, 403, 404, 422, 428, 500, 503] {
             assert!(matches!(
-                ConditionalCall::check_status(s),
+                ConditionalCall::check_status(s, false),
                 Err(ExecuteError::Failed(_))
             ));
+        }
+    }
+
+    /// `.` and `..` as the resource id or tenant are rejected, since URL path building would drop or resolve them.
+    #[test]
+    fn dot_segments_rejected() {
+        let action = ActionId::new("refund.issue").unwrap();
+        let args = ValidatedArgs::new(serde_json::json!({}));
+        let context = AuthorizationContext::default();
+        let allow = Decision::Allow {
+            determining_policies: vec![],
+        };
+        let bind = |tenant: &str, id: &str| {
+            let mut sp = spec();
+            sp.tenant = TenantId::new(tenant).unwrap();
+            let ctx = ExecutionContext::from_chain(vec![grant("g1", None, sp)]).unwrap();
+            let resource = ResolvedResource::new(
+                EntityUid::new("Support::Invoice", id).unwrap(),
+                ResourceVersion::new("1"),
+            );
+            let req = AuthorizationRequest::new(&ctx, &action, &resource, &args, &context, None);
+            ConditionalCall::new(
+                &AuthorizedAction::bind(DecisionId::new("d").unwrap(), &allow, &req).unwrap(),
+                "Support::Invoice",
+            )
+            .map(drop)
+        };
+        assert_eq!(bind("acme", "acme-inv-001"), Ok(()));
+        for (tenant, id) in [("acme", "."), ("acme", ".."), (".", "x"), ("..", "x")] {
+            assert!(
+                matches!(bind(tenant, id), Err(ExecuteError::Failed(_))),
+                "{tenant:?} {id:?}"
+            );
         }
     }
 }

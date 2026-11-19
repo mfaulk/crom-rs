@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crom_guard_testkit::{
     ApiCredential, BusinessApi, Effect, Ledger, RefundResponse, RunningApi, DECISION_ID_HEADER,
+    RESOURCE_NOT_FOUND_HEADER,
 };
 use reqwest::{Client, StatusCode};
 
@@ -422,4 +423,27 @@ async fn updates_bump_version_and_lookups_are_unledgered() {
     assert!(api.lookup_customer("acme", "globex-cus-000").is_none());
     assert!(api.lookup_customer("acme", "acme-cus-999").is_none());
     assert!(api.ledger().entries().is_empty());
+}
+
+/// Tenant-scoped not-found responses carry the resource-not-found marker; a 404 for an unknown route does not.
+#[tokio::test]
+async fn resource_not_found_is_marked() {
+    let (_api, running) = start(Ledger::in_memory()).await;
+    let base = running.base_url();
+    let missing = authed(
+        &c(),
+        reqwest::Method::GET,
+        format!("{base}/tenants/acme/customers/globex-cus-000"),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(missing.headers()[RESOURCE_NOT_FOUND_HEADER], "true");
+    let route = authed(&c(), reqwest::Method::GET, format!("{base}/no/such/route"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(route.status(), StatusCode::NOT_FOUND);
+    assert!(route.headers().get(RESOURCE_NOT_FOUND_HEADER).is_none());
 }

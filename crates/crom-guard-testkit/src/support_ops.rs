@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::api::{BusinessApi, DECISION_ID_HEADER};
+use crate::api::{BusinessApi, DECISION_ID_HEADER, RESOURCE_NOT_FOUND_HEADER};
 use crate::data::{Customer, Invoice};
 
 pub const TENANT_TYPE: &str = "Support::Tenant";
@@ -30,7 +30,8 @@ pub enum SupportAction {
     CustomerRead,
     InvoiceList,
     RefundIssue,
-    /// Registered so `no-bulk-export` can forbid it (G11).
+    /// Registered so `no-bulk-export` can forbid it (G11). Its executor
+    /// always fails closed without a downstream call.
     CustomerExport,
 }
 
@@ -64,7 +65,7 @@ impl SupportAction {
             Self::CustomerRead => "Read one customer record.",
             Self::InvoiceList => "List a customer's invoices.",
             Self::RefundIssue => "Refund part or all of an invoice.",
-            Self::CustomerExport => "Export every customer in the tenant.",
+            Self::CustomerExport => "Export customers. Always fails: not executable in v1.",
         }
     }
 
@@ -233,6 +234,14 @@ impl ProtectedOperation for SupportOperation {
         credential: CredentialLease,
     ) -> BoxFuture<'a, Result<ExecutionOutput, ExecuteError>> {
         Box::pin(async move {
+            // The schema types `customer.export` on one Customer, but the
+            // export is tenant-wide: a permit on that customer would leak
+            // every customer in the tenant. A real export needs a
+            // Tenant-typed resource (a schema change, out of scope for v1),
+            // so this executor never calls downstream.
+            if self.kind == SupportAction::CustomerExport {
+                return Err(export_not_executable());
+            }
             if action.action() != &self.action {
                 return Err(ExecuteError::Failed(format!(
                     "{} executor given a {} action",
@@ -252,6 +261,12 @@ impl ProtectedOperation for SupportOperation {
                 .await
         })
     }
+}
+
+fn export_not_executable() -> ExecuteError {
+    ExecuteError::Failed(
+        "customer.export is not executable: it needs a Tenant-typed resource".into(),
+    )
 }
 
 fn context_for(kind: SupportAction, args: &Value) -> Result<AuthorizationContext, DenyReason> {
@@ -308,14 +323,39 @@ impl SupportResolver {
     }
 }
 
+impl SupportResolver {
+    /// The lookup takes the business API's lock, so it runs on the blocking
+    /// pool when a Tokio runtime is present; either way it runs only when
+    /// the future is polled, so `TimeoutResolver` can bound it. A panicked
+    /// lookup is `Unavailable`.
+    fn resolve_owned(
+        &self,
+        tenant: TenantId,
+        args: Value,
+    ) -> BoxFuture<'static, Result<ResolvedResource, ResolveError>> {
+        let this = Self {
+            kind: self.kind,
+            api: self.api.clone(),
+        };
+        Box::pin(async move {
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => rt
+                    .spawn_blocking(move || this.lookup(&tenant, &args))
+                    .await
+                    .unwrap_or(Err(ResolveError::Unavailable)),
+                Err(_) => this.lookup(&tenant, &args),
+            }
+        })
+    }
+}
+
 impl ResourceResolver for SupportResolver {
     fn resolve<'a>(
         &'a self,
         tenant: &'a TenantId,
         args: &'a ValidatedArgs,
     ) -> BoxFuture<'a, Result<ResolvedResource, ResolveError>> {
-        let r = self.lookup(tenant, args.as_json());
-        Box::pin(async move { r })
+        self.resolve_owned(tenant.clone(), args.as_json().clone())
     }
 }
 
@@ -419,21 +459,14 @@ impl Downstream {
                     Some(json!({ "amount_cents": a.amount_cents })),
                 )
             }
-            SupportAction::CustomerExport => (
-                Method::POST,
-                self.url(&["tenants", t.tenant, "customers", "export"]),
-                None,
-            ),
+            // Also refused here, so no path reaches the export endpoint.
+            SupportAction::CustomerExport => return Err(export_not_executable()),
         };
         let mut req = self
             .client
             .request(method, url)
             .header(DECISION_ID_HEADER, t.decision_id);
-        // The export endpoint is tenant-wide and has no single version to
-        // condition on; every other call is conditioned on the bound one.
-        if kind != SupportAction::CustomerExport {
-            req = req.header(IF_MATCH, t.if_match);
-        }
+        req = req.header(IF_MATCH, t.if_match);
         if let Some(b) = body {
             req = req.json(&b);
         }
@@ -441,7 +474,8 @@ impl Downstream {
         let resp = req.send().await.map_err(|e| {
             ExecuteError::Failed(format!("downstream request: {}", e.without_url()))
         })?;
-        ConditionalCall::check_status(resp.status().as_u16())?;
+        let missing = resp.headers().get(RESOURCE_NOT_FOUND_HEADER).is_some();
+        ConditionalCall::check_status(resp.status().as_u16(), missing)?;
         let body: Value = resp
             .json()
             .await
@@ -459,10 +493,7 @@ impl Downstream {
                 downstream_ref: body["refund_id"].as_str().map(str::to_owned),
                 content: body,
             },
-            SupportAction::CustomerExport => ExecutionOutput {
-                content: json!({ "customers": body }),
-                downstream_ref: None,
-            },
+            SupportAction::CustomerExport => return Err(export_not_executable()),
         })
     }
 }
@@ -747,18 +778,47 @@ mod tests {
         }
     }
 
-    /// Export calls the tenant's export endpoint under the principal's tenant only.
+    /// Export fails closed without any downstream call, so it cannot leak the tenant even if a policy permitted it.
     #[tokio::test]
-    async fn export_is_tenant_scoped() {
+    async fn export_fails_closed_without_effect() {
         let (api, _running, ops) = start().await;
         let o = op(&ops, SupportAction::CustomerExport);
         let args = json!({"customer_id": "acme-cus-000"});
         let r = o.resolver.inner().lookup(&acme(), &args).unwrap();
-        let out = execute_bound(o, &r, &args, &lease()).await.unwrap();
-        let customers = out.content["customers"].as_array().unwrap();
-        assert_eq!(customers.len(), 10);
-        assert!(customers.iter().all(|c| c["tenant"] == "acme"));
-        assert_eq!(api.ledger().entries().len(), 1);
+        assert!(matches!(
+            execute_bound(o, &r, &args, &lease()).await,
+            Err(ExecuteError::Failed(_))
+        ));
+        assert!(api.ledger().entries().is_empty());
+    }
+
+    /// A 404 the API does not mark as resource-not-found (here, a wrong route) is a plain failure, not a precondition.
+    #[tokio::test]
+    async fn unmarked_404_is_failed_not_precondition() {
+        let (api, running, _ops) = start().await;
+        let o = SupportOperation::new(
+            SupportAction::RefundIssue,
+            api.clone(),
+            &SupportConfig::new(format!("{}/no-such-prefix", running.base_url())),
+        )
+        .unwrap();
+        let args = json!({"invoice_id": "acme-inv-001", "amount_cents": 100});
+        let r = o.resolver.inner().lookup(&acme(), &args).unwrap();
+        assert!(matches!(
+            execute_bound(&o, &r, &args, &lease()).await,
+            Err(ExecuteError::Failed(_))
+        ));
+        assert!(api.ledger().entries().is_empty());
+    }
+
+    /// Resolution happens when the future is polled, not when `resolve` returns it, so the timeout can bound it.
+    #[tokio::test]
+    async fn resolution_runs_inside_the_future() {
+        let (api, _running, ops) = start().await;
+        let r = op(&ops, SupportAction::CustomerRead).resolver.inner();
+        let fut = r.resolve_owned(acme(), json!({"customer_id": "acme-cus-004"}));
+        api.update_customer("acme", "acme-cus-004", |_| {});
+        assert_eq!(fut.await.unwrap().version().as_str(), "2");
     }
 
     /// A credential the API does not accept fails the call without any effect.

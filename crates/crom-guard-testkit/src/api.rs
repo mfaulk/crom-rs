@@ -15,6 +15,10 @@ use crate::ledger::{Effect, Ledger, LedgerError};
 /// Guard `executed` audit record (`UnmediatedEffect` probe).
 pub const DECISION_ID_HEADER: &str = "x-guard-decision-id";
 
+/// Set (to `true`) on a `404` that means "no such resource in this
+/// tenant", so executors can tell it from a 404 for an unknown route.
+pub const RESOURCE_NOT_FOUND_HEADER: &str = "x-resource-not-found";
+
 /// A bearer credential the API accepts. Only Guard's credential is
 /// configured in the reference deployment; the direct ("Guard off") baseline
 /// configures one for the trusted test driver instead.
@@ -254,7 +258,12 @@ impl IntoResponse for ApiError {
             // The effect would be unrecorded, so it is not performed.
             Self::LedgerUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "ledger_unavailable"),
         };
-        (status, Json(ErrorBody { error: code.into() })).into_response()
+        let mut resp = (status, Json(ErrorBody { error: code.into() })).into_response();
+        if self == Self::NotFound {
+            resp.headers_mut()
+                .insert(RESOURCE_NOT_FOUND_HEADER, HeaderValue::from_static("true"));
+        }
+        resp
     }
 }
 
