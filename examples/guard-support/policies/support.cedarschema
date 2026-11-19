@@ -1,0 +1,62 @@
+// Guard entity model v1 for the support reference deployment (ADR 0003).
+// Entities come from the trusted resolver and the grant record only; nothing
+// here is populated from agent-supplied tool arguments except validated
+// operation fields such as `context.amount_cents`.
+namespace Support {
+  entity Tenant;
+  entity User in [Tenant] {
+    tenant: Tenant,
+    role: String,
+    refund_limit_cents: Long,
+  };
+  entity Agent {
+    tenant: Tenant,
+    delegator: User,
+  };
+  entity Customer in [Tenant] {
+    tenant: Tenant,
+  };
+  entity Invoice in [Customer] {
+    tenant: Tenant,
+    customer: Customer,
+    amount_cents: Long,
+    refunded_cents: Long,
+  };
+
+  // Constraints of one grant in the chain. Guard evaluates the policy set
+  // once per grant, each time with that grant's record.
+  type GrantCtx = {
+    customers: Set<Customer>,
+    max_refund_cents: Long,
+  };
+
+  // Present only when Guard has matched a stored, unused, unexpired approval
+  // to the request's action digest. Never taken from tool arguments.
+  type ApprovalCtx = {
+    approver: User,
+    amount_cents: Long,
+  };
+
+  action "customer.read", "invoice.list" appliesTo {
+    principal: Agent,
+    resource: Customer,
+    context: { grant: GrantCtx },
+  };
+
+  action "refund.issue" appliesTo {
+    principal: Agent,
+    resource: Invoice,
+    context: {
+      grant: GrantCtx,
+      amount_cents: Long,
+      approval?: ApprovalCtx,
+    },
+  };
+
+  // Registered so the deny-by-policy path is exercised; no permit exists.
+  action "customer.export" appliesTo {
+    principal: Agent,
+    resource: Customer,
+    context: { grant: GrantCtx },
+  };
+}

@@ -344,6 +344,24 @@ jobs:
         with:
           command: check advisories bans sources licenses
 
+  guard-policies:
+    name: security / Guard Cedar policies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: guard-policies
+      # Version must match the cedar-policy pin in ADR 0003. `cargo install`
+      # is a no-op when the cached ~/.cargo/bin already has this version.
+      - name: Install cedar-policy-cli
+        run: cargo install --locked cedar-policy-cli --version 4.15.0
+      # ADR 0003 / #346: strict validation of the reference policy set.
+      - name: Validate Guard policies (strict)
+        run: scripts/validate-guard-policies.sh
+
   workflows:
     name: lint / workflows + spend-cap gate
     runs-on: ubuntu-latest

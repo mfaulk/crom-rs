@@ -417,7 +417,8 @@ are recorded in a separate `untrusted` object.
 ### 9.1 Policy engine: Cedar
 
 Recommendation: **`cedar-policy` 4.x** (4.15.0 current; Apache-2.0; MSRV
-1.89). ADR 0003 ([#346](https://github.com/mfaulk/crom-rs/issues/346)) confirms with a spike. Rationale:
+1.89). Confirmed by the spike in
+[ADR 0003](../security/decisions/0003-guard-policy-engine.md) ([#346](https://github.com/mfaulk/crom-rs/issues/346)); pin `=4.15.0`. Rationale:
 
 - Principal/action/resource/context matches the problem directly. Default
   deny; any satisfied `forbid` overrides every `permit`.
@@ -440,9 +441,12 @@ argument conditions); Biscuit (strong offline attenuation, but a token format
 rather than a central policy language; candidate for M19 capability
 handles). No new DSL.
 
-Cost: about 88 transitive crates (including `lalrpop`) and a longer compile.
-Mitigation: only `crom-guard` and `crom-guard-server` depend on it, not
-`crom-core` or `crom-sdk`.
+Cost (measured in [ADR 0003](../security/decisions/0003-guard-policy-engine.md) §3.6–§3.7):
+106 transitive packages with build dependencies, 48 of them new to the
+workspace lockfile (including `lalrpop`); ≈ +33 s per cold dev build on 4
+cores. `is_authorized` p50 7.1 µs on the v1 support set; per-request cost is
+dominated by entity-store construction. Mitigation: only `crom-guard` and
+`crom-guard-server` depend on it, not `crom-core` or `crom-sdk`.
 
 ### 9.2 Decision interface (illustrative; frozen in [#347](https://github.com/mfaulk/crom-rs/issues/347)/[#349](https://github.com/mfaulk/crom-rs/issues/349))
 
@@ -484,74 +488,50 @@ variant except `Allow` means the executor does not run.
 - Resolver error or timeout → `Deny(ResourceNotFound | EngineUnavailable)`.
 - Audit write failure → the operation is not executed (§12.3).
 
-### 9.3 Entity model and example policies (illustrative; validated in [#346](https://github.com/mfaulk/crom-rs/issues/346))
+### 9.3 Entity model and policies (v1, [ADR 0003](../security/decisions/0003-guard-policy-engine.md))
 
-```cedarschema
-namespace Support {
-  entity Tenant;
-  entity User     in [Tenant] { tenant: Tenant, role: String, refund_limit_cents: Long };
-  entity Agent              { tenant: Tenant, delegator: User };
-  entity Customer in [Tenant] { tenant: Tenant };
-  entity Invoice  in [Customer] { tenant: Tenant, customer: Customer, amount_cents: Long, refunded_cents: Long };
-  type GrantCtx = { customers: Set<Customer>, max_refund_cents: Long };
-  action "customer.read", "invoice.list"
-    appliesTo { principal: Agent, resource: Customer, context: { grant: GrantCtx } };
-  action "refund.issue"
-    appliesTo { principal: Agent, resource: Invoice,
-                context: { grant: GrantCtx, amount_cents: Long,
-                           approval?: { approver: User, amount_cents: Long } } };
-}
-```
+The v1 schema and policy set are committed at
+`examples/guard-support/policies/support.cedarschema` and `support.cedar`.
+They validate in strict mode with no warnings
+(`scripts/validate-guard-policies.sh`, CI job
+`security / Guard Cedar policies`). Entity types: `Tenant`; `User`
+(`tenant`, `role`, `refund_limit_cents`); `Agent` (`tenant`, `delegator`);
+`Customer` (`tenant`); `Invoice` (`tenant`, `customer`, `amount_cents`,
+`refunded_cents`). Grant constraints are the `GrantCtx` record in
+`context.grant`. Approvals are the optional `ApprovalCtx` record in
+`context.approval`. Policies: `tenant-wall`, `read-delegated-customers`,
+`refund-within-limits`, `refund-with-supervisor-approval` (`@approval("supervisor")`),
+and `no-bulk-export`.
 
-```cedar
-@id("tenant-wall")
-forbid (principal, action, resource) unless { resource.tenant == principal.tenant };
+Changes from the draft in this plan, found by the spike (ADR 0003 §3.1):
+`customer.export` is declared as an action (strict validation rejects the
+undeclared action); the approval permit also requires
+`context.amount_cents > 0` (otherwise a negative refund with a matching
+approval is permitted) and `context.approval.approver.tenant == principal.tenant`
+(otherwise another tenant's supervisor can approve).
 
-@id("read-delegated-customers")
-permit (principal is Support::Agent,
-        action in [Support::Action::"customer.read", Support::Action::"invoice.list"],
-        resource is Support::Customer)
-when { context.grant.customers.contains(resource) };
-
-@id("refund-within-limits")
-permit (principal is Support::Agent, action == Support::Action::"refund.issue",
-        resource is Support::Invoice)
-when { context.grant.customers.contains(resource.customer)
-    && context.amount_cents > 0
-    && context.amount_cents <= context.grant.max_refund_cents
-    && context.amount_cents <= principal.delegator.refund_limit_cents
-    && context.amount_cents + resource.refunded_cents <= resource.amount_cents };
-
-@id("refund-with-supervisor-approval")
-@approval("supervisor")
-permit (principal is Support::Agent, action == Support::Action::"refund.issue",
-        resource is Support::Invoice)
-when { context.grant.customers.contains(resource.customer)
-    && context has approval
-    && context.approval.approver.role == "supervisor"
-    && context.approval.amount_cents == context.amount_cents
-    && context.amount_cents + resource.refunded_cents <= resource.amount_cents };
-
-@id("no-bulk-export")
-forbid (principal, action == Support::Action::"customer.export", resource);
-```
-
-Whether the action set is checked in Rust (`action ∈ grant.actions` before
-Cedar) or encoded in Cedar is decided in [#346](https://github.com/mfaulk/crom-rs/issues/346). The plan recommends Rust,
-because it is a trivially reviewable set check and keeps the operator's
-policy independent of grant shape.
+Decided in [#346](https://github.com/mfaulk/crom-rs/issues/346): the action set is checked in Rust
+(`action ∈ grant.actions` for every grant in the chain, before resource
+resolution), not in Cedar. Cedar can express it, but it is a grant invariant
+that must not depend on operator policy text (ADR 0003 §4.3).
 
 ### 9.4 Approval semantics
 
 `ApprovalRequired` is an **orchestration state, not a policy result that
 authorizes anything**:
 
-1. Guard evaluates the real request. If denied, it re-evaluates the same
-   request with a synthetic, schema-valid `context.approval` placeholder,
-   restricted to policies annotated `@approval`. If that would allow, the
-   response is `ApprovalRequired { requirement }`. The requirement includes
-   the action digest = SHA-256 over the canonical
-   (grant_id, action, resolved resource uid, validated arguments).
+1. Guard evaluates the real request. If it is denied, no `forbid`
+   determined the deny, and the request carried no approval, Guard
+   re-evaluates the same request with a synthetic, schema-valid
+   `context.approval` placeholder. The approver is a reserved `User` UID with
+   `role` = the `@approval` value and `tenant = principal.tenant`. This probe
+   uses **every `forbid` plus the permits annotated `@approval`** and runs
+   against every grant in the chain. Probing `@approval` permits alone would
+   request approval for cross-tenant resources (ADR 0003 §3.5). If the probe
+   allows with no errors, the response is `ApprovalRequired { requirement }`;
+   any probe error is `Deny(PolicyError)`. The requirement includes the action
+   digest = SHA-256 over the canonical (grant_id, action, resolved resource
+   uid, validated arguments).
 2. Nothing executes. The trusted application, not the agent, obtains a human
    decision through its own UI and calls `POST /admin/approvals` with the
    approver's user entity and the action digest.
@@ -651,16 +631,17 @@ flowchart LR
    denied. Validate arguments against the operation's JSON Schema with
    `additionalProperties: false`, then parse them into the operation's typed
    argument struct. Fields such as `tenant_id` are not in the schema and are
-   therefore rejected.
+   therefore rejected. Then check `action ∈ grant.actions` for every grant
+   in the chain, so an action the grant cannot use never reaches the
+   resolver (ADR 0003 §4.3).
 3. **Resolve the resource.** The operation's `ResourceResolver` maps the
    argument reference (e.g. `invoice_id`) to a `ResolvedResource { uid,
    attributes, version }` using **trusted application data**, never argument
    values other than the identifier. Not found → `Deny(ResourceNotFound)`,
    with no distinction from "exists in another tenant" in the agent-visible
    message.
-4. **Authorize.** Check `action ∈ grant.actions` for every grant in the
-   chain, then evaluate Cedar for each grant's context. Apply the
-   fail-closed rules in §9.2.
+4. **Authorize.** Evaluate Cedar for each grant's context (the action-set
+   check already ran in step 2). Apply the fail-closed rules in §9.2.
 5. **Bind.** Construct a sealed `AuthorizedAction { decision_id, action,
    resource uid + version, validated args, principal }`. Executors accept
    only this type, which has no public constructor.
@@ -1146,8 +1127,8 @@ These are targets, not current results. No baseline numbers exist yet.
 | # | Risk / question | Affects | Handling |
 |---|---|---|---|
 | 1 | `cedar-policy` MSRV 1.89 vs workspace 1.88 | [#349](https://github.com/mfaulk/crom-rs/issues/349) | PR #338 first; pin `cedar-policy = "=4.15.x"`-compatible minor in [#349](https://github.com/mfaulk/crom-rs/issues/349) |
-| 2 | Cedar compile weight (~88 crates, `lalrpop`) slows CI | [#349](https://github.com/mfaulk/crom-rs/issues/349) | Only Guard crates depend on it; measure CI delta in [#346](https://github.com/mfaulk/crom-rs/issues/346) |
-| 3 | Approval modelling via `@approval` re-evaluation may be confusing or mis-specified | [#346](https://github.com/mfaulk/crom-rs/issues/346), [#354](https://github.com/mfaulk/crom-rs/issues/354) | ADR 0003 compares this with a separate approval policy set. Decide with a test table before [#354](https://github.com/mfaulk/crom-rs/issues/354) |
+| 2 | Cedar compile weight (106 transitive packages, `lalrpop`) slows CI | [#349](https://github.com/mfaulk/crom-rs/issues/349) | Only Guard crates depend on it. Measured in ADR 0003 §3.7: ≈ +33 s cold dev build on 4 cores, 106 transitive packages |
+| 3 | Approval modelling via `@approval` re-evaluation may be confusing or mis-specified | [#346](https://github.com/mfaulk/crom-rs/issues/346), [#354](https://github.com/mfaulk/crom-rs/issues/354) | Decided in ADR 0003 §4.4: `@approval` probe over all forbids plus `@approval` permits; a separate approval set was rejected. 20-case decision table in ADR 0003 §3.5 |
 | 4 | Errored Cedar policies are skipped, so a mistyped `forbid` fails open | [#349](https://github.com/mfaulk/crom-rs/issues/349) | Strict schema validation at load; treat any evaluation error as deny; tests per §9.2 |
 | 5 | TOCTOU between authorize and execute when application data changes | [#350](https://github.com/mfaulk/crom-rs/issues/350) | Version-conditioned executor calls; scenario for ownership change mid-call |
 | 6 | Executors are trusted code; a buggy executor defeats Guard | [#351](https://github.com/mfaulk/crom-rs/issues/351) | Executors receive only `AuthorizedAction`; review checklist; claims scoped to reference operations |

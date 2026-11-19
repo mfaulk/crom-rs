@@ -65,10 +65,14 @@ Several important pieces are not built yet:
   of **Crom Guard**, planned for milestone M18
   ([plan](docs/milestones/MILESTONE_18.md),
   [issues](https://github.com/mfaulk/crom-rs/milestone/2)). The architecture
-  is proposed in [ADR 0002](docs/security/decisions/0002-guard-architecture.md);
+  is proposed in [ADR 0002](docs/security/decisions/0002-guard-architecture.md),
+  and the Cedar policy model in
+  [ADR 0003](docs/security/decisions/0003-guard-policy-engine.md).
   `crates/crom-guard` and `crates/crom-guard-server` are empty skeletons so
-  far; `crates/crom-guard-testkit` provides the controlled business API and
-  effect ledger the M18 tests measure against.
+  far. `crates/crom-guard-testkit` provides the controlled business API and
+  effect ledger the M18 tests measure against, and the reference policy set
+  (`examples/guard-support/policies/`) is validated in CI by
+  `scripts/validate-guard-policies.sh`.
 - **The sandbox is opt-in and Linux-only.** `sandbox.mode` defaults to `off`.
   It covers agent shell commands, not MCP servers or validation commands.
   Other platforms refuse sandboxed commands rather than run them unprotected.
