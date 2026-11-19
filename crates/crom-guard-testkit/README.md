@@ -101,6 +101,20 @@ For the E2 "Guard off" baseline, configure a credential for the trusted test dri
   A `412`, or a `404` marked with `X-Resource-Not-Found`, returns `ExecuteError::Precondition`, and the API performed no effect. An unmarked `404` returns `ExecuteError::Failed`. `refund.issue` reads only `amount_cents` from the arguments.
 - **Export never executes.** `customer.export` resolves the named customer, because the schema declares a `Customer` resource. The export endpoint is tenant-wide, though, so a policy that permitted export on one customer would leak every customer in the tenant. The executor therefore always returns `ExecuteError::Failed` without a downstream call or ledger entry. A real export needs a `Tenant`-typed resource, which is a schema change and out of scope for v1. The operation exists so that `no-bulk-export` can forbid it (G11).
 
+`support_registry(&api, &config)` returns an `OperationRegistry` with all four plus `guard.delegate`. `ApiCredential::from_broker_json` reads a `FileCredentialBroker` file, so the API can accept exactly the credentials Guard's broker hands out.
+
+## `crom-guard-support` example binary
+
+`examples/crom-guard-support.rs` is the stock `crom-guard` CLI with `support_registry` compiled in, plus the business API in the same process. It is the reference deployment's Guard ([docs/guard/reference-deployment.md](../../docs/guard/reference-deployment.md)):
+
+```sh
+cargo build --locked -p crom-guard-testkit --example crom-guard-support
+CROM_GUARD_SUPPORT_CREDENTIALS=credentials.json CROM_GUARD_SUPPORT_LEDGER=ledger.jsonl \
+  <target-dir>/debug/examples/crom-guard-support serve --config guard.toml
+```
+
+`crom-guard-server` is a dev-dependency here, for the example only. It must never depend on this crate (`scripts/check-guard-deps.sh`).
+
 ## Tests
 
 ```sh

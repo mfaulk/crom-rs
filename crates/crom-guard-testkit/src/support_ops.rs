@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use crom_guard::{
     ActionId, AttrValue, AuthorizationContext, AuthorizedAction, BoxFuture, ConditionalCall,
-    CredentialLease, DenyReason, EntityUid, ExecuteError, ExecutionOutput, ProtectedOperation,
-    ResolveError, ResolvedResource, ResourceResolver, ResourceVersion, TenantId, TimeoutResolver,
-    ValidatedArgs,
+    CredentialLease, DenyReason, EntityUid, ExecuteError, ExecutionOutput, OperationRegistry,
+    ProtectedOperation, RegistryError, ResolveError, ResolvedResource, ResourceResolver,
+    ResourceVersion, TenantId, TimeoutResolver, ValidatedArgs,
 };
 use reqwest::header::IF_MATCH;
 use reqwest::{Method, Url};
@@ -151,6 +151,22 @@ pub enum SupportOpsError {
     BaseUrl(String),
     #[error("http client: {0}")]
     Client(String),
+    #[error("registry: {0}")]
+    Registry(#[from] RegistryError),
+}
+
+/// The reference deployment's registry: the four support operations and
+/// `guard.delegate`. Used by the `crom-guard-support` example binary.
+pub fn support_registry(
+    api: &Arc<BusinessApi>,
+    config: &SupportConfig,
+) -> Result<OperationRegistry, SupportOpsError> {
+    let mut registry = OperationRegistry::new();
+    for op in operations(api, config)? {
+        registry.register(Arc::new(op))?;
+    }
+    registry.register_delegate()?;
+    Ok(registry)
 }
 
 /// All four support operations.
@@ -546,6 +562,28 @@ mod tests {
             decision_id: "dec-1",
         };
         o.downstream.send(o.kind, &t, args, credential).await
+    }
+
+    /// The reference registry holds the four support operations plus `guard.delegate`.
+    #[tokio::test]
+    async fn support_registry_registers_support_ops_and_delegate() {
+        let (api, running, _) = start().await;
+        let registry = support_registry(&api, &SupportConfig::new(running.base_url())).unwrap();
+        let ids: Vec<String> = registry
+            .action_ids()
+            .into_iter()
+            .map(|a| a.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "customer.export",
+                "customer.read",
+                "guard.delegate",
+                "invoice.list",
+                "refund.issue"
+            ]
+        );
     }
 
     /// Every schema forbids extra properties, declares no tenant field, and rejects a forged `tenant_id`.

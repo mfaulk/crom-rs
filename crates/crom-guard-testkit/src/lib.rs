@@ -14,5 +14,6 @@ pub use api::{
 pub use data::{canary, seed, Customer, Dataset, Invoice, User};
 pub use ledger::{Effect, Ledger, LedgerEntry, LedgerError};
 pub use support_ops::{
-    operations, SupportAction, SupportConfig, SupportOperation, SupportOpsError, SupportResolver,
+    operations, support_registry, SupportAction, SupportConfig, SupportOperation, SupportOpsError,
+    SupportResolver,
 };
