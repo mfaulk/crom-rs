@@ -3,7 +3,7 @@
 Runnable demos for `crom`. Each demo lives in its own directory under
 `examples/`. Crate-based demos are **excluded from the root workspace** —
 run `cargo` commands from inside the demo directory, not from the repo
-root. A few demos (`auth-demo/`, `plugin-demo/`) are not crates and ship
+root. A few demos (`auth-demo/`, `plugin-demo/`, `guard-support/`) are not crates and ship
 only scripts and config fixtures.
 
 Most demos work offline (no provider API key). Demos that drive the agent
@@ -25,6 +25,7 @@ provider you logged into).
 | [`beta-demo/`](beta-demo/) | TUI / terminal UX fixture for `crom tui` | yes |
 | [`auth-demo/`](auth-demo/) *(not a crate)* | Provider login + credential store walkthrough against a fake provider; driven by `auth-demo/run.sh` | no |
 | [`planning-demo/`](planning-demo/) | Plan-then-act flow with a planted bug | yes |
+| [`guard-support/`](guard-support/) *(not a crate yet)* | Crom Guard reference deployment; so far only the Cedar schema and policy set, validated by `scripts/validate-guard-policies.sh` | no |
 | [`headless-sdk-demo/`](headless-sdk-demo/) | Embedding `crom-sdk`: in-memory workspace, return-only patches, plan/act, cancellation, approval callbacks, custom tools | no (uses `fake-provider`) |
 
 ## End-to-end scripts
