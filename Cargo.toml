@@ -16,6 +16,7 @@ members = [
     "crates/crom-eval",
     "crates/crom-guard",
     "crates/crom-guard-server",
+    "crates/crom-guard-testkit",
 ]
 exclude = [
     "crates/crom-eval/eval",
