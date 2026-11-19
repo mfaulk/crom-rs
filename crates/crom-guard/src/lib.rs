@@ -19,6 +19,7 @@ mod audit;
 mod context;
 mod credential;
 mod decision;
+mod delegate;
 mod error;
 mod executor;
 mod grant;
@@ -57,6 +58,7 @@ pub use credential::{
     EnvCredentialBroker, FileCredentialBroker, MAX_CREDENTIALS_FILE_BYTES,
 };
 pub use decision::{ActionDigest, ApprovalRequirement, Decision, DenyReason};
+pub use delegate::DELEGATE_ACTION;
 pub use error::GuardError;
 pub use executor::ConditionalCall;
 pub use grant::{

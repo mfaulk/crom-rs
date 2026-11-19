@@ -159,6 +159,42 @@ fn random_id(prefix: &str) -> Result<String, GrantStoreError> {
     Ok(s)
 }
 
+/// The attenuation rules of MILESTONE_18 §8.3 for a child of `parent`
+/// created at `now`; returns the child's `expires_at`. Shared by
+/// `delegate` and the `guard.delegate` pre-decision check, so both apply
+/// exactly the same rules.
+pub(crate) fn check_narrowing(
+    parent: &Grant,
+    spec: &DelegationSpec,
+    now: Timestamp,
+) -> Result<Timestamp, GrantStoreError> {
+    if !spec.actions.is_subset(parent.actions()) {
+        return Err(GrantStoreError::InvalidSpec(
+            "actions exceed the parent's".into(),
+        ));
+    }
+    spec.constraints
+        .narrows(parent.constraints())
+        .map_err(|e| GrantStoreError::InvalidSpec(e.to_string()))?;
+    if parent.max_depth() == 0 {
+        return Err(GrantStoreError::InvalidSpec(
+            "parent grant may not delegate".into(),
+        ));
+    }
+    if spec.max_depth >= parent.max_depth() {
+        return Err(GrantStoreError::InvalidSpec(
+            "max_depth must be below the parent's".into(),
+        ));
+    }
+    let expires_at = now.saturating_add_secs(spec.ttl_seconds);
+    if expires_at > parent.expires_at() {
+        return Err(GrantStoreError::InvalidSpec(
+            "expiry exceeds the parent's".into(),
+        ));
+    }
+    Ok(expires_at)
+}
+
 impl MemoryGrantStore {
     pub fn new(config: GrantStoreConfig) -> Self {
         Self {
@@ -259,30 +295,7 @@ impl MemoryGrantStore {
             .check_live(now)
             .map_err(|r| GrantStoreError::InvalidSpec(format!("parent grant is not live: {r}")))?;
         let p = current.leaf();
-        if !spec.actions.is_subset(p.actions()) {
-            return Err(GrantStoreError::InvalidSpec(
-                "actions exceed the parent's".into(),
-            ));
-        }
-        spec.constraints
-            .narrows(p.constraints())
-            .map_err(|e| GrantStoreError::InvalidSpec(e.to_string()))?;
-        if p.max_depth() == 0 {
-            return Err(GrantStoreError::InvalidSpec(
-                "parent grant may not delegate".into(),
-            ));
-        }
-        if spec.max_depth >= p.max_depth() {
-            return Err(GrantStoreError::InvalidSpec(
-                "max_depth must be below the parent's".into(),
-            ));
-        }
-        let expires_at = now.saturating_add_secs(spec.ttl_seconds);
-        if expires_at > p.expires_at() {
-            return Err(GrantStoreError::InvalidSpec(
-                "expiry exceeds the parent's".into(),
-            ));
-        }
+        let expires_at = check_narrowing(p, &spec, now)?;
         let used = state.children.get(p.grant_id()).copied().unwrap_or(0);
         if used >= self.config.max_children_per_grant {
             return Err(GrantStoreError::InvalidSpec(

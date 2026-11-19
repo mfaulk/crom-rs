@@ -109,3 +109,17 @@ cargo test -p crom-guard-testkit
 
 - `tests/pipeline_e2e.rs` runs a full `crom_guard::Guard` over `support_ops`, a `FileCredentialBroker`, and a `FileAuditSink`, against the HTTP API (#351). The ledger is the oracle: an allowed refund has one effect carrying the decision id; an ownership change or revoke between authorize and execute has none; `customer.export` is denied, and fails closed even under a permitting policy.
 - `tests/canary.rs` checks that the broker's secret and the session handle never appear in any `CallOutcome`, audit line, ledger entry, or `tracing` output. It installs a global trace subscriber, so it is its own test binary.
+  The test environment registers `guard.delegate`; the canary also delegates a child and checks that the child handle appears only in the delegate result (#353).
+- `tests/scenario_g10.rs` replays the scenario fixture below.
+
+## Scenario fixtures
+
+`fixtures/scenarios/` holds scripted adversarial scenarios for #361, as JSON:
+
+- `grant`: the parent `GrantSpec` the application issues;
+- `steps`: each with `name`, `as` (`parent` or a handle bound by an earlier step), `tool`, `arguments`, `expect` (`executed` or a deny code) and, optionally, `bind_handle` (store the child handle from a `guard.delegate` result under that name);
+- `expected_ledger_effects`: the only ledger effects the run may produce, as partial `Effect` objects in order.
+
+| File | Scenario |
+|---|---|
+| `g10-subagent-escalation.json` | G10 (#353): widening `guard.delegate` requests and a child using undelegated authority |

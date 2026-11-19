@@ -1274,3 +1274,112 @@ fn accepts_approval_tests_as_top_level_conjuncts() {
     )
     .unwrap();
 }
+
+mod attenuation {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    const POOL: [&str; 3] = ["customer.read", "refund.issue", "customer.export"];
+
+    #[derive(Debug, Clone)]
+    struct Arb {
+        actions: Vec<bool>,
+        customers: Vec<bool>,
+        max_refund: i64,
+    }
+
+    fn arb() -> impl Strategy<Value = Arb> {
+        (
+            proptest::collection::vec(any::<bool>(), 3),
+            proptest::collection::vec(any::<bool>(), 3),
+            0i64..=12_000,
+        )
+            .prop_map(|(actions, customers, max_refund)| Arb {
+                actions,
+                customers,
+                max_refund,
+            })
+    }
+
+    /// A grant with exactly the generated authority; nothing relates a child to its parent.
+    fn unchecked(id: &str, parent: Option<&str>, depth: u8, a: &Arb) -> Grant {
+        let actions = POOL
+            .iter()
+            .zip(&a.actions)
+            .filter(|(_, m)| **m)
+            .map(|(x, _)| ActionId::new(*x).unwrap())
+            .collect();
+        let customers = ["c1", "c2", "c3"]
+            .iter()
+            .zip(&a.customers)
+            .filter(|(_, m)| **m)
+            .map(|(c, _)| uid("Customer", c))
+            .collect();
+        Grant::issue(
+            GrantSpec {
+                tenant: TenantId::new("t1").unwrap(),
+                delegator: alice(),
+                run_id: RunId::new("run-1").unwrap(),
+                actions,
+                constraints: Constraints::new(BTreeMap::from([
+                    ("customers".to_owned(), Constraint::Set(customers)),
+                    (
+                        "max_refund_cents".to_owned(),
+                        Constraint::AtMost(a.max_refund),
+                    ),
+                ]))
+                .unwrap(),
+                ttl_seconds: 600,
+                max_depth: depth,
+            },
+            GrantIssue {
+                grant_id: GrantId::new(id).unwrap(),
+                issuer: AppId::new("support-app").unwrap(),
+                agent: AgentId::new(format!("a-{id}")).unwrap(),
+                not_before: Timestamp::from_unix_millis(1_000),
+                expires_at: Timestamp::from_unix_millis(601_000),
+                parent: parent.map(|p| GrantId::new(p).unwrap()),
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 10_000, failure_persistence: None, ..ProptestConfig::default() })]
+
+        /// With no narrowing check at all, chain evaluation alone guarantees that a child chain allows only what its parent alone allows (MILESTONE_18 §8.3).
+        #[test]
+        fn chain_allow_implies_parent_allow(
+            parent in arb(),
+            child in arb(),
+            action in 0usize..3,
+            cust_ix in 0usize..4,
+            amount in 1i64..=12_000,
+        ) {
+            let root = unchecked("g-root", None, 1, &parent);
+            let leaf = unchecked("g-child", Some("g-root"), 0, &child);
+            let cust = ["c1", "c2", "c3", "c9"][cust_ix];
+            let tenant = if cust == "c9" { "t2" } else { "t1" };
+            let refund = POOL[action] == "refund.issue";
+            let resource = if refund {
+                invoice(&format!("{cust}-inv"), tenant, cust, 20_000, 0)
+            } else {
+                customer(cust, tenant)
+            };
+            let case = Case {
+                name: "attenuation",
+                action: POOL[action],
+                resource,
+                amount: refund.then_some(amount),
+                approval: None,
+                chain: vec![],
+                expect: Expect::Allow(&[]),
+            };
+            let both = Parts::build(&case, ExecutionContext::from_chain(vec![leaf, root.clone()]).unwrap());
+            let alone = Parts::build(&case, ExecutionContext::from_chain(vec![root]).unwrap());
+            if pdp().authorize(&both.request()).is_allow() {
+                prop_assert!(pdp().authorize(&alone.request()).is_allow());
+            }
+        }
+    }
+}

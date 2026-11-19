@@ -9,8 +9,8 @@ mod common;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use common::{env, permissive_export_policies, CANARY, POLICIES};
-use crom_guard::{CallMeta, CallOutcome, DecisionKind, RecordKind};
+use common::{delegating_grant_spec, env, env_with, permissive_export_policies, CANARY, POLICIES};
+use crom_guard::{CallMeta, CallOutcome, CallResult, DecisionKind, RecordKind};
 use serde_json::json;
 
 #[derive(Clone, Default)]
@@ -30,7 +30,7 @@ fn texts(o: &CallOutcome) -> String {
     format!("{o:?}\n{}", serde_json::to_string(o).unwrap())
 }
 
-/// The canary secret appears in no outcome, audit line, error string, ledger entry, or trace event for any kind of call.
+/// The canary secret and every session handle (a delegated child's included, outside its own delegate result) appear in no outcome, audit line, error string, ledger entry, or trace event for any kind of call.
 #[tokio::test]
 async fn broker_secret_never_leaves_guard() {
     let capture = Capture::default();
@@ -103,6 +103,46 @@ async fn broker_secret_never_leaves_guard() {
             .await,
     );
 
+    // Delegation (#353): the child handle is a secret held only by the
+    // delegate result.
+    let deleg = env_with(POLICIES, delegating_grant_spec()).await;
+    let delegated = deleg
+        .call(
+            "guard.delegate",
+            json!({"actions": ["customer.read", "refund.issue"], "ttl_seconds": 60,
+                   "constraints": [{"name": "max_refund_cents", "at_most": 2_000}]}),
+        )
+        .await;
+    let child = match &delegated.result {
+        CallResult::Executed { content } => content["handle"].as_str().unwrap().to_owned(),
+        other => panic!("{other:?}"),
+    };
+    for (tool, args) in [
+        (
+            "refund.issue",
+            json!({"invoice_id": "acme-inv-001", "amount_cents": 1_000}),
+        ),
+        (
+            "refund.issue",
+            json!({"invoice_id": "acme-inv-001", "amount_cents": 3_000}),
+        ),
+        ("customer.read", json!({"customer_id": "acme-cus-001"})),
+        (
+            "guard.delegate",
+            json!({"actions": ["customer.read"], "ttl_seconds": 1}),
+        ),
+    ] {
+        seen.push(deleg.call_as(&child, tool, args).await);
+    }
+    seen.push(
+        deleg
+            .call(
+                "guard.delegate",
+                json!({"actions": ["customer.export", "guard.delegate"], "ttl_seconds": 60}),
+            )
+            .await,
+    );
+
     let codes: Vec<_> = seen
         .iter()
         .map(|o| o.code().unwrap_or("executed"))
@@ -121,13 +161,20 @@ async fn broker_secret_never_leaves_guard() {
         assert!(codes.contains(&expected), "{codes:?} lacks {expected}");
     }
 
+    assert!(codes.contains(&"action_not_granted"), "{codes:?}");
+    // The delegate result is the one place the child handle may appear.
+    assert!(texts(&delegated).contains(&child));
+
     let mut haystacks = vec![
         e.audit_text(),
         permissive.audit_text(),
+        deleg.audit_text(),
         e.broker_debug.clone(),
+        format!("{:?}", deleg.guard),
+        format!("{:?}", deleg.store),
     ];
     haystacks.extend(seen.iter().map(texts));
-    for env in [&e, &permissive] {
+    for env in [&e, &permissive, &deleg] {
         haystacks.push(serde_json::to_string(&env.api.ledger().entries()).unwrap());
     }
     let traces = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
@@ -139,9 +186,11 @@ async fn broker_secret_never_leaves_guard() {
             !h.contains(&e.handle),
             "session handle leaked in haystack {i}"
         );
-        assert!(
-            !h.contains(&permissive.handle),
-            "session handle leaked in haystack {i}"
-        );
+        for handle in [&permissive.handle, &deleg.handle, &child] {
+            assert!(
+                !h.contains(handle.as_str()),
+                "session handle leaked in haystack {i}"
+            );
+        }
     }
 }

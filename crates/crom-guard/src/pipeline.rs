@@ -527,8 +527,9 @@ impl Call<'_> {
         self.finish(result, execute_us).await
     }
 
-    /// Builtins (#353): no resolver and no Cedar evaluation; the decision
-    /// record is still written first and the chain rechecked.
+    /// Builtins (#353): no resolver and no Cedar evaluation. The builtin's
+    /// own `check` decides; the decision record is still written first and
+    /// the chain rechecked.
     async fn run_builtin(
         mut self,
         entry: &Registered,
@@ -538,6 +539,12 @@ impl Call<'_> {
         let OpKind::Builtin(op) = &entry.kind else {
             return self.deny(DenyReason::PolicyError).await;
         };
+        let now = self.rec.time;
+        match guarded_sync(|| op.check(&ctx, &args, now)) {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => return self.deny(reason).await,
+            Err(Panicked) => return self.panicked("builtin check").await,
+        }
         self.rec.decision = Some(DecisionKind::Allow);
         self.rec.enforcement = Some(Enforcement::GuardValidation);
         if let Err(r) = self.write_decision().await {
@@ -884,6 +891,18 @@ mod tests {
         fn input_schema(&self) -> &Value {
             &self.schema
         }
+        fn check(
+            &self,
+            _: &ExecutionContext,
+            args: &ValidatedArgs,
+            _: Timestamp,
+        ) -> Result<(), DenyReason> {
+            match args.as_json().get("check").and_then(Value::as_str) {
+                Some("deny") => Err(DenyReason::PolicyDeny),
+                Some("panic") => panic!("builtin check bug"),
+                _ => Ok(()),
+            }
+        }
         fn run<'a>(
             &'a self,
             ctx: &'a ExecutionContext,
@@ -942,7 +961,8 @@ mod tests {
     fn echo(action: &str) -> Arc<Echo> {
         Arc::new(Echo {
             action: ActionId::new(action).unwrap(),
-            schema: json!({"type": "object", "additionalProperties": false}),
+            schema: json!({"type": "object", "additionalProperties": false,
+                           "properties": {"check": {"type": "string"}}}),
             runs: AtomicUsize::new(0),
         })
     }
@@ -983,6 +1003,30 @@ mod tests {
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].record, RecordKind::Decision);
         assert_eq!(recs[1].outcome, Some(Outcome::Executed));
+    }
+
+    /// A builtin whose `check` denies or panics writes one deny decision record and never runs.
+    #[test]
+    fn builtin_check_decides_before_the_decision_record() {
+        for (mode, code, reason) in [
+            ("deny", "policy_deny", DenyReason::PolicyDeny),
+            ("panic", "engine_unavailable", DenyReason::EngineUnavailable),
+        ] {
+            let (guard, op, sink, handle) = setup(true);
+            let out = block_on(guard.call(
+                &handle,
+                "guard.echo",
+                json!({"check": mode}),
+                CallMeta::default(),
+            ));
+            assert_eq!(out.code(), Some(code), "{mode}");
+            assert_eq!(op.runs.load(Ordering::SeqCst), 0, "{mode}");
+            let recs = sink.0.lock().unwrap();
+            assert_eq!(recs.len(), 1, "{mode}");
+            assert_eq!(recs[0].decision, Some(DecisionKind::Deny), "{mode}");
+            assert_eq!(recs[0].reason, Some(reason), "{mode}");
+            assert!(!guard.is_failed_closed());
+        }
     }
 
     /// Latches Guard when it records a decision, as a concurrent failure would.
