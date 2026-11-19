@@ -184,20 +184,51 @@ fn check_approval(policy: &cedar::Policy, id: &str, role: &str) -> Result<(), Pd
     {
         return Err(fail("the role must be non-empty [A-Za-z0-9_.-]"));
     }
-    let text = policy
-        .to_string()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if !text.contains("context has approval") {
-        return Err(fail("the permit must test `context has approval`"));
+    // Checked on the parsed policy (EST), not its text: both tests must be
+    // top-level `&&` conjuncts of `when` clauses, so the permit cannot be
+    // satisfied without an approval of that role. `unless` is refused
+    // outright rather than reasoned about.
+    let est = policy
+        .to_json()
+        .map_err(|e| fail(&format!("cannot inspect policy: {e}")))?;
+    let mut conj = Vec::new();
+    for c in est["conditions"].as_array().into_iter().flatten() {
+        if c["kind"] != "when" {
+            return Err(fail("an @approval permit may not have `unless` clauses"));
+        }
+        conjuncts(&c["body"], &mut conj);
     }
-    if !text.contains(&format!("context.approval.approver.role == \"{role}\"")) {
+    let context = serde_json::json!({"Var": "context"});
+    let has = serde_json::json!({"has": {"left": context, "attr": "approval"}});
+    if !conj.contains(&&has) {
         return Err(fail(
-            "the permit must test `context.approval.approver.role == \"<role>\"`",
+            "a `when` clause must test `context has approval` as a top-level conjunct",
+        ));
+    }
+    let path = ["approval", "approver", "role"].iter().fold(
+        context,
+        |l, a| serde_json::json!({".": {"left": l, "attr": a}}),
+    );
+    let value = serde_json::json!({"Value": role});
+    let role_test = |l: &serde_json::Value, r: &serde_json::Value| serde_json::json!({"==": {"left": l, "right": r}});
+    if !conj.contains(&&role_test(&path, &value)) && !conj.contains(&&role_test(&value, &path)) {
+        return Err(fail(
+            "a `when` clause must test `context.approval.approver.role == \"<role>\"` \
+             as a top-level conjunct",
         ));
     }
     Ok(())
+}
+
+/// Flattens nested `&&` into its operands.
+fn conjuncts<'a>(e: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+    match e.get("&&") {
+        Some(and) => {
+            conjuncts(&and["left"], out);
+            conjuncts(&and["right"], out);
+        }
+        None => out.push(e),
+    }
 }
 
 impl CedarPdp {
@@ -645,8 +676,9 @@ impl<'a> Inputs<'a> {
             resource: r.resource(),
             args: r.args(),
             context: r.context().fields(),
-            // #347 gives the approver no tenant of its own; approvals are
-            // bound to the grant (#354), so the approver is in its tenant.
+            // `ApprovalContext` carries no approver tenant, so the Cedar
+            // `approver.tenant == principal.tenant` test always holds here.
+            // #354 must reject cross-tenant approvers before building one.
             approval: r.approval().map(|a| ApprovalInput {
                 approver: a.approver(),
                 tenant: p.tenant(),
@@ -730,10 +762,17 @@ fn check_reserved(inp: &Inputs<'_>) -> Result<(), String> {
             .any(|p| p.id().starts_with(RESERVED_ID_PREFIX))
         || r.attrs().values().any(mentions_reserved)
         || inp.context.values().any(mentions_reserved)
-        || inp
-            .approval
-            .as_ref()
-            .is_some_and(|a| a.fields.values().any(mentions_reserved));
+        || inp.delegator.attrs().values().any(mentions_reserved)
+        || inp.chain.iter().any(|g| {
+            g.constraints()
+                .to_context_record()
+                .values()
+                .any(mentions_reserved)
+        })
+        || inp.approval.as_ref().is_some_and(|a| {
+            a.fields.values().any(mentions_reserved)
+                || a.approver.attrs().values().any(mentions_reserved)
+        });
     if reserved {
         return Err(format!(
             "input uses the reserved id prefix {RESERVED_ID_PREFIX:?}"

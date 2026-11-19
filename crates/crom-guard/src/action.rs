@@ -69,6 +69,10 @@ impl AuthorizationContext {
 /// unused). Becomes `context.approval`. Only the approval store builds it
 /// (#354); the approver comes from the trusted application's admin call.
 ///
+/// The approver has no tenant here, so the PDP gives it the principal's
+/// tenant. The approval store must reject an approver from another tenant
+/// before building this value; the Cedar tenant test is defense in depth.
+///
 /// ```compile_fail
 /// let a = crom_guard::ApprovalContext {
 ///     approval_id: "ap1".parse().unwrap(),

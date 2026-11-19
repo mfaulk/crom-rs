@@ -129,10 +129,20 @@ fn chain(gs: &[G]) -> ExecutionContext {
 }
 
 fn grant(g: &G, parent: Option<&str>, depth: usize, constraints: Constraints) -> Grant {
+    grant_by(g, parent, depth, constraints, alice())
+}
+
+fn grant_by(
+    g: &G,
+    parent: Option<&str>,
+    depth: usize,
+    constraints: Constraints,
+    delegator: Delegator,
+) -> Grant {
     Grant::issue(
         GrantSpec {
             tenant: TenantId::new("t1").unwrap(),
-            delegator: alice(),
+            delegator,
             run_id: RunId::new("run-1").unwrap(),
             actions: g
                 .actions
@@ -1128,4 +1138,139 @@ fn pdp_latency() {
         std::hint::black_box(CedarPdp::from_sources("Support", SCHEMA, POLICIES).unwrap());
     }
     println!("load: {:.2}ms avg", t.elapsed().as_secs_f64() * 10.0);
+}
+
+fn approval_bypass(conditions: &str) -> Result<CedarPdp, PdpLoadError> {
+    load_with(&format!(
+        "@id(\"x\")\n@approval(\"supervisor\")\n\
+         permit (principal, action == Support::Action::\"refund.issue\", resource)\n{conditions};"
+    ))
+}
+
+/// An @approval permit whose required tests appear only in a comment is refused.
+#[test]
+fn refuses_approval_tests_in_comment_only() {
+    let e = approval_bypass(
+        "// context has approval && context.approval.approver.role == \"supervisor\"\nwhen { true }",
+    );
+    assert!(matches!(e, Err(PdpLoadError::Approval { .. })), "{e:?}");
+}
+
+/// An @approval permit whose required tests sit under a disjunction is refused.
+#[test]
+fn refuses_approval_tests_under_disjunction() {
+    let e = approval_bypass(
+        "when { context.amount_cents > 0 || (context has approval && \
+         context.approval.approver.role == \"supervisor\") }",
+    );
+    assert!(matches!(e, Err(PdpLoadError::Approval { .. })), "{e:?}");
+}
+
+/// An @approval permit with an `unless` clause (here holding the required tests) is refused.
+#[test]
+fn refuses_approval_tests_in_unless() {
+    let e = approval_bypass(
+        "when { context.amount_cents > 0 }\nunless { context has approval && \
+         context.approval.approver.role == \"supervisor\" }",
+    );
+    assert!(matches!(e, Err(PdpLoadError::Approval { .. })), "{e:?}");
+}
+
+fn reserved_ref() -> AttrValue {
+    ent("User", "__guard_x")
+}
+
+fn customers_and_max(customers: &[EntityUid]) -> Constraints {
+    Constraints::new(BTreeMap::from([
+        (
+            "customers".to_owned(),
+            Constraint::Set(customers.iter().cloned().collect()),
+        ),
+        ("max_refund_cents".to_owned(), Constraint::AtMost(10_000)),
+    ]))
+    .unwrap()
+}
+
+fn assert_reserved_deny(e: &Evaluation) {
+    assert_eq!(e.decision, Decision::deny(DenyReason::PolicyError));
+    assert!(
+        e.errors.iter().any(|m| m.contains("reserved")),
+        "{:?}",
+        e.errors
+    );
+}
+
+/// A grant constraint set naming a reserved-prefix entity is denied, even where the request would otherwise be allowed.
+#[test]
+fn reserved_id_in_grant_constraints_denies() {
+    let c = read(
+        "",
+        "customer.read",
+        customer("c1", "t1"),
+        Expect::Allow(&[]),
+    );
+    let cons = customers_and_max(&[uid("Customer", "c1"), uid("Customer", "__guard_x")]);
+    let ctx = ExecutionContext::from_chain(vec![grant(&G_FULL, None, 0, cons)]).unwrap();
+    let parts = Parts::build(&c, ctx);
+    assert_reserved_deny(&pdp().evaluate_chain(&parts.request()));
+}
+
+/// Delegator attributes referencing a reserved-prefix entity are denied.
+#[test]
+fn reserved_id_in_delegator_attrs_denies() {
+    let c = read(
+        "",
+        "customer.read",
+        customer("c1", "t1"),
+        Expect::Allow(&[]),
+    );
+    let d = Delegator::new(
+        UserId::new("alice").unwrap(),
+        "agent",
+        [
+            ("refund_limit_cents".to_owned(), AttrValue::Long(5_000)),
+            ("manager".to_owned(), reserved_ref()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let cons = customers_and_max(&[uid("Customer", "c1")]);
+    let ctx = ExecutionContext::from_chain(vec![grant_by(&G_FULL, None, 0, cons, d)]).unwrap();
+    let parts = Parts::build(&c, ctx);
+    assert_reserved_deny(&pdp().evaluate_chain(&parts.request()));
+}
+
+/// Approver attributes referencing a reserved-prefix entity are denied.
+#[test]
+fn reserved_id_in_approver_attrs_denies() {
+    let approver = Delegator::new(
+        UserId::new("sup").unwrap(),
+        "supervisor",
+        [
+            ("refund_limit_cents".to_owned(), AttrValue::Long(100_000)),
+            ("manager".to_owned(), reserved_ref()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let c = refund(
+        "",
+        i1(),
+        8_000,
+        Some((approver, 8_000)),
+        vec![G_FULL],
+        Expect::Allow(&[]),
+    );
+    let parts = Parts::new(&c);
+    assert_reserved_deny(&pdp().evaluate_chain(&parts.request()));
+}
+
+/// The required tests are accepted as top-level conjuncts across several `when` clauses, in either operand order.
+#[test]
+fn accepts_approval_tests_as_top_level_conjuncts() {
+    approval_bypass(
+        "when { context.amount_cents > 0 && (context has approval) }\n\
+         when { \"supervisor\" == context.approval.approver.role }",
+    )
+    .unwrap();
 }

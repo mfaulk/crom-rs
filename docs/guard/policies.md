@@ -25,7 +25,8 @@ Loading fails with `PdpLoadError` if any of these is true:
 - An `@approval("<role>")` annotation:
   - is on a `forbid`;
   - has an empty role, or one outside `[A-Za-z0-9_.-]`;
-  - is on a permit whose text does not contain both `context has approval` and `context.approval.approver.role == "<role>"`. Whitespace is normalized before this check.
+  - is on a permit with any `unless` clause;
+  - is on a permit whose `when` clauses do not have both `context has approval` and `context.approval.approver.role == "<role>"` (either operand order) as top-level `&&` conjuncts. The check runs on the parsed policy (`Policy::to_json`), not the text, so a test inside a comment, under `||`, or in an `unless` does not count. `@approval` permits are also in the main policy set, so a permit that could be satisfied without an approval would authorize without one.
 
 ## Writing policies
 
@@ -49,6 +50,8 @@ Loading fails with `PdpLoadError` if any of these is true:
   The action's declared context must match this shape exactly, or the request is denied.
 - For an approvable permit, annotate it `@approval("<role>")`. Inside it, test `context has approval`, `context.approval.approver.role == "<role>"`, and every field the approval must match. Also test `context.approval.approver.tenant == principal.tenant`.
 
+> **Approver tenant: the Cedar check is defense in depth only.** `ApprovalContext` carries the approver as a `Delegator`, which has no tenant. The PDP therefore sets the approver entity's `tenant` to the principal's tenant, so `context.approval.approver.tenant == principal.tenant` is always true on the public path. **The approval store (#354) must reject an approver from a different tenant before it builds an `ApprovalContext`.** Keep the Cedar test anyway: it starts to bite if the approval model later carries the approver's own tenant.
+
 ## Evaluation
 
 `evaluate_chain(&AuthorizationRequest) -> Evaluation` returns the decision, the main-evaluation result for each grant, and any error messages. `authorize` returns only the decision. The steps run in this order:
@@ -59,6 +62,8 @@ Loading fails with `PdpLoadError` if any of these is true:
 4. **Approval probe.** The probe set is every `forbid` plus every `@approval` permit. For each `@approval` role, in policy order, it is evaluated against every grant in the chain. The probe adds a placeholder approver, `User::"__guard_approval_placeholder__"`: role = the annotation value, tenant = the principal's, and the delegator's other attributes zeroed. `context.approval` is set to `{approver: placeholder}` plus the request's operation fields.
    - If every grant allows → `ApprovalRequired { role, action_digest }`.
    - If the action's context does not accept that approval record, or no role succeeds, the deny from step 3 stands.
+
+   Known limitation: the probe set has no ordinary permits. In a chain of more than one grant, if an ancestor allows the request only through an ordinary permit (e.g. `refund-within-limits`) and the `@approval` permit does not also hold for that ancestor, the probe denies on it. The result is a plain deny, not `ApprovalRequired`. This fails closed: an approval prompt is missed, nothing is authorized.
    - The probe never returns `Allow`.
 
 ### Fail-closed rules
@@ -70,9 +75,9 @@ Loading fails with `PdpLoadError` if any of these is true:
 | A policy dereferences an entity missing from the store | `Deny(PolicyError)` | `missing_entity_denies` |
 | Context, grant record, or resource fails schema validation | `Deny(PolicyError)` | `schema_invalid_context_denies`, `schema_invalid_grant_record_denies`, table rows 43–45 |
 | Approver and delegator share an id but differ | `Deny(PolicyError)` | `conflicting_approver_entity_denies` |
-| An input uses the reserved `__guard` id prefix | `Deny(PolicyError)` | table row 46 |
+| An input uses the reserved `__guard` id prefix: the resource, its parents or attributes, operation context, delegator or approver attributes, grant constraint sets, or approval fields | `Deny(PolicyError)` | table row 46, `reserved_id_in_*` |
 | An action missing from any grant, or undeclared in the schema | `Deny(ActionNotGranted)` / `Deny(UnknownAction)` | table rows 04, 39, 42 |
-| A schema or policy set that fails to parse or validate (warnings included), or has bad `@id`/`@approval` | `PdpLoadError`, so Guard does not start | `refuses_*` |
+| A schema or policy set that fails to parse or validate (warnings included), or has bad `@id`/`@approval` | `PdpLoadError`, so Guard does not start | `refuses_*` (including `refuses_approval_tests_in_comment_only`, `_under_disjunction`, `_in_unless`) |
 
 ## Hashes and audit
 
