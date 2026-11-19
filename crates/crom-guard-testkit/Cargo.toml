@@ -20,3 +20,6 @@ reqwest = { workspace = true }
 [dev-dependencies]
 jsonschema = { version = "0.61", default-features = false }
 tempfile = { workspace = true }
+# Canary test: captures every trace event.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

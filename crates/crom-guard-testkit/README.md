@@ -106,3 +106,6 @@ For the E2 "Guard off" baseline, configure a credential for the trusted test dri
 ```sh
 cargo test -p crom-guard-testkit
 ```
+
+- `tests/pipeline_e2e.rs` runs a full `crom_guard::Guard` over `support_ops`, a `FileCredentialBroker`, and a `FileAuditSink`, against the HTTP API (#351). The ledger is the oracle: an allowed refund has one effect carrying the decision id; an ownership change or revoke between authorize and execute has none; `customer.export` is denied, and fails closed even under a permitting policy.
+- `tests/canary.rs` checks that the broker's secret and the session handle never appear in any `CallOutcome`, audit line, ledger entry, or `tracing` output. It installs a global trace subscriber, so it is its own test binary.

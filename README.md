@@ -72,9 +72,11 @@ Several important pieces are not built yet:
   ([docs/guard/README.md](docs/guard/README.md)), the hash-chained audit
   log ([docs/guard/audit.md](docs/guard/audit.md)), the downstream
   credential brokers ([docs/guard/credentials.md](docs/guard/credentials.md)),
-  and the Cedar policy decision point
-  ([docs/guard/policies.md](docs/guard/policies.md)), with no enforcement
-  pipeline yet; `crates/crom-guard-server` only runs `crom-guard audit verify <log>`. `crates/crom-guard-testkit` provides the controlled business API and
+  the Cedar policy decision point
+  ([docs/guard/policies.md](docs/guard/policies.md)), and the in-process
+  enforcement pipeline and operation registry
+  ([docs/guard/pipeline.md](docs/guard/pipeline.md)), with no network
+  transport yet; `crates/crom-guard-server` only runs `crom-guard audit verify <log>`. `crates/crom-guard-testkit` provides the controlled business API and
   effect ledger the M18 tests measure against, and the reference policy set
   (`examples/guard-support/policies/`) is validated in CI by
   `scripts/validate-guard-policies.sh`.

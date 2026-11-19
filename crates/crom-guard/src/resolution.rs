@@ -76,7 +76,7 @@ impl<R: ResourceResolver> ResourceResolver for TimeoutResolver<R> {
 
 /// The resolver is polled first, so a result that is ready when the timer
 /// fires still wins.
-async fn race<W, T>(work: W, timer: T) -> Result<ResolvedResource, ResolveError>
+pub(crate) async fn race<W, T>(work: W, timer: T) -> Result<ResolvedResource, ResolveError>
 where
     W: Future<Output = Result<ResolvedResource, ResolveError>>,
     T: Future<Output = ()>,

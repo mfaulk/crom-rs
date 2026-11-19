@@ -14,6 +14,7 @@ use cedar_policy as cedar;
 use cedar_policy::RestrictedExpression as Expr;
 use sha2::{Digest, Sha256};
 
+pub(crate) use digest::args_digest_hex;
 pub use digest::ACTION_DIGEST_DOMAIN;
 
 use crate::action::AuthorizationRequest;
