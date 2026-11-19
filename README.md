@@ -81,7 +81,10 @@ Several important pieces are not built yet:
   over Streamable HTTP, with a separate admin API for grants and approvals
   ([docs/guard/server.md](docs/guard/server.md)): `crom-guard serve --config
   guard.toml`, `crom-guard policy validate`, `crom-guard audit verify <log>`. `crates/crom-guard-testkit` provides the controlled business API and
-  effect ledger the M18 tests measure against, and the reference policy set
+  effect ledger the M18 tests measure against, a standard-library Python
+  MCP client runs the reference matrix against a real Guard in CI
+  ([docs/guard/reference-deployment.md](docs/guard/reference-deployment.md)),
+  and the reference policy set
   (`examples/guard-support/policies/`) is validated in CI by
   `scripts/validate-guard-policies.sh`.
 - **The sandbox is opt-in and Linux-only.** `sandbox.mode` defaults to `off`.

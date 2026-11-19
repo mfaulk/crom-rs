@@ -18,8 +18,15 @@ tokio = { workspace = true, features = ["net"] }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+# The crom-guard-support example binary (support_ops behind the server CLI).
+# crom-guard-server must not depend on this crate (scripts/check-guard-deps.sh).
+crom-guard-server = { path = "../crom-guard-server" }
 jsonschema = { version = "0.61", default-features = false }
 tempfile = { workspace = true }
 # Canary test: captures every trace event.
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "crom-guard-support"
+path = "examples/crom-guard-support.rs"

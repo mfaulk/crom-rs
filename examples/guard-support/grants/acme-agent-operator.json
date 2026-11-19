@@ -1,0 +1,16 @@
+{
+  "tenant": "acme",
+  "delegator": {
+    "id": "acme-agent-operator",
+    "role": "agent-operator",
+    "attrs": {"refund_limit_cents": {"long": 5000}}
+  },
+  "run_id": "run-acme-operator",
+  "actions": ["customer.read", "invoice.list", "refund.issue", "customer.export", "guard.delegate"],
+  "constraints": {
+    "customers": {"set": [{"type": "Support::Customer", "id": "acme-cus-000"}]},
+    "max_refund_cents": {"at_most": 10000}
+  },
+  "ttl_seconds": 600,
+  "max_depth": 1
+}

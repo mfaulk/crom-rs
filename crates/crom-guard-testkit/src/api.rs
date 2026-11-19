@@ -28,6 +28,36 @@ pub struct ApiCredential {
     pub secret: String,
 }
 
+impl ApiCredential {
+    /// The `id` and `secret` of every entry of a `crom_guard::FileCredentialBroker`
+    /// file, so the API accepts exactly what Guard's broker hands out. Errors
+    /// never contain a secret.
+    pub fn from_broker_json(text: &str) -> Result<Vec<Self>, String> {
+        #[derive(Deserialize)]
+        struct File {
+            credentials: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            id: String,
+            secret: String,
+        }
+        let file: File = serde_json::from_str(text)
+            .map_err(|e| format!("credentials file: line {} column {}", e.line(), e.column()))?;
+        if file.credentials.is_empty() {
+            return Err("credentials file lists no credentials".into());
+        }
+        Ok(file
+            .credentials
+            .into_iter()
+            .map(|e| Self {
+                id: e.id,
+                secret: e.secret,
+            })
+            .collect())
+    }
+}
+
 impl std::fmt::Debug for ApiCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiCredential")
@@ -439,4 +469,32 @@ async fn customer_export(
         },
     )?;
     Ok(Json(customers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The business API's credentials are read from a `FileCredentialBroker` file, keeping only id and secret.
+    #[test]
+    fn credentials_from_broker_json_reads_ids_and_secrets() {
+        let text = r#"{"credentials": [
+            {"id": "business-api", "secret": "s3cret", "actions": ["refund.issue"]},
+            {"id": "other", "secret": "two"}
+        ]}"#;
+        let creds = ApiCredential::from_broker_json(text).unwrap();
+        let pairs: Vec<(&str, &str)> = creds
+            .iter()
+            .map(|c| (c.id.as_str(), c.secret.as_str()))
+            .collect();
+        assert_eq!(pairs, [("business-api", "s3cret"), ("other", "two")]);
+    }
+
+    /// A broker file without credentials, or with a malformed entry, is rejected.
+    #[test]
+    fn credentials_from_broker_json_rejects_bad_files() {
+        assert!(ApiCredential::from_broker_json(r#"{"credentials": []}"#).is_err());
+        assert!(ApiCredential::from_broker_json(r#"{"credentials": [{"id": "x"}]}"#).is_err());
+        assert!(ApiCredential::from_broker_json("not json").is_err());
+    }
 }

@@ -22,3 +22,4 @@
 # .worktreeinclude
 .env
 .env.local
+__pycache__/

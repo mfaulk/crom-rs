@@ -33,6 +33,8 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
+`crom-guard-support` ([reference-deployment.md](reference-deployment.md)) is such a binary for the support reference operations.
+
 Tests and embedders can call `crom_guard_server::start(config, registry)` directly. It returns a `ServerHandle` with the bound addresses and `shutdown()`.
 
 ## Configuration

@@ -1,0 +1,31 @@
+# Reference Guard config for the support deployment (docs/guard/server.md).
+# Relative paths resolve against this file's directory, so run Guard from a
+# private (0700) state directory holding a copy of this file and of
+# policies/, plus admin.token and credentials.json (both 0600).
+# run-python-client.sh sets that up in a temporary directory.
+
+[agent]
+listen = "127.0.0.1:8470"
+
+[admin]
+listen = "unix:admin.sock"
+token_file = "admin.token"
+app_id = "support-app"
+
+[policy]
+namespace = "Support"
+schema = "policies/support.cedarschema"
+policies = "policies/support.cedar"
+
+[credentials]
+file = "credentials.json"
+
+[audit]
+path = "audit.jsonl"
+
+[grants]
+max_ttl_seconds = 3600
+
+[approvals]
+max_ttl_seconds = 900
+pending_ttl_seconds = 900
