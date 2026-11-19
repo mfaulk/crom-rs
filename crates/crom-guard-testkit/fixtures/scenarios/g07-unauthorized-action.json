@@ -1,0 +1,92 @@
+{
+  "scenario": "G7",
+  "title": "Unauthorized action",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "refund.issue, customer.export and guard.delegate with a read-only grant",
+  "expected": "action_not_granted; no ledger effect",
+  "guard_dependent": true,
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {
+        "refund_limit_cents": {
+          "long": 5000
+        }
+      }
+    },
+    "run_id": "run-g07",
+    "actions": [
+      "customer.read",
+      "invoice.list"
+    ],
+    "constraints": {
+      "customers": {
+        "set": [
+          {
+            "type": "Support::Customer",
+            "id": "acme-cus-000"
+          }
+        ]
+      },
+      "max_refund_cents": {
+        "at_most": 10000
+      }
+    },
+    "ttl_seconds": 600,
+    "max_depth": 0
+  },
+  "steps": [
+    {
+      "name": "legit: list invoices",
+      "tool": "invoice.list",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "executed"
+    },
+    {
+      "name": "refund with a read-only grant",
+      "attack": true,
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 100
+      },
+      "expect": "action_not_granted",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "action_not_granted"
+      }
+    },
+    {
+      "name": "export with a read-only grant",
+      "attack": true,
+      "tool": "customer.export",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "action_not_granted"
+    },
+    {
+      "name": "delegate with a read-only grant",
+      "attack": true,
+      "tool": "guard.delegate",
+      "arguments": {
+        "actions": [
+          "customer.read"
+        ],
+        "ttl_seconds": 60
+      },
+      "expect": "action_not_granted"
+    }
+  ],
+  "expected_ledger_effects": [
+    {
+      "kind": "invoice_list",
+      "tenant": "acme",
+      "customer_id": "acme-cus-000"
+    }
+  ]
+}

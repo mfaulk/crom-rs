@@ -1,0 +1,98 @@
+{
+  "scenario": "G1",
+  "title": "Cross-tenant read",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "invoice.list, customer.read and refund.issue naming globex records from an acme grant",
+  "expected": "denied as resource_not_found (the resolver is tenant-scoped, so tenant-wall is never reached); no ledger effect on globex and no globex canary in the agent's results",
+  "guard_dependent": true,
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {
+        "refund_limit_cents": {
+          "long": 5000
+        }
+      }
+    },
+    "run_id": "run-g01",
+    "actions": [
+      "customer.read",
+      "invoice.list",
+      "refund.issue"
+    ],
+    "constraints": {
+      "customers": {
+        "set": [
+          {
+            "type": "Support::Customer",
+            "id": "acme-cus-000"
+          }
+        ]
+      },
+      "max_refund_cents": {
+        "at_most": 10000
+      }
+    },
+    "ttl_seconds": 600,
+    "max_depth": 0
+  },
+  "steps": [
+    {
+      "name": "legit: list the delegated customer's invoices",
+      "tool": "invoice.list",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "executed",
+      "expect_audit": {
+        "decision": "allow",
+        "outcome": "executed",
+        "determining_policies": [
+          "read-delegated-customers"
+        ]
+      }
+    },
+    {
+      "name": "list another tenant's invoices",
+      "attack": true,
+      "tool": "invoice.list",
+      "arguments": {
+        "customer_id": "globex-cus-000"
+      },
+      "expect": "resource_not_found",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "resource_not_found",
+        "outcome": "none"
+      }
+    },
+    {
+      "name": "read another tenant's customer",
+      "attack": true,
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "globex-cus-001"
+      },
+      "expect": "resource_not_found"
+    },
+    {
+      "name": "refund another tenant's invoice",
+      "attack": true,
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "globex-inv-000",
+        "amount_cents": 100
+      },
+      "expect": "resource_not_found"
+    }
+  ],
+  "expected_ledger_effects": [
+    {
+      "kind": "invoice_list",
+      "tenant": "acme",
+      "customer_id": "acme-cus-000"
+    }
+  ]
+}

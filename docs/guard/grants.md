@@ -152,7 +152,7 @@ Attenuation (#353):
 ```sh
 cargo test -p crom-guard --test attenuation        # widening attempts, multi-hop, revoke, handle secrecy, 10k-case proptest
 cargo test -p crom-guard --lib pdp::tests::attenuation   # 10k-case chain-evaluation proptest, no narrowing check
-cargo test -p crom-guard-testkit --test scenario_g10 --test canary
+cargo test -p crom-guard-testkit --test guard_adversarial --test canary
 ```
 
-`crates/crom-guard-testkit/fixtures/scenarios/g10-subagent-escalation.json` is the scenario G10 fixture for #361: the parent grant, the legitimate subtask (delegate, then read and refund within the child's limits), each escalation attempt with its expected code, and the expected ledger effects. `tests/scenario_g10.rs` replays it against the business API with the ledger as the oracle.
+`crates/crom-guard-testkit/fixtures/scenarios/g10-subagent-escalation.json` is the scenario G10 fixture for #361: the parent grant, the legitimate subtask (delegate, then read and refund within the child's limits), each escalation attempt with its expected code, and the expected ledger effects. `tests/guard_adversarial.rs` replays it with the other Guard scenarios, against the business API with the ledger as the oracle ([scenarios.md](scenarios.md)).

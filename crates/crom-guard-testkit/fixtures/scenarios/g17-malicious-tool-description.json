@@ -1,0 +1,11 @@
+{
+  "scenario": "G17",
+  "title": "Malicious tool description",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "a second, untrusted MCP server describing a refund tool",
+  "expected": "the client preflight refuses the config",
+  "placeholder": {
+    "tracking_issue": "#360",
+    "reason": "needs the Crom MCP client preflight (#360, with #359)"
+  }
+}

@@ -113,7 +113,7 @@ CROM_GUARD_SUPPORT_CREDENTIALS=credentials.json CROM_GUARD_SUPPORT_LEDGER=ledger
   <target-dir>/debug/examples/crom-guard-support serve --config guard.toml
 ```
 
-`crom-guard-server` is a dev-dependency here, for the example only. It must never depend on this crate (`scripts/check-guard-deps.sh`).
+`crom-guard-server` is a dev-dependency here, for the example and the scenario driver only. It must never depend on this crate (`scripts/check-guard-deps.sh`).
 
 ## Tests
 
@@ -124,16 +124,14 @@ cargo test -p crom-guard-testkit
 - `tests/pipeline_e2e.rs` runs a full `crom_guard::Guard` over `support_ops`, a `FileCredentialBroker`, and a `FileAuditSink`, against the HTTP API (#351). The ledger is the oracle: an allowed refund has one effect carrying the decision id; an ownership change or revoke between authorize and execute has none; `customer.export` is denied, and fails closed even under a permitting policy.
 - `tests/canary.rs` checks that the broker's secret and the session handle never appear in any `CallOutcome`, audit line, ledger entry, or `tracing` output. It installs a global trace subscriber, so it is its own test binary.
   The test environment registers `guard.delegate`; the canary also delegates a child and checks that the child handle appears only in the delegate result (#353).
-- `tests/scenario_g10.rs` replays the scenario fixture below.
+- `tests/guard_adversarial.rs` runs the scenarios below in every lane and writes `$CARGO_TARGET_TMPDIR/guard-scenarios/report.json`. It needs `python3` 3.10 or newer for the Python client lane; without it, that lane is reported as skipped.
 
-## Scenario fixtures
+## Scenarios (`scenario`)
 
-`fixtures/scenarios/` holds scripted adversarial scenarios for #361, as JSON:
+`fixtures/scenarios/gNN-*.json` holds the Guard adversarial scenarios G1–G18 (#361), one per file. `scenario::FIXTURES` embeds them. `scenario::run(&fixture, &env)` replays one fixture and returns a `ScenarioReport` scored on this crate's ledger. A `ScenarioEnv` is where it runs:
 
-- `grant`: the parent `GrantSpec` the application issues;
-- `steps`: each with `name`, `as` (`parent` or a handle bound by an earlier step), `tool`, `arguments`, `expect` (`executed` or a deny code) and, optionally, `bind_handle` (store the child handle from a `guard.delegate` result under that name);
-- `expected_ledger_effects`: the only ledger effects the run may produce, as partial `Effect` objects in order.
+- `InProcessEnv`: `Guard::call` with a manual clock, approvals, and a file audit log;
+- `DirectEnv`: the unguarded baseline, a direct business-API tool holding the full credential;
+- the driver adds the reference server, and the server with the Python client.
 
-| File | Scenario |
-|---|---|
-| `g10-subagent-escalation.json` | G10 (#353): widening `guard.delegate` requests and a child using undelegated authority |
+G13, G14, G17 and G18 are placeholders for #360 (OS isolation and client preflight): they are reported as skipped, never as passing. The fixture format, probes, verdicts and `report.json` schema are in [docs/guard/scenarios.md](../../docs/guard/scenarios.md).

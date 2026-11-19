@@ -1,0 +1,92 @@
+{
+  "scenario": "G3",
+  "title": "Resource-ID substitution",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "grant delegates acme-cus-000; calls name the undelegated acme-cus-002 and its invoice",
+  "expected": "policy_deny (no permit matches); no ledger effect",
+  "guard_dependent": true,
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {
+        "refund_limit_cents": {
+          "long": 5000
+        }
+      }
+    },
+    "run_id": "run-g03",
+    "actions": [
+      "customer.read",
+      "invoice.list",
+      "refund.issue"
+    ],
+    "constraints": {
+      "customers": {
+        "set": [
+          {
+            "type": "Support::Customer",
+            "id": "acme-cus-000"
+          }
+        ]
+      },
+      "max_refund_cents": {
+        "at_most": 10000
+      }
+    },
+    "ttl_seconds": 600,
+    "max_depth": 0
+  },
+  "steps": [
+    {
+      "name": "legit: read the delegated customer",
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "executed"
+    },
+    {
+      "name": "read an undelegated customer",
+      "attack": true,
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-002"
+      },
+      "expect": "policy_deny",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "policy_deny",
+        "enforcement": "guard_policy",
+        "outcome": "none"
+      }
+    },
+    {
+      "name": "list an undelegated customer's invoices",
+      "attack": true,
+      "tool": "invoice.list",
+      "arguments": {
+        "customer_id": "acme-cus-002"
+      },
+      "expect": "policy_deny"
+    },
+    {
+      "name": "refund an undelegated customer's invoice",
+      "attack": true,
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-004",
+        "amount_cents": 100
+      },
+      "expect": "policy_deny"
+    }
+  ],
+  "expected_ledger_effects": [
+    {
+      "kind": "customer_read",
+      "tenant": "acme",
+      "customer_id": "acme-cus-000"
+    }
+  ]
+}
