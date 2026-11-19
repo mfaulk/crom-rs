@@ -13,3 +13,11 @@ publish = false
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tempfile = { workspace = true }
+# Validates the published audit schema in tests only.
+jsonschema = { version = "0.61", default-features = false }

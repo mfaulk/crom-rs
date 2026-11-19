@@ -4,6 +4,10 @@ M17.3 (#291). Every tool call the agent loop gates produces exactly one
 `SecurityDecision` record, and every recorded event is secret-redacted before
 it reaches a session file, the event stream, telemetry, or an eval artifact.
 
+These records have no integrity protection and are best-effort. Crom Guard
+keeps its own durable, hash-chained `guard-audit/v1` log of mediated
+operations; see [docs/guard/audit.md](../guard/audit.md).
+
 ## `SecurityDecision`
 
 `AgentEvent::SecurityDecision` (`crom-core/src/events.rs`), surfaced to SDK

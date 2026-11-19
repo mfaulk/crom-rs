@@ -18,3 +18,7 @@ doc = false
 # scripts/check-guard-deps.sh in CI).
 [dependencies]
 crom-guard = { path = "../crom-guard" }
+
+[dev-dependencies]
+futures = { workspace = true }
+tempfile = { workspace = true }
