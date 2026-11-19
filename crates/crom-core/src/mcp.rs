@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use crom_mcp::{
     agent_tool_name, mcp_result_to_text_and_metadata, mutating_tool_name, McpClient,
     McpConnectionStatus, McpError, McpLimits, McpOptions, McpServerConfig, McpServerStatus,
-    McpToolCallCompleted, McpToolCallFailed, McpToolCallStarted, McpToolDefinition, McpToolSummary,
-    McpToolsDiscovered,
+    McpToolCallCompleted, McpToolCallFailed, McpToolCallStarted, McpToolDefinition, McpToolResult,
+    McpToolSummary, McpToolsDiscovered,
 };
 use futures::future::join_all;
 use serde_json::{json, Value};
@@ -29,6 +29,16 @@ pub struct McpRegistrationReport {
 pub async fn register_mcp_tools(
     registry: &mut ToolRegistry,
     options: &McpOptions,
+) -> McpRegistrationReport {
+    register_mcp_tools_with_guard_approver(registry, options, None).await
+}
+
+/// [`register_mcp_tools`], with the host's source of Guard approvals for
+/// tools from `guard: true` servers ([`crate::guard::GuardApprover`]).
+pub async fn register_mcp_tools_with_guard_approver(
+    registry: &mut ToolRegistry,
+    options: &McpOptions,
+    guard_approver: Option<Arc<dyn crate::guard::GuardApprover>>,
 ) -> McpRegistrationReport {
     let mut report = McpRegistrationReport::default();
     if !options.enabled {
@@ -121,7 +131,7 @@ pub async fn register_mcp_tools(
             if guard {
                 report.guard_tools.insert(agent_name.clone());
             }
-            registry.register(Arc::new(McpTool::new(
+            let mut mcp_tool = McpTool::new(
                 server_name.clone(),
                 transport,
                 agent_name,
@@ -129,7 +139,11 @@ pub async fn register_mcp_tools(
                 client.clone(),
                 limits,
                 guard,
-            )));
+            );
+            if guard {
+                mcp_tool.guard_approver = guard_approver.clone();
+            }
+            registry.register(Arc::new(mcp_tool));
         }
         status.status = if status.error.is_some() {
             McpConnectionStatus::Failed
@@ -329,6 +343,8 @@ pub struct McpTool {
     limits: McpLimits,
     /// Results are Guard verdicts (`crate::guard`).
     guard: bool,
+    /// Only set for `guard` tools.
+    guard_approver: Option<Arc<dyn crate::guard::GuardApprover>>,
 }
 
 /// Shared handle to a connected MCP client, dispatched according to the
@@ -389,7 +405,54 @@ impl McpTool {
             client,
             limits,
             guard,
+            guard_approver: None,
         }
+    }
+
+    async fn call(&self, input: Value, meta: Option<Value>) -> Result<McpToolResult, McpError> {
+        // Concurrency-capable transports (Streamable HTTP) dispatch through a
+        // shared reference so multiple tool calls to the same server can be in
+        // flight at once: a slow call no longer blocks a fast one. Single-flight
+        // transports (stdio) still serialize behind the client `Mutex`.
+        match &self.client {
+            McpClientHandle::Concurrent(client) => {
+                client
+                    .call_tool_concurrent_with_meta(&self.remote_tool_name, input, meta)
+                    .await
+            }
+            McpClientHandle::Serial(client) => {
+                let mut client = client.lock().await;
+                client
+                    .call_tool_with_meta(&self.remote_tool_name, input, meta)
+                    .await
+            }
+        }
+    }
+
+    /// Guard answered `approval_required`: ask the host's approver and, if
+    /// it returns a well-formed approval id, retry once with it. Crom never
+    /// retries otherwise.
+    async fn retry_with_approval(
+        &self,
+        input: &Value,
+        first: McpToolResult,
+    ) -> Result<McpToolResult, McpError> {
+        let Some(approver) = &self.guard_approver else {
+            return Ok(first);
+        };
+        let Some(request) =
+            crate::guard::approval_request(&self.server_name, &self.remote_tool_name, &first)
+        else {
+            return Ok(first);
+        };
+        let Some(meta) = approver
+            .request_approval(request)
+            .await
+            .and_then(|id| crate::guard::approval_meta(&id))
+        else {
+            return Ok(first);
+        };
+        self.call(input.clone(), Some(meta)).await
     }
 
     pub fn call_started(&self) -> McpToolCallStarted {
@@ -441,21 +504,12 @@ impl Tool for McpTool {
 
     async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolResult, ToolError> {
         let started = Instant::now();
-        // Concurrency-capable transports (Streamable HTTP) dispatch through a
-        // shared reference so multiple tool calls to the same server can be in
-        // flight at once: a slow call no longer blocks a fast one. Single-flight
-        // transports (stdio) still serialize behind the client `Mutex`.
-        let called = match &self.client {
-            McpClientHandle::Concurrent(client) => {
-                client
-                    .call_tool_concurrent(&self.remote_tool_name, input)
-                    .await
+        let mut called = self.call(input.clone(), None).await;
+        if let (true, Ok(first)) = (self.guard, &called) {
+            if first.is_error {
+                called = self.retry_with_approval(&input, first.clone()).await;
             }
-            McpClientHandle::Serial(client) => {
-                let mut client = client.lock().await;
-                client.call_tool(&self.remote_tool_name, input).await
-            }
-        };
+        }
         let result = match called {
             Ok(result) => result,
             // Guard gave no verdict: a tool error, never an `Err` that the

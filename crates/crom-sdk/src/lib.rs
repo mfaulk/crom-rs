@@ -107,6 +107,7 @@ pub use workspace::{
 // the underlying crates into their Cargo.toml when they only want the public
 // SDK surface.
 pub use crom_auth::ProviderId;
+pub use crom_core::guard::{GuardApprovalRequest, GuardApprover};
 pub use crom_core::permission::{PermissionKind, PermissionMode};
 pub use crom_core::plan::{PlanDocument, PlanId, PlanStatus, PlanningMode, PlanningOptions};
 pub use crom_core::{ModelProvider, Tool, ToolContext, ToolRegistry, ToolResult};

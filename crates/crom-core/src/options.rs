@@ -108,6 +108,9 @@ pub struct AgentOptions {
     pub usage_budget: crate::usage_budget::UsageBudget,
     pub session_id: Option<SessionId>,
     pub permission_callback: Option<Arc<dyn PermissionCallback>>,
+    /// Host source of Crom Guard approvals for tools from `guard: true` MCP
+    /// servers ([`crate::guard::GuardApprover`]). `None`: no approval retry.
+    pub guard_approver: Option<Arc<dyn crate::guard::GuardApprover>>,
     pub system_prompt: Option<String>,
     pub project_instructions: Option<String>,
     pub max_tokens: u32,
@@ -159,6 +162,7 @@ impl Default for AgentOptions {
             usage_budget: Default::default(),
             session_id: None,
             permission_callback: None,
+            guard_approver: None,
             system_prompt: None,
             project_instructions: None,
             max_tokens: 4096,
@@ -191,6 +195,7 @@ impl std::fmt::Debug for AgentOptions {
             .field("max_tokens", &self.max_tokens)
             .field("approval_memory", &self.approval_memory)
             .field("mcp_enabled", &self.mcp.enabled)
+            .field("guard_approver", &self.guard_approver.is_some())
             .field("tool_search", &self.tool_search)
             .field("agents_count", &self.agents.len())
             .field("agent_runtime_enabled", &self.agent_runtime.enabled)

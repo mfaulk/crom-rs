@@ -1732,6 +1732,8 @@ async fn resolve_common(
         usage_budget: Default::default(),
         session_id: None,
         permission_callback,
+        // The CLI has no source of Guard approvals (docs/sdk/guard.md).
+        guard_approver: None,
         system_prompt: None,
         project_instructions: instructions,
         max_tokens,

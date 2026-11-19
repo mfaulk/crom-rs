@@ -56,6 +56,61 @@ pub struct GuardVerdict {
     pub decision_id: Option<String>,
 }
 
+/// A Guard `approval_required` result, shown to the host's [`GuardApprover`].
+/// It carries no arguments: the approver should review Guard's own pending
+/// request (`GET /admin/approvals/{action_digest}`), which is what Guard
+/// will bind the approval to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardApprovalRequest {
+    pub server_name: String,
+    /// Guard's operation name, e.g. `refund.issue`.
+    pub tool_name: String,
+    pub action_digest: String,
+    pub required_role: Option<String>,
+}
+
+/// The trusted application's source of Guard approvals (MILESTONE_18 §9.4).
+/// Distinct from Crom's own approval callback, which never satisfies Guard.
+#[async_trait::async_trait]
+pub trait GuardApprover: Send + Sync {
+    /// Return the approval id obtained from Guard's admin API to retry the
+    /// call once with `_meta.approval_id`, or `None` to leave it blocked.
+    async fn request_approval(&self, request: GuardApprovalRequest) -> Option<String>;
+}
+
+/// The approval request in a Guard `approval_required` result, if it has a
+/// well-formed digest.
+pub fn approval_request(
+    server_name: &str,
+    tool_name: &str,
+    result: &McpToolResult,
+) -> Option<GuardApprovalRequest> {
+    if verdict_from_result(result).status != GuardStatus::ApprovalRequired {
+        return None;
+    }
+    let structured = result.structured_content.as_ref()?;
+    let digest = structured.get("action_digest")?.as_str()?;
+    if !is_safe_id(digest) {
+        return None;
+    }
+    Some(GuardApprovalRequest {
+        server_name: server_name.to_owned(),
+        tool_name: tool_name.to_owned(),
+        action_digest: digest.to_owned(),
+        required_role: structured
+            .get("role")
+            .and_then(Value::as_str)
+            .filter(|r| is_safe_id(r))
+            .map(str::to_owned),
+    })
+}
+
+/// The `_meta` for a retry, or `None` if the approver's id is not a safe
+/// identifier (it is then never sent).
+pub fn approval_meta(approval_id: &str) -> Option<Value> {
+    is_safe_id(approval_id).then(|| serde_json::json!({ "approval_id": approval_id }))
+}
+
 /// Classify a `tools/call` result from a Guard server. `isError: false` is
 /// always `executed`: Guard then puts the operation's own output in
 /// `structuredContent`, whose `status`/`code` are business data.
@@ -449,5 +504,55 @@ mod tests {
         assert!(check_guard_allow_rules(&rules, &real).is_ok());
         let other = [ToolRule::ExactTool("mcp__docs__search".into())];
         assert!(check_guard_allow_rules(&other, &plain).is_ok());
+    }
+
+    /// Only an `approval_required` result with a safe digest yields an approval request; an unsafe role is dropped.
+    #[test]
+    fn approval_request_needs_approval_required_and_safe_digest() {
+        let req = |sc: Value, is_error: bool| {
+            approval_request(
+                "guard",
+                "refund.issue",
+                &result(json!({"structuredContent": sc, "isError": is_error, "_meta": meta()})),
+            )
+        };
+        let r = req(
+            json!({"status": "approval_required", "role": "supervisor", "action_digest": "ab12"}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.action_digest, "ab12");
+        assert_eq!(r.tool_name, "refund.issue");
+        assert_eq!(r.required_role.as_deref(), Some("supervisor"));
+        let bad_role = req(
+            json!({"status": "approval_required", "role": "a b", "action_digest": "ab"}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(bad_role.required_role, None);
+        assert!(req(
+            json!({"status": "approval_required", "action_digest": "a/b"}),
+            true
+        )
+        .is_none());
+        assert!(req(json!({"status": "approval_required"}), true).is_none());
+        assert!(req(json!({"status": "denied", "action_digest": "ab"}), true).is_none());
+        assert!(req(
+            json!({"status": "approval_required", "action_digest": "ab"}),
+            false
+        )
+        .is_none());
+    }
+
+    /// An approval id is sent as `_meta.approval_id` only if it is a safe identifier.
+    #[test]
+    fn approval_meta_rejects_unsafe_ids() {
+        assert_eq!(
+            approval_meta("ap_0123"),
+            Some(json!({"approval_id": "ap_0123"}))
+        );
+        assert_eq!(approval_meta(""), None);
+        assert_eq!(approval_meta("ap_1\nX: y"), None);
+        assert_eq!(approval_meta(&"a".repeat(129)), None);
     }
 }

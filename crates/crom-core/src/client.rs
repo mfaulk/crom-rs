@@ -499,7 +499,12 @@ impl AgentClient {
     pub async fn connect_mcp_servers(&mut self) -> Result<(), AgentError> {
         let options = self.inner.options.lock().await.clone();
         let mut tools = ToolRegistry::new();
-        let report = crate::mcp::register_mcp_tools(&mut tools, &options.mcp).await;
+        let report = crate::mcp::register_mcp_tools_with_guard_approver(
+            &mut tools,
+            &options.mcp,
+            options.guard_approver.clone(),
+        )
+        .await;
         if options.mcp.strict
             && report
                 .statuses
@@ -733,7 +738,12 @@ impl AgentClient {
                 options.tool_search.max_results,
             )));
         }
-        let report = crate::mcp::register_mcp_tools(&mut registry, &options.mcp).await;
+        let report = crate::mcp::register_mcp_tools_with_guard_approver(
+            &mut registry,
+            &options.mcp,
+            options.guard_approver.clone(),
+        )
+        .await;
         if options.mcp.strict
             && report
                 .statuses

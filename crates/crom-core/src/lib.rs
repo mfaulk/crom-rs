@@ -111,7 +111,10 @@ pub use hooks::{
     aggregate, Hook, HookAddedContext, HookAggregateDecision, HookCallRecord, HookError,
     HookEventName, HookInput, HookMatcher, HookOutput, Hooks, StopReason, ToolMatcher,
 };
-pub use mcp::{mcp_completion_from_result, mcp_failure_from_error, register_mcp_tools, McpTool};
+pub use mcp::{
+    mcp_completion_from_result, mcp_failure_from_error, register_mcp_tools,
+    register_mcp_tools_with_guard_approver, McpTool,
+};
 pub use options::{is_valid_session_id_str, AgentOptions, SessionId};
 pub use permission::{
     ApprovalMemoryMode, PermissionCallback, PermissionDecision, PermissionKind, PermissionMode,
