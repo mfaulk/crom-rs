@@ -199,7 +199,8 @@ pub struct GrantSpec {
     pub actions: BTreeSet<ActionId>,
     #[serde(default)]
     pub constraints: Constraints,
-    /// Lifetime from issuance. The store caps it at its configured maximum.
+    /// Lifetime from issuance. The store rejects 0 and values above its
+    /// configured maximum.
     pub ttl_seconds: u64,
     /// Remaining delegation depth. 0 (the default) forbids `delegate`.
     #[serde(default)]
