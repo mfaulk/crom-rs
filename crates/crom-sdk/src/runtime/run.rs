@@ -363,6 +363,8 @@ pub(crate) async fn execute_request(
         usage_budget: request.budgets.usage_budget(),
         permission_mode: PermissionMode::Default,
         allowed_tools: tools.names(),
+        allowed_tool_rules: runtime.tool_policy.allowed_tools.clone(),
+        disallowed_tool_rules: runtime.tool_policy.disallowed_tools.clone(),
         ..Default::default()
     };
     if let Some(root) = workspace_for_run.filesystem_root() {
@@ -834,6 +836,8 @@ pub(crate) async fn execute_plan_with_turns(
     let provider = runtime.provider.clone();
     let tools = build_tool_registry(&runtime.tool_policy, workspace.clone());
     options.allowed_tools = tools.names();
+    options.allowed_tool_rules = runtime.tool_policy.allowed_tools.clone();
+    options.disallowed_tool_rules = runtime.tool_policy.disallowed_tools.clone();
 
     let plan_req = crom_core::plan::PlanRequest {
         prompt: request.task.clone(),
@@ -952,6 +956,8 @@ pub(crate) async fn execute_act(
     let started = Instant::now();
     let mut options = AgentOptions {
         model: model.clone(),
+        allowed_tool_rules: runtime.tool_policy.allowed_tools.clone(),
+        disallowed_tool_rules: runtime.tool_policy.disallowed_tools.clone(),
         ..Default::default()
     };
     if let Some(root) = workspace_for_run.filesystem_root() {

@@ -214,6 +214,7 @@ impl AgentRuntimeBuilder {
         if let Some(sep) = self.side_effect_policy {
             tool_policy.side_effect_policy = sep;
         }
+        validate_tool_rules(&tool_policy)?;
         let interactivity = self.interactivity.unwrap_or_default();
         let verbosity = self.verbosity.unwrap_or_default();
         let storage = self.storage.unwrap_or_else(default_storage);
@@ -352,6 +353,24 @@ fn api_key_credential(
 // Verify `ProviderId` is in scope.
 #[allow(dead_code)]
 fn _provider_id(_p: ProviderId) {}
+
+fn validate_tool_rules(policy: &ToolPolicy) -> Result<(), AgentSdkError> {
+    let lists = [
+        ("allowed_tools", &policy.allowed_tools),
+        ("disallowed_tools", &policy.disallowed_tools),
+    ];
+    for (list, rules) in lists {
+        for (i, rule) in rules.iter().enumerate() {
+            rule.validate().map_err(|e| {
+                AgentSdkError::invalid_request(
+                    "policy.invalid_tool_rule",
+                    format!("tool_policy.{list}[{i}]: {e}"),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
 
 #[cfg(all(test, feature = "fake-provider"))]
 mod tests {
