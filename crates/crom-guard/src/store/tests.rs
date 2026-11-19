@@ -214,7 +214,7 @@ fn unknown_action_rejected_at_issuance() {
     assert!(issue(&s, empty).is_err());
 }
 
-/// A narrower child authenticates with the full chain, copies identity from the parent, and has its expiry capped at the parent's.
+/// A narrower child authenticates with the full chain and copies identity from the parent.
 #[test]
 fn delegate_issues_narrower_child() {
     let s = store();
@@ -222,16 +222,12 @@ fn delegate_issues_narrower_child() {
     let pctx = auth(&s, &parent.handle, T0).unwrap();
     let c = now_ready(s.delegate(
         &pctx,
-        child(&["customer.read"], &["acme-cus-001"], 500, 3600, 0),
+        child(&["customer.read"], &["acme-cus-001"], 500, 600, 0),
         T0,
     ))
     .unwrap();
     assert_eq!(c.grant.parent(), Some(parent.grant.grant_id()));
-    assert_eq!(
-        c.grant.expires_at(),
-        parent.grant.expires_at(),
-        "capped at parent expiry"
-    );
+    assert_eq!(c.grant.expires_at(), parent.grant.expires_at());
     assert_eq!(c.grant.tenant(), parent.grant.tenant());
     assert_eq!(c.grant.delegator(), parent.grant.delegator());
     assert_eq!(c.grant.issuer(), parent.grant.issuer());
@@ -245,7 +241,7 @@ fn delegate_issues_narrower_child() {
     );
 }
 
-/// Delegation is refused for wider actions or constraints, non-decreasing depth, a depth-0 parent, and a revoked parent.
+/// Delegation is refused for wider actions, constraints, or expiry, non-decreasing depth, a depth-0 parent, and an expired or revoked parent.
 #[test]
 fn delegate_rejects_widening() {
     let s = store();
@@ -264,6 +260,15 @@ fn delegate_rejects_widening() {
     assert!(try_child(child(&["customer.read"], &["acme-cus-003"], 1, 60, 0)).is_err());
     assert!(try_child(child(&["customer.read"], &["acme-cus-001"], 10_001, 60, 0)).is_err());
     assert!(try_child(child(&["customer.read"], &["acme-cus-001"], 1, 60, 1)).is_err());
+    // spec() ttl is 600 s, so 601 s would outlive the parent.
+    assert!(try_child(child(&["customer.read"], &["acme-cus-001"], 1, 601, 0)).is_err());
+    let late = Timestamp::from_unix_millis(parent.grant.expires_at().as_unix_millis());
+    assert!(now_ready(s.delegate(
+        &pctx,
+        child(&["customer.read"], &["acme-cus-001"], 1, 1, 0),
+        late
+    ))
+    .is_err());
 
     let leaf = try_child(child(&["customer.read"], &["acme-cus-001"], 1, 60, 0)).unwrap();
     let leaf_ctx = auth(&s, &leaf.handle, T0).unwrap();
@@ -321,7 +326,7 @@ fn plaintext_handle_not_stored_or_printed() {
     }
 }
 
-/// No authenticate call that starts after `revoke` returns ever yields a context, under concurrent load.
+/// No authenticate call that starts after `revoke` returns ever yields a context, and some calls provably start after it.
 #[test]
 fn revoke_racing_authenticate() {
     for _ in 0..20 {
@@ -331,39 +336,177 @@ fn revoke_racing_authenticate() {
         let revoked = Arc::new(AtomicBool::new(false));
         let violations = Arc::new(AtomicUsize::new(0));
         let successes = Arc::new(AtomicUsize::new(0));
+        let denied_after = Arc::new(AtomicUsize::new(0));
         let threads: Vec<_> = (0..8)
             .map(|_| {
-                let (s, revoked, violations, successes, secret) = (
+                let (s, revoked, violations, successes, denied_after, secret) = (
                     s.clone(),
                     revoked.clone(),
                     violations.clone(),
                     successes.clone(),
+                    denied_after.clone(),
                     secret.clone(),
                 );
                 std::thread::spawn(move || {
                     let h = SessionHandle::parse(&secret).unwrap();
-                    for _ in 0..2_000 {
+                    // Run until some calls have started after the revoke.
+                    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    // Bounded, so a store that never denies fails instead of hanging.
+                    while std::time::Instant::now() < give_up {
                         let after_revoke = revoked.load(Ordering::SeqCst);
-                        if auth(&s, &h, T0).is_ok() {
-                            successes.fetch_add(1, Ordering::Relaxed);
-                            if after_revoke {
-                                violations.fetch_add(1, Ordering::SeqCst);
+                        match auth(&s, &h, T0) {
+                            Ok(_) => {
+                                successes.fetch_add(1, Ordering::SeqCst);
+                                if after_revoke {
+                                    violations.fetch_add(1, Ordering::SeqCst);
+                                }
                             }
+                            Err(_) if after_revoke => {
+                                if denied_after.fetch_add(1, Ordering::SeqCst) >= 64 {
+                                    return;
+                                }
+                            }
+                            Err(_) => {}
                         }
                     }
                 })
             })
             .collect();
-        while successes.load(Ordering::Relaxed) == 0 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while successes.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workers never authenticated"
+            );
             std::hint::spin_loop();
         }
         now_ready(s.revoke(&app(), issued.grant.grant_id(), T0)).unwrap();
         revoked.store(true, Ordering::SeqCst);
         for t in threads {
-            t.join().unwrap();
+            t.join().expect("worker panicked");
         }
         assert_eq!(violations.load(Ordering::SeqCst), 0);
+        assert!(denied_after.load(Ordering::SeqCst) > 0);
     }
+}
+
+/// Revoking a parent while its child is being authenticated never lets a later child call succeed.
+#[test]
+fn parent_revoke_racing_child_authenticate() {
+    let s = Arc::new(store());
+    let parent = issue(&s, spec()).unwrap();
+    let pctx = auth(&s, &parent.handle, T0).unwrap();
+    let c = now_ready(s.delegate(
+        &pctx,
+        child(&["customer.read"], &["acme-cus-001"], 1, 60, 0),
+        T0,
+    ))
+    .unwrap();
+    let secret = c.handle.expose_secret().to_owned();
+    let revoked = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (s, revoked) = (s.clone(), revoked.clone());
+        std::thread::spawn(move || {
+            let h = SessionHandle::parse(&secret).unwrap();
+            let mut checked_after = 0;
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while checked_after < 64 && std::time::Instant::now() < give_up {
+                let after = revoked.load(Ordering::SeqCst);
+                let r = auth(&s, &h, T0);
+                if after {
+                    assert!(
+                        r.is_err(),
+                        "child authenticated after parent revoke returned"
+                    );
+                    checked_after += 1;
+                }
+            }
+        })
+    };
+    now_ready(s.revoke(&app(), parent.grant.grant_id(), T0)).unwrap();
+    revoked.store(true, Ordering::SeqCst);
+    worker.join().expect("worker panicked");
+}
+
+/// A grant can delegate at most `max_children_per_grant` children.
+#[test]
+fn children_per_grant_bounded() {
+    let mut cfg = GrantStoreConfig::new([action("customer.read")].into());
+    cfg.max_children_per_grant = 2;
+    let s = MemoryGrantStore::new(cfg);
+    let parent = issue(&s, spec()).unwrap();
+    let pctx = auth(&s, &parent.handle, T0).unwrap();
+    let d = || child(&["customer.read"], &["acme-cus-001"], 1, 60, 0);
+    assert!(now_ready(s.delegate(&pctx, d(), T0)).is_ok());
+    assert!(now_ready(s.delegate(&pctx, d(), T0)).is_ok());
+    assert!(now_ready(s.delegate(&pctx, d(), T0)).is_err());
+}
+
+/// A full store sweeps expired grants before refusing, and refuses with Unavailable when nothing has expired.
+#[test]
+fn capacity_bounded_and_expired_swept() {
+    let mut cfg = GrantStoreConfig::new([action("customer.read")].into());
+    cfg.max_grants = 2;
+    let s = MemoryGrantStore::new(cfg);
+    let short = || GrantSpec {
+        ttl_seconds: 1,
+        ..spec()
+    };
+    let a = issue(&s, short()).unwrap();
+    issue(&s, short()).unwrap();
+    assert_eq!(issue(&s, short()).err(), Some(GrantStoreError::Unavailable));
+    let later = T0.saturating_add_secs(1);
+    let fresh = now_ready(s.issue(&app(), short(), later)).unwrap();
+    assert_eq!(auth(&s, &a.handle, later).unwrap_err(), DenyReason::NoGrant);
+    assert!(auth(&s, &fresh.handle, later).is_ok());
+}
+
+/// Delegation narrows across several levels, and every ancestor stays in the chain.
+#[test]
+fn multi_level_delegation() {
+    let s = store();
+    let root = issue(
+        &s,
+        GrantSpec {
+            max_depth: 2,
+            ..spec()
+        },
+    )
+    .unwrap();
+    let rctx = auth(&s, &root.handle, T0).unwrap();
+    let mid = now_ready(s.delegate(
+        &rctx,
+        child(
+            &["customer.read"],
+            &["acme-cus-001", "acme-cus-002"],
+            900,
+            300,
+            1,
+        ),
+        T0,
+    ))
+    .unwrap();
+    let mctx = auth(&s, &mid.handle, T0).unwrap();
+    // Wider than mid (but within root) is still rejected.
+    assert!(now_ready(s.delegate(
+        &mctx,
+        child(&["customer.read"], &["acme-cus-001"], 1_000, 60, 0),
+        T0
+    ))
+    .is_err());
+    let leaf = now_ready(s.delegate(
+        &mctx,
+        child(&["customer.read"], &["acme-cus-001"], 100, 60, 0),
+        T0,
+    ))
+    .unwrap();
+    let lctx = auth(&s, &leaf.handle, T0).unwrap();
+    assert_eq!(lctx.chain().len(), 3);
+    now_ready(s.revoke(&app(), root.grant.grant_id(), T0)).unwrap();
+    assert_eq!(
+        auth(&s, &leaf.handle, T0).unwrap_err(),
+        DenyReason::GrantRevoked
+    );
 }
 
 fn arb_spec() -> impl Strategy<Value = GrantSpec> {

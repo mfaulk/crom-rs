@@ -19,6 +19,10 @@ use crate::traits::{BoxFuture, GrantStore, GrantStoreError, IssuedGrant, Sealed}
 /// Default and upper bound for [`GrantStoreConfig::max_ttl_seconds`]
 /// (MILESTONE_18 §8.2: `expires_at ≤ now + max_ttl`, default 1 h).
 pub const DEFAULT_MAX_TTL_SECONDS: u64 = 3600;
+/// Default [`GrantStoreConfig::max_grants`].
+pub const DEFAULT_MAX_GRANTS: usize = 100_000;
+/// Default [`GrantStoreConfig::max_children_per_grant`].
+pub const DEFAULT_MAX_CHILDREN_PER_GRANT: u32 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantStoreConfig {
@@ -27,6 +31,12 @@ pub struct GrantStoreConfig {
     /// Longest lifetime a grant may request. Longer requests are rejected,
     /// not capped, so the application learns its grant is shorter.
     pub max_ttl_seconds: u64,
+    /// Live-plus-unswept grants the store holds. When full, expired grants
+    /// are swept; if it is still full, `issue` and `delegate` fail with
+    /// `Unavailable` (agents can drive `delegate`, so memory must be bounded).
+    pub max_grants: usize,
+    /// Children one grant may ever create through `delegate`.
+    pub max_children_per_grant: u32,
 }
 
 impl GrantStoreConfig {
@@ -34,6 +44,8 @@ impl GrantStoreConfig {
         Self {
             registered_actions,
             max_ttl_seconds: DEFAULT_MAX_TTL_SECONDS,
+            max_grants: DEFAULT_MAX_GRANTS,
+            max_children_per_grant: DEFAULT_MAX_CHILDREN_PER_GRANT,
         }
     }
 }
@@ -60,6 +72,7 @@ struct HandleEntry {
 struct State {
     grants: HashMap<GrantId, Grant>,
     handles: HashMap<u64, Vec<HandleEntry>>,
+    children: HashMap<GrantId, u32>,
 }
 
 impl State {
@@ -77,6 +90,19 @@ impl State {
             chain.push(g.clone());
         }
         ExecutionContext::from_chain(chain).map_err(|_| DenyReason::EngineUnavailable)
+    }
+
+    /// Drops grants with `expires_at <= now`. A child never expires after
+    /// its parent, so whole expired subtrees go together and no live grant
+    /// loses an ancestor; their handles then fail with `NoGrant`.
+    fn sweep_expired(&mut self, now: Timestamp) {
+        self.grants.retain(|_, g| g.expires_at() > now);
+        let grants = &self.grants;
+        self.handles.retain(|_, entries| {
+            entries.retain(|e| grants.contains_key(&e.grant_id));
+            !entries.is_empty()
+        });
+        self.children.retain(|id, _| grants.contains_key(id));
     }
 
     fn insert(&mut self, grant: Grant, hash: HandleHash) {
@@ -167,20 +193,26 @@ impl MemoryGrantStore {
         Ok(())
     }
 
+    /// Generates ids and a handle, then inserts under the caller's write
+    /// guard, so checks and insertion are one atomic step.
     fn store_new(
         &self,
+        state: &mut State,
+        now: Timestamp,
         spec: GrantSpec,
         issue: impl FnOnce(GrantId, AgentId) -> GrantIssue,
     ) -> Result<IssuedGrant, GrantStoreError> {
+        if state.grants.len() >= self.config.max_grants {
+            state.sweep_expired(now);
+            if state.grants.len() >= self.config.max_grants {
+                return Err(GrantStoreError::Unavailable);
+            }
+        }
         let grant_id = GrantId::new(random_id("g_")?).expect("valid id");
         let agent = AgentId::new(random_id("a_")?).expect("valid id");
         let handle = SessionHandle::from_random_bytes(random_bytes()?);
         let grant = Grant::issue(spec, issue(grant_id, agent));
-        let hash = hash_handle(&handle);
-        self.state
-            .write()
-            .map_err(|_| GrantStoreError::Unavailable)?
-            .insert(grant.clone(), hash);
+        state.insert(grant.clone(), hash_handle(&handle));
         Ok(IssuedGrant { grant, handle })
     }
 
@@ -192,7 +224,11 @@ impl MemoryGrantStore {
     ) -> Result<IssuedGrant, GrantStoreError> {
         self.check_request(&spec.actions, spec.ttl_seconds)?;
         let expires_at = now.saturating_add_secs(spec.ttl_seconds);
-        self.store_new(spec, |grant_id, agent| GrantIssue {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| GrantStoreError::Unavailable)?;
+        self.store_new(&mut state, now, spec, |grant_id, agent| GrantIssue {
             grant_id,
             issuer: issuer.clone(),
             agent,
@@ -208,22 +244,21 @@ impl MemoryGrantStore {
         spec: DelegationSpec,
         now: Timestamp,
     ) -> Result<IssuedGrant, GrantStoreError> {
-        // Re-read the parent chain from the store: the caller's snapshot may
-        // predate a revocation.
-        let current = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| GrantStoreError::Unavailable)?;
-            state
-                .chain(parent.leaf().grant_id())
-                .map_err(|_| GrantStoreError::UnknownGrant)?
-        };
+        self.check_request(&spec.actions, spec.ttl_seconds)?;
+        // One write guard covers re-reading the parent, the checks, and the
+        // insert, so a delegation cannot succeed after `revoke` returns.
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| GrantStoreError::Unavailable)?;
+        // Re-read the chain: the caller's snapshot may predate a revocation.
+        let current = state
+            .chain(parent.leaf().grant_id())
+            .map_err(|_| GrantStoreError::UnknownGrant)?;
         current
             .check_live(now)
             .map_err(|r| GrantStoreError::InvalidSpec(format!("parent grant is not live: {r}")))?;
         let p = current.leaf();
-        self.check_request(&spec.actions, spec.ttl_seconds)?;
         if !spec.actions.is_subset(p.actions()) {
             return Err(GrantStoreError::InvalidSpec(
                 "actions exceed the parent's".into(),
@@ -242,9 +277,18 @@ impl MemoryGrantStore {
                 "max_depth must be below the parent's".into(),
             ));
         }
-        let expires_at = now
-            .saturating_add_secs(spec.ttl_seconds)
-            .min(p.expires_at());
+        let expires_at = now.saturating_add_secs(spec.ttl_seconds);
+        if expires_at > p.expires_at() {
+            return Err(GrantStoreError::InvalidSpec(
+                "expiry exceeds the parent's".into(),
+            ));
+        }
+        let used = state.children.get(p.grant_id()).copied().unwrap_or(0);
+        if used >= self.config.max_children_per_grant {
+            return Err(GrantStoreError::InvalidSpec(
+                "parent grant has delegated its maximum number of children".into(),
+            ));
+        }
         let child_spec = GrantSpec {
             tenant: p.tenant().clone(),
             delegator: p.delegator().clone(),
@@ -256,14 +300,16 @@ impl MemoryGrantStore {
         };
         let issuer = p.issuer().clone();
         let parent_id = p.grant_id().clone();
-        self.store_new(child_spec, |grant_id, agent| GrantIssue {
+        let issued = self.store_new(&mut state, now, child_spec, |grant_id, agent| GrantIssue {
             grant_id,
             issuer,
             agent,
             not_before: now,
             expires_at,
-            parent: Some(parent_id),
-        })
+            parent: Some(parent_id.clone()),
+        })?;
+        *state.children.entry(parent_id).or_insert(0) += 1;
+        Ok(issued)
     }
 
     fn authenticate_sync(
