@@ -23,6 +23,12 @@ explicitly via `AgentRuntimeBuilder`:
 approvals; `allowed_tools` pre-approves matching calls. Malformed rules fail
 `build()`.
 
+`ToolPolicy::guard(GuardConnection::new(url, handle))` connects the run to a
+Crom Guard agent endpoint as its only MCP server. Guard decides every
+protected operation; Crom records each call at the `guard` audit layer with
+Guard's decision id. See [`docs/sdk/guard.md`](../../docs/sdk/guard.md)
+(`cargo test -p crom-sdk --features fake-provider --test guard_client`).
+
 `RunBudgets` caps turns, tool calls, duration, patch size, cumulative
 input/output tokens, and nominal cost (`with_max_cost_usd`, which needs
 `AgentRuntimeBuilder::pricing`). A breach fails the run with a `budget.*`

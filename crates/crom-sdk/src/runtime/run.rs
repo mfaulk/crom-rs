@@ -362,9 +362,10 @@ pub(crate) async fn execute_request(
         max_tool_calls: request.budgets.max_tool_calls,
         usage_budget: request.budgets.usage_budget(),
         permission_mode: PermissionMode::Default,
-        allowed_tools: tools.names(),
+        allowed_tools: runtime.tool_policy.allowed_tool_names(&tools),
         allowed_tool_rules: runtime.tool_policy.allowed_tools.clone(),
         disallowed_tool_rules: runtime.tool_policy.disallowed_tools.clone(),
+        mcp: runtime.tool_policy.mcp_options(),
         ..Default::default()
     };
     if let Some(root) = workspace_for_run.filesystem_root() {
@@ -958,6 +959,7 @@ pub(crate) async fn execute_act(
         model: model.clone(),
         allowed_tool_rules: runtime.tool_policy.allowed_tools.clone(),
         disallowed_tool_rules: runtime.tool_policy.disallowed_tools.clone(),
+        mcp: runtime.tool_policy.mcp_options(),
         ..Default::default()
     };
     if let Some(root) = workspace_for_run.filesystem_root() {

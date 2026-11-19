@@ -59,6 +59,8 @@ tempfile = { workspace = true }
 crom-core = { workspace = true }
 crom-auth = { workspace = true }
 crom-tools = { workspace = true }
+# Guard client configuration (`ToolPolicy::guard`).
+crom-mcp = { workspace = true }
 
 # Optional provider integrations
 crom-anthropic = { workspace = true, optional = true }
@@ -73,6 +75,16 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 wiremock = { workspace = true }
+# Guard client integration test (tests/guard_client.rs): a real Guard server
+# in process. Dev-only; the Guard crates never depend on crom-* crates
+# (scripts/check-guard-deps.sh).
+crom-guard = { path = "../crom-guard" }
+crom-guard-server = { path = "../crom-guard-server" }
+crom-guard-testkit = { path = "../crom-guard-testkit" }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # Each example below requires the fake-provider feature for an offline
 # build. Run with: `cargo run --example <name> --features fake-provider -p crom-sdk`

@@ -215,6 +215,7 @@ impl AgentRuntimeBuilder {
             tool_policy.side_effect_policy = sep;
         }
         validate_tool_rules(&tool_policy)?;
+        validate_guard(&tool_policy)?;
         let interactivity = self.interactivity.unwrap_or_default();
         let verbosity = self.verbosity.unwrap_or_default();
         let storage = self.storage.unwrap_or_else(default_storage);
@@ -372,6 +373,26 @@ fn validate_tool_rules(policy: &ToolPolicy) -> Result<(), AgentSdkError> {
     Ok(())
 }
 
+fn validate_guard(policy: &ToolPolicy) -> Result<(), AgentSdkError> {
+    let Some(guard) = &policy.guard else {
+        return Ok(());
+    };
+    let invalid = |m: String| AgentSdkError::invalid_request("policy.invalid_guard", m);
+    guard.validate().map_err(invalid)?;
+    let prefix = format!("mcp__{}__", crate::policy::GUARD_SERVER_NAME);
+    if let Some(t) = policy
+        .custom_tools
+        .iter()
+        .find(|t| t.name().starts_with(&prefix))
+    {
+        return Err(invalid(format!(
+            "custom tool {:?} is in Guard's tool namespace",
+            t.name()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(all(test, feature = "fake-provider"))]
 mod tests {
     //! Builder validation beyond `builder_without_provider_fails`: the
@@ -392,6 +413,67 @@ mod tests {
 
     fn secret(s: &str) -> SecretString {
         SecretString::new(s.to_string())
+    }
+
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl crom_core::Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn permission_kind(&self) -> crom_core::PermissionKind {
+            crom_core::PermissionKind::ReadOnly
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: crom_core::ToolContext,
+        ) -> Result<crom_core::ToolResult, crom_core::ToolError> {
+            Ok(crom_core::ToolResult::ok_text("x"))
+        }
+    }
+
+    async fn build_guard(policy: ToolPolicy) -> Result<AgentRuntime, AgentSdkError> {
+        AgentRuntime::builder()
+            .provider(fake())
+            .tool_policy(policy)
+            .build()
+            .await
+    }
+
+    fn guard_conn(url: &str) -> crate::GuardConnection {
+        crate::GuardConnection::new(url, secret("gsh_0123456789abcdef"))
+    }
+
+    /// A Guard connection with a non-http URL is rejected at build.
+    #[tokio::test]
+    async fn guard_with_non_http_url_is_rejected() {
+        let err = build_guard(ToolPolicy::guard(guard_conn("unix:/tmp/guard")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, AgentSdkErrorKind::InvalidRequest);
+        assert_eq!(err.diagnostics[0].code, "policy.invalid_guard");
+    }
+
+    /// A custom tool that would shadow a Guard tool name (and inherit its allow rule) is rejected.
+    #[tokio::test]
+    async fn custom_tool_in_guard_namespace_is_rejected() {
+        let policy = ToolPolicy::guard(guard_conn("http://127.0.0.1:8470/mcp"))
+            .with_custom_tool(Arc::new(NamedTool("mcp__guard__refund_issue")));
+        let err = build_guard(policy).await.unwrap_err();
+        assert_eq!(err.diagnostics[0].code, "policy.invalid_guard");
+        assert!(
+            build_guard(ToolPolicy::guard(guard_conn("http://127.0.0.1:8470/mcp")))
+                .await
+                .is_ok()
+        );
     }
 
     // A Fake provider builds and falls back to the "fake-model" default id
