@@ -1,6 +1,7 @@
 # Milestone 18 — Crom Guard v0: Enforceable Agent Authority
 
-**Status:** planned (no implementation merged) · **GitHub milestone:**
+**Status:** implemented; the optional spend-capped live demo has not been run, and #340 is still open
+(see [Status](#status)) · **GitHub milestone:**
 [M18 — Crom Guard v0: Enforceable Agent Authority](https://github.com/mfaulk/crom-rs/milestone/2)
 
 **Theme:** Extract the first framework-independent security component from
@@ -8,6 +9,23 @@ Crom. A trusted application delegates explicitly bounded authority to an AI
 agent. **Crom Guard** enforces that authority when the agent invokes protected
 operations, keeps downstream credentials out of the agent's reach, and records
 verifiable evidence of every authorized and refused operation.
+
+## Status
+
+Every workstream issue (#341–#363, #402, #405, #413) has merged, and #364
+adds the [tutorial](../guard/tutorial.md) and the
+[security and overhead report](../benchmarks/M18-guard.md). Results, what
+they do and do not show, and the GP1–GP8 property coverage are in that
+report; §5–§19 below are the plan as written, and §18 holds the targets the
+report measures against.
+
+| Item | State |
+|---|---|
+| §20 definition of done | Met except where noted in §20 |
+| §18 targets | Met in the archived run and in PR CI: `executed = 0` in every Guard lane and > 0 without Guard (`guard_off`) or with the sandbox off; audit coverage 1.000 with `audit verify` passing; E1 59/59 cells agree; E4a decisions equal across four provider profiles; Python client passes the §14.2 matrix in PR CI; `guard / adversarial (linux)` needs no paid inference. Numbers: [M18-guard.md](../benchmarks/M18-guard.md#results-generated-from-the-archive) |
+| Live demo (E3 model-generated lane, E4b) | Not run. Manual and spend-capped: `.github/workflows/guard-live.yml` (`max_total_cost_usd` ≤ $2). See [experiments.md](../guard/experiments.md#e3-scripted-vs-model-generated-attacks) |
+| E4a transcripts | Synthetic (rendered in each provider's wire format), not captured from providers |
+| #340 | Readiness record (§22) filled; the issue is still open |
 
 > Findings below are from source inspection at `eaa61f6` (`main`,
 > 2026-11-16). File references are `crates/<crate>/src/<file>:<line>` at that
@@ -1094,7 +1112,8 @@ Related, not in M18: #297 (M17 baseline), #205 (keychain), #231, #117–#122,
 
 ## 18. Measurable acceptance criteria
 
-These are targets, not current results. No baseline numbers exist yet.
+These are the targets as planned. Measured results, with their limits, are
+in [docs/benchmarks/M18-guard.md](../benchmarks/M18-guard.md).
 
 | Metric | Target | Measured by |
 |---|---|---|
@@ -1148,28 +1167,31 @@ These are targets, not current results. No baseline numbers exist yet.
 
 ## 20. Definition of done
 
-- [ ] D1–D3 fixed with regression tests; #338 merged; #319 resolved or
+- [x] D1–D3 fixed with regression tests; #338 merged; #319 resolved or
       documented.
-- [ ] ADR 0002 and ADR 0003 merged; threat model extended.
-- [ ] `crom-guard` and `crom-guard-server` build with no other `crom-*`
+- [x] ADR 0002 and ADR 0003 merged; threat model extended.
+- [x] `crom-guard` and `crom-guard-server` build with no other `crom-*`
       dependency (CI check).
-- [ ] Grants: issue, bind, expire, revoke, attenuate, all with property
+- [x] Grants: issue, bind, expire, revoke, attenuate, all with property
       tests showing no widening.
-- [ ] Cedar PDP with schema validation and the fail-closed rules of §9.2.
-- [ ] Enforcement pipeline with sealed `AuthorizedAction` and
+- [x] Cedar PDP with schema validation and the fail-closed rules of §9.2.
+- [x] Enforcement pipeline with sealed `AuthorizedAction` and
       version-conditioned execution.
-- [ ] Approvals bound to action digests, single use.
-- [ ] Credential broker; credential never leaves the Guard process (tests).
-- [ ] Hash-chained audit log with `audit verify`; Crom `guard` layer
+- [x] Approvals bound to action digests, single use.
+- [x] Credential broker; credential never leaves the Guard process (tests).
+- [x] Hash-chained audit log with `audit verify`; Crom `guard` layer
       correlation.
-- [ ] Python stdlib client passes the §14.2 matrix in PR CI.
-- [ ] Reference deployment preflight and bypass tests in the Linux CI lane.
-- [ ] ≥22 adversarial scenarios; scripted lane reports `executed = 0` in the
+- [x] Python stdlib client passes the §14.2 matrix in PR CI.
+- [x] Reference deployment preflight and bypass tests in the Linux CI lane.
+- [x] ≥22 adversarial scenarios (G1–G18 plus the 10 M17 scenarios); scripted lane reports `executed = 0` in the
       supported configuration and `> 0` for isolation-dependent scenarios with
       the sandbox off.
-- [ ] Scoreboard with E1–E5 results; `docs/benchmarks/M18-guard.md` published
-      with limitations.
-- [ ] Tutorial lets a new developer run the demo offline.
+- [x] Scoreboard with E1–E5 results; `docs/benchmarks/M18-guard.md` published
+      with limitations. E3's model-generated lane and E4b (live, optional)
+      have not been run.
+- [x] Tutorial lets a new developer run the demo offline
+      ([docs/guard/tutorial.md](../guard/tutorial.md); CI runs its commands
+      with `scripts/guard-tutorial.sh`).
 
 ## 21. Follow-up milestone candidates
 

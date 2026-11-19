@@ -191,7 +191,8 @@ suite that measures executed effects is [`adversarial-suite.md`](adversarial-sui
 ## 9. Crom Guard (M18)
 
 Statements here are the targets the M18 tests must meet. The Status column
-of §9.2 records which properties the M18 tests now cover.
+of §9.2 records which properties the M18 tests now cover: all eight, within
+the supported deployment of §9.1.
 
 ### 9.1 Supported deployment
 
@@ -222,18 +223,18 @@ preflight that refuses deployments outside it, are in
 
 GP1–GP6 are the falsifiable claims of [`MILESTONE_18.md` §18](../milestones/MILESTONE_18.md#18-measurable-acceptance-criteria);
 GP7–GP8 are the fail-closed and audit-before-execute rules of MILESTONE_18 §9.2 and §10.2.
-This table is the property-coverage table reused by #364.
+The full list of tests per property, with what the measured results do and do not show, is the property-coverage table of [`docs/benchmarks/M18-guard.md`](../benchmarks/M18-guard.md#property-coverage-gp1gp8) (#364).
 
 | # | Property | Test | Status |
 |---|---|---|---|
-| GP1 | An agent cannot read a customer or invoice of a tenant other than its grant's tenant through the protected API, including with a forged tenant or user identifier in the arguments. Not-found and other-tenant are indistinguishable to the agent. | Resolver and schema tests in #350 (`tenant_id` rejected by `additionalProperties: false`); cross-tenant and forged-identifier scenarios in #361 (ledger shows no effect, audit shows `deny`) | Planned |
-| GP2 | An agent cannot issue a refund above `min(grant limit, delegator limit, remaining invoice amount)` without a single-use approval the trusted app issued for that exact action. | Approval binding, replay, and mismatch tests in #354; Cedar limit tests in #349; over-limit and forged-approval scenarios in #361 | Planned |
-| GP3 | An agent cannot obtain a child grant with an action, constraint, expiry, or depth exceeding its own. | Attenuation tests in #353 (each widening dimension rejected); broader-child-grant scenario in #361 | Planned |
-| GP4 | A grant is unusable after expiry or revocation for every request that starts after the revocation is recorded. | Lifecycle tests in #348 (expiry, revoke, re-check immediately before execute, MILESTONE_18 §10.2 step 6); replay scenario in #361 | Planned |
-| GP5 | Every protected effect in the business ledger has exactly one Guard `executed` record, and the audit chain verifies. | Hash-chain and `audit verify` tests in #352; ledger reconciliation in #361 and #363 | Planned |
+| GP1 | An agent cannot read a customer or invoice of a tenant other than its grant's tenant through the protected API, including with a forged tenant or user identifier in the arguments. Not-found and other-tenant are indistinguishable to the agent. | `crates/crom-guard/tests/pipeline.rs` (`not_found_and_other_tenant_are_indistinguishable`, `invalid_arguments_denied_before_resolution`), `crates/crom-guard-testkit/tests/pipeline_e2e.rs` (`other_tenant_and_missing_ids_look_the_same`, `forged_tenant_argument_rejected`), `schemas_reject_forged_tenant_id` in `crates/crom-guard-testkit/src/support_ops.rs`; scenarios G1–G3 (ledger shows no effect); E1 | Tested |
+| GP2 | An agent cannot issue a refund above `min(grant limit, delegator limit, remaining invoice amount)` without a single-use approval the trusted app issued for that exact action. | `crates/crom-guard/tests/approvals.rs` (binding, replay, mismatch, expiry, cross-tenant approver, concurrent use), PDP `decision_table` in `crates/crom-guard/src/pdp/tests.rs`, `crates/crom-guard-server/tests/approvals.rs`; scenarios G8, G9; E1 | Tested |
+| GP3 | An agent cannot obtain a child grant with an action, constraint, expiry, or depth exceeding its own. | `crates/crom-guard/tests/attenuation.rs` (`widening_attempts_are_denied`, `child_authority_implies_parent_authority` over 10,000 random cases), `chain_allow_implies_parent_allow` (proptest) in `crates/crom-guard/src/pdp/tests.rs`; scenario G10; E1 | Tested |
+| GP4 | A grant is unusable after expiry or revocation for every request that starts after the revocation is recorded. | Grant store tests in `crates/crom-guard/src/store/tests.rs` (expiry, revoke, races), `crates/crom-guard/tests/pipeline.rs` (`revoke_between_authorize_and_execute_has_no_effect`, `expiry_between_authorize_and_execute_has_no_effect`); scenarios G4–G6; E1 | Tested |
+| GP5 | Every protected effect in the business ledger has exactly one Guard `executed` record, and the audit chain verifies. | `crates/crom-guard/tests/audit.rs` (edit, deletion, insertion, reordering, truncation with anchor), `crates/crom-guard-server/tests/cli.rs` (`verify_*`), `crates/crom-guard-testkit/tests/business_api.rs` (`ledger_records_guard_decision_id`); every Guard scenario lane reports `unmediated = 0` and audit coverage 1.000; `unmediated_and_tampered_audit_probes_fire` | Tested |
 | GP6 | In the supported deployment, agent Bash cannot reach the business API or read Guard's credential, state, or audit log. | #360: `crates/crom-guard-testkit/tests/bypass.rs` (G13, G14, G16, G18 from agent Bash; sandbox `required`: no unmediated ledger effect, audit verifies; `off`: every probe fires; the same attacks as a separate uid) and the `crom-guard check` preflight (`crates/crom-guard-server/src/check.rs`, one test per failing condition). CI: `guard / isolation (linux)`. Profile: [deployment.md](../guard/deployment.md) | Tested |
-| GP7 | Guard fails closed: a missing, unknown, expired, or revoked handle; an unknown action name; arguments failing the schema; an unresolvable resource; any Cedar evaluation error; or a policy set failing schema validation each yield deny (or refusal to start), never allow. | PDP fail-closed tests in #349; pipeline tests in #351 | Planned |
-| GP8 | Audit before execute: if the `decision` record cannot be written, the executor is not called; executors accept only a sealed `AuthorizedAction` with no public constructor. | Pipeline tests with a failing audit sink in #351 and #352 (no ledger effect) | Planned |
+| GP7 | Guard fails closed: a missing, unknown, expired, or revoked handle; an unknown action name; arguments failing the schema; an unresolvable resource; any Cedar evaluation error; or a policy set failing schema validation each yield deny (or refusal to start), never allow. | `crates/crom-guard/src/pdp/tests.rs` (`erroring_*`, `missing_entity_denies`, `schema_invalid_*`, `refuses_*`), `crates/crom-guard/tests/pipeline.rs` (bad handles, unknown tools, invalid arguments, resolver failures), `crates/crom-guard-server/tests/http.rs` `refuses_invalid_policy` | Tested |
+| GP8 | Audit before execute: if the `decision` record cannot be written, the executor is not called; executors accept only a sealed `AuthorizedAction` with no public constructor. | `crates/crom-guard/tests/pipeline.rs` (`audit_decision_failure_denies`, `chained_sink_storage_failure_denies`, `outcome_write_failure_fails_closed`), `crates/crom-guard/tests/audit.rs` (`disk_full_fails_closed`), `compile_fail` doctests on `AuthorizedAction` in `crates/crom-guard/src/action.rs` | Tested |
 
 Properties P1–P9 (§7) remain prerequisites: GP6 relies on P1–P4 and P7, and
 Crom as a client relies on P9 and the #341–#343 fixes.

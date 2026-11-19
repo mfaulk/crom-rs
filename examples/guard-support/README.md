@@ -11,6 +11,8 @@ The crate is excluded from the root workspace, like the other examples. All
 authorization lives in `policies/` and the testkit operations
 (`crom_guard_testkit::support_ops`); this crate decides nothing itself.
 Walkthrough: [docs/guard/reference-app.md](../../docs/guard/reference-app.md).
+Step-by-step tutorial, including driving Guard by hand and changing a
+policy: [docs/guard/tutorial.md](../../docs/guard/tutorial.md).
 
 | Path | Contents |
 |---|---|

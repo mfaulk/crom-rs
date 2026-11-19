@@ -170,11 +170,13 @@ separate tables.
 ### The archive
 
 `docs/guard/results/` holds the reports the published scoreboard is built
-from. [scoreboard.md](scoreboard.md) is generated, never edited:
+from. [scoreboard.md](scoreboard.md) and the "Results" section of
+[docs/benchmarks/M18-guard.md](../benchmarks/M18-guard.md) (between its
+`BEGIN GENERATED` and `END GENERATED` markers) are generated, never edited:
 
 ```sh
-scripts/guard-scoreboard.sh            # rewrite docs/guard/scoreboard.md from docs/guard/results/
-scripts/guard-scoreboard.sh --check    # fail if it is stale
+scripts/guard-scoreboard.sh            # rewrite both from docs/guard/results/
+scripts/guard-scoreboard.sh --check    # fail if either is stale
 ```
 
 | File | Produced by |
@@ -200,7 +202,8 @@ reports in, and run `scripts/guard-scoreboard.sh`.
 `guard / adversarial (linux)` runs the scenarios and the experiments, uploads
 `guard-scenarios-report` and `guard-experiments-report`, then runs
 `scripts/guard-scoreboard.sh --check` with the fresh reports. That fails if
-`scoreboard.md` does not regenerate from the archive, or if a deterministic
+`scoreboard.md` or the generated section of `M18-guard.md` does not
+regenerate from the archive, or if a deterministic
 fact of the fresh run differs from the archive: every (scenario, lane) pair
 with its status and verdict counts, ledger and audit results, every E1 cell,
 E2 counts per lane and per scenario, and every E4a decision view (reference

@@ -431,7 +431,8 @@ jobs:
           name: guard-experiments-report
           path: target/tmp/guard-experiments/
           if-no-files-found: ignore
-      # docs/guard/scoreboard.md must regenerate from docs/guard/results/, and
+      # docs/guard/scoreboard.md and the generated section of
+      # docs/benchmarks/M18-guard.md must regenerate from docs/guard/results/, and
       # this run's deterministic facts must match the archived reports.
       - name: Guard scoreboard (archive and fresh run)
         run: |
@@ -490,6 +491,11 @@ jobs:
           cargo run --manifest-path examples/guard-support/Cargo.toml -- --agent scripted
           jq -e '.checks[] | select(.check | startswith("crom-guard check")) | .pass' target/guard-demo/report.json
           ! grep -q '^FAIL' target/guard-demo/guard-check.txt
+      # #364: every runnable `sh` block of docs/guard/tutorial.md, in order,
+      # then checks on the decisions, ledger, policy change and preflight it
+      # produced. The doc is the only copy of the commands.
+      - name: Guard tutorial (docs/guard/tutorial.md)
+        run: scripts/guard-tutorial.sh
       - name: Upload demo artifacts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

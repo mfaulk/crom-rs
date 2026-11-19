@@ -45,6 +45,21 @@ much of it is still planned (see [Limitations and roadmap](#limitations-and-road
 - **Audit:** every gated tool call produces a structured `SecurityDecision`
   record (what was attempted, which layer decided, and the outcome), with
   secrets redacted.
+- **Crom Guard (M18):** enforceable, task-scoped authority for agents that
+  act on business systems, usable from any MCP client. A trusted application
+  issues an agent a grant (tenant, delegator, actions, customers, refund
+  limits, expiry); the `crom-guard` service authorizes every call to a
+  protected operation with Cedar policies, binds approvals to the exact
+  action, lets agents delegate only narrower authority to subagents, holds
+  the downstream credential itself, and writes a hash-chained audit log
+  (`crom-guard audit verify`). `crom-guard check` refuses deployments outside
+  the isolation profile. Start with the
+  [tutorial](docs/guard/tutorial.md); design and API in
+  [docs/guard/](docs/guard/README.md); measured results and their limits in
+  [docs/benchmarks/M18-guard.md](docs/benchmarks/M18-guard.md). Crom connects
+  to Guard as an MCP client (`ToolPolicy::guard`,
+  [docs/sdk/guard.md](docs/sdk/guard.md)), and the reference application is
+  [examples/guard-support/](examples/guard-support/README.md).
 - **Measurement:** a reproducible evaluation harness with leveled coding
   tasks and hidden tests, spend-capped live runs, a scoreboard, and an
   adversarial security suite. The suite scores attacks on the effects they
@@ -52,50 +67,24 @@ much of it is still planned (see [Limitations and roadmap](#limitations-and-road
 
 ## Limitations and roadmap
 
-What exists today protects a **coding agent working in a local workspace**.
-Several important pieces are not built yet:
+What exists today protects a **coding agent working in a local workspace**,
+and, through Crom Guard, the protected operations of one reference
+application. Several important pieces are not built yet:
 
-- **Authorization is not yet resource-aware.** Policy decides on tool names
-  and a few arguments (shell command, file path). It cannot express rules
-  like "this customer's records only" or "refunds up to $100".
-- **Delegated, task-scoped authority is planned, not implemented.** This
-  includes trusted principals, grants an application issues to an agent,
-  narrower authority for subagents, keeping downstream credentials away from
-  agents, and enforcement usable from other agent frameworks. It is the goal
-  of **Crom Guard**, planned for milestone M18
-  ([plan](docs/milestones/MILESTONE_18.md),
-  [issues](https://github.com/mfaulk/crom-rs/milestone/2)). The architecture
-  is proposed in [ADR 0002](docs/security/decisions/0002-guard-architecture.md),
-  and the Cedar policy model in
-  [ADR 0003](docs/security/decisions/0003-guard-policy-engine.md).
-  `crates/crom-guard` defines the core types and traits
-  ([docs/guard/README.md](docs/guard/README.md)), the hash-chained audit
-  log ([docs/guard/audit.md](docs/guard/audit.md)), the downstream
-  credential brokers ([docs/guard/credentials.md](docs/guard/credentials.md)),
-  the Cedar policy decision point
-  ([docs/guard/policies.md](docs/guard/policies.md)), and the in-process
-  enforcement pipeline and operation registry
-  ([docs/guard/pipeline.md](docs/guard/pipeline.md)) with single-use,
-  digest-bound approvals ([docs/guard/approvals.md](docs/guard/approvals.md)).
-  `crates/crom-guard-server` (binary `crom-guard`) serves it to any MCP client
-  over Streamable HTTP, with a separate admin API for grants and approvals
-  ([docs/guard/server.md](docs/guard/server.md)): `crom-guard serve --config
-  guard.toml`, `crom-guard policy validate`, `crom-guard audit verify <log>`, and the
-  isolation preflight `crom-guard check`
-  ([docs/guard/deployment.md](docs/guard/deployment.md)).
-  Crom itself connects to Guard as an MCP client (`ToolPolicy::guard` in the
-  SDK, or `"guard": true` on an http MCP server) and records each call at the
-  `guard` audit layer with Guard's decision id
-  ([docs/sdk/guard.md](docs/sdk/guard.md)). `crates/crom-guard-testkit` provides the controlled business API and
-  effect ledger the M18 tests measure against, a standard-library Python
-  MCP client runs the reference matrix against a real Guard in CI
-  ([docs/guard/reference-deployment.md](docs/guard/reference-deployment.md)),
-  the customer-support reference application runs a scripted Crom agent
-  through the same matrix in CI (`cargo run --manifest-path
-  examples/guard-support/Cargo.toml`, [docs/guard/reference-app.md](docs/guard/reference-app.md)),
-  and the reference policy set
-  (`examples/guard-support/policies/`) is validated in CI by
-  `scripts/validate-guard-policies.sh`.
+- **Crom Guard v0 (M18) is a reference, not a product.** Its claims hold in
+  one supported deployment (Linux, Guard on its own state directory, agent
+  Bash sandboxed without network or the agent under its own uid, Guard as
+  the only path to the business API), for the reference support operations
+  and policies, against the tested scenarios
+  ([report](docs/benchmarks/M18-guard.md#what-the-results-do-not-show)).
+  Grants live in memory and do not survive a restart; there are no
+  self-contained capability tokens, OAuth flows, or distributed revocation;
+  executors and resolvers are trusted application code; and no live-model
+  run has been made yet (the scripted lanes are the evidence). Follow-ups are
+  listed in [MILESTONE_18 §21](docs/milestones/MILESTONE_18.md#21-follow-up-milestone-candidates).
+- **Crom's own policy is not resource-aware.** Outside Guard, policy decides
+  on tool names and a few arguments (shell command, file path). Rules like
+  "this customer's records only" need a Guard protected operation.
 - **The sandbox is opt-in and Linux-only.** `sandbox.mode` defaults to `off`.
   It covers agent shell commands, not MCP servers or validation commands.
   Other platforms refuse sandboxed commands rather than run them unprotected.
@@ -106,8 +95,11 @@ Several important pieces are not built yet:
   claim of immunity to prompt injection. See the
   [threat model](docs/security/threat-model.md) for what is and is not
   covered.
-- **No published benchmark numbers yet.** The live baseline is in progress
-  ([#297](https://github.com/mfaulk/crom-rs/issues/297)).
+- **Benchmarks are early.** The M17 live capability baseline
+  ([docs/benchmarks/M17-baseline.md](docs/benchmarks/M17-baseline.md)) and
+  the M18 Guard report ([docs/benchmarks/M18-guard.md](docs/benchmarks/M18-guard.md),
+  scripted lanes only) are first measurements on one model pair and one
+  reference application.
 - Not published to crates.io. Install from source.
 
 Plans live in [`docs/milestones/`](docs/milestones/) and the
@@ -165,8 +157,9 @@ commands on Linux, see the [sandbox guide](docs/security/sandbox.md).
 - Security: [threat model](docs/security/threat-model.md),
   [sandbox](docs/security/sandbox.md), [audit events](docs/security/audit.md),
   [adversarial suite](docs/security/adversarial-suite.md)
-- Crom Guard: [core types](docs/guard/README.md),
-  [pipeline](docs/guard/pipeline.md), [server and admin API](docs/guard/server.md)
+- Crom Guard: [tutorial](docs/guard/tutorial.md), [core types](docs/guard/README.md),
+  [pipeline](docs/guard/pipeline.md), [server and admin API](docs/guard/server.md),
+  [deployment](docs/guard/deployment.md), [M18 report](docs/benchmarks/M18-guard.md)
 - [Evaluation harness](docs/eval.md)
 - [Examples](examples/README.md)
 - [Milestones](docs/milestones/)
