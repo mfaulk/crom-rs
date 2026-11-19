@@ -368,6 +368,18 @@ pub fn load_mcp_options(
                         ),
                     ));
                 }
+                // `guard: true` changes how results are audited and lets
+                // allow rules for `mcp__guard__*` apply; only operator
+                // config may set it.
+                if let Some((name, _)) = file.mcp_servers.iter().find(|(_, c)| c.is_guard()) {
+                    return Err(McpError::config(
+                        absolute,
+                        format!(
+                            "mcpServers.{name} sets `guard: true`; repository config may not \
+                             declare a Crom Guard server (use --mcp-config or user settings)"
+                        ),
+                    ));
+                }
             }
             options.servers.extend(file.mcp_servers);
             options.config_file = Some(path.clone());
@@ -889,6 +901,25 @@ mod tests {
             assert!(msg.contains("never reads host environment"), "{msg}");
             assert!(!msg.contains("hostsecretvalue"));
         });
+    }
+
+    /// A repo `.agent/mcp.json` may not mark a server `guard: true`, even in a trusted workspace; an operator config may.
+    #[test]
+    fn repo_mcp_json_cannot_mark_guard() {
+        let dir = TempDir::new().unwrap();
+        let cfg = serde_json::json!({"mcpServers": {
+            "guard": {"type": "http", "url": "http://127.0.0.1:9/mcp", "guard": true}
+        }});
+        write_repo_mcp(dir.path(), cfg.clone());
+        let err = load_mcp_options(dir.path(), None, None, None, None, None, true).unwrap_err();
+        assert!(err.to_string().contains("guard"), "{err}");
+
+        let ops = TempDir::new().unwrap();
+        let path = ops.path().join("mcp.json");
+        std::fs::write(&path, cfg.to_string()).unwrap();
+        let options =
+            load_mcp_options(dir.path(), None, Some(&path), None, None, None, true).unwrap();
+        assert!(options.servers["guard"].is_guard());
     }
 
     #[test]

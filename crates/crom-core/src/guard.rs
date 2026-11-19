@@ -2,15 +2,24 @@
 //! Guard is an independent gate: a Guard denial, approval requirement,
 //! malformed response, or an unreachable Guard must reach the model as a
 //! tool error and the audit as `blocked` at layer `guard`, never as success.
+//! A timeout is different: the call may have run, so it is never reported
+//! as "not authorized".
 
-use crom_mcp::{McpError, McpToolResult};
+use crom_mcp::{McpError, McpOptions, McpToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::events::{EnforcementLayer, SecurityDecision, SecurityOutcome};
+use crate::policy::PolicyOutcome;
 use crate::tool::ToolResult;
+use crate::tool_rule::ToolRule;
 
 /// `ToolResult.metadata` key holding the [`GuardVerdict`].
 pub const GUARD_METADATA_KEY: &str = "guard";
+
+/// Name under which `ToolPolicy::guard` registers Guard; see
+/// [`check_guard_allow_rules`].
+pub const GUARD_SERVER_NAME: &str = "guard";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,8 +29,10 @@ pub enum GuardStatus {
     ApprovalRequired,
     /// Authorized, then the precondition check or executor failed.
     Failed,
-    /// Transport error, timeout, or JSON-RPC error: Guard gave no verdict.
+    /// Connection or JSON-RPC error: Guard gave no verdict.
     Unavailable,
+    /// The request timed out: Guard may have executed it.
+    OutcomeUnknown,
     /// An error result Crom could not read as a Guard verdict.
     Malformed,
 }
@@ -29,7 +40,7 @@ pub enum GuardStatus {
 impl GuardStatus {
     /// Whether the call is recorded `blocked`: Guard did not authorize it.
     pub fn is_blocked(self) -> bool {
-        !matches!(self, Self::Executed | Self::Failed)
+        !matches!(self, Self::Executed | Self::Failed | Self::OutcomeUnknown)
     }
 }
 
@@ -37,7 +48,7 @@ impl GuardStatus {
 pub struct GuardVerdict {
     pub status: GuardStatus,
     /// Guard's stable code (`resource_not_found`, `approval_required`, ...)
-    /// or a Crom-side code for `unavailable` / `malformed`.
+    /// or a Crom-side code for `unavailable` / `outcome_unknown` / `malformed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     /// `_meta.decision_id`, the join key to Guard's audit log.
@@ -45,7 +56,9 @@ pub struct GuardVerdict {
     pub decision_id: Option<String>,
 }
 
-/// Classify a `tools/call` result from a Guard server.
+/// Classify a `tools/call` result from a Guard server. `isError: false` is
+/// always `executed`: Guard then puts the operation's own output in
+/// `structuredContent`, whose `status`/`code` are business data.
 pub fn verdict_from_result(result: &McpToolResult) -> GuardVerdict {
     let decision_id = result
         .extra
@@ -57,18 +70,21 @@ pub fn verdict_from_result(result: &McpToolResult) -> GuardVerdict {
     let structured = result.structured_content.as_ref();
     let field = |k: &str| structured.and_then(|s| s.get(k)).and_then(Value::as_str);
     let code = || Some(field("code").map_or("unknown", safe_code).to_owned());
-    let (status, code) = match field("status") {
-        Some("denied") => (GuardStatus::Denied, code()),
-        Some("approval_required") => (
-            GuardStatus::ApprovalRequired,
-            Some("approval_required".to_owned()),
-        ),
-        Some("failed") => (GuardStatus::Failed, code()),
-        _ if !result.is_error => (GuardStatus::Executed, None),
-        _ => (
-            GuardStatus::Malformed,
-            Some("malformed_response".to_owned()),
-        ),
+    let (status, code) = if !result.is_error {
+        (GuardStatus::Executed, None)
+    } else {
+        match field("status") {
+            Some("denied") => (GuardStatus::Denied, code()),
+            Some("approval_required") => (
+                GuardStatus::ApprovalRequired,
+                Some("approval_required".to_owned()),
+            ),
+            Some("failed") => (GuardStatus::Failed, code()),
+            _ => (
+                GuardStatus::Malformed,
+                Some("malformed_response".to_owned()),
+            ),
+        }
     };
     GuardVerdict {
         status,
@@ -80,18 +96,21 @@ pub fn verdict_from_result(result: &McpToolResult) -> GuardVerdict {
 /// Classify a failed `tools/call` request. The error text is never kept:
 /// transport errors can echo request details.
 pub fn verdict_from_error(err: &McpError) -> GuardVerdict {
-    let code = match err {
-        McpError::Timeout { .. } => "guard_timeout",
-        McpError::JsonRpc { error, .. } => error
-            .data
-            .as_ref()
-            .and_then(|d| d.get("code"))
-            .and_then(Value::as_str)
-            .map_or("guard_error", safe_code),
-        _ => "guard_unavailable",
+    let (status, code) = match err {
+        McpError::Timeout { .. } => (GuardStatus::OutcomeUnknown, "guard_timeout"),
+        McpError::JsonRpc { error, .. } => (
+            GuardStatus::Unavailable,
+            error
+                .data
+                .as_ref()
+                .and_then(|d| d.get("code"))
+                .and_then(Value::as_str)
+                .map_or("guard_error", safe_code),
+        ),
+        _ => (GuardStatus::Unavailable, "guard_unavailable"),
     };
     GuardVerdict {
-        status: GuardStatus::Unavailable,
+        status,
         code: Some(code.to_owned()),
         decision_id: None,
     }
@@ -99,22 +118,86 @@ pub fn verdict_from_error(err: &McpError) -> GuardVerdict {
 
 impl GuardVerdict {
     /// The tool error the model sees when Guard gave no result.
-    pub fn into_unavailable_result(self) -> ToolResult {
+    pub fn into_error_result(self) -> ToolResult {
         let code = self.code.as_deref().unwrap_or("guard_unavailable");
-        let mut res = ToolResult::error_text(format!(
-            "Guard request failed ({code}); the call was not authorized."
-        ));
+        let text = if self.status == GuardStatus::OutcomeUnknown {
+            format!(
+                "Guard request failed ({code}); outcome unknown — the action may have run; \
+                 check before retrying."
+            )
+        } else {
+            format!("Guard request failed ({code}); the call was not authorized.")
+        };
+        let mut res = ToolResult::error_text(text);
         res.metadata = serde_json::json!({ GUARD_METADATA_KEY: self });
         res
     }
+
+    fn sanitized(mut self) -> Self {
+        self.code = self.code.map(|c| safe_code(&c).to_owned());
+        self.decision_id = self.decision_id.filter(|d| is_safe_id(d));
+        self
+    }
 }
 
-/// The verdict a Guard-backed MCP tool attached to its result, if any.
+/// The verdict a Guard-backed MCP tool attached to its result, if any. The
+/// caller must only ask for results of `guard: true` MCP tools.
 pub fn verdict_of(result: &ToolResult) -> Option<GuardVerdict> {
     result
         .metadata
         .get(GUARD_METADATA_KEY)
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .and_then(|v| serde_json::from_value::<GuardVerdict>(v.clone()).ok())
+        .map(GuardVerdict::sanitized)
+}
+
+/// Record `verdict` on the call's `SecurityDecision` (layer `guard`).
+pub fn apply_verdict(audit: &mut SecurityDecision, verdict: GuardVerdict) {
+    audit.enforcement = EnforcementLayer::Guard;
+    audit.guard_decision_id = verdict.decision_id;
+    match verdict.status {
+        GuardStatus::Executed => {}
+        GuardStatus::Failed | GuardStatus::OutcomeUnknown => {
+            audit.outcome = SecurityOutcome::Failed;
+            audit.reason = verdict.code;
+        }
+        _ => {
+            audit.decision = PolicyOutcome::Deny;
+            audit.outcome = SecurityOutcome::Blocked;
+            audit.reason = verdict.code;
+        }
+    }
+}
+
+/// Guard's own `guard.*` tools (e.g. `guard.delegate`, which returns a
+/// child session handle). Crom never exposes them to the agent: a handle in
+/// a tool result would reach the model, events and the session file.
+pub fn is_reserved_guard_tool(remote_name: &str) -> bool {
+    remote_name.starts_with("guard.")
+}
+
+/// Refuse allow rules that target the MCP server named `guard` unless that
+/// server is configured `guard: true`, so a same-named ordinary server
+/// cannot inherit them.
+pub fn check_guard_allow_rules(rules: &[ToolRule], mcp: &McpOptions) -> Result<(), String> {
+    let Some(server) = mcp.servers.get(GUARD_SERVER_NAME) else {
+        return Ok(());
+    };
+    if !mcp.enabled || server.is_guard() {
+        return Ok(());
+    }
+    let prefix = format!("mcp__{GUARD_SERVER_NAME}__");
+    let targets_guard = |r: &ToolRule| match r {
+        ToolRule::McpServerGlob { server, .. } => server == GUARD_SERVER_NAME,
+        ToolRule::ExactTool(n) | ToolRule::ToolGlob(n) => n.starts_with(&prefix),
+        _ => false,
+    };
+    match rules.iter().find(|r| targets_guard(r)) {
+        Some(r) => Err(format!(
+            "allow rule {r:?} targets MCP server {GUARD_SERVER_NAME:?}, which is not configured \
+             `guard: true`"
+        )),
+        None => Ok(()),
+    }
 }
 
 fn is_safe_id(s: &str) -> bool {
@@ -196,14 +279,20 @@ mod tests {
         assert!(!f.status.is_blocked());
     }
 
-    /// A denial status is never read as success, even when `isError` is false.
+    /// `isError: false` is `executed` whatever `structuredContent` says: Guard puts the operation's own output there.
     #[test]
-    fn denied_status_without_is_error_is_still_denied() {
-        let v = verdict_from_result(&result(json!({
-            "structuredContent": {"status": "denied", "code": "policy_denied"},
-            "isError": false, "_meta": meta()
-        })));
-        assert_eq!(v.status, GuardStatus::Denied);
+    fn executed_result_ignores_business_status_field() {
+        for status in ["failed", "denied", "approval_required"] {
+            let v = verdict_from_result(&result(json!({
+                "content": [{"type": "text", "text": "{}"}],
+                "structuredContent": {"status": status, "code": "refund_pending", "refund_id": "r1"},
+                "isError": false,
+                "_meta": meta()
+            })));
+            assert_eq!(v.status, GuardStatus::Executed, "{status}");
+            assert_eq!(v.code, None);
+            assert_eq!(v.decision_id.as_deref(), Some("dec-0001"));
+        }
     }
 
     /// An error result without a recognizable status is malformed and blocked.
@@ -231,15 +320,13 @@ mod tests {
         assert_eq!(v.decision_id, None);
     }
 
-    /// Transport failures are `unavailable` with a fixed code; a JSON-RPC error keeps Guard's safe `data.code`.
+    /// Connection and JSON-RPC errors are `unavailable` (blocked); a JSON-RPC error keeps Guard's safe `data.code`.
     #[test]
     fn transport_errors_are_unavailable() {
-        let t = verdict_from_error(&McpError::Timeout { seconds: 5 });
-        assert_eq!(t.status, GuardStatus::Unavailable);
-        assert_eq!(t.code.as_deref(), Some("guard_timeout"));
-        assert!(t.status.is_blocked());
         let h = verdict_from_error(&McpError::Transport("connection refused".into()));
+        assert_eq!(h.status, GuardStatus::Unavailable);
         assert_eq!(h.code.as_deref(), Some("guard_unavailable"));
+        assert!(h.status.is_blocked());
         let r = verdict_from_error(&McpError::JsonRpc {
             id: None,
             error: Box::new(JsonRpcError {
@@ -248,16 +335,119 @@ mod tests {
                 data: Some(json!({"code": "rate_limited"})),
             }),
         });
+        assert_eq!(r.status, GuardStatus::Unavailable);
         assert_eq!(r.code.as_deref(), Some("rate_limited"));
+    }
+
+    /// A timeout is `outcome_unknown`: not blocked, and the model is told the action may have run.
+    #[test]
+    fn timeout_is_outcome_unknown() {
+        let t = verdict_from_error(&McpError::Timeout { seconds: 5 });
+        assert_eq!(t.status, GuardStatus::OutcomeUnknown);
+        assert_eq!(t.code.as_deref(), Some("guard_timeout"));
+        assert!(!t.status.is_blocked());
+        let res = t.into_error_result();
+        assert!(res.is_error);
+        let text = res.flatten_text();
+        assert!(text.contains("outcome unknown"), "{text}");
+        assert!(text.contains("may have run"), "{text}");
+        assert!(!text.contains("not authorized"), "{text}");
+        let u = verdict_from_error(&McpError::Transport("refused".into())).into_error_result();
+        assert!(u.flatten_text().contains("not authorized"));
     }
 
     /// The verdict round-trips through tool-result metadata and is absent for ordinary results.
     #[test]
     fn verdict_round_trips_through_tool_result_metadata() {
         let v = verdict_from_error(&McpError::Timeout { seconds: 5 });
-        let res = v.clone().into_unavailable_result();
-        assert!(res.is_error);
+        let res = v.clone().into_error_result();
         assert_eq!(verdict_of(&res), Some(v));
         assert_eq!(verdict_of(&ToolResult::ok_text("x")), None);
+    }
+
+    /// Codes and decision ids read back from metadata are re-filtered to the safe character set.
+    #[test]
+    fn verdict_of_refilters_metadata() {
+        let mut res = ToolResult::error_text("x");
+        res.metadata = json!({GUARD_METADATA_KEY: {
+            "status": "denied", "code": "Bearer gsh_x y", "decision_id": "a b"
+        }});
+        let v = verdict_of(&res).unwrap();
+        assert_eq!(v.code.as_deref(), Some("unknown"));
+        assert_eq!(v.decision_id, None);
+    }
+
+    fn base_decision() -> SecurityDecision {
+        serde_json::from_value(json!({
+            "session_id": "s", "run_id": "r", "turn_index": 1,
+            "principal": {"kind": "session"}, "tool_use_id": "t",
+            "tool_name": "mcp__guard__refund_issue", "decision": "allow",
+            "enforcement": "policy", "outcome": "failed"
+        }))
+        .unwrap()
+    }
+
+    /// Blocked verdicts audit as blocked/deny; outcome-unknown audits as failed with Crom's allow kept.
+    #[test]
+    fn apply_verdict_sets_layer_outcome_and_reason() {
+        let mut d = base_decision();
+        apply_verdict(
+            &mut d,
+            GuardVerdict {
+                status: GuardStatus::Denied,
+                code: Some("resource_not_found".into()),
+                decision_id: Some("dec-1".into()),
+            },
+        );
+        assert_eq!(d.enforcement, EnforcementLayer::Guard);
+        assert_eq!(d.outcome, SecurityOutcome::Blocked);
+        assert_eq!(d.decision, PolicyOutcome::Deny);
+        assert_eq!(d.reason.as_deref(), Some("resource_not_found"));
+        assert_eq!(d.guard_decision_id.as_deref(), Some("dec-1"));
+
+        let mut d = base_decision();
+        apply_verdict(
+            &mut d,
+            verdict_from_error(&McpError::Timeout { seconds: 5 }),
+        );
+        assert_eq!(d.enforcement, EnforcementLayer::Guard);
+        assert_eq!(d.outcome, SecurityOutcome::Failed);
+        assert_eq!(d.decision, PolicyOutcome::Allow);
+        assert_eq!(d.reason.as_deref(), Some("guard_timeout"));
+    }
+
+    /// A Guard-reserved `guard.*` tool (e.g. `guard.delegate`) is never exposed to the agent.
+    #[test]
+    fn reserved_guard_tools_are_not_exposed() {
+        assert!(is_reserved_guard_tool("guard.delegate"));
+        assert!(!is_reserved_guard_tool("customer.read"));
+    }
+
+    fn mcp(servers: Value) -> crom_mcp::McpOptions {
+        crom_mcp::McpOptions {
+            enabled: true,
+            servers: serde_json::from_value(servers).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    /// An allow rule for server `guard` is refused unless that server is configured `guard: true`.
+    #[test]
+    fn guard_allow_rule_requires_guard_server() {
+        let rules = [ToolRule::McpServerGlob {
+            server: "guard".into(),
+            tool_glob: "*".into(),
+        }];
+        let plain = mcp(json!({"guard": {"type": "http", "url": "http://127.0.0.1:1/mcp"}}));
+        assert!(check_guard_allow_rules(&rules, &plain).is_err());
+        let glob = [ToolRule::ToolGlob("mcp__guard__*".into())];
+        assert!(check_guard_allow_rules(&glob, &plain).is_err());
+        let exact = [ToolRule::ExactTool("mcp__guard__customer_read".into())];
+        assert!(check_guard_allow_rules(&exact, &plain).is_err());
+        let real =
+            mcp(json!({"guard": {"type": "http", "url": "http://127.0.0.1:1/mcp", "guard": true}}));
+        assert!(check_guard_allow_rules(&rules, &real).is_ok());
+        let other = [ToolRule::ExactTool("mcp__docs__search".into())];
+        assert!(check_guard_allow_rules(&other, &plain).is_ok());
     }
 }

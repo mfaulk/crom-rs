@@ -379,6 +379,19 @@ fn validate_guard(policy: &ToolPolicy) -> Result<(), AgentSdkError> {
     };
     let invalid = |m: String| AgentSdkError::invalid_request("policy.invalid_guard", m);
     guard.validate().map_err(invalid)?;
+    let builtins = &policy.enable_builtin_tools;
+    let bash_enabled = builtins.bash && policy.side_effect_policy.allow_command_execution;
+    if bash_enabled && policy.sandbox.mode != crom_core::SandboxMode::Required {
+        return Err(invalid(
+            "with Guard, Bash requires sandbox mode `required`".into(),
+        ));
+    }
+    // Subagents are not shown to inherit the Guard-only MCP set and sandbox.
+    if builtins.agent {
+        return Err(invalid(
+            "with Guard, the subagent (`agent`) tool is not supported".into(),
+        ));
+    }
     let prefix = format!("mcp__{}__", crate::policy::GUARD_SERVER_NAME);
     if let Some(t) = policy
         .custom_tools
@@ -459,6 +472,36 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind, AgentSdkErrorKind::InvalidRequest);
+        assert_eq!(err.diagnostics[0].code, "policy.invalid_guard");
+    }
+
+    /// A deny rule naming a dotted Guard tool fails `build()` instead of silently never matching.
+    #[tokio::test]
+    async fn dotted_mcp_rule_is_rejected_at_build() {
+        let mut policy = ToolPolicy::guard(guard_conn("http://127.0.0.1:8470/mcp"));
+        policy.disallowed_tools.push(crom_core::ToolRule::ExactTool(
+            "mcp__guard__refund.issue".into(),
+        ));
+        let err = build_guard(policy).await.unwrap_err();
+        assert_eq!(err.diagnostics[0].code, "policy.invalid_tool_rule");
+    }
+
+    /// With Guard, Bash is rejected unless the sandbox is required, and the subagent tool is rejected.
+    #[tokio::test]
+    async fn guard_rejects_unsandboxed_bash_and_subagents() {
+        let base = ToolPolicy::guard(guard_conn("http://127.0.0.1:8470/mcp"));
+        let mut bash = base.clone();
+        bash.enable_builtin_tools.bash = true;
+        bash.side_effect_policy = crate::SideEffectPolicy::command_execution();
+        assert!(build_guard(bash.clone()).await.is_ok());
+        bash.sandbox.mode = crom_core::SandboxMode::Off;
+        let err = build_guard(bash).await.unwrap_err();
+        assert_eq!(err.diagnostics[0].code, "policy.invalid_guard");
+        assert!(err.message.contains("sandbox"), "{}", err.message);
+
+        let mut agent = base;
+        agent.enable_builtin_tools.agent = true;
+        let err = build_guard(agent).await.unwrap_err();
         assert_eq!(err.diagnostics[0].code, "policy.invalid_guard");
     }
 

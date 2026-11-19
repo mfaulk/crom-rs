@@ -56,6 +56,7 @@ impl Guard {
         for op in operations(&api, &SupportConfig::new(running.base_url())).unwrap() {
             registry.register(Arc::new(op)).unwrap();
         }
+        registry.register_delegate().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
@@ -100,6 +101,11 @@ impl Guard {
 
     /// Issues an acme grant limited to customer `acme-cus-000`; returns the session handle.
     async fn issue_handle(&self) -> String {
+        self.issue_handle_with(&["customer.read", "invoice.list", "refund.issue"], 0)
+            .await
+    }
+
+    async fn issue_handle_with(&self, actions: &[&str], max_depth: u8) -> String {
         let AdminAddr::Tcp(admin) = &self.server.as_ref().unwrap().admin_addr else {
             panic!("tcp admin listener expected");
         };
@@ -108,12 +114,13 @@ impl Guard {
             "delegator": {"id": "acme-agent-operator", "role": "agent-operator",
                           "attrs": {"refund_limit_cents": {"long": 5000}}},
             "run_id": "run-crom",
-            "actions": ["customer.read", "invoice.list", "refund.issue"],
+            "actions": actions,
             "constraints": {
                 "customers": {"set": [{"type": "Support::Customer", "id": "acme-cus-000"}]},
                 "max_refund_cents": {"at_most": 10000}
             },
-            "ttl_seconds": 600
+            "ttl_seconds": 600,
+            "max_depth": max_depth
         });
         let resp = reqwest::Client::new()
             .post(format!("http://{admin}/admin/grants"))
@@ -460,4 +467,87 @@ async fn unknown_handle_fails_the_run_before_any_call() {
     );
     assert_eq!(out.status, AgentRunStatus::Failed);
     assert!(guard.audit().is_empty());
+}
+
+/// Guard's `guard.delegate` (it returns a child session handle) is never registered as a Crom tool.
+#[tokio::test]
+async fn guard_delegate_is_not_exposed() {
+    let guard = Guard::start().await;
+    let handle = guard
+        .issue_handle_with(&["customer.read", "guard.delegate"], 1)
+        .await;
+    let out = run_crom(
+        &guard,
+        &handle,
+        tool_turn(&[
+            ("ok", READ, json!({"customer_id": "acme-cus-000"})),
+            (
+                "d1",
+                "mcp__guard__guard_delegate",
+                json!({"actions": ["customer.read"], "ttl_seconds": 60}),
+            ),
+        ]),
+        None,
+    )
+    .await;
+    assert_eq!(
+        decision(&out.decisions, "ok").outcome,
+        SecurityOutcome::Executed
+    );
+    let d = decision(&out.decisions, "d1");
+    assert_eq!(d.enforcement, EnforcementLayer::Policy, "{d:?}");
+    assert_eq!(d.outcome, SecurityOutcome::Blocked, "{d:?}");
+    assert_eq!(
+        d.reason.as_deref(),
+        Some("tool not allowed: mcp__guard__guard_delegate")
+    );
+    let audit = guard.audit();
+    assert!(
+        !audit.iter().any(|r| r["action"] == "guard.delegate"),
+        "{audit:?}"
+    );
+}
+
+/// `act` reaches Guard only for the Guard tools the plan names; an unplanned Guard tool never reaches Guard.
+#[tokio::test]
+async fn act_reaches_guard_only_for_planned_tools() {
+    use crom_core::plan::{PlanDocument, PlanId, PlanToolUse};
+    let guard = Guard::start().await;
+    let handle = guard.issue_handle().await;
+    let mut plan = PlanDocument::new_draft(PlanId("plan-guard".into()), "t", "look up");
+    plan.requested_tools.push(PlanToolUse {
+        tool_name: READ.into(),
+        permission_kind: crom_sdk::PermissionKind::External,
+        input_constraints: Value::Null,
+        reason: None,
+    });
+    let provider = ScriptedFakeProvider::new(tool_turn(&[
+        ("a1", READ, json!({"customer_id": "acme-cus-000"})),
+        (
+            "a2",
+            "mcp__guard__invoice_list",
+            json!({"customer_id": "acme-cus-000"}),
+        ),
+    ]));
+    let connection = GuardConnection::new(guard.mcp_url.clone(), SecretString::new(handle));
+    let runtime = AgentRuntime::builder()
+        .provider(ProviderConfig::fake(Arc::new(provider)))
+        .tool_policy(ToolPolicy::guard(connection))
+        .build()
+        .await
+        .unwrap();
+    let mut req = crom_sdk::ActRequest::from_plan(plan);
+    req.test_force_approval = true;
+    runtime.act(req).await.unwrap();
+    let audit = guard.audit();
+    assert!(
+        audit
+            .iter()
+            .any(|r| r["action"] == "customer.read" && r["outcome"] == "executed"),
+        "{audit:?}"
+    );
+    assert!(
+        !audit.iter().any(|r| r["action"] == "invoice.list"),
+        "{audit:?}"
+    );
 }

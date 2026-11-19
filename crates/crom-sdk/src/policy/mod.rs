@@ -246,7 +246,7 @@ pub struct ToolPolicy {
 }
 
 /// MCP server name Guard is registered under; its tools are `mcp__guard__*`.
-pub const GUARD_SERVER_NAME: &str = "guard";
+pub const GUARD_SERVER_NAME: &str = crom_core::guard::GUARD_SERVER_NAME;
 
 /// A Crom Guard agent endpoint and the session handle the trusted
 /// application obtained from Guard's admin API. The handle is sent only as

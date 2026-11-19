@@ -38,8 +38,8 @@ Emission points in `run_loop` (`crom-core/src/agent.rs`):
 | Tool returns `ToolError::PermissionDenied` | `sandbox` | `blocked` |
 | Tool ran, then a post-tool hook returned `Deny` | `hook` (`policy_source: hook`, `decision: deny`) | `blocked` |
 | Tool ran | `policy` or `hook` | `executed` / `failed` (`is_error`) |
-| Guard server: Guard executed / precondition or executor failed | `guard` | `executed` / `failed` |
-| Guard server: denied, `approval_required`, unreachable, timeout, or unreadable result | `guard` (`decision: deny`) | `blocked` |
+| Guard server: Guard executed / precondition or executor failed / request timed out (outcome unknown) | `guard` | `executed` / `failed` |
+| Guard server: denied, `approval_required`, unreachable, JSON-RPC error, or unreadable error result | `guard` (`decision: deny`) | `blocked` |
 
 Policy engine stage order (`PolicyEngine::evaluate_tool`,
 `crom-core/src/policy.rs`); the first stage that decides wins:

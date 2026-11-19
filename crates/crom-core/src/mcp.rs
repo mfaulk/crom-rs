@@ -21,6 +21,9 @@ pub struct McpRegistrationReport {
     pub statuses: Vec<McpServerStatus>,
     pub discovered: Vec<McpToolsDiscovered>,
     pub logs: Vec<(String, crom_mcp::McpServerLogEntry)>,
+    /// Agent names of the tools registered from `guard: true` servers. Only
+    /// their results are read as Guard verdicts.
+    pub guard_tools: std::collections::BTreeSet<String>,
 }
 
 pub async fn register_mcp_tools(
@@ -93,6 +96,9 @@ pub async fn register_mcp_tools(
         let transport = status.transport;
         let mut summaries = Vec::new();
         for tool in tools {
+            if guard && crate::guard::is_reserved_guard_tool(&tool.name) {
+                continue;
+            }
             let agent_name = match agent_tool_name(&server_name, &tool.name) {
                 Ok(name) => name,
                 Err(err) => {
@@ -112,6 +118,9 @@ pub async fn register_mcp_tools(
                 agent_tool_name: agent_name.clone(),
                 description: tool.description.clone(),
             });
+            if guard {
+                report.guard_tools.insert(agent_name.clone());
+            }
             registry.register(Arc::new(McpTool::new(
                 server_name.clone(),
                 transport,
@@ -452,7 +461,7 @@ impl Tool for McpTool {
             // Guard gave no verdict: a tool error, never an `Err` that the
             // loop would audit as an ordinary failure.
             Err(err) if self.guard => {
-                return Ok(crate::guard::verdict_from_error(&err).into_unavailable_result())
+                return Ok(crate::guard::verdict_from_error(&err).into_error_result())
             }
             Err(err) => return Err(tool_error_from_mcp(err)),
         };

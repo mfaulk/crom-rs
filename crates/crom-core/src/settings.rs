@@ -700,6 +700,11 @@ pub enum SettingsError {
          environment variables (move this server to user settings or --mcp-config)"
     )]
     RepoEnvInterpolation { path: PathBuf, field: String },
+    #[error(
+        "{path}: mcp.servers.{server} sets `guard: true`; repository config may not declare a \
+         Crom Guard server (move it to user settings or --mcp-config)"
+    )]
+    RepoGuardServer { path: PathBuf, server: String },
 }
 
 /// Load project settings from `<cwd>/.agent/settings.json` if present.
@@ -798,12 +803,19 @@ pub fn load_with_trust(
 
 /// Repository config never gets host-env interpolation (#290), trusted or
 /// not: an MCP server defined in project settings with `${VAR}` is an error.
+/// Nor may it declare a `guard: true` (Crom Guard) server.
 fn reject_repo_mcp_interpolation(p: &SettingsFile, path: &Path) -> Result<(), SettingsError> {
     let Some(mcp) = &p.mcp else { return Ok(()) };
     if let Some(field) = crom_mcp::first_env_placeholder(&mcp.servers) {
         return Err(SettingsError::RepoEnvInterpolation {
             path: path.to_path_buf(),
             field: format!("mcp.servers.{field}"),
+        });
+    }
+    if let Some((name, _)) = mcp.servers.iter().find(|(_, c)| c.is_guard()) {
+        return Err(SettingsError::RepoGuardServer {
+            path: path.to_path_buf(),
+            server: name.clone(),
         });
     }
     Ok(())
@@ -1903,6 +1915,28 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, SettingsError::RepoEnvInterpolation { .. }),
+            "{err}"
+        );
+    }
+
+    /// Project settings may not declare a `guard: true` MCP server, even when the workspace is trusted.
+    #[test]
+    fn trusted_project_mcp_servers_cannot_mark_guard() {
+        let project = TempDir::new().unwrap();
+        write_project(
+            project.path(),
+            serde_json::json!({"mcp": {"servers": {"guard": {
+                "type": "http", "url": "http://127.0.0.1:8470/mcp", "guard": true
+            }}}}),
+        );
+        let err = load_with_trust(
+            project.path(),
+            SettingSource::Project,
+            WorkspaceTrust::Trusted,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SettingsError::RepoGuardServer { .. }),
             "{err}"
         );
     }
