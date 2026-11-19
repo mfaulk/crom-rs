@@ -124,9 +124,14 @@ Each operation's `policy_only` samples are the decision records appended
 while that operation's timed calls ran (exactly one per call), not a slice
 by position.
 
-What dominates: Guard's end-to-end cost on the guarded paths is mostly the
-audit sink's per-record `fsync`. An executed call writes two records
-(decision, then outcome); a denied call writes one. In the archived run
+What dominates (an inference, not a measured breakdown): Guard's
+end-to-end cost on the guarded paths is attributed mostly to the audit
+sink's per-record `fsync`. An executed call writes two records (decision,
+then outcome); a denied call writes one, and the medians scale roughly with
+that count while `policy_only` stays small. E5 has no path without `fsync`.
+The closest measured comparison is the separate, unarchived
+`pipeline_latency` test (in-memory sink, stub executor,
+[pipeline.md](pipeline.md#tests)), which is a different harness. In the archived run
 (btrfs, release), the in-process p50 is 1.52–1.63 ms for executed calls
 and 0.75–0.80 ms for denied ones, against 45–78 µs for `policy_only`
 ([scoreboard.md](scoreboard.md), E5).
@@ -170,11 +175,13 @@ separate tables.
 ### The archive
 
 `docs/guard/results/` holds the reports the published scoreboard is built
-from. [scoreboard.md](scoreboard.md) is generated, never edited:
+from. [scoreboard.md](scoreboard.md) and the "Results" section of
+[docs/benchmarks/M18-guard.md](../benchmarks/M18-guard.md) (between its
+`BEGIN GENERATED` and `END GENERATED` markers) are generated, never edited:
 
 ```sh
-scripts/guard-scoreboard.sh            # rewrite docs/guard/scoreboard.md from docs/guard/results/
-scripts/guard-scoreboard.sh --check    # fail if it is stale
+scripts/guard-scoreboard.sh            # rewrite both from docs/guard/results/
+scripts/guard-scoreboard.sh --check    # fail if either is stale
 ```
 
 | File | Produced by |
@@ -200,7 +207,8 @@ reports in, and run `scripts/guard-scoreboard.sh`.
 `guard / adversarial (linux)` runs the scenarios and the experiments, uploads
 `guard-scenarios-report` and `guard-experiments-report`, then runs
 `scripts/guard-scoreboard.sh --check` with the fresh reports. That fails if
-`scoreboard.md` does not regenerate from the archive, or if a deterministic
+`scoreboard.md` or the generated section of `M18-guard.md` does not
+regenerate from the archive, or if a deterministic
 fact of the fresh run differs from the archive: every (scenario, lane) pair
 with its status and verdict counts, ledger and audit results, every E1 cell,
 E2 counts per lane and per scenario, and every E4a decision view (reference

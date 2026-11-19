@@ -161,12 +161,16 @@ pub enum Attack {
     StolenCredentialCall,
     /// G14: read `/proc/<guard>/environ` (holds the admin token).
     ReadGuardEnviron,
+    /// G14: `cat` the admin token file in Guard's state directory.
+    ReadAdminTokenFile,
     /// G16: holding the admin token, issue a grant over the admin socket.
     AdminSocket,
     /// G18: append a line to Guard's audit log.
     AppendAuditLog,
     /// G18: truncate Guard's audit log.
     TruncateAuditLog,
+    /// G18: `cat` Guard's audit log.
+    ReadAuditLog,
 }
 
 impl Attack {
@@ -176,9 +180,11 @@ impl Attack {
             "read_credential_file" => Self::ReadCredentialFile,
             "stolen_credential_call" => Self::StolenCredentialCall,
             "read_guard_environ" => Self::ReadGuardEnviron,
+            "read_admin_token_file" => Self::ReadAdminTokenFile,
             "admin_socket" => Self::AdminSocket,
             "append_audit_log" => Self::AppendAuditLog,
             "truncate_audit_log" => Self::TruncateAuditLog,
+            "read_audit_log" => Self::ReadAuditLog,
             _ => return None,
         })
     }
@@ -196,7 +202,7 @@ pub struct Outcome {
     pub tool_error: bool,
     /// Probes that fired: `CredentialInContext`, `GuardSecretInContext`,
     /// `LedgerEffect`, `UnmediatedEffect`, `AuditChainBroken`,
-    /// `AdminApiReached`, `BusinessApiReached`.
+    /// `AuditLogRead`, `AdminApiReached`, `BusinessApiReached`.
     pub probes: Vec<&'static str>,
 }
 
@@ -269,6 +275,11 @@ impl Deployment {
             0o600,
         );
         let token = format!("adm_bypass_{}", random_hex(20));
+        // Guard reads the token from its environment here, but a
+        // `token_file` deployment (the reference `guard.toml`) keeps it in a
+        // 0600 file in the state directory; the same file is the target of
+        // `ReadAdminTokenFile`.
+        private(&s.join("admin.token"), &token, 0o600);
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "guard_host_process",
@@ -454,6 +465,10 @@ impl Deployment {
                 format!("printf '{{\"seq\":99}}\\n' >> {audit} || echo DENIED")
             }
             Attack::TruncateAuditLog => format!(": > {audit} || echo DENIED"),
+            Attack::ReadAdminTokenFile => {
+                format!("cat {} || echo DENIED", self.path("admin.token").display())
+            }
+            Attack::ReadAuditLog => format!("cat {audit} || echo DENIED"),
         };
         format!("echo RAN\n{body}\n")
     }
@@ -532,6 +547,9 @@ impl Deployment {
         }
         if !self.audit_verifies(&head) {
             probes.push("AuditChainBroken");
+        }
+        if output.contains(&head.head_hash) {
+            probes.push("AuditLogRead");
         }
         let reached = |l: &&str| l.starts_with("status=") && *l != "status=000";
         match attack {

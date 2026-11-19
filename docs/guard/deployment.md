@@ -103,9 +103,11 @@ Every attack script prints `RAN` first and `DENIED` when the OS refuses a step; 
 | `g14_credential_file_read` (G14) | `cat` Guard's credential file | secret absent (network off and on) | secret read |
 | `g14_stolen_credential_direct_call` (G14) | read the credential file, call the API with it | `unmediated = 0` (network off and on) | `200`, `unmediated = 1` |
 | `g14_guard_environ_read` (G14) | read `/proc/<guard>/environ` | admin token absent (network off and on) | token read |
+| `g14_admin_token_file_read` (G14) | `cat` the 0600 `admin.token` in Guard's state directory (the file a `token_file` deployment uses; this harness's Guard reads the token from its environment) | token absent (network off and on) | token read |
 | `g16_admin_socket` (G16) | holding the admin token, `curl --unix-socket` to issue itself a grant | no connection (`AF_UNIX` is refused even with network on) | `201`: grant issued |
 | `g18_audit_log_append`, `g18_audit_log_truncate` (G18) | append to, or truncate, Guard's audit log | `audit verify` passes against the earlier head (network off and on) | the chain breaks |
-| `separate_uid_agent` | all of the above as user `nobody` via `sudo -n`, sandbox off | every read, append and admin connect denied; direct API `401`; `unmediated = 0` | — |
+| `g18_audit_log_read` (G18) | `cat` Guard's audit log | the head hash absent from the output (network off and on) | log read |
+| `separate_uid_agent` | all of the above as user `nobody` via `sudo -n`, sandbox off | every file read, append and admin connect denied; the business API is reachable but answers `401` without Guard's credential; `unmediated = 0` | — |
 | `state_under_builtin_read_root_is_refused` | Guard state copied under a writable directory of the built-in read set (e.g. `$CARGO_HOME/registry`) | sandboxed `cat` reads the credential (the hole is real), and `check` fails `sandbox-paths` | — |
 | `preflight_matches_the_tested_profile` | — | the attacked deployment passes `check` with the reference Crom settings, and fails it with `mode = "off"` or `network = true` | |
 | `check_models_the_sandbox_read_set`, `check_models_the_crom_settings_path` | — | `check`'s copies of the sandbox's built-in read set and of Crom's settings path equal `crom_tools::sandbox::builtin_read_paths()` and `crom_core::settings::user_settings_path()` | |

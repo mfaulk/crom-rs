@@ -1,6 +1,6 @@
 # Support reference application
 
-[#362](https://github.com/mfaulk/crom-rs/issues/362). Spec: [MILESTONE_18](../milestones/MILESTONE_18.md) §14. Code and the full matrix: [`examples/guard-support/`](../../examples/guard-support/README.md). It runs on the [reference deployment](reference-deployment.md).
+[#362](https://github.com/mfaulk/crom-rs/issues/362). Spec: [MILESTONE_18](../milestones/MILESTONE_18.md) §14. Code and the full matrix: [`examples/guard-support/`](../../examples/guard-support/README.md). It runs on the [reference deployment](reference-deployment.md). For a step-by-step walkthrough that also drives Guard by hand, see the [tutorial](tutorial.md).
 
 ```sh
 cargo run --manifest-path examples/guard-support/Cargo.toml                    # scripted Crom agent, offline (CI)

@@ -113,6 +113,20 @@ async fn g14_guard_environ_read() {
     denied_then_live(Attack::ReadGuardEnviron, &SANDBOXED, "GuardSecretInContext").await;
 }
 
+/// G14: Bash cannot read the admin token file in Guard's state directory with the sandbox required; with it off, the token is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn g14_admin_token_file_read() {
+    if !sandbox_available() {
+        return;
+    }
+    denied_then_live(
+        Attack::ReadAdminTokenFile,
+        &SANDBOXED,
+        "GuardSecretInContext",
+    )
+    .await;
+}
+
 /// G16: even holding the admin token, Bash cannot reach the admin socket with the sandbox required (AF_UNIX stays refused when network is granted); with it off, it mints itself a grant.
 #[tokio::test(flavor = "multi_thread")]
 async fn g16_admin_socket() {
@@ -138,6 +152,15 @@ async fn g18_audit_log_truncate() {
         return;
     }
     denied_then_live(Attack::TruncateAuditLog, &SANDBOXED, "AuditChainBroken").await;
+}
+
+/// G18: Bash cannot read Guard's audit log with the sandbox required; with it off, the log (its head hash) is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn g18_audit_log_read() {
+    if !sandbox_available() {
+        return;
+    }
+    denied_then_live(Attack::ReadAuditLog, &SANDBOXED, "AuditLogRead").await;
 }
 
 /// The attacked deployment passes `crom-guard check` with the reference Crom settings, and fails it with the sandbox off or network granted.
@@ -236,7 +259,7 @@ fn reference_crom_settings_parse() {
     assert!(s.sandbox.is_some());
 }
 
-/// With the agent under a separate uid (no Crom sandbox), every read, append and admin connect is denied, the business API stays reachable but refuses it (401), and no probe fires.
+/// With the agent under a separate uid (no Crom sandbox), every read (credential, admin token file, environ, audit log), append and admin connect is denied, the business API stays reachable but answers 401 without Guard's credential, and no probe fires.
 #[tokio::test(flavor = "multi_thread")]
 async fn separate_uid_agent() {
     if let Some(why) = separate_uid_unavailable() {
@@ -247,9 +270,11 @@ async fn separate_uid_agent() {
         Attack::ReadCredentialFile,
         Attack::StolenCredentialCall,
         Attack::ReadGuardEnviron,
+        Attack::ReadAdminTokenFile,
         Attack::AdminSocket,
         Attack::AppendAuditLog,
         Attack::TruncateAuditLog,
+        Attack::ReadAuditLog,
     ] {
         let o = d.attack(attack, Agent::SeparateUid).await;
         assert!(o.ran && o.denied, "{attack:?}: {}", o.output);

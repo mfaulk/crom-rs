@@ -1049,9 +1049,11 @@ fn e5_note(e: &E5Summary) -> String {
         _ => String::new(),
     };
     format!(
-        "Guard's end-to-end cost on the guarded paths is dominated by the audit sink's \
-         per-record fsync: an executed call writes two records (decision, then outcome), a \
-         denied call one.{measured} `policy_only` is Cedar evaluation alone, read from \
+        "Inferred, not measured: most of Guard's end-to-end cost on the guarded paths is \
+         attributed to the audit sink's per-record fsync, because an executed call writes \
+         two records (decision, then outcome) and a denied call one, and `policy_only` is \
+         small. E5 has no path without fsync, so this attribution is not a measured \
+         breakdown.{measured} `policy_only` is Cedar evaluation alone, read from \
          the decision records' integer-microsecond `policy_us`; it is not the same span \
          as the end-to-end rows, which are wall-clock per call.\n\n"
     )
