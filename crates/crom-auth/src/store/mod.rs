@@ -899,11 +899,9 @@ mod tests {
     }
 
     #[test]
-    // Deadlock regression: cloned stores sharing one on-disk index, with
-    // one thread running `put` and another running `delete`/`set_active` in
-    // a tight loop, must all COMPLETE. The buggy code took the in-process
-    // mutex then blocked on the flock in `put`, but the flock then the mutex
-    // in `delete`/`set_active` — inverted ordering that could deadlock.
+    // Deadlock regression: cloned stores sharing one on-disk index, running
+    // `put`, `delete` and `set_active` in tight loops, must all complete
+    // without stalling (the pre-#271 code took mutex then flock in `put`).
     fn concurrent_put_and_delete_do_not_deadlock() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = CredentialStore::build(
@@ -919,6 +917,7 @@ mod tests {
         };
 
         let iters = 200;
+        let progress: [Arc<AtomicUsize>; 3] = Default::default();
         let s_put = store.clone();
         let s_del = store.clone();
         let s_active = store.clone();
@@ -926,35 +925,94 @@ mod tests {
         let put_secret = secret.clone();
         let del_acct = acct.clone();
         let active_acct = acct.clone();
+        let [p_put, p_del, p_active] = progress.clone();
 
         let t_put = std::thread::spawn(move || {
             for _ in 0..iters {
                 s_put.put(put_acct.clone(), &put_secret).unwrap();
+                p_put.fetch_add(1, Ordering::SeqCst);
             }
         });
         let t_del = std::thread::spawn(move || {
             for _ in 0..iters {
                 let _ = s_del.delete(&del_acct.provider, &del_acct.account_id);
+                p_del.fetch_add(1, Ordering::SeqCst);
             }
         });
         let t_active = std::thread::spawn(move || {
             for _ in 0..iters {
                 let _ = s_active.set_active(&active_acct.provider, active_acct.account_id.clone());
+                p_active.fetch_add(1, Ordering::SeqCst);
             }
         });
 
-        // Join on a watchdog thread so a deadlock surfaces as a test
-        // failure (timeout) rather than hanging the whole suite forever.
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            t_put.join().unwrap();
-            t_del.join().unwrap();
-            t_active.join().unwrap();
-            let _ = done_tx.send(());
+        // Every operation fsyncs and all three serialize on the flock, so a
+        // slow CI disk can take tens of seconds (#319). Fail only when no
+        // thread completes an operation for STALL: a deadlock makes no
+        // progress at all.
+        if let Err(counts) =
+            wait_while_progressing(&progress, 3 * iters, std::time::Duration::from_secs(20))
+        {
+            panic!("put/delete/set_active stalled (completed put/delete/set_active = {counts:?})");
+        }
+        t_put.join().unwrap();
+        t_del.join().unwrap();
+        t_active.join().unwrap();
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Waits until the counters sum to `total`. Returns the per-counter
+    /// counts as `Err` if their sum stops changing for `stall`.
+    fn wait_while_progressing(
+        counters: &[Arc<AtomicUsize>],
+        total: usize,
+        stall: std::time::Duration,
+    ) -> Result<(), Vec<usize>> {
+        let snapshot =
+            || -> Vec<usize> { counters.iter().map(|c| c.load(Ordering::SeqCst)).collect() };
+        let mut last = snapshot().iter().sum::<usize>();
+        let mut last_change = std::time::Instant::now();
+        loop {
+            let counts = snapshot();
+            let sum: usize = counts.iter().sum();
+            if sum >= total {
+                return Ok(());
+            }
+            if sum != last {
+                last = sum;
+                last_change = std::time::Instant::now();
+            } else if last_change.elapsed() >= stall {
+                return Err(counts);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    // The progress watchdog reports a stall, with per-counter counts, when no counter advances.
+    fn progress_watchdog_reports_stall() {
+        let counters: [Arc<AtomicUsize>; 2] = Default::default();
+        counters[0].store(3, Ordering::SeqCst);
+        let r = wait_while_progressing(&counters, 10, std::time::Duration::from_millis(100));
+        assert_eq!(r, Err(vec![3, 0]));
+    }
+
+    #[test]
+    // The progress watchdog keeps waiting past the stall window while counters keep advancing.
+    fn progress_watchdog_tolerates_slow_progress() {
+        let counter: Arc<AtomicUsize> = Default::default();
+        let c = counter.clone();
+        let t = std::thread::spawn(move || {
+            for _ in 0..100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                c.fetch_add(1, Ordering::SeqCst);
+            }
         });
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("put/delete/set_active deadlocked (no completion within timeout)");
+        let r = wait_while_progressing(&[counter], 100, std::time::Duration::from_secs(1));
+        t.join().unwrap();
+        assert_eq!(r, Ok(()));
     }
 
     #[test]
