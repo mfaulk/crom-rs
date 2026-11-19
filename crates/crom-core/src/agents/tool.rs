@@ -1168,8 +1168,10 @@ fn build_child_options(
         usage_budget: parent.usage_budget,
         session_id: Some(child_session),
         permission_callback: parent.permission_callback.clone(),
-        // Guard approvals are not delegated to subagents.
-        guard_approver: None,
+        // Guard approvals are not delegated to subagents. The approver rides
+        // in each run's ToolContext, so the shared Guard tools cannot reach
+        // the parent's.
+        guard_approval: None,
         system_prompt: None,
         project_instructions: if runtime_options.context_policy.inherit_project_instructions {
             parent.project_instructions.clone()

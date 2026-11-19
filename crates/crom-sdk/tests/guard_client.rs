@@ -12,12 +12,13 @@ use crom_core::events::{EnforcementLayer, SecurityDecision, SecurityOutcome};
 use crom_core::{ModelEvent, ModelProvider, ModelRequest, ProviderError, ToolCall};
 use crom_guard_server::{AdminAddr, ServerHandle};
 use crom_guard_testkit::{
-    operations, ApiCredential, BusinessApi, Ledger, RunningApi, SupportConfig,
+    operations, ApiCredential, BusinessApi, Effect, Ledger, RunningApi, SupportConfig,
 };
 use crom_sdk::fake_provider::ScriptedFakeProvider;
 use crom_sdk::{
-    AgentRequest, AgentRunStatus, AgentRuntime, FileStorage, GuardApprovalRequest, GuardApprover,
-    GuardConnection, ProviderConfig, SdkEvent, SecretString, SessionPolicy, ToolPolicy,
+    AgentRequest, AgentRunStatus, AgentRuntime, CancellationHandle, FileStorage,
+    GuardApprovalRequest, GuardApprovalStep, GuardApprover, GuardConnection, ProviderConfig,
+    SdkEvent, SecretString, SessionPolicy, ToolPolicy,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -34,7 +35,8 @@ struct Guard {
     dir: tempfile::TempDir,
     mcp_url: String,
     server: Option<ServerHandle>,
-    _api: RunningApi,
+    api: Arc<BusinessApi>,
+    _running: RunningApi,
 }
 
 fn write_private(path: &Path, contents: &str) {
@@ -95,7 +97,8 @@ impl Guard {
             dir,
             mcp_url: format!("http://{}/mcp", server.agent_addr),
             server: Some(server),
-            _api: running,
+            api,
+            _running: running,
         }
     }
 
@@ -248,13 +251,14 @@ async fn run_crom(
 ) -> RunOutput {
     let connection =
         GuardConnection::new(guard.mcp_url.clone(), SecretString::new(handle.to_owned()));
-    run_crom_with(connection, turns, before_turn).await
+    run_crom_with(connection, turns, before_turn, None).await
 }
 
 async fn run_crom_with(
     connection: GuardConnection,
     turns: Vec<Vec<ModelEvent>>,
     before_turn: Option<BeforeTurn>,
+    cancel_slot: Option<Arc<OnceLock<CancellationHandle>>>,
 ) -> RunOutput {
     let traces = trace_buffer();
     let storage_dir = tempfile::tempdir().unwrap();
@@ -276,6 +280,9 @@ async fn run_crom_with(
         .session_policy(SessionPolicy::Persisted)
         .max_turns(3);
     let mut run = runtime.run(request).await.unwrap();
+    if let Some(slot) = cancel_slot {
+        let _ = slot.set(run.cancellation.clone());
+    }
     let mut events = Vec::new();
     while let Some(ev) = run.events.next().await {
         events.push(ev.unwrap());
@@ -565,6 +572,8 @@ const REFUND: &str = "mcp__guard__refund_issue";
 #[derive(Clone, Copy)]
 enum ApproverMode {
     Approve,
+    /// Approves, but the run is cancelled before the approver answers.
+    CancelThenApprove,
     Decline,
     Bogus,
     Unsafe,
@@ -576,6 +585,9 @@ struct AdminApprover {
     admin: std::net::SocketAddr,
     mode: ApproverMode,
     seen: Mutex<Vec<GuardApprovalRequest>>,
+    /// Approval ids issued by Guard's admin API.
+    issued: Mutex<Vec<String>>,
+    cancel: Arc<OnceLock<CancellationHandle>>,
 }
 
 impl AdminApprover {
@@ -587,6 +599,8 @@ impl AdminApprover {
             admin: *admin,
             mode,
             seen: Mutex::new(Vec::new()),
+            issued: Mutex::new(Vec::new()),
+            cancel: Arc::new(OnceLock::new()),
         })
     }
 }
@@ -611,7 +625,7 @@ impl GuardApprover for AdminApprover {
             ApproverMode::Decline => return None,
             ApproverMode::Bogus => return Some(format!("ap_{}", "0".repeat(32))),
             ApproverMode::Unsafe => return Some("ap_1\nInjected: x".into()),
-            ApproverMode::Approve => {}
+            ApproverMode::Approve | ApproverMode::CancelThenApprove => {}
         }
         let body: Value = http
             .post(&base)
@@ -629,14 +643,21 @@ impl GuardApprover for AdminApprover {
             .json()
             .await
             .unwrap();
-        Some(body["approval_id"].as_str().unwrap().to_owned())
+        let id = body["approval_id"].as_str().unwrap().to_owned();
+        self.issued.lock().unwrap().push(id.clone());
+        if let ApproverMode::CancelThenApprove = self.mode {
+            self.cancel.get().expect("run started").cancel();
+        }
+        Some(id)
     }
 }
 
 async fn run_refund_with(guard: &Guard, approver: Option<Arc<AdminApprover>>) -> RunOutput {
     let handle = guard.issue_handle().await;
     let mut connection = GuardConnection::new(guard.mcp_url.clone(), SecretString::new(handle));
+    let mut cancel_slot = None;
     if let Some(a) = approver {
+        cancel_slot = Some(a.cancel.clone());
         connection = connection.with_approver(a);
     }
     run_crom_with(
@@ -647,6 +668,7 @@ async fn run_refund_with(guard: &Guard, approver: Option<Arc<AdminApprover>>) ->
             json!({"invoice_id": "acme-inv-001", "amount_cents": 7500}),
         )]),
         None,
+        cancel_slot,
     )
     .await
 }
@@ -671,10 +693,14 @@ async fn approver_approval_retries_once_and_executes() {
     assert_eq!(seen[0].server_name, "guard");
     assert_eq!(seen[0].tool_name, "refund.issue");
     assert_eq!(seen[0].required_role.as_deref(), Some("supervisor"));
+    assert_eq!(seen[0].tool_use_id.as_deref(), Some("r1"));
 
     let d = decision(&out.decisions, "r1");
+    assert_eq!(seen[0].session_id, d.session_id.as_str());
     assert_eq!(d.enforcement, EnforcementLayer::Guard, "{d:?}");
     assert_eq!(d.outcome, SecurityOutcome::Executed, "{d:?}");
+    let approval = d.guard_approval.clone().expect("approval round recorded");
+    assert_eq!(approval.step, GuardApprovalStep::Retried);
     assert!(!tool_completed_is_error(&out.events, "r1"));
     let audit = guard.audit();
     let executed: Vec<_> = audit
@@ -694,6 +720,65 @@ async fn approver_approval_retries_once_and_executes() {
         "first call and one retry: {decisions:?}"
     );
     assert_eq!(decisions[0]["decision"], "approval_required");
+    assert_eq!(
+        decisions[0]["decision_id"].as_str(),
+        approval.approval_required_decision_id.as_deref()
+    );
+}
+
+/// The approval id Guard issued appears in no Crom output: events, model requests, persisted session, or traces.
+#[tokio::test]
+async fn approval_id_canary_is_absent_from_crom_outputs() {
+    let guard = Guard::start().await;
+    let approver = AdminApprover::new(&guard, ApproverMode::Approve);
+    let out = run_refund_with(&guard, Some(approver.clone())).await;
+    assert_eq!(
+        decision(&out.decisions, "r1").outcome,
+        SecurityOutcome::Executed
+    );
+    // The retry really carried the id, and traces include the MCP requests.
+    assert!(out.outputs.contains("tools/call"));
+    let issued = approver.issued.lock().unwrap().clone();
+    assert_eq!(issued.len(), 1);
+    let id = &issued[0];
+    assert!(id.starts_with("ap_"), "{id}");
+    // Guard runs in this process and logs the ids it issues to the shared
+    // trace capture; only Crom's output is in scope here.
+    let crom: String = out
+        .outputs
+        .lines()
+        .filter(|l| !l.contains(" crom_guard_server::") && !l.contains(" crom_guard::"))
+        .collect();
+    assert!(!crom.contains(id.as_str()), "approval id leaked");
+    assert!(!crom.contains(id.trim_start_matches("ap_")));
+}
+
+/// A run cancelled while the approver is answering never sends the retry: Guard records one decision and the ledger has no refund.
+#[tokio::test]
+async fn cancel_during_approval_sends_no_retry_and_has_no_effect() {
+    let guard = Guard::start().await;
+    let approver = AdminApprover::new(&guard, ApproverMode::CancelThenApprove);
+    let out = run_refund_with(&guard, Some(approver.clone())).await;
+    assert_eq!(approver.issued.lock().unwrap().len(), 1, "approval issued");
+    let recs = refund_records(&guard);
+    assert_eq!(recs.len(), 1, "no retry reached Guard: {recs:?}");
+    assert_eq!(recs[0]["decision"], "approval_required");
+    let refunds: Vec<_> = guard
+        .api
+        .ledger()
+        .entries()
+        .into_iter()
+        .filter(|e| matches!(e.effect, Effect::Refund { .. }))
+        .collect();
+    assert!(refunds.is_empty(), "{refunds:?}");
+    // A cancelled run may end before it emits the call's decision.
+    if let Some(d) = out.decisions.iter().find(|d| d.tool_use_id == "r1") {
+        assert_eq!(d.outcome, SecurityOutcome::Blocked, "{d:?}");
+        assert_eq!(
+            d.guard_approval.as_ref().map(|a| a.step),
+            Some(GuardApprovalStep::Cancelled)
+        );
+    }
 }
 
 /// Without an approver, or when the approver declines, the call stays blocked with `approval_required` and is not retried.

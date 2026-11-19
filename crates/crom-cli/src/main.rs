@@ -1733,7 +1733,7 @@ async fn resolve_common(
         session_id: None,
         permission_callback,
         // The CLI has no source of Guard approvals (docs/sdk/guard.md).
-        guard_approver: None,
+        guard_approval: None,
         system_prompt: None,
         project_instructions: instructions,
         max_tokens,

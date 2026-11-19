@@ -27,6 +27,7 @@ consumers as `SdkEvent::SecurityDecision` under **every** verbosity.
 | `outcome` | `blocked`, `executed`, `failed` |
 | `reason` | Redacted free text. At layer `guard`: Guard's stable code (`resource_not_found`, `approval_required`, ...) or `guard_unavailable` / `guard_timeout` / `malformed_response` |
 | `guard_decision_id` | Guard's `_meta.decision_id`; joins Guard's `guard-audit/v1` records. Only on calls to a server configured `guard: true`. Absent in records written before #359, which still deserialize |
+| `guard_approval` | Set when the host's Guard approver handled an `approval_required` result: `step` (`retried`, `declined`, `timed_out`, `cancelled`) and `approval_required_decision_id`, the first call's Guard decision id. Never holds the approval id ([sdk/guard.md](../sdk/guard.md)) |
 
 Emission points in `run_loop` (`crom-core/src/agent.rs`):
 

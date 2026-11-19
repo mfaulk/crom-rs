@@ -710,6 +710,9 @@ pub struct SecurityDecision {
     /// Guard's audit log. Only set for servers configured with `guard: true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_decision_id: Option<String>,
+    /// The host-approval round for a Guard `approval_required` result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_approval: Option<crate::guard::GuardApprovalRecord>,
 }
 
 /// Who issued the tool call.

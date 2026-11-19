@@ -28,8 +28,8 @@ use crate::events::{
 use crate::events::{EnforcementLayer, SecurityDecision, SecurityOutcome, SecurityPrincipal};
 use crate::hooks::{aggregate, HookAggregateDecision, HookEventName, HookInput, Hooks, StopReason};
 use crate::mcp::{
-    mcp_completion_from_result, mcp_failure_from_error, register_mcp_tools_with_guard_approver,
-    tool_metadata, McpRegistrationReport,
+    mcp_completion_from_result, mcp_failure_from_error, register_mcp_tools, tool_metadata,
+    McpRegistrationReport,
 };
 use crate::options::{AgentOptions, SessionId};
 use crate::permission::PermissionMode;
@@ -438,12 +438,7 @@ pub(crate) async fn run_loop(
         .await;
         return Ok(());
     }
-    let mcp_report = register_mcp_tools_with_guard_approver(
-        &mut tools,
-        &options.mcp,
-        options.guard_approver.clone(),
-    )
-    .await;
+    let mcp_report = register_mcp_tools(&mut tools, &options.mcp).await;
     if options.mcp.enabled {
         emit_telemetry(
             &telemetry_sink,
@@ -1895,6 +1890,8 @@ pub(crate) async fn run_loop(
                 run_id: Some(cfg.run_id.clone()),
                 turn_index: turns,
                 tool_call_id: Some(call.id.clone()),
+                cancel: Some(cfg.cancel.clone()),
+                guard_approval: options.guard_approval.clone(),
             };
             let started = Instant::now();
             emit_telemetry(

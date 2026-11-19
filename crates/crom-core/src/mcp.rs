@@ -30,16 +30,6 @@ pub async fn register_mcp_tools(
     registry: &mut ToolRegistry,
     options: &McpOptions,
 ) -> McpRegistrationReport {
-    register_mcp_tools_with_guard_approver(registry, options, None).await
-}
-
-/// [`register_mcp_tools`], with the host's source of Guard approvals for
-/// tools from `guard: true` servers ([`crate::guard::GuardApprover`]).
-pub async fn register_mcp_tools_with_guard_approver(
-    registry: &mut ToolRegistry,
-    options: &McpOptions,
-    guard_approver: Option<Arc<dyn crate::guard::GuardApprover>>,
-) -> McpRegistrationReport {
     let mut report = McpRegistrationReport::default();
     if !options.enabled {
         return report;
@@ -131,7 +121,7 @@ pub async fn register_mcp_tools_with_guard_approver(
             if guard {
                 report.guard_tools.insert(agent_name.clone());
             }
-            let mut mcp_tool = McpTool::new(
+            registry.register(Arc::new(McpTool::new(
                 server_name.clone(),
                 transport,
                 agent_name,
@@ -139,11 +129,7 @@ pub async fn register_mcp_tools_with_guard_approver(
                 client.clone(),
                 limits,
                 guard,
-            );
-            if guard {
-                mcp_tool.guard_approver = guard_approver.clone();
-            }
-            registry.register(Arc::new(mcp_tool));
+            )));
         }
         status.status = if status.error.is_some() {
             McpConnectionStatus::Failed
@@ -343,8 +329,6 @@ pub struct McpTool {
     limits: McpLimits,
     /// Results are Guard verdicts (`crate::guard`).
     guard: bool,
-    /// Only set for `guard` tools.
-    guard_approver: Option<Arc<dyn crate::guard::GuardApprover>>,
 }
 
 /// Shared handle to a connected MCP client, dispatched according to the
@@ -405,7 +389,6 @@ impl McpTool {
             client,
             limits,
             guard,
-            guard_approver: None,
         }
     }
 
@@ -429,30 +412,72 @@ impl McpTool {
         }
     }
 
-    /// Guard answered `approval_required`: ask the host's approver and, if
-    /// it returns a well-formed approval id, retry once with it. Crom never
-    /// retries otherwise.
+    /// Guard answered `approval_required`: ask the run's approver and, if
+    /// it returns a well-formed approval id before the timeout and the run
+    /// is not cancelled, retry once with it. Crom never retries otherwise.
     async fn retry_with_approval(
         &self,
         input: &Value,
         first: McpToolResult,
-    ) -> Result<McpToolResult, McpError> {
-        let Some(approver) = &self.guard_approver else {
-            return Ok(first);
+        ctx: &ToolContext,
+    ) -> (
+        Result<McpToolResult, McpError>,
+        Option<crate::guard::GuardApprovalRecord>,
+    ) {
+        use crate::guard::{GuardApprovalRecord, GuardApprovalStep};
+        let Some(hook) = &ctx.guard_approval else {
+            return (Ok(first), None);
         };
-        let Some(request) =
-            crate::guard::approval_request(&self.server_name, &self.remote_tool_name, &first)
-        else {
-            return Ok(first);
+        let Some(request) = crate::guard::approval_request(
+            ctx.session_id.as_str(),
+            ctx.tool_call_id.as_deref(),
+            &self.server_name,
+            &self.remote_tool_name,
+            &first,
+        ) else {
+            return (Ok(first), None);
         };
-        let Some(meta) = approver
-            .request_approval(request)
-            .await
-            .and_then(|id| crate::guard::approval_meta(&id))
-        else {
-            return Ok(first);
+        let first_decision = crate::guard::verdict_from_result(&first).decision_id;
+        let record = |step| GuardApprovalRecord {
+            step,
+            approval_required_decision_id: first_decision.clone(),
         };
-        self.call(input.clone(), Some(meta)).await
+        let cancelled = || {
+            ctx.cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+        };
+        let ask = hook.approver.request_approval(request);
+        let wait_cancel = async {
+            while !cancelled() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        };
+        let timeout = async {
+            match hook.timeout {
+                Some(t) => tokio::time::sleep(t).await,
+                None => std::future::pending().await,
+            }
+        };
+        let answer = tokio::select! {
+            a = ask => Ok(a),
+            _ = wait_cancel => Err(GuardApprovalStep::Cancelled),
+            _ = timeout => Err(GuardApprovalStep::TimedOut),
+        };
+        // A cancel that lands while the approver is answering still wins.
+        let answer = match answer {
+            Ok(_) if cancelled() => Err(GuardApprovalStep::Cancelled),
+            other => other,
+        };
+        let meta = match answer {
+            Ok(id) => id.as_deref().and_then(crate::guard::approval_meta),
+            Err(step) => return (Ok(first), Some(record(step))),
+        };
+        let Some(meta) = meta else {
+            return (Ok(first), Some(record(GuardApprovalStep::Declined)));
+        };
+        let rec = record(GuardApprovalStep::Retried);
+        (self.call(input.clone(), Some(meta)).await, Some(rec))
     }
 
     pub fn call_started(&self) -> McpToolCallStarted {
@@ -502,12 +527,13 @@ impl Tool for McpTool {
         )
     }
 
-    async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolResult, ToolError> {
         let started = Instant::now();
         let mut called = self.call(input.clone(), None).await;
+        let mut approval = None;
         if let (true, Ok(first)) = (self.guard, &called) {
             if first.is_error {
-                called = self.retry_with_approval(&input, first.clone()).await;
+                (called, approval) = self.retry_with_approval(&input, first.clone(), &ctx).await;
             }
         }
         let result = match called {
@@ -515,7 +541,9 @@ impl Tool for McpTool {
             // Guard gave no verdict: a tool error, never an `Err` that the
             // loop would audit as an ordinary failure.
             Err(err) if self.guard => {
-                return Ok(crate::guard::verdict_from_error(&err).into_error_result())
+                let mut verdict = crate::guard::verdict_from_error(&err);
+                verdict.approval = approval;
+                return Ok(verdict.into_error_result());
             }
             Err(err) => return Err(tool_error_from_mcp(err)),
         };
@@ -539,7 +567,8 @@ impl Tool for McpTool {
         });
         let mut is_error = result.is_error;
         if self.guard {
-            let verdict = crate::guard::verdict_from_result(&result);
+            let mut verdict = crate::guard::verdict_from_result(&result);
+            verdict.approval = approval;
             // Only an `executed` verdict may reach the model as success.
             is_error |= verdict.status != crate::guard::GuardStatus::Executed;
             metadata[crate::guard::GUARD_METADATA_KEY] = json!(verdict);
