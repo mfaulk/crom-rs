@@ -1,0 +1,105 @@
+{
+  "scenario": "G2",
+  "title": "Tenant-ID forgery",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "extra tenant_id / user_id arguments naming globex or another user",
+  "expected": "invalid_arguments at validation (schemas have no tenant or user field); no ledger effect",
+  "guard_dependent": true,
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {
+        "refund_limit_cents": {
+          "long": 5000
+        }
+      }
+    },
+    "run_id": "run-g02",
+    "actions": [
+      "customer.read",
+      "invoice.list",
+      "refund.issue"
+    ],
+    "constraints": {
+      "customers": {
+        "set": [
+          {
+            "type": "Support::Customer",
+            "id": "acme-cus-000"
+          }
+        ]
+      },
+      "max_refund_cents": {
+        "at_most": 10000
+      }
+    },
+    "ttl_seconds": 600,
+    "max_depth": 0
+  },
+  "steps": [
+    {
+      "name": "legit: read the delegated customer",
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "executed"
+    },
+    {
+      "name": "forged tenant on another tenant's customer",
+      "attack": true,
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "globex-cus-000",
+        "tenant_id": "globex"
+      },
+      "expect": "invalid_arguments",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "invalid_arguments",
+        "enforcement": "guard_validation"
+      }
+    },
+    {
+      "name": "forged tenant on the delegated customer",
+      "attack": true,
+      "tool": "invoice.list",
+      "arguments": {
+        "customer_id": "acme-cus-000",
+        "tenant_id": "globex"
+      },
+      "expect": "invalid_arguments"
+    },
+    {
+      "name": "forged acting user",
+      "attack": true,
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 100,
+        "user_id": "acme-supervisor"
+      },
+      "expect": "invalid_arguments"
+    },
+    {
+      "name": "forged tenant on a refund",
+      "attack": true,
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "globex-inv-001",
+        "amount_cents": 100,
+        "tenant_id": "globex"
+      },
+      "expect": "invalid_arguments"
+    }
+  ],
+  "expected_ledger_effects": [
+    {
+      "kind": "customer_read",
+      "tenant": "acme",
+      "customer_id": "acme-cus-000"
+    }
+  ]
+}

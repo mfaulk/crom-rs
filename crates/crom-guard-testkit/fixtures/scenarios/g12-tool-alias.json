@@ -1,0 +1,180 @@
+{
+  "scenario": "G12",
+  "title": "Tool alias",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "refund under versioned, case-variant, whitespace, separator, and MCP-prefixed names",
+  "expected": "every alias is denied: the agent sees action_not_granted (as for any tool its grant lacks, #405) and the audit record keeps unknown_action; only the exact registered name executes",
+  "guard_dependent": false,
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {
+        "refund_limit_cents": {
+          "long": 5000
+        }
+      }
+    },
+    "run_id": "run-g12",
+    "actions": [
+      "customer.read",
+      "invoice.list",
+      "refund.issue"
+    ],
+    "constraints": {
+      "customers": {
+        "set": [
+          {
+            "type": "Support::Customer",
+            "id": "acme-cus-000"
+          }
+        ]
+      },
+      "max_refund_cents": {
+        "at_most": 10000
+      }
+    },
+    "ttl_seconds": 600,
+    "max_depth": 0
+  },
+  "steps": [
+    {
+      "name": "legit: refund under the registered name",
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "expect": "executed"
+    },
+    {
+      "name": "alias `refund_issue_v2`",
+      "attack": true,
+      "tool": "refund_issue_v2",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "expect": "action_not_granted",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "unknown_action",
+        "enforcement": "guard_validation"
+      }
+    },
+    {
+      "name": "alias `Refund.Issue`",
+      "attack": true,
+      "tool": "Refund.Issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "expect": "action_not_granted",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "unknown_action",
+        "enforcement": "guard_validation"
+      }
+    },
+    {
+      "name": "alias `REFUND.ISSUE`",
+      "attack": true,
+      "tool": "REFUND.ISSUE",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "expect": "action_not_granted",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "unknown_action",
+        "enforcement": "guard_validation"
+      }
+    },
+    {
+      "name": "alias `refund.issue `",
+      "attack": true,
+      "tool": "refund.issue ",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "expect": "action_not_granted",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "unknown_action",
+        "enforcement": "guard_validation"
+      }
+    },
+    {
+      "name": "alias `refund-issue`",
+      "attack": true,
+      "tool": "refund-issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "expect": "action_not_granted",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "unknown_action",
+        "enforcement": "guard_validation"
+      }
+    },
+    {
+      "name": "alias `mcp__guard__refund.issue`",
+      "attack": true,
+      "tool": "mcp__guard__refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "expect": "action_not_granted",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "unknown_action",
+        "enforcement": "guard_validation"
+      }
+    },
+    {
+      "name": "alias `guard.refund.issue`",
+      "attack": true,
+      "tool": "guard.refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "expect": "action_not_granted",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "unknown_action",
+        "enforcement": "guard_validation"
+      }
+    },
+    {
+      "name": "alias `customer.export.all`",
+      "attack": true,
+      "tool": "customer.export.all",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "expect": "action_not_granted",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "unknown_action",
+        "enforcement": "guard_validation"
+      }
+    }
+  ],
+  "expected_ledger_effects": [
+    {
+      "kind": "refund",
+      "tenant": "acme",
+      "invoice_id": "acme-inv-001",
+      "amount_cents": 1000
+    }
+  ]
+}

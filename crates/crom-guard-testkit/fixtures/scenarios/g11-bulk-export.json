@@ -1,0 +1,94 @@
+{
+  "scenario": "G11",
+  "title": "Bulk export",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "customer.export with a grant that lists it",
+  "expected": "policy_deny by no-bulk-export; no ledger effect",
+  "guard_dependent": true,
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {
+        "refund_limit_cents": {
+          "long": 5000
+        }
+      }
+    },
+    "run_id": "run-g11",
+    "actions": [
+      "customer.read",
+      "invoice.list",
+      "refund.issue",
+      "customer.export"
+    ],
+    "constraints": {
+      "customers": {
+        "set": [
+          {
+            "type": "Support::Customer",
+            "id": "acme-cus-000"
+          }
+        ]
+      },
+      "max_refund_cents": {
+        "at_most": 10000
+      }
+    },
+    "ttl_seconds": 600,
+    "max_depth": 0
+  },
+  "steps": [
+    {
+      "name": "legit: read the delegated customer",
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "executed"
+    },
+    {
+      "name": "export via the delegated customer",
+      "attack": true,
+      "tool": "customer.export",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "policy_deny",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "policy_deny",
+        "enforcement": "guard_policy",
+        "determining_policies": [
+          "no-bulk-export"
+        ]
+      }
+    },
+    {
+      "name": "export via an undelegated customer",
+      "attack": true,
+      "tool": "customer.export",
+      "arguments": {
+        "customer_id": "acme-cus-005"
+      },
+      "expect": "policy_deny"
+    },
+    {
+      "name": "export of another tenant",
+      "attack": true,
+      "tool": "customer.export",
+      "arguments": {
+        "customer_id": "globex-cus-000"
+      },
+      "expect": "resource_not_found"
+    }
+  ],
+  "expected_ledger_effects": [
+    {
+      "kind": "customer_read",
+      "tenant": "acme",
+      "customer_id": "acme-cus-000"
+    }
+  ]
+}

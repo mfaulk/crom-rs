@@ -1,0 +1,147 @@
+{
+  "scenario": "G4",
+  "title": "Unknown principal",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "no session handle, a well-formed handle never issued, a malformed handle, and the revoked handle of an earlier run",
+  "expected": "denied at the session stage; no ledger effect",
+  "guard_dependent": true,
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {
+        "refund_limit_cents": {
+          "long": 5000
+        }
+      }
+    },
+    "run_id": "run-g04",
+    "actions": [
+      "customer.read",
+      "invoice.list",
+      "refund.issue"
+    ],
+    "constraints": {
+      "customers": {
+        "set": [
+          {
+            "type": "Support::Customer",
+            "id": "acme-cus-000"
+          }
+        ]
+      },
+      "max_refund_cents": {
+        "at_most": 10000
+      }
+    },
+    "ttl_seconds": 600,
+    "max_depth": 0
+  },
+  "grants": {
+    "previous": {
+      "tenant": "acme",
+      "delegator": {
+        "id": "acme-agent-operator",
+        "role": "agent-operator",
+        "attrs": {
+          "refund_limit_cents": {
+            "long": 5000
+          }
+        }
+      },
+      "run_id": "run-g04-previous",
+      "actions": [
+        "customer.read",
+        "invoice.list",
+        "refund.issue"
+      ],
+      "constraints": {
+        "customers": {
+          "set": [
+            {
+              "type": "Support::Customer",
+              "id": "acme-cus-000"
+            }
+          ]
+        },
+        "max_refund_cents": {
+          "at_most": 10000
+        }
+      },
+      "ttl_seconds": 600,
+      "max_depth": 0
+    }
+  },
+  "steps": [
+    {
+      "name": "application revokes the earlier run's grant",
+      "app": {
+        "revoke": {
+          "grant": "previous"
+        }
+      }
+    },
+    {
+      "name": "legit: read with the issued handle",
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "executed"
+    },
+    {
+      "name": "no handle",
+      "attack": true,
+      "as": "$none",
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "no_grant",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "no_grant",
+        "enforcement": "guard_session"
+      }
+    },
+    {
+      "name": "well-formed handle never issued",
+      "attack": true,
+      "as": "$forged",
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 100
+      },
+      "expect": "no_grant"
+    },
+    {
+      "name": "malformed handle",
+      "attack": true,
+      "as": "$malformed",
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "no_grant"
+    },
+    {
+      "name": "replayed handle of an earlier, revoked run",
+      "attack": true,
+      "as": "previous",
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "grant_revoked"
+    }
+  ],
+  "expected_ledger_effects": [
+    {
+      "kind": "customer_read",
+      "tenant": "acme",
+      "customer_id": "acme-cus-000"
+    }
+  ]
+}

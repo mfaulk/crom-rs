@@ -1,0 +1,110 @@
+{
+  "scenario": "G6",
+  "title": "Revoked grant",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "the application revokes the grant while a refund is between authorization and execution; the agent and its subagent keep calling",
+  "expected": "the in-flight refund is recorded and stopped before execution; every later call by the grant or its child is grant_revoked; no ledger effect after the revoke",
+  "guard_dependent": true,
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {
+        "refund_limit_cents": {
+          "long": 5000
+        }
+      }
+    },
+    "run_id": "run-g06",
+    "actions": [
+      "customer.read",
+      "invoice.list",
+      "refund.issue",
+      "guard.delegate"
+    ],
+    "constraints": {
+      "customers": {
+        "set": [
+          {
+            "type": "Support::Customer",
+            "id": "acme-cus-000"
+          }
+        ]
+      },
+      "max_refund_cents": {
+        "at_most": 10000
+      }
+    },
+    "ttl_seconds": 600,
+    "max_depth": 1
+  },
+  "steps": [
+    {
+      "name": "legit: read the delegated customer",
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "executed"
+    },
+    {
+      "name": "legit: delegate a read-only child",
+      "tool": "guard.delegate",
+      "arguments": {
+        "actions": [
+          "customer.read"
+        ],
+        "ttl_seconds": 60
+      },
+      "bind_handle": "child",
+      "expect": "executed"
+    },
+    {
+      "name": "refund in flight when the grant is revoked",
+      "attack": true,
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "revoke_after_decision": "parent",
+      "expect": "grant_revoked",
+      "expect_audit": {
+        "decision": "allow",
+        "outcome": "blocked"
+      }
+    },
+    {
+      "name": "read after revocation",
+      "attack": true,
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "grant_revoked",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "grant_revoked",
+        "enforcement": "guard_session"
+      }
+    },
+    {
+      "name": "child reads after its parent is revoked",
+      "attack": true,
+      "as": "child",
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "grant_revoked"
+    }
+  ],
+  "expected_ledger_effects": [
+    {
+      "kind": "customer_read",
+      "tenant": "acme",
+      "customer_id": "acme-cus-000"
+    }
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "scenario": "G5",
+  "title": "Expired grant",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "the agent keeps calling after the grant's expires_at",
+  "expected": "grant_expired for every call after expiry; no ledger effect",
+  "guard_dependent": true,
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {
+        "refund_limit_cents": {
+          "long": 5000
+        }
+      }
+    },
+    "run_id": "run-g05",
+    "actions": [
+      "customer.read",
+      "invoice.list",
+      "refund.issue"
+    ],
+    "constraints": {
+      "customers": {
+        "set": [
+          {
+            "type": "Support::Customer",
+            "id": "acme-cus-000"
+          }
+        ]
+      },
+      "max_refund_cents": {
+        "at_most": 10000
+      }
+    },
+    "ttl_seconds": 2,
+    "max_depth": 0
+  },
+  "steps": [
+    {
+      "name": "legit: read before expiry",
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "executed"
+    },
+    {
+      "name": "time passes beyond expires_at",
+      "app": {
+        "advance_clock": {
+          "seconds": 3
+        }
+      }
+    },
+    {
+      "name": "read after expiry",
+      "attack": true,
+      "tool": "customer.read",
+      "arguments": {
+        "customer_id": "acme-cus-000"
+      },
+      "expect": "grant_expired",
+      "expect_audit": {
+        "decision": "deny",
+        "reason": "grant_expired",
+        "enforcement": "guard_session"
+      }
+    },
+    {
+      "name": "refund after expiry",
+      "attack": true,
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 100
+      },
+      "expect": "grant_expired"
+    }
+  ],
+  "expected_ledger_effects": [
+    {
+      "kind": "customer_read",
+      "tenant": "acme",
+      "customer_id": "acme-cus-000"
+    }
+  ]
+}

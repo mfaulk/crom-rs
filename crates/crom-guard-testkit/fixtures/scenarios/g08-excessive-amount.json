@@ -1,0 +1,133 @@
+{
+  "scenario": "G8",
+  "title": "Excessive amount",
+  "spec": "MILESTONE_18 §13.3",
+  "vector": "refund above the delegator's 50.00 limit without an approval",
+  "expected": "approval_required and no ledger effect; the same refund executes only with an approval the application issued for that exact action",
+  "guard_dependent": true,
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {
+        "refund_limit_cents": {
+          "long": 5000
+        }
+      }
+    },
+    "run_id": "run-g08",
+    "actions": [
+      "customer.read",
+      "invoice.list",
+      "refund.issue"
+    ],
+    "constraints": {
+      "customers": {
+        "set": [
+          {
+            "type": "Support::Customer",
+            "id": "acme-cus-000"
+          }
+        ]
+      },
+      "max_refund_cents": {
+        "at_most": 10000
+      }
+    },
+    "ttl_seconds": 600,
+    "max_depth": 0
+  },
+  "steps": [
+    {
+      "name": "legit: refund within the limit",
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 1000
+      },
+      "expect": "executed",
+      "expect_audit": {
+        "decision": "allow",
+        "outcome": "executed",
+        "determining_policies": [
+          "refund-within-limits"
+        ]
+      }
+    },
+    {
+      "name": "refund above the limit, no approval",
+      "attack": true,
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 6000
+      },
+      "bind_digest": "d1",
+      "expect": "approval_required",
+      "expect_audit": {
+        "decision": "approval_required",
+        "outcome": "none"
+      }
+    },
+    {
+      "name": "refund above the grant's max_refund_cents, no approval",
+      "attack": true,
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 11000
+      },
+      "expect": "approval_required"
+    },
+    {
+      "name": "supervisor approves the pending 60.00 refund",
+      "app": {
+        "approve": {
+          "digest": "d1",
+          "approver": {
+            "id": "acme-supervisor",
+            "role": "supervisor",
+            "attrs": {
+              "refund_limit_cents": {
+                "long": 100000
+              }
+            }
+          },
+          "approver_tenant": "acme",
+          "ttl_seconds": 60,
+          "bind_approval": "ap1"
+        }
+      }
+    },
+    {
+      "name": "legit: the approved refund",
+      "tool": "refund.issue",
+      "arguments": {
+        "invoice_id": "acme-inv-001",
+        "amount_cents": 6000
+      },
+      "approval": "ap1",
+      "expect": "executed",
+      "expect_audit": {
+        "decision": "allow",
+        "outcome": "executed",
+        "approver_role": "supervisor"
+      }
+    }
+  ],
+  "expected_ledger_effects": [
+    {
+      "kind": "refund",
+      "tenant": "acme",
+      "invoice_id": "acme-inv-001",
+      "amount_cents": 1000
+    },
+    {
+      "kind": "refund",
+      "tenant": "acme",
+      "invoice_id": "acme-inv-001",
+      "amount_cents": 6000
+    }
+  ]
+}

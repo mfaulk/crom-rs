@@ -5,6 +5,8 @@
 pub mod api;
 pub mod data;
 pub mod ledger;
+#[cfg(unix)]
+pub mod scenario;
 pub mod support_ops;
 
 pub use api::{

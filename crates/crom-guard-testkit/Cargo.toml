@@ -8,7 +8,7 @@ description = "Controlled business API, synthetic tenants, and effect ledger for
 publish = false
 
 [dependencies]
-# For support_ops only; the HTTP API and ledger do not use it.
+# For support_ops and scenario only; the HTTP API and ledger do not use it.
 crom-guard = { path = "../crom-guard" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 serde = { workspace = true }
@@ -16,13 +16,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 reqwest = { workspace = true }
+# Scenario environments keep credentials and audit logs in a temp dir.
+tempfile = { workspace = true }
 
 [dev-dependencies]
-# The crom-guard-support example binary (support_ops behind the server CLI).
+# The crom-guard-support example binary (support_ops behind the server CLI)
+# and the server lanes of tests/guard_adversarial.rs.
 # crom-guard-server must not depend on this crate (scripts/check-guard-deps.sh).
 crom-guard-server = { path = "../crom-guard-server" }
 jsonschema = { version = "0.61", default-features = false }
-tempfile = { workspace = true }
 # Canary test: captures every trace event.
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
