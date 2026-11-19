@@ -10,6 +10,7 @@
 mod admin;
 mod admin_token;
 mod agent;
+pub mod check;
 pub mod cli;
 pub mod config;
 mod limiter;

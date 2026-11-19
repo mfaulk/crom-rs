@@ -125,6 +125,7 @@ cargo test -p crom-guard-testkit
 - `tests/canary.rs` checks that the broker's secret and the session handle never appear in any `CallOutcome`, audit line, ledger entry, or `tracing` output. It installs a global trace subscriber, so it is its own test binary.
   The test environment registers `guard.delegate`; the canary also delegates a child and checks that the child handle appears only in the delegate result (#353).
 - `tests/guard_adversarial.rs` runs the scenarios below in every lane and writes `$CARGO_TARGET_TMPDIR/guard-scenarios/report.json`. It needs `python3` 3.10 or newer for the Python client lane; without it, that lane is reported as skipped.
+- `tests/bypass.rs` (Linux) attacks a Guard child process from agent Bash run through Crom's `BashTool`, with the sandbox `required` and `off`, and as a separate uid via `sudo -n` (#360, G13, G14, G16, G18). The ledger and audit log are the oracle. It dev-depends on `crom-core` and `crom-tools`; see [docs/guard/deployment.md](../../docs/guard/deployment.md).
 
 ## Scenarios (`scenario`)
 

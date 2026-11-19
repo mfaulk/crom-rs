@@ -1,0 +1,22 @@
+{
+  "sandbox": {
+    "mode": "required",
+    "network": false
+  },
+  "mcp": {
+    "enabled": true,
+    "servers": {
+      "guard": {
+        "type": "http",
+        "url": "http://127.0.0.1:8470/mcp",
+        "headers": {
+          "Authorization": "Bearer ${CROM_GUARD_HANDLE}"
+        }
+      }
+    }
+  },
+  "plugins": {
+    "allow_plugin_mcp": false
+  },
+  "allowed_tools": ["mcp__guard__*"]
+}

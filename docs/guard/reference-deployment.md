@@ -11,6 +11,7 @@
 | Grant fixture | `examples/guard-support/grants/acme-agent-operator.json` |
 | Driver | `examples/guard-support/run-python-client.sh` |
 | Python client | `examples/guard-support/clients/python/` ([README](../../examples/guard-support/clients/python/README.md)) |
+| Crom agent settings for the isolation profile (#360) | `examples/guard-support/agent/crom-settings.json` |
 
 ## `crom-guard-support`
 
@@ -40,5 +41,7 @@ Every path in it is relative (`admin.sock`, `admin.token`, `credentials.json`, `
 ## Driver
 
 `run-python-client.sh` sets up that state directory with a random admin token and business-API secret, starts `crom-guard-support` on free loopback ports, issues grants through the admin socket with `trusted_app.py`, and runs the scripted Python agent. It then checks that the agent never held the business-API credential, that no log contains a secret, and that the audit log verifies. The client README has the matrix and the checks.
+
+The driver runs the Python agent on Guard's uid without a sandbox, so it is outside the isolation profile and `crom-guard check` fails for it; it demonstrates the properties that do not depend on isolation (GP1–GP5, GP7, GP8). Bash and credential-file bypass, and the profile that prevents it, are covered by [deployment.md](deployment.md) (#360).
 
 The admin client (`trusted_app.py`) and the grant fixture are independent of the Python agent, so other drivers can reuse them to issue grants, revoke them, and approve pending requests.

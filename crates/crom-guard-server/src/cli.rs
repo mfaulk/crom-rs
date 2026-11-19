@@ -11,7 +11,10 @@ use crate::config::{AdminListen, Config};
 const USAGE: &str = "usage:
   crom-guard serve --config <guard.toml> [--agent-listen <addr>] [--admin-listen <addr|unix:path>]
   crom-guard policy validate --namespace <ns> --schema <file> --policies <file>
-  crom-guard audit verify <path> [--anchor <seq>:<hash>]...";
+  crom-guard audit verify <path> [--anchor <seq>:<hash>]...
+  crom-guard check --config <guard.toml> [--crom-settings <settings.json>]
+                   [--crom-mcp-config <mcp.json>] [--crom-workspace <dir>]
+                   [--agent-user <name|uid>]";
 
 /// Exit codes: 0 success; 1 refused to start, failed, or verification
 /// failed; 2 usage error.
@@ -21,6 +24,7 @@ pub fn main_with(operations: impl FnOnce() -> OperationRegistry) -> ExitCode {
         Some("serve") => serve(&args[1..], operations),
         Some("policy") => policy(&args[1..]),
         Some("audit") => audit(&args[1..]),
+        Some("check") => check(&args[1..]),
         _ => usage(),
     }
 }
@@ -206,6 +210,55 @@ fn audit(args: &[String]) -> ExitCode {
             eprintln!("crom-guard: audit chain broken: {path}: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Exit 0: every isolation-profile check passed. 1: at least one failed.
+/// 2: usage error.
+fn check(args: &[String]) -> ExitCode {
+    let known = [
+        "--config",
+        "--crom-settings",
+        "--crom-mcp-config",
+        "--crom-workspace",
+        "--agent-user",
+    ];
+    let Some(flags) = flags(args, &known) else {
+        return usage();
+    };
+    let get = |name| flags.iter().find(|(f, _)| *f == name).map(|(_, v)| *v);
+    let Some(config) = get("--config") else {
+        return usage();
+    };
+    let agent_uid = match get("--agent-user").map(crate::check::resolve_user) {
+        None => None,
+        Some(Ok(uid)) => Some(uid),
+        Some(Err(e)) => {
+            eprintln!("crom-guard: --agent-user: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let report = crate::check::run(&crate::check::CheckOptions {
+        config: config.into(),
+        crom_settings: get("--crom-settings").map(Into::into),
+        crom_mcp_config: get("--crom-mcp-config").map(Into::into),
+        crom_workspace: get("--crom-workspace").map(Into::into),
+        agent_uid,
+    });
+    for f in &report.findings {
+        let status = if f.passed { "ok" } else { "FAIL" };
+        println!("{status}: {}: {}", f.check, f.detail);
+    }
+    if report.passed() {
+        println!("ok: deployment matches the isolation profile");
+        ExitCode::SUCCESS
+    } else {
+        let failed = report.failed();
+        eprintln!(
+            "crom-guard: {} check(s) failed; this deployment is outside the isolation profile",
+            failed.len()
+        );
+        ExitCode::from(1)
     }
 }
 

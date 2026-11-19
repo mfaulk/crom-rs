@@ -17,9 +17,10 @@ The two credentials never cross. A session handle sent to the admin API gets `40
 crom-guard serve --config guard.toml [--agent-listen 127.0.0.1:8470] [--admin-listen unix:/run/crom-guard/admin.sock]
 crom-guard policy validate --namespace Support --schema support.cedarschema --policies support.cedar
 crom-guard audit verify audit.jsonl [--anchor <seq>:<hash>]...
+crom-guard check --config guard.toml [--crom-settings settings.json] [--crom-mcp-config mcp.json] [--crom-workspace dir] [--agent-user name|uid]
 ```
 
-Exit codes: 0 success; 1 refused to start, invalid policy, or broken audit chain; 2 usage error. `serve` stops on SIGINT or SIGTERM (see "Shutdown").
+Exit codes: 0 success; 1 refused to start, invalid policy, broken audit chain, or a failed `check`; 2 usage error. `check` is the isolation-profile preflight ([deployment.md](deployment.md)). `serve` stops on SIGINT or SIGTERM (see "Shutdown").
 
 The stock binary compiles in **no protected operations**: every `tools/call` is denied (`action_not_granted`) and no grant can be issued. A deployment builds its own small binary that registers its operations and hands over to the same CLI:
 
@@ -183,7 +184,7 @@ Nothing is cancelled, so shutdown never latches Guard and never leaves a decisio
 
 ## Deployment notes
 
-- Run Guard as its own user. The credential file, admin token file, audit log and admin socket should be readable only by that user. Agents must not be able to reach the admin socket (#360 checks this).
+- Run Guard as its own user. The credential file, admin token file, audit log and admin socket should be readable only by that user. Agents must not be able to reach the admin socket. The isolation profile and `crom-guard check` are in [deployment.md](deployment.md).
 - Grants live in memory: restarting Guard invalidates every handle ([grants.md](grants.md), "Restart semantics").
 - Connection caps and the deny rate limit are coarse DoS guards, not quotas. Loopback-only deployment is assumed (§7.5).
 

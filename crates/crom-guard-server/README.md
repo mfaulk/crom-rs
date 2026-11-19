@@ -18,7 +18,13 @@ crate other than `crom-guard` (`scripts/check-guard-deps.sh`). Not published.
 crom-guard serve --config guard.toml
 crom-guard policy validate --namespace Support --schema s.cedarschema --policies p.cedar
 crom-guard audit verify audit.jsonl
+crom-guard check --config guard.toml --crom-settings settings.json   # or --agent-user <user>
 ```
+
+`check` is the isolation-profile preflight: it exits 1 when the deployment
+lets an agent reach Guard's credential, token, audit log, admin socket, or
+the business API by another path
+([docs/guard/deployment.md](../../docs/guard/deployment.md)).
 
 The stock binary registers no protected operations. A deployment registers
 its own and calls `crom_guard_server::cli::main_with`.
