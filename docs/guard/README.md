@@ -31,7 +31,7 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | action | `ValidatedArgs`, `AuthorizationContext`, `ApprovalContext`, `AuthorizationRequest`, `AuthorizedAction` | `AuthorizationContext` rejects the Guard-owned keys `grant` and `approval`. `AuthorizationRequest` carries the validated args, so the PDP can compute the approval digest |
 | decision | `Decision`, `DenyReason`, `ApprovalRequirement`, `ActionDigest` | Agents see only `DenyReason::code()`. The full value, including ancestor grant ids, goes to the audit log |
 | credential | `CredentialLease`, `CredentialBroker` | The lease exposes its secret only inside `with_secret(\|s\| ..)` |
-| audit | `AuditRecord`, `AuditSink`, `AuditReceipt`, … | The `guard-audit/v1` fields from §12.1. The sink adds the chaining (#352) |
+| audit | `AuditRecord`, `AuditSink`, `AuditReceipt`, `FileAuditSink`, `verify_log`, … | The `guard-audit/v1` fields from §12.1. `FileAuditSink` adds `seq`, `prev_hash` and `hash`, and `verify_log` checks the chain (#352). See [audit.md](audit.md) |
 | time | `Timestamp`, `Clock`, `SystemClock` | Unix milliseconds on Guard's clock |
 
 ## Traits
@@ -43,7 +43,7 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | `ResourceResolver` | no | app code, #350 | Async (`BoxFuture`). Not-found and other-tenant both return the same `ResolveError::NotFound` |
 | `ProtectedOperation` | no | app code, #351, #356 | One `ActionId` per MCP tool. Provides the input schema, resolver, Cedar context, and `execute(AuthorizedAction, CredentialLease)` |
 | `CredentialBroker` | no | #355 | Async. Hands out leases. The agent never receives one |
-| `AuditSink` | no | #352 | Async. `append` must be durable before it resolves. On `Err`, nothing executes |
+| `AuditSink` | no | #352 (`ChainedAuditSink` / `FileAuditSink`) | Async. `append` must be durable before it resolves. On `Err`, nothing executes |
 
 Sealed traits produce authority, so implementations outside this crate are rejected at compile time.
 
@@ -68,6 +68,7 @@ Sealed traits produce authority, so implementations outside this crate are rejec
 ## Tests
 
 ```sh
-cargo test -p crom-guard          # unit tests, plus the compile_fail doctests
+cargo test -p crom-guard          # unit tests, compile_fail doctests, tests/audit.rs (tamper, durability, schema)
+cargo test -p crom-guard-server   # `crom-guard audit verify` CLI
 scripts/check-guard-deps.sh       # no other crom-* dependency
 ```

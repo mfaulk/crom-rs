@@ -32,6 +32,10 @@ pub use action::{
     ReservedContextKey, ValidatedArgs, RESERVED_CONTEXT_KEYS,
 };
 pub use audit::{
+    verify_file, verify_log, verify_log_with, AuditEntry, AuditStorage, ChainSummary,
+    ChainedAuditSink, FileAuditSink, VerifyError, VerifyErrorKind, GENESIS_HASH,
+};
+pub use audit::{
     AuditError, AuditIdentity, AuditReceipt, AuditRecord, AuditSink, DecisionKind, Durations,
     Enforcement, Outcome, RecordKind, UntrustedCorrelation, AUDIT_FORMAT,
 };

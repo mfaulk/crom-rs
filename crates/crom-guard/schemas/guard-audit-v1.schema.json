@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mfaulk/crom-rs/crates/crom-guard/schemas/guard-audit-v1.schema.json",
+  "title": "guard-audit/v1 record",
+  "description": "One line of a Crom Guard audit log (JSONL). Integrity rules (hash input, seq, prev_hash) are in docs/guard/audit.md and are not expressible here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format", "seq", "prev_hash", "record", "decision_id", "time", "duration_us",
+    "identity", "action", "resource", "args_digest", "args_logged", "decision",
+    "reason", "determining_policies", "policy_set_hash", "schema_hash",
+    "approval_id", "enforcement", "outcome", "downstream_ref", "untrusted", "hash"
+  ],
+  "properties": {
+    "format": { "const": "guard-audit/v1" },
+    "seq": { "type": "integer", "minimum": 1 },
+    "prev_hash": { "$ref": "#/$defs/hex64" },
+    "record": { "enum": ["decision", "outcome"] },
+    "decision_id": { "$ref": "#/$defs/id" },
+    "time": { "description": "Unix milliseconds on Guard's clock.", "type": "integer", "minimum": 0 },
+    "duration_us": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_us", "resolve_us", "execute_us"],
+      "properties": {
+        "policy_us": { "$ref": "#/$defs/optional_u64" },
+        "resolve_us": { "$ref": "#/$defs/optional_u64" },
+        "execute_us": { "$ref": "#/$defs/optional_u64" }
+      }
+    },
+    "identity": {
+      "description": "Copied from the grant record; null when the session was not authenticated.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["issuer", "tenant", "delegator", "agent", "run_id", "grant_id", "grant_chain"],
+          "properties": {
+            "issuer": { "$ref": "#/$defs/id" },
+            "tenant": { "$ref": "#/$defs/id" },
+            "delegator": { "$ref": "#/$defs/id" },
+            "agent": { "$ref": "#/$defs/id" },
+            "run_id": { "$ref": "#/$defs/id" },
+            "grant_id": { "$ref": "#/$defs/id" },
+            "grant_chain": { "type": "array", "items": { "$ref": "#/$defs/id" } }
+          }
+        }
+      ]
+    },
+    "action": { "$ref": "#/$defs/optional_id" },
+    "resource": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "id"],
+          "properties": {
+            "type": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        }
+      ]
+    },
+    "args_digest": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/hex64" }] },
+    "args_logged": { "description": "Only the operation's allowlisted argument fields.", "type": "object" },
+    "decision": { "enum": [null, "allow", "deny", "approval_required"] },
+    "reason": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reason"],
+          "properties": {
+            "reason": {
+              "enum": [
+                "no_grant", "grant_not_yet_valid", "grant_expired", "grant_revoked",
+                "unknown_action", "action_not_granted", "invalid_arguments",
+                "resource_not_found", "policy_deny", "policy_error",
+                "engine_unavailable", "approval_invalid", "audit_unavailable"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reason", "grant_id"],
+          "properties": {
+            "reason": { "const": "chain_deny" },
+            "grant_id": { "$ref": "#/$defs/id" }
+          }
+        }
+      ]
+    },
+    "determining_policies": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+    "policy_set_hash": { "type": ["string", "null"] },
+    "schema_hash": { "type": ["string", "null"] },
+    "approval_id": { "$ref": "#/$defs/optional_id" },
+    "enforcement": {
+      "enum": [
+        null, "guard_session", "guard_validation", "guard_policy", "guard_chain",
+        "guard_approval", "executor_precondition"
+      ]
+    },
+    "outcome": { "enum": [null, "blocked", "executed", "failed", "revoked_during_execution"] },
+    "downstream_ref": { "description": "Business-API effect id, for ledger correlation.", "type": ["string", "null"] },
+    "untrusted": {
+      "description": "Agent-supplied correlation values; never used for decisions.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_use_id", "client_request_id", "requested_tool", "client_info"],
+      "properties": {
+        "tool_use_id": { "type": ["string", "null"] },
+        "client_request_id": { "type": ["string", "null"] },
+        "requested_tool": { "type": ["string", "null"] },
+        "client_info": {}
+      }
+    },
+    "hash": { "$ref": "#/$defs/hex64" }
+  },
+  "$defs": {
+    "hex64": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9._:@-]{1,128}$" },
+    "optional_id": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/id" }] },
+    "optional_u64": { "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 0 }] }
+  }
+}

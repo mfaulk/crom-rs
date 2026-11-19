@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+mod chain;
+mod sink;
+
+pub use chain::{
+    verify_file, verify_log, verify_log_with, AuditEntry, ChainSummary, VerifyError,
+    VerifyErrorKind, GENESIS_HASH,
+};
+pub use sink::{AuditStorage, ChainedAuditSink, FileAuditSink};
+
 use crate::decision::DenyReason;
 use crate::ids::{
     ActionId, AgentId, AppId, ApprovalId, DecisionId, GrantId, PolicyId, RunId, TenantId, UserId,
