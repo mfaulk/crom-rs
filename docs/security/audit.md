@@ -19,7 +19,7 @@ consumers as `SdkEvent::SecurityDecision` under **every** verbosity.
 | `policy_source` | `PolicyDecisionSource` stage that decided (`hook`, `disallow_rule`, `permission_mode`, `allow_rule`, `approval_callback`, `approval_memory`, `external_effect_policy`, `default_deny`, `workspace_trust`); absent when the call never reached the policy engine or was refused below it |
 | `rule` | Matching rule as `<list>[<index>]: <rule json>`, e.g. `disallowed_tools[0]: "Write"` |
 | `decision` | `allow` / `deny` / `ask` |
-| `enforcement` | `policy` (policy engine, tool allowlist, tool-catalog loading gate), `hook` (`PreToolUse` hook), `checkpoint` (checkpoint safety gate), `sandbox` (tool-level `PermissionDenied`: the Read/Write/Edit path sandbox, and a Bash call refused because the [OS sandbox](sandbox.md) is `required` but cannot be enforced) |
+| `enforcement` | `policy` (policy engine, tool allowlist, tool-catalog loading gate), `hook` (`PreToolUse` hook, or a `PostToolUse`/`PostToolUseFailure` hook `Deny`), `checkpoint` (checkpoint safety gate), `sandbox` (tool-level `PermissionDenied`: the Read/Write/Edit path sandbox, and a Bash call refused because the [OS sandbox](sandbox.md) is `required` but cannot be enforced) |
 | `outcome` | `blocked`, `executed`, `failed` |
 | `reason` | Redacted free text |
 
@@ -31,7 +31,35 @@ Emission points in `run_loop` (`crom-core/src/agent.rs`):
 | Policy engine deny (any stage) | `policy` or `hook` | `blocked` |
 | Checkpoint `before_bash` / capture deny | `checkpoint` | `blocked` |
 | Tool returns `ToolError::PermissionDenied` | `sandbox` | `blocked` |
+| Tool ran, then a post-tool hook returned `Deny` | `hook` (`policy_source: hook`, `decision: deny`) | `blocked` |
 | Tool ran | `policy` or `hook` | `executed` / `failed` (`is_error`) |
+
+Policy engine stage order (`PolicyEngine::evaluate_tool`,
+`crom-core/src/policy.rs`); the first stage that decides wins:
+
+1. `PreToolUse` hooks — `Deny` returns here; `Allow` and `Ask` are recorded
+   and applied below.
+2. Disallow rules.
+3. Approval memory, deny side (`DenyForSession`).
+4. Plan mode (always denies).
+5. MCP external-effect floor (`external_effect_policy`): for
+   `PermissionKind::External` tools with no matching `allowed_tools` rule,
+   `RequireExplicitAllowRule` denies and `DenyMutatingNameByDefault` denies
+   write-like names. Nothing below — hook `Allow`, the `dontAsk` tool-name
+   list (`AgentOptions::allowed_tools`), permission modes, approval memory,
+   the approval callback — can override it (#343).
+6. Hook `Allow`.
+7. Permission mode (`dontAsk` rules and name list, `acceptEdits`,
+   read-only auto-allow); skipped when a hook asked.
+8. Allow rules; skipped when a hook asked.
+9. Approval memory, allow side; skipped when a hook asked.
+10. Approval callback.
+11. Default deny.
+
+Post-tool hook `Deny` is enforced, not advisory: the tool has already run,
+so its effects stand, but the model receives an error result
+(`Tool result blocked by post-tool hook: <reason>`) instead of the output.
+`McpResultSizeLimitHook` uses this to withhold oversized MCP results.
 
 CLI slash-command `` !`cmd` `` / `@file` expansions (#290) that the policy
 engine denies record a blocked decision with `tool_use_id`

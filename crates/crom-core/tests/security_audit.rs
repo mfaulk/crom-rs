@@ -103,6 +103,35 @@ impl Tool for WriteTool {
     }
 }
 
+/// MCP-named external tool that records whether it ran.
+struct McpWriteTool {
+    ran: Arc<Mutex<bool>>,
+}
+
+#[async_trait]
+impl Tool for McpWriteTool {
+    fn name(&self) -> &str {
+        "mcp__x__write"
+    }
+    fn description(&self) -> &str {
+        ""
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type": "object"})
+    }
+    fn permission_kind(&self) -> PermissionKind {
+        PermissionKind::External
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        *self.ran.lock().unwrap() = true;
+        Ok(ToolResult::ok_text("remote write done"))
+    }
+}
+
 /// Read-only tool whose in-process path guard always refuses.
 struct GuardedReadTool;
 
@@ -168,6 +197,17 @@ impl Hook for DenyHook {
     }
 }
 
+struct AllowHook;
+
+#[async_trait]
+impl Hook for AllowHook {
+    async fn call(&self, _input: HookInput) -> Result<HookOutput, HookError> {
+        Ok(HookOutput::Allow {
+            updated_input: None,
+        })
+    }
+}
+
 #[derive(Default)]
 struct CapturingSink {
     lines: Mutex<Vec<String>>,
@@ -220,13 +260,20 @@ fn registry() -> (ToolRegistry, Arc<Mutex<bool>>) {
     tools.register(Arc::new(WriteTool { ran: ran.clone() }));
     tools.register(Arc::new(GuardedReadTool));
     tools.register(Arc::new(FailingTool));
+    tools.register(Arc::new(McpWriteTool { ran: ran.clone() }));
     (tools, ran)
 }
 
 fn options() -> AgentOptions {
     AgentOptions {
         max_turns: Some(3),
-        allowed_tools: vec!["Echo".into(), "Write".into(), "Read".into(), "Fail".into()],
+        allowed_tools: vec![
+            "Echo".into(),
+            "Write".into(),
+            "Read".into(),
+            "Fail".into(),
+            "mcp__x__write".into(),
+        ],
         permission_mode: PermissionMode::AcceptEdits,
         cwd: std::path::PathBuf::from("/work"),
         ..AgentOptions::default()
@@ -326,6 +373,81 @@ async fn hook_denial_is_attributed_to_hook_layer() {
     assert_eq!(d.enforcement, EnforcementLayer::Hook);
     assert_eq!(d.policy_source, Some(PolicyDecisionSource::Hook));
     assert_eq!(d.outcome, SecurityOutcome::Blocked);
+    assert_eq!(d.reason.as_deref(), Some("hook says no"));
+}
+
+fn assert_blocked_by_external_effect_policy(events: &[AgentEvent], id: &str) {
+    let ds = decisions(events);
+    let d = decision_for(&ds, id);
+    assert_eq!(d.decision, PolicyOutcome::Deny);
+    assert_eq!(d.outcome, SecurityOutcome::Blocked);
+    assert_eq!(d.enforcement, EnforcementLayer::Policy);
+    assert_eq!(
+        d.policy_source,
+        Some(PolicyDecisionSource::ExternalEffectPolicy)
+    );
+}
+
+#[tokio::test]
+// A PreToolUse hook Allow does not run an MCP tool lacking an explicit allow rule; the block is attributed to the external-effect policy.
+async fn hook_allow_does_not_run_mcp_tool_without_allow_rule() {
+    let hooks = Hooks::new().pre_tool_use("*", Arc::new(AllowHook)).unwrap();
+    let (events, ran) = run_with(
+        tool_turn(vec![("m1", "mcp__x__write", json!({}))]),
+        options(),
+        hooks,
+        None,
+    )
+    .await;
+    assert!(!*ran.lock().unwrap(), "MCP tool must not execute");
+    assert_blocked_by_external_effect_policy(&events, "m1");
+}
+
+#[tokio::test]
+// dontAsk's tool-name allowlist does not run an MCP tool lacking an explicit allow rule.
+async fn dont_ask_name_list_does_not_run_mcp_tool_without_allow_rule() {
+    let mut opts = options();
+    opts.permission_mode = PermissionMode::DontAsk;
+    let (events, ran) = run_with(
+        tool_turn(vec![("m1", "mcp__x__write", json!({}))]),
+        opts,
+        Hooks::new(),
+        None,
+    )
+    .await;
+    assert!(!*ran.lock().unwrap(), "MCP tool must not execute");
+    assert_blocked_by_external_effect_policy(&events, "m1");
+}
+
+#[tokio::test]
+// A PostToolUse hook Deny replaces the tool result with an error and records the call as blocked by the hook layer.
+async fn post_tool_hook_deny_withholds_result_and_records_blocked() {
+    let hooks = Hooks::new()
+        .post_tool_use("Echo", Arc::new(DenyHook))
+        .unwrap();
+    let (events, _) = run_with(
+        tool_turn(vec![("e1", "Echo", json!({"text": "PAYLOAD-XYZ"}))]),
+        options(),
+        hooks,
+        None,
+    )
+    .await;
+    let result = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::UserToolResult(r) if r.tool_use_id == "e1" => Some(r.clone()),
+            _ => None,
+        })
+        .expect("tool result for e1");
+    assert!(result.is_error);
+    assert!(!result.content.contains("PAYLOAD-XYZ"));
+    assert!(result.content.contains("hook says no"));
+    let ds = decisions(&events);
+    let d = decision_for(&ds, "e1");
+    assert_eq!(d.outcome, SecurityOutcome::Blocked);
+    assert_eq!(d.decision, PolicyOutcome::Deny);
+    assert_eq!(d.enforcement, EnforcementLayer::Hook);
+    assert_eq!(d.policy_source, Some(PolicyDecisionSource::Hook));
     assert_eq!(d.reason.as_deref(), Some("hook says no"));
 }
 
