@@ -66,6 +66,11 @@ pub fn permissive_export_policies() -> String {
 }
 
 pub async fn env(policies: &str) -> Env {
+    env_with(policies, grant_spec()).await
+}
+
+/// `env` with `guard.delegate` registered and `spec` as the agent's grant.
+pub async fn env_with(policies: &str, spec: GrantSpec) -> Env {
     let api = BusinessApi::new(
         vec![ApiCredential {
             id: "business-api".into(),
@@ -78,6 +83,7 @@ pub async fn env(policies: &str) -> Env {
     for op in operations(&api, &SupportConfig::new(running.base_url())).unwrap() {
         registry.register(Arc::new(op)).unwrap();
     }
+    registry.register_delegate().unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let creds = dir.path().join("credentials.json");
@@ -104,11 +110,7 @@ pub async fn env(policies: &str) -> Env {
         registry.action_ids(),
     )));
     let issued = store
-        .issue(
-            &AppId::new("support-app").unwrap(),
-            grant_spec(),
-            SystemClock.now(),
-        )
+        .issue(&AppId::new("support-app").unwrap(), spec, SystemClock.now())
         .await
         .unwrap();
     let guard = Guard::new(
@@ -164,10 +166,22 @@ pub fn grant_spec() -> GrantSpec {
     }
 }
 
+/// `grant_spec` plus `guard.delegate` and one level of delegation.
+pub fn delegating_grant_spec() -> GrantSpec {
+    let mut s = grant_spec();
+    s.actions.insert(ActionId::new(DELEGATE_ACTION).unwrap());
+    s.max_depth = 1;
+    s
+}
+
 impl Env {
     pub async fn call(&self, tool: &str, args: Value) -> CallOutcome {
+        self.call_as(&self.handle, tool, args).await
+    }
+
+    pub async fn call_as(&self, handle: &str, tool: &str, args: Value) -> CallOutcome {
         self.guard
-            .call(&self.handle, tool, args, CallMeta::default())
+            .call(handle, tool, args, CallMeta::default())
             .await
     }
 

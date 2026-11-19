@@ -1,0 +1,142 @@
+{
+  "scenario": "G10",
+  "title": "Subagent escalation",
+  "spec": "MILESTONE_18 §8.3, §13.3",
+  "vector": "guard.delegate requesting broader actions, customers, limits, expiry, or depth than the parent grant; a child using authority it was not delegated",
+  "expected": "every widening delegation is rejected before any grant is created; the child handle cannot exceed its own grant or its parent's",
+  "grant": {
+    "tenant": "acme",
+    "delegator": {
+      "id": "acme-agent-operator",
+      "role": "agent-operator",
+      "attrs": {"refund_limit_cents": {"long": 5000}}
+    },
+    "run_id": "run-g10",
+    "actions": ["customer.read", "invoice.list", "refund.issue", "guard.delegate"],
+    "constraints": {
+      "customers": {"set": [
+        {"type": "Support::Customer", "id": "acme-cus-000"},
+        {"type": "Support::Customer", "id": "acme-cus-001"}
+      ]},
+      "max_refund_cents": {"at_most": 10000}
+    },
+    "ttl_seconds": 600,
+    "max_depth": 1
+  },
+  "steps": [
+    {
+      "name": "legit: delegate read and small refunds on one customer",
+      "as": "parent",
+      "tool": "guard.delegate",
+      "arguments": {
+        "actions": ["customer.read", "refund.issue"],
+        "constraints": [
+          {"name": "customers", "set": [{"type": "Support::Customer", "id": "acme-cus-000"}]},
+          {"name": "max_refund_cents", "at_most": 2000}
+        ],
+        "ttl_seconds": 300
+      },
+      "expect": "executed",
+      "bind_handle": "child"
+    },
+    {
+      "name": "legit: child reads its customer",
+      "as": "child",
+      "tool": "customer.read",
+      "arguments": {"customer_id": "acme-cus-000"},
+      "expect": "executed"
+    },
+    {
+      "name": "legit: child refunds within its limit",
+      "as": "child",
+      "tool": "refund.issue",
+      "arguments": {"invoice_id": "acme-inv-001", "amount_cents": 1000},
+      "expect": "executed"
+    },
+    {
+      "name": "broader actions",
+      "as": "parent",
+      "tool": "guard.delegate",
+      "arguments": {"actions": ["customer.read", "customer.export"], "ttl_seconds": 60},
+      "expect": "policy_deny"
+    },
+    {
+      "name": "broader customers",
+      "as": "parent",
+      "tool": "guard.delegate",
+      "arguments": {
+        "actions": ["customer.read"],
+        "constraints": [{"name": "customers", "set": [
+          {"type": "Support::Customer", "id": "acme-cus-000"},
+          {"type": "Support::Customer", "id": "acme-cus-002"}
+        ]}],
+        "ttl_seconds": 60
+      },
+      "expect": "policy_deny"
+    },
+    {
+      "name": "higher refund limit",
+      "as": "parent",
+      "tool": "guard.delegate",
+      "arguments": {
+        "actions": ["refund.issue"],
+        "constraints": [{"name": "max_refund_cents", "at_most": 20000}],
+        "ttl_seconds": 60
+      },
+      "expect": "policy_deny"
+    },
+    {
+      "name": "later expiry than the parent",
+      "as": "parent",
+      "tool": "guard.delegate",
+      "arguments": {"actions": ["customer.read"], "ttl_seconds": 3600},
+      "expect": "policy_deny"
+    },
+    {
+      "name": "depth not below the parent's",
+      "as": "parent",
+      "tool": "guard.delegate",
+      "arguments": {"actions": ["customer.read"], "ttl_seconds": 60, "max_depth": 1},
+      "expect": "policy_deny"
+    },
+    {
+      "name": "forged tenant field",
+      "as": "parent",
+      "tool": "guard.delegate",
+      "arguments": {"actions": ["customer.read"], "ttl_seconds": 60, "tenant": "globex"},
+      "expect": "invalid_arguments"
+    },
+    {
+      "name": "child re-delegates without guard.delegate",
+      "as": "child",
+      "tool": "guard.delegate",
+      "arguments": {"actions": ["customer.read"], "ttl_seconds": 60},
+      "expect": "action_not_granted"
+    },
+    {
+      "name": "child reads the parent's other customer",
+      "as": "child",
+      "tool": "customer.read",
+      "arguments": {"customer_id": "acme-cus-001"},
+      "expect": "policy_deny"
+    },
+    {
+      "name": "child refunds on the parent's other customer",
+      "as": "child",
+      "tool": "refund.issue",
+      "arguments": {"invoice_id": "acme-inv-002", "amount_cents": 500},
+      "expect": "policy_deny"
+    },
+    {
+      "name": "child lists invoices, an action only the parent holds",
+      "as": "child",
+      "tool": "invoice.list",
+      "arguments": {"customer_id": "acme-cus-000"},
+      "expect": "action_not_granted"
+    }
+  ],
+  "expected_ledger_effects": [
+    {"kind": "customer_read", "customer_id": "acme-cus-000"},
+    {"kind": "refund", "invoice_id": "acme-inv-001", "amount_cents": 1000}
+  ]
+}
