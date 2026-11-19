@@ -56,6 +56,14 @@ impl ActionDigest {
     }
 }
 
+/// Hex SHA-256 of the canonical JSON of `args` (the encoding documented on
+/// [`ActionDigest::compute`]): the audit `args_digest`.
+pub(crate) fn args_digest_hex(args: &ValidatedArgs) -> String {
+    let mut json = String::new();
+    canonical_json(args.as_json(), &mut json);
+    hex::encode(Sha256::digest(json.as_bytes()))
+}
+
 fn canonical_json(v: &serde_json::Value, out: &mut String) {
     use serde_json::Value;
     match v {

@@ -1,8 +1,10 @@
 # Crom Guard core types
 
-`crates/crom-guard` (#347) defines the types and traits the rest of M18 builds on. The architecture is in [ADR 0002](../security/decisions/0002-guard-architecture.md), and the policy model is in [ADR 0003](../security/decisions/0003-guard-policy-engine.md). The spec is [MILESTONE_18](../milestones/MILESTONE_18.md) §8–§10 and §12. Run `cargo doc -p crom-guard --open` for the full API. The Cedar policy decision point (#349) is described in [policies.md](policies.md).
+`crates/crom-guard` (#347) defines the types and traits the rest of M18 builds on. The architecture is in [ADR 0002](../security/decisions/0002-guard-architecture.md), and the policy model is in [ADR 0003](../security/decisions/0003-guard-policy-engine.md). The spec is [MILESTONE_18](../milestones/MILESTONE_18.md) §8–§10 and §12. Run `cargo doc -p crom-guard --open` for the full API. The Cedar policy decision point (#349) is described in [policies.md](policies.md). The enforcement pipeline (`Guard::call`) and the operation registry (#351) are described in [pipeline.md](pipeline.md).
 
 This PR freezes the public API. Signature changes after it merges need owner approval.
+
+Pipeline (#351): `authenticate → normalize + validate → resolve → authorize (whole chain) → bind → decision record → recheck → execute → outcome record`. Any failure before execution denies, and a failed decision-record write denies too.
 
 ## Where authority lives
 
@@ -38,6 +40,8 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | pdp | `CedarPdp`, `Evaluation`, `GrantEvaluation`, `PdpLoadError` | The Cedar PDP (#349): load-time checks, per-grant evaluation, the approval probe, and `ActionDigest::compute`. See [policies.md](policies.md) |
 | resolution | `TimeoutResolver`, `ResolveTimer`; `From<ResolveError> for DenyReason` | Bounds a resolver by a host-supplied timer. A timeout returns `ResolveError::Unavailable`, which maps to `engine_unavailable`. `NotFound` maps to `resource_not_found` (#350) |
 | executor | `ConditionalCall` | The version-condition contract for executors. See [protected-operations.md](protected-operations.md) (#350) |
+| pipeline | `Guard`, `CallMeta`, `CallOutcome`, `CallResult`, `ApprovalVerifier`, `NoApprovals` | MILESTONE_18 §10.2 steps 1–8 with the audit and recheck ordering. Agents see only stable codes. See [pipeline.md](pipeline.md) (#351) |
+| registry | `OperationRegistry`, `RegistryError`, `ToolInfo`, `RESERVED_ACTION_PREFIX`, `MAX_ARGUMENT_BYTES` | One exact tool name per action. Schemas must be closed objects (`additionalProperties: false`) and are compiled at registration (#351) |
 
 ## Traits
 
@@ -49,6 +53,7 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | `ProtectedOperation` | no | app code; reference: `crom_guard_testkit::support_ops` (#350, #356) | One `ActionId` per MCP tool. Provides the input schema, resolver, Cedar context, and `execute(AuthorizedAction, CredentialLease)`. Executors follow `ConditionalCall` |
 | `CredentialBroker` | no | `FileCredentialBroker`, `EnvCredentialBroker` ([credentials.md](credentials.md)) | Async. Hands out leases. The agent never receives one |
 | `AuditSink` | no | #352 (`ChainedAuditSink` / `FileAuditSink`) | Async. `append` must be durable before it resolves. On `Err`, nothing executes |
+| `ApprovalVerifier` | yes | `NoApprovals` (default); the approval store (#354) | Async. Matches a presented approval to the request's action digest. See [pipeline.md](pipeline.md) |
 
 Sealed traits produce authority, so implementations outside this crate are rejected at compile time.
 
@@ -73,8 +78,9 @@ Sealed traits produce authority, so implementations outside this crate are rejec
 ## Tests
 
 ```sh
-cargo test -p crom-guard          # unit tests, compile_fail doctests, tests/audit.rs (tamper, durability, schema)
-cargo test -p crom-guard-testkit  # business API, ledger, support_ops resolvers and executors
+cargo test -p crom-guard          # unit tests, compile_fail doctests, tests/audit.rs, tests/pipeline.rs
+cargo test -p crom-guard-testkit  # business API, ledger, support_ops, end-to-end pipeline, credential canary
+cargo run -p crom-guard --example embedded  # in-process Guard
 cargo test -p crom-guard-server   # `crom-guard audit verify` CLI
 scripts/check-guard-deps.sh       # no other crom-* dependency
 # PDP latency on the support set (release build, prints p50/p95/p99)

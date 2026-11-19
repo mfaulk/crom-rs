@@ -59,7 +59,7 @@ M18 provides only the in-memory store. Restarting Guard invalidates every grant 
 The store doesn't enforce these, so the issues that use it must:
 
 - **#353:** only a grant whose `actions` include the delegate operation may call `delegate`. The store checks only `max_depth`.
-- **#351:** take `now` from a trusted `Clock`, never from the request. If the wall clock is set back, expired grants come back to life (revoked ones stay revoked).
+- **#351 (done):** `Guard` takes `now` from its injected `Clock`, never from the request ([pipeline.md](pipeline.md)). If the wall clock is set back, expired grants come back to life (revoked ones stay revoked).
 - **#349:** evaluate every grant in the chain on its own. A child may add constraints its parent lacks, which narrows authority only if no policy treats a missing constraint as permissive.
 
 Handle secrets are not zeroized in memory; that is a follow-up.

@@ -58,4 +58,4 @@ For containers. `EnvCredentialBroker::from_env(vec![EnvCredential { id, var, act
 - rotation, including a failed reload keeping the last good table;
 - the environment broker's leasing, rotation and missing-variable error.
 
-The wrong-owner check is not tested, because creating a file owned by another uid needs root. The pipeline (#351) will extend the canary scan to `CallOutcome`, audit records and `tracing` output.
+The wrong-owner check is not tested, because creating a file owned by another uid needs root. The pipeline (#351) extends the canary scan to `CallOutcome`, audit records, ledger entries and `tracing` output end to end: `crates/crom-guard-testkit/tests/canary.rs`.

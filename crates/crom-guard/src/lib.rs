@@ -24,6 +24,8 @@ mod grant;
 mod handle;
 mod ids;
 mod pdp;
+mod pipeline;
+mod registry;
 mod resolution;
 mod resource;
 mod store;
@@ -63,6 +65,13 @@ pub use ids::{
 pub use pdp::{
     CedarPdp, Evaluation, GrantEvaluation, PdpLoadError, ACTION_DIGEST_DOMAIN,
     APPROVAL_PLACEHOLDER_ID, MAX_POLICY_SOURCE_BYTES,
+};
+pub use pipeline::{
+    ApprovalVerifier, CallMeta, CallOutcome, CallResult, Guard, NoApprovals, EXECUTION_FAILED,
+    MAX_CLIENT_INFO_BYTES, MAX_CORRELATION_LEN, PRECONDITION_FAILED,
+};
+pub use registry::{
+    OperationRegistry, RegistryError, ToolInfo, MAX_ARGUMENT_BYTES, RESERVED_ACTION_PREFIX,
 };
 pub use resolution::{ResolveTimer, TimeoutResolver};
 pub use resource::{ResolvedResource, ResourceVersion};

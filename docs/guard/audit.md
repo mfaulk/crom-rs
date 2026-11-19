@@ -76,7 +76,7 @@ Appends go through a mutex, so `seq` is strictly increasing with no gaps. The wr
 - **Restart.** `open` re-verifies the log. A torn trailing line left by the failed write makes `open` fail. Guard then stays down until an operator inspects the log.
 - **Recovery.** Use `audit verify`, which names the line, then truncate the file to the last complete line. This is deliberate: silently dropping the fragment would also hide a byte-level truncation. That record was never acknowledged, so no executor ran on it.
 
-**Logging rules.** Records hold only what `AuditRecord` allows: an args digest, the per-operation allowlisted args, and agent-supplied values kept apart under `untrusted`. As a last line of defense, the sink refuses any record whose encoded line contains a plaintext session handle (`gsh_` followed by 64 hex digits). Such a record returns `AuditError::Unavailable`, nothing is written, and the sink keeps working. Keeping credentials out of `args_logged` is the pipeline's job (#351), so credential-canary tests belong there.
+**Logging rules.** Records hold only what `AuditRecord` allows: an args digest, the per-operation allowlisted args, and agent-supplied values kept apart under `untrusted`. As a last line of defense, the sink refuses any record whose encoded line contains a plaintext session handle (`gsh_` followed by 64 hex digits). Such a record returns `AuditError::Unavailable`, nothing is written, and the sink keeps working. Keeping credentials out of `args_logged` is the pipeline's job (#351); its credential-canary test is `crates/crom-guard-testkit/tests/canary.rs` ([pipeline.md](pipeline.md)).
 
 ## Ledger correlation
 

@@ -776,6 +776,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror",
+ "tracing",
  "zeroize",
 ]
 
@@ -801,6 +802,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
