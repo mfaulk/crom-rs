@@ -3,7 +3,7 @@ use std::fmt;
 use crate::context::{ExecutionContext, TrustedPrincipal};
 use crate::decision::Decision;
 use crate::grant::Delegator;
-use crate::ids::{ActionId, ApprovalId, DecisionId};
+use crate::ids::{ActionId, ApprovalId, DecisionId, TenantId};
 use crate::resource::{ResolvedResource, ResourceVersion};
 use crate::value::{Attrs, EntityUid};
 
@@ -70,14 +70,16 @@ impl AuthorizationContext {
 /// [`MemoryApprovalStore`](crate::MemoryApprovalStore) builds it; the
 /// approver comes from the trusted application's admin call.
 ///
-/// The approver has no tenant here, so the PDP gives it the principal's
-/// tenant. The store rejects an approver from another tenant before
-/// building this value; the Cedar tenant test is defense in depth.
+/// The PDP gives the approver the principal's tenant. The store rejects an
+/// approver from another tenant before building this value, so
+/// `approver_tenant` (the stored one, for audit) always equals it; the
+/// Cedar tenant test is defense in depth.
 ///
 /// ```compile_fail
 /// let a = crom_guard::ApprovalContext {
 ///     approval_id: "ap1".parse().unwrap(),
 ///     approver: todo!(),
+///     approver_tenant: "acme".parse().unwrap(),
 ///     fields: Default::default(),
 /// };
 /// ```
@@ -85,15 +87,22 @@ impl AuthorizationContext {
 pub struct ApprovalContext {
     approval_id: ApprovalId,
     approver: Delegator,
+    approver_tenant: TenantId,
     /// Approved values, e.g. `amount_cents`.
     fields: Attrs,
 }
 
 impl ApprovalContext {
-    pub(crate) fn new(approval_id: ApprovalId, approver: Delegator, fields: Attrs) -> Self {
+    pub(crate) fn new(
+        approval_id: ApprovalId,
+        approver: Delegator,
+        approver_tenant: TenantId,
+        fields: Attrs,
+    ) -> Self {
         Self {
             approval_id,
             approver,
+            approver_tenant,
             fields,
         }
     }
@@ -102,6 +111,9 @@ impl ApprovalContext {
     }
     pub fn approver(&self) -> &Delegator {
         &self.approver
+    }
+    pub fn approver_tenant(&self) -> &TenantId {
+        &self.approver_tenant
     }
     pub fn fields(&self) -> &Attrs {
         &self.fields

@@ -49,8 +49,8 @@ pub use audit::{
     ChainedAuditSink, FileAuditSink, VerifyError, VerifyErrorKind, GENESIS_HASH,
 };
 pub use audit::{
-    AuditError, AuditIdentity, AuditReceipt, AuditRecord, AuditSink, DecisionKind, Durations,
-    Enforcement, Outcome, RecordKind, UntrustedCorrelation, AUDIT_FORMAT,
+    AuditApprover, AuditError, AuditIdentity, AuditReceipt, AuditRecord, AuditSink, DecisionKind,
+    Durations, Enforcement, Outcome, RecordKind, UntrustedCorrelation, AUDIT_FORMAT,
 };
 pub use context::{ChainError, ExecutionContext, TrustedPrincipal};
 pub use credential::{

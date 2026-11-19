@@ -18,7 +18,7 @@ Only three kinds of value carry authority, and only `crom-guard` can construct t
 
 All of `ValidatedArgs`, `AuthorizationRequest` and `ApprovalContext` are crate-built too. So resolvers, the policy decision point (PDP) and executors only ever see schema-validated input and approvals that matched.
 
-**Approver tenant.** `ApprovalContext` has no approver tenant, so the PDP gives the approver the principal's tenant. `MemoryApprovalStore` (#354) rejects approvers from another tenant before it builds an `ApprovalContext` (see [approvals.md](approvals.md)). The `approver.tenant == principal.tenant` test in the Cedar policies is defense in depth only (see [policies.md](policies.md)).
+**Approver tenant.** The PDP gives the approver the principal's tenant. `ApprovalContext` carries the stored approver tenant only for the audit record's `approver` (#402). `MemoryApprovalStore` (#354) rejects approvers from another tenant before it builds an `ApprovalContext` (see [approvals.md](approvals.md)). The `approver.tenant == principal.tenant` test in the Cedar policies is defense in depth only (see [policies.md](policies.md)).
 
 Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are publicly constructible, and `Grant` can be deserialized so the store can persist it. None of them authorizes anything by itself.
 

@@ -99,6 +99,17 @@
     "policy_set_hash": { "type": ["string", "null"] },
     "schema_hash": { "type": ["string", "null"] },
     "approval_id": { "$ref": "#/$defs/optional_id" },
+    "approver": {
+      "description": "Optional; present only with approval_id, and omitted (never null) otherwise. Copied from the approval store's record of the trusted admin call, not from agent input.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "tenant"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "role": { "type": "string" },
+        "tenant": { "$ref": "#/$defs/id" }
+      }
+    },
     "enforcement": {
       "enum": [
         null, "guard_session", "guard_validation", "guard_policy", "guard_chain",

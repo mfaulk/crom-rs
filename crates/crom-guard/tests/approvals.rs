@@ -335,10 +335,19 @@ impl Fixture {
         assert_eq!(d.reason, Some(DenyReason::ApprovalInvalid));
         assert_eq!(d.enforcement, Some(Enforcement::GuardApproval));
         assert_eq!(d.approval_id, None);
+        assert_eq!(d.approver, None);
     }
 }
 
-/// A stored approval for exactly the digested request executes it once, and the audit decision record carries the approval id.
+fn audit_approver(id: &str, role: &str) -> AuditApprover {
+    AuditApprover {
+        id: UserId::new(id).unwrap(),
+        role: role.into(),
+        tenant: TenantId::new("acme").unwrap(),
+    }
+}
+
+/// A stored approval for exactly the digested request executes it once, and the audit decision and outcome records carry the approval id and the stored approver.
 #[test]
 fn valid_approval_allows_once() {
     let f = fixture();
@@ -350,6 +359,18 @@ fn valid_approval_allows_once() {
     let d = f.decision_record(&out);
     assert_eq!(d.decision, Some(DecisionKind::Allow));
     assert_eq!(d.approval_id.as_ref(), Some(&id));
+    let approver = audit_approver("acme-supervisor", "supervisor");
+    assert_eq!(d.approver.as_ref(), Some(&approver));
+    let records = f.sink.0.lock().unwrap().clone();
+    let o = records
+        .iter()
+        .find(|r| r.decision_id == out.decision_id && r.record == RecordKind::Outcome)
+        .expect("outcome record");
+    assert_eq!(o.approver.as_ref(), Some(&approver));
+    // Only id, role, and tenant: no Delegator attrs and no store internals.
+    let json = serde_json::to_string(&records).unwrap();
+    assert!(!json.contains("refund_limit_cents"), "{json}");
+    assert!(!json.contains("expires_at") && !json.contains("action_digest"));
     assert_eq!(
         f.approvals.status(&app(), &id, f.clock.now()),
         Some(ApprovalStatus::Used)
@@ -477,7 +498,20 @@ fn other_issuer_cannot_see_or_approve() {
     assert!(!f.call(refund("acme-inv-001", BIG), with_id(&id)).is_error());
 }
 
-/// Cedar sees the stored approver: an approval by a non-supervisor matches the digest but Cedar denies, and the approval is consumed anyway.
+/// A call that needs approval and presents none records neither an approval id nor an approver.
+#[test]
+fn approval_required_records_no_approver() {
+    let f = fixture();
+    let d = f.required(refund("acme-inv-001", BIG));
+    let records = f.sink.0.lock().unwrap().clone();
+    let r = records.last().expect("decision record");
+    assert_eq!(r.decision, Some(DecisionKind::ApprovalRequired));
+    assert_eq!(r.approval_id, None);
+    assert_eq!(r.approver, None);
+    assert!(f.approvals.pending(&app(), &d, f.clock.now()).is_some());
+}
+
+/// Cedar sees the stored approver: an approval by a non-supervisor matches the digest but Cedar denies, the approval is consumed anyway, and audit names that approver.
 #[test]
 fn stored_approver_role_reaches_cedar_and_deny_burns_approval() {
     let f = fixture();
@@ -489,7 +523,9 @@ fn stored_approver_role_reaches_cedar_and_deny_burns_approval() {
     });
     let out = f.call(refund("acme-inv-001", BIG), with_id(&id));
     assert_eq!(out.code(), Some("policy_deny"), "{out:?}");
-    assert_eq!(f.decision_record(&out).approval_id.as_ref(), Some(&id));
+    let rec = f.decision_record(&out);
+    assert_eq!(rec.approval_id.as_ref(), Some(&id));
+    assert_eq!(rec.approver, Some(audit_approver("acme-clerk", "clerk")));
     assert_eq!(f.executed(), 0);
     assert_eq!(
         f.approvals.status(&app(), &id, f.clock.now()),

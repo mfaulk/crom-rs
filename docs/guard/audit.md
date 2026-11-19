@@ -15,7 +15,7 @@ One record per line, UTF-8, terminated by `\n`. Each line is one JSON object, wr
 - `format` is always `guard-audit/v1`.
 - `seq` is 1 for the first record and goes up by exactly 1 per line.
 - `prev_hash` is the previous line's `hash`. For `seq` 1 it is `GENESIS_HASH`, 64 `0`s.
-- `<AuditRecord members>` are the fields of `crom_guard::AuditRecord` (§12.1), in declaration order. Every field is present; absent values are `null`. Identity fields are nested under `identity`, not flat. `reason` is `{"reason":"<code>"}`, or `{"reason":"chain_deny","grant_id":..}` for a chain deny.
+- `<AuditRecord members>` are the fields of `crom_guard::AuditRecord` (§12.1), in declaration order. Every field is present, and absent values are `null`, except `approver`, which is omitted when absent ([Approver](#approver)). Identity fields are nested under `identity`, not flat. `reason` is `{"reason":"<code>"}`, or `{"reason":"chain_deny","grant_id":..}` for a chain deny.
 - `hash` is always the last member.
 
 All hex is lowercase.
@@ -77,6 +77,18 @@ Appends go through a mutex, so `seq` is strictly increasing with no gaps. The wr
 - **Recovery.** Use `audit verify`, which names the line, then truncate the file to the last complete line. This is deliberate: silently dropping the fragment would also hide a byte-level truncation. That record was never acknowledged, so no executor ran on it.
 
 **Logging rules.** Records hold only what `AuditRecord` allows: an args digest, the per-operation allowlisted args, and agent-supplied values kept apart under `untrusted`. As a last line of defense, the sink refuses any record whose encoded line contains a plaintext session handle (`gsh_` followed by 64 hex digits). Such a record returns `AuditError::Unavailable`, nothing is written, and the sink keeps working. Keeping credentials out of `args_logged` is the pipeline's job (#351); its credential-canary test is `crates/crom-guard-testkit/tests/canary.rs` ([pipeline.md](pipeline.md)).
+
+## Approver
+
+`approver` (#402) is an optional `guard-audit/v1` member, written right after `approval_id`:
+
+```
+..,"approval_id":"ap_…","approver":{"id":"<user id>","role":"<role>","tenant":"<tenant id>"},"enforcement":..
+```
+
+- **When.** Present exactly when `approval_id` is: a presented approval matched in `verify`. That is the decision record and, if it executed, the outcome record. A matched approval is consumed before Cedar, so a later deny's record names the approver too.
+- **Source.** `AuditApprover` is copied from the approval store's record of the trusted admin call (`ApprovalSpec::approver` id and role, and `approver_tenant`), never from agent input. It has exactly these three members: no `Delegator` attrs and no store internals ([approvals.md](approvals.md#audit)).
+- **Compatibility.** The member is omitted, not `null`, when absent. Records without it keep the bytes and hashes they had before #402, so older logs verify unchanged (`pre_approver_log_still_verifies` and `records_without_approver_encode_unchanged`, against `crates/crom-guard/tests/fixtures/guard-audit-v1-pre-approver.jsonl`). `"approver":null`, a missing member, or an extra member is a `Schema` error. A verifier older than #402 rejects records that carry an approver as an unknown member.
 
 ## Ledger correlation
 

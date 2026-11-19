@@ -84,6 +84,26 @@ impl From<&crate::TrustedPrincipal> for AuditIdentity {
     }
 }
 
+/// Who approved, copied from the approval store's record of the trusted
+/// admin call (#402). Deliberately omits the approver's other Cedar
+/// attributes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditApprover {
+    pub id: UserId,
+    pub role: String,
+    pub tenant: TenantId,
+}
+
+impl From<&crate::ApprovalContext> for AuditApprover {
+    fn from(a: &crate::ApprovalContext) -> Self {
+        Self {
+            id: a.approver().id().clone(),
+            role: a.approver().role().to_owned(),
+            tenant: a.approver_tenant().clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Durations {
     pub policy_us: Option<u64>,
@@ -126,6 +146,11 @@ pub struct AuditRecord {
     pub policy_set_hash: Option<String>,
     pub schema_hash: Option<String>,
     pub approval_id: Option<ApprovalId>,
+    /// Set with `approval_id`. The only member omitted when absent rather
+    /// than written as `null`, so records from before it existed (#402)
+    /// keep their bytes and hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<AuditApprover>,
     pub enforcement: Option<Enforcement>,
     pub outcome: Option<Outcome>,
     /// Business-API effect id, for ledger correlation.
@@ -152,6 +177,7 @@ impl AuditRecord {
             policy_set_hash: None,
             schema_hash: None,
             approval_id: None,
+            approver: None,
             enforcement: None,
             outcome: None,
             downstream_ref: None,
