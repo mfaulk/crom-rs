@@ -411,12 +411,15 @@ struct GenerateResponse {
 
 #[derive(Deserialize)]
 struct GeminiCandidate {
+    /// Omitted when generation stops early (e.g. `MAX_TOKENS` spent on
+    /// thoughts, `MALFORMED_FUNCTION_CALL`, `SAFETY`).
+    #[serde(default)]
     content: GeminiCandidateContent,
     #[serde(default, rename = "finishReason")]
     finish_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct GeminiCandidateContent {
     #[serde(default)]
     parts: Vec<GeminiCandidatePart>,
@@ -698,6 +701,48 @@ mod tests {
             Err(ProviderError::Auth(_)) => {}
             Err(other) => panic!("expected Auth error, got: {other:?}"),
             Ok(_) => panic!("expected Err(Auth), got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    // A candidate without `content` (early stop) still yields MessageStop with its finish reason and usage.
+    async fn candidate_without_content_keeps_stop_reason_and_usage() {
+        let body = r#"{
+            "candidates":[{"finishReason":"MAX_TOKENS","index":0}],
+            "usageMetadata":{"promptTokenCount":120,"thoughtsTokenCount":8}
+        }"#;
+        let transport = Arc::new(MockTransport {
+            gen_response: Some(TransportResponse::new(200, body)),
+            ..Default::default()
+        });
+        let provider = GeminiProvider::new(
+            GeminiConfig::default(),
+            transport,
+            Arc::new(|| cred("AI-1")),
+        );
+        let req = ModelRequest {
+            model: "gemini-2.5-flash".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: vec![],
+            deferred_tools: vec![],
+            tool_search_config: None,
+            max_tokens: 8,
+        };
+        let events: Vec<_> = provider
+            .stream_turn(req)
+            .await
+            .expect("response without content must parse")
+            .collect()
+            .await;
+        match events.last() {
+            Some(Ok(ModelEvent::MessageStop { stop_reason, usage })) => {
+                assert_eq!(stop_reason.as_deref(), Some("MAX_TOKENS"));
+                let usage = usage.as_ref().expect("usage reported");
+                assert_eq!(usage.input_tokens, Some(120));
+                assert_eq!(usage.output_tokens, Some(8));
+            }
+            other => panic!("expected MessageStop, got {other:?}"),
         }
     }
 
