@@ -67,7 +67,8 @@ Several important pieces are not built yet:
   [issues](https://github.com/mfaulk/crom-rs/milestone/2)). The architecture
   is proposed in [ADR 0002](docs/security/decisions/0002-guard-architecture.md);
   `crates/crom-guard` and `crates/crom-guard-server` are empty skeletons so
-  far.
+  far; `crates/crom-guard-testkit` provides the controlled business API and
+  effect ledger the M18 tests measure against.
 - **The sandbox is opt-in and Linux-only.** `sandbox.mode` defaults to `off`.
   It covers agent shell commands, not MCP servers or validation commands.
   Other platforms refuse sandboxed commands rather than run them unprotected.
