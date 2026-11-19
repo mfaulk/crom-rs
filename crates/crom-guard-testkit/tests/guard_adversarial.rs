@@ -58,6 +58,10 @@ const PYTHON_AGENT: &str = concat!(
     "/tests/python/scenario_agent.py"
 );
 
+/// Set in CI: a missing `python3` fails the run instead of skipping the
+/// Python client lane.
+const REQUIRE_PYTHON_CLIENT: &str = "CROM_REQUIRE_PYTHON_CLIENT_TESTS";
+
 fn python() -> Option<&'static str> {
     let ok = std::process::Command::new("python3")
         .args(["-c", "import sys; sys.exit(sys.version_info < (3, 10))"])
@@ -522,6 +526,9 @@ fn catalog_covers_g1_to_g18() {
 async fn scenarios_execute_nothing_with_guard_and_something_without() {
     let py = python();
     if py.is_none() {
+        if std::env::var_os(REQUIRE_PYTHON_CLIENT).is_some() {
+            panic!("python3 >= 3.10 not found, and {REQUIRE_PYTHON_CLIENT} is set");
+        }
         eprintln!("SKIP python client lane: python3 >= 3.10 not found");
     }
     let mut reports = Vec::new();

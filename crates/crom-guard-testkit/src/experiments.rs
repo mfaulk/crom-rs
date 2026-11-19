@@ -390,6 +390,9 @@ pub fn decision_sequence(records: &[AuditRecord]) -> Vec<DecisionView> {
 pub struct ProviderReplay {
     pub provider: String,
     pub model: String,
+    /// The tool-call encoding on the wire. OpenAI and DeepSeek share
+    /// chat completions, so four profiles cover three formats.
+    pub wire_format: String,
     /// The transcript under `fixtures/experiments/e4a/`.
     pub transcript: String,
     /// `synthetic` or `recorded`, from the transcript.

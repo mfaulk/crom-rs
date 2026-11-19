@@ -245,25 +245,21 @@ async fn e5_latency() {
 
     let inproc = InProcessEnv::start().await;
     let h = inproc.issue("parent", &grant).await.unwrap();
+    let mut policy = Vec::new();
     for (op, tool, args, want, _) in &ops {
-        let s = measure(&inproc, &h, tool, args, want, warmup, iters).await;
+        measure(&inproc, &h, tool, args, want, 0, warmup).await;
+        // Policy time comes from the decision records this operation's timed
+        // calls appended, and from no other operation's.
+        let start = inproc.audit().unwrap().records.len();
+        let s = measure(&inproc, &h, tool, args, want, 0, iters).await;
         push(op, "guard_in_process", want, &s);
+        let p = policy_samples_ns(&inproc.audit().unwrap().records[start..], tool);
+        assert_eq!(p.len(), iters, "one decision record per timed {op} call");
+        policy.push((op, want, p));
     }
-    let records = inproc.audit().unwrap();
-    assert!(records.verified.is_ok());
-    for (op, tool, _, want, _) in &ops {
-        // The last `iters` decisions for this action are the timed calls.
-        let mut s = policy_samples_ns(&records.records, tool);
-        let ours = ops.iter().filter(|o| o.1 == *tool).count();
-        let per_op = s.len() / ours;
-        let idx = ops
-            .iter()
-            .filter(|o| o.1 == *tool)
-            .position(|o| o.0 == *op)
-            .unwrap();
-        s = s[idx * per_op..(idx + 1) * per_op].to_vec();
-        let s = s[s.len() - iters..].to_vec();
-        push(op, "policy_only", want, &s);
+    assert!(inproc.audit().unwrap().verified.is_ok());
+    for (op, want, p) in policy {
+        push(op, "policy_only", want, &p);
     }
 
     let http = HttpEnv::start().await;
@@ -307,11 +303,13 @@ async fn e5_latency() {
 const E4A_FORMAT: &str = "crom-conformance-transcript/v1";
 const E4A_KEY: &str = "e4a-replay-key";
 /// (profile, model), as in the provider-conformance suite.
-const E4A_PROFILES: [(&str, &str); 4] = [
-    ("anthropic", "claude-sonnet-4-6"),
-    ("openai", "gpt-4.1"),
-    ("deepseek", "deepseek-chat"),
-    ("gemini", "gemini-2.5-pro"),
+/// Profile, model, and wire format (OpenAI and DeepSeek share chat
+/// completions: four profiles, three formats).
+const E4A_PROFILES: [(&str, &str, &str); 4] = [
+    ("anthropic", "claude-sonnet-4-6", "anthropic-messages"),
+    ("openai", "gpt-4.1", "openai-chat-completions"),
+    ("deepseek", "deepseek-chat", "openai-chat-completions"),
+    ("gemini", "gemini-2.5-pro", "gemini-generate-content"),
 ];
 
 /// The E4a grant: the E5 grant under its own run id.
@@ -639,13 +637,14 @@ async fn e4a_provider_replay() {
     assert_eq!(reference.len(), e4a_calls().len());
 
     let mut providers = Vec::new();
-    for (profile, model) in E4A_PROFILES {
+    for (profile, model, wire_format) in E4A_PROFILES {
         let t = load_transcript(profile, model);
         let r = replay_through_crom(&t).await;
         let decisions = decision_sequence(&r.audit.records);
         providers.push(ProviderReplay {
             provider: profile.into(),
             model: t.model.clone(),
+            wire_format: wire_format.into(),
             transcript: format!("fixtures/experiments/e4a/{profile}.json"),
             source: t.source.clone(),
             requests_served: r.served,
@@ -683,7 +682,7 @@ async fn e4a_provider_replay() {
 /// Each committed synthetic E4a transcript is exactly what the provider-neutral call script renders; a `recorded` transcript is exempt.
 #[test]
 fn e4a_transcripts_match_the_script() {
-    for (profile, model) in E4A_PROFILES {
+    for (profile, model, _) in E4A_PROFILES {
         let text = std::fs::read_to_string(transcript_path(profile)).unwrap();
         let committed: Value = serde_json::from_str(&text).unwrap();
         if committed["source"] == "recorded" {
