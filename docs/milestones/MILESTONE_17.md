@@ -1,6 +1,6 @@
 # Milestone 17 — Measurable Agent Capability and Secure Execution
 
-**Status:** in progress (infrastructure merged; live runs and #297 baseline pending) · **GitHub milestone:**
+**Status:** in progress (infrastructure, live runs, and baseline report done; #297 human review of L4 patches pending) · **GitHub milestone:**
 [M17 — Measurable Agent Capability and Secure Execution](https://github.com/mfaulk/crom-rs/milestone/1)
 
 **Theme:** Stop measuring progress by features shipped. Establish Crom as a
@@ -660,25 +660,25 @@ Related, not in M17:
 
 **Infrastructure completion targets (all required):**
 
-- [ ] All required CI jobs (§7, M17.0) green on `main`; rename landed.
+- [x] All required CI jobs (§7, M17.0) green on `main`; rename landed.
 - [x] `provider-conformance` completes on Anthropic, OpenAI, and DeepSeek
   through the headless SDK. Failures are classified. The offline variant runs
   in PR CI.
-- [ ] Usage is recorded with unknown ≠ 0. Nominal cost comes from versioned
+- [x] Usage is recorded with unknown ≠ 0. Nominal cost comes from versioned
   pricing. Token, cost, and run spend budgets are enforced.
-- [ ] Task schema v3. ≥10 L1, ≥10 L2, and ≥10 L3 capability tasks pass
+- [x] Task schema v3. ≥10 L1, ≥10 L2, and ≥10 L3 capability tasks pass
   `validate-task`. Harness tasks are reported separately.
-- [ ] ≥5 frozen L4 tasks, with selection recorded before the first baseline
+- [x] ≥5 frozen L4 tasks, with selection recorded before the first baseline
   run.
-- [ ] The Linux sandbox enforces §11 properties 1–7, with tests in the PR CI
+- [x] The Linux sandbox enforces §11 properties 1–7, with tests in the PR CI
   security lane. Other platforms fail closed.
-- [ ] S1 gaps from §3.4 are closed, with regression tests.
-- [ ] ≥8 adversarial scenarios. The scripted lane reports `executed = 0`
+- [x] S1 gaps from §3.4 are closed, with regression tests.
+- [x] ≥8 adversarial scenarios. The scripted lane reports `executed = 0`
   with the sandbox on, and `executed > 0` with it off for the
   sandbox-relevant scenarios.
-- [ ] Result schema v2, `scoreboard`, and paired `compare`/`regressions` ship
+- [x] Result schema v2, `scoreboard`, and paired `compare`/`regressions` ship
   with text, Markdown, and JSON output.
-- [ ] CI lanes exist; no implicit paid usage.
+- [x] CI lanes exist; no implicit paid usage.
 
 **Capability measurements (recorded, no threshold):**
 
@@ -686,6 +686,8 @@ Related, not in M17:
   the security suite, on one low-cost and one high-capability model. It
   includes cost per resolved task and failure taxonomy, and records human
   review separately from automated verification.
+  Published; human review of L4 patches pending, and the security suite has
+  no live run (scripted lane only, #382).
 
 **Long-term goals (inform M18, not gates):** higher L2/L3 resolve rates, lower
 cost per solve, and `executed = 0` maintained under a broader adversarial
@@ -771,7 +773,7 @@ filled by an opt-in `Eval (live smoke)` dispatch (`eval-live.yml`) with
 | `anthropic` | `claude-sonnet-4-6` | 6/6 resolved | 2/6 resolved, 1 errored, 3 skipped ([run 43956910916](https://github.com/mfaulk/crom-rs/actions/runs/43956910916), $0.062); after #336: 6/6 resolved ([run 43959506643](https://github.com/mfaulk/crom-rs/actions/runs/43959506643), $0.207) | first run: `conf-long-output` **Crom** bug (see below), 3 skipped as a consequence; re-run: none |
 | `openai` | `gpt-4.1` | 6/6 resolved | 6/6 resolved ([run 43957425729](https://github.com/mfaulk/crom-rs/actions/runs/43957425729), $0.058) | — |
 | `deepseek` | `deepseek-flash` | 6/6 resolved | 6/6 resolved ([run 43956919752](https://github.com/mfaulk/crom-rs/actions/runs/43956919752), $0.004) | — |
-| `gemini` | `gemini-2.5-pro` | 6/6 resolved | _pending_ (not required by #284) | — |
+| `gemini` | `gemini-2.5-pro` (offline), `gemini-2.5-flash` (live) | 6/6 resolved | HTTP 402 before funding ([run 43961262604](https://github.com/mfaulk/crom-rs/actions/runs/43961262604)); 2/6, 1 errored, 3 skipped ([run 44435512883](https://github.com/mfaulk/crom-rs/actions/runs/44435512883)); after #418: 5/6 resolved ([run 44553452314](https://github.com/mfaulk/crom-rs/actions/runs/44553452314), $0.007) | `conf-long-output`: **Crom** bug fixed in #418, then **Crom** agent-loop gap (#419) |
 
 Live runs on 2026-11-16, `max_run_cost_usd = 2` each. DeepSeek ran
 `deepseek-flash` because the profile default `deepseek-chat` has no entry in
@@ -793,6 +795,15 @@ Live runs on 2026-11-16, `max_run_cost_usd = 2` each. DeepSeek ran
   unknown, so `--max-run-cost-usd` could no longer be enforced and the
   remaining three tasks were skipped (fail-closed, as designed). Usage that
   `message_delta` did report is lost when a turn ends in an error.
+- **Gemini `conf-long-output` — Crom bug, fixed in #418.** Gemini omits
+  `content` on a candidate that stops early. The adapter required the field,
+  so the response failed to parse (`missing field content`), and the lost
+  usage skipped the remaining tasks as above.
+- **Gemini empty turn — open (#419).** After #418, the same task returned a
+  turn with no content, 0 output tokens, and no tool calls. The agent loop
+  accepted it as a final answer (`did_not_attempt`). The finish reason is not
+  recorded in events, so the cause (likely `MALFORMED_FUNCTION_CALL`) is
+  unconfirmed.
 
 ### Live baseline — #297
 
