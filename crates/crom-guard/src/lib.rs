@@ -41,7 +41,10 @@ pub use audit::{
     Enforcement, Outcome, RecordKind, UntrustedCorrelation, AUDIT_FORMAT,
 };
 pub use context::{ChainError, ExecutionContext, TrustedPrincipal};
-pub use credential::{BrokerError, CredentialBroker, CredentialLease};
+pub use credential::{
+    BrokerError, CredentialBroker, CredentialLease, CredentialLoadError, EnvCredential,
+    EnvCredentialBroker, FileCredentialBroker, MAX_CREDENTIALS_FILE_BYTES,
+};
 pub use decision::{ActionDigest, ApprovalRequirement, Decision, DenyReason};
 pub use error::GuardError;
 pub use grant::{
