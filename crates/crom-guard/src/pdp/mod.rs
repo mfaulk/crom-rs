@@ -679,7 +679,7 @@ impl<'a> Inputs<'a> {
             context: r.context().fields(),
             // `ApprovalContext` carries no approver tenant, so the Cedar
             // `approver.tenant == principal.tenant` test always holds here.
-            // #354 must reject cross-tenant approvers before building one.
+            // `MemoryApprovalStore` rejects cross-tenant approvers first.
             approval: r.approval().map(|a| ApprovalInput {
                 approver: a.approver(),
                 tenant: p.tenant(),
