@@ -163,6 +163,24 @@ L3 18/30 and L4 3/15 (Opus). An interrupted DeepSeek re-run (44373414333)
 stopped after 11 L3 attempts when the account ran out of credit (HTTP 402;
 classified as a billing error since #372).
 
+## Provider conformance
+
+`crom eval run --suite provider-conformance` (6 tasks, 1 repetition, sandbox
+`required`) via `eval-live.yml`, one run per provider profile:
+
+| Provider | Model | Commit | Workflow run | Resolved | Cost |
+|---|---|---|---|---|---|
+| `deepseek` | `deepseek-flash` | `ba8bcd5` | [43956919752](https://github.com/mfaulk/crom-rs/actions/runs/43956919752) | 6/6 | $0.0038 |
+| `openai` | `gpt-4.1` | `ba8bcd5` | [43957425729](https://github.com/mfaulk/crom-rs/actions/runs/43957425729) | 6/6 | $0.0582 |
+| `anthropic` | `claude-sonnet-4-6` | `ee8ceb2` | [43959506643](https://github.com/mfaulk/crom-rs/actions/runs/43959506643) | 6/6 | $0.2074 |
+| `gemini` | `gemini-2.5-flash` | `e50f4bd` | [44553452314](https://github.com/mfaulk/crom-rs/actions/runs/44553452314) | 5/6 | $0.0070 |
+
+- `conf-long-output` caused all three failed attempts:
+  - **Anthropic, first attempt** ([43956910916](https://github.com/mfaulk/crom-rs/actions/runs/43956910916), `ba8bcd5`): errored with unknown usage, so the spend cap skipped the 3 remaining tasks (#376).
+  - **Gemini, first attempt** ([44435512883](https://github.com/mfaulk/crom-rs/actions/runs/44435512883), `eaa61f6`): errored with `missing field content`. Gemini omits `content` on early-stopped candidates, and the adapter treated the field as required. Fixed in #418.
+  - **Gemini after #418:** returned an empty turn (0 output tokens, no tool calls), which the agent loop accepted as a final answer (`did_not_attempt`, #419).
+- The Gemini run on `eaa61f6` before that (43961262604) stopped on HTTP 402 (no prepaid credit).
+
 ## Security suite
 
 Not measured live. `crom eval run --suite adversarial` runs the fixtures
@@ -213,7 +231,10 @@ archive.
   differences are harness-only.
 - Costs are nominal list prices from `prices.toml`, not invoiced amounts.
 - The L4 corpus is 5 tasks; one task drives most of the L4 gap.
-- Gemini was not run: the account had no prepaid credit (HTTP 402); #283.
+- Gemini was measured on provider conformance only, not on L1–L4 (see
+  [Provider conformance](#provider-conformance)).
+- Conformance is one repetition per provider on 6 tasks, run across
+  different commits.
 - No live security measurement (see above; #382).
 
 ## Reproduce
@@ -225,7 +246,12 @@ $ gh workflow run eval-benchmark.yml --ref <commit> -f max_run_cost_usd=5 \
     -f targets=deepseek:deepseek-flash -f suites="l3 l4" -f repetitions=3
 $ gh workflow run eval-benchmark.yml --ref <commit> -f max_run_cost_usd=50 \
     -f targets=anthropic:claude-opus-5-5 -f suites="l3 l4" -f repetitions=3
+$ gh workflow run eval-live.yml --ref <commit> -f max_run_cost_usd=2 \
+    -f suite=provider-conformance -f provider=gemini -f model=gemini-2.5-flash
 ```
+
+Conformance results are not in the archive below. They are in each run's
+`eval-live-runs` artifact (kept until about 2027-02-14 to 2027-02-17).
 
 Locally, with a provider key set:
 
