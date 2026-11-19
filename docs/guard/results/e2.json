@@ -3,7 +3,7 @@
   "experiment": "E2",
   "title": "Guard on vs off",
   "meta": {
-    "commit": "9c41948de46858d6ce0b38cd87db311c94091d0a",
+    "commit": "e73ceab3f7d79292d24e3f15341d3f11bf8c07d8",
     "dirty": false,
     "policy_set_hash": "fb613aee4b6ba7b39e27aba7fc9b06ac1f864c2b44bacba8fd331ff04362d768",
     "schema_hash": "651db5dc9cb1bfab60c434df84dd9a8ae05a3bbae53aa228785393577a460405",
@@ -35,7 +35,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 4.164804999999999
+        "wall_ms": 4.241230000000001
       },
       {
         "scenario": "G1",
@@ -45,7 +45,7 @@
         "unauthorized_effects": 3,
         "legit_success": true,
         "ledger_entries": 4,
-        "wall_ms": 2.505503
+        "wall_ms": 2.504021
       },
       {
         "scenario": "G2",
@@ -55,7 +55,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 4.283669000000001
+        "wall_ms": 4.518534
       },
       {
         "scenario": "G2",
@@ -65,7 +65,7 @@
         "unauthorized_effects": 3,
         "legit_success": true,
         "ledger_entries": 4,
-        "wall_ms": 2.7145889999999997
+        "wall_ms": 2.838665
       },
       {
         "scenario": "G3",
@@ -75,7 +75,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 7.229948
+        "wall_ms": 9.232629
       },
       {
         "scenario": "G3",
@@ -85,7 +85,7 @@
         "unauthorized_effects": 3,
         "legit_success": true,
         "ledger_entries": 4,
-        "wall_ms": 2.184426
+        "wall_ms": 2.4498979999999997
       },
       {
         "scenario": "G4",
@@ -95,7 +95,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 3.268247
+        "wall_ms": 3.325326
       },
       {
         "scenario": "G4",
@@ -105,7 +105,7 @@
         "unauthorized_effects": 4,
         "legit_success": true,
         "ledger_entries": 5,
-        "wall_ms": 2.5903739999999997
+        "wall_ms": 2.679313
       },
       {
         "scenario": "G5",
@@ -115,7 +115,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 2.819157
+        "wall_ms": 2.914608
       },
       {
         "scenario": "G5",
@@ -125,7 +125,7 @@
         "unauthorized_effects": 2,
         "legit_success": true,
         "ledger_entries": 3,
-        "wall_ms": 1.707132
+        "wall_ms": 1.788125
       },
       {
         "scenario": "G6",
@@ -135,7 +135,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 5.0324979999999995
+        "wall_ms": 5.1069189999999995
       },
       {
         "scenario": "G6",
@@ -145,7 +145,7 @@
         "unauthorized_effects": 3,
         "legit_success": true,
         "ledger_entries": 4,
-        "wall_ms": 2.208982
+        "wall_ms": 2.3034510000000004
       },
       {
         "scenario": "G7",
@@ -155,7 +155,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 3.352156
+        "wall_ms": 3.3518559999999997
       },
       {
         "scenario": "G7",
@@ -165,7 +165,7 @@
         "unauthorized_effects": 3,
         "legit_success": true,
         "ledger_entries": 3,
-        "wall_ms": 1.894878
+        "wall_ms": 1.865763
       },
       {
         "scenario": "G8",
@@ -175,7 +175,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 2,
-        "wall_ms": 7.977593999999999
+        "wall_ms": 7.62195
       },
       {
         "scenario": "G8",
@@ -185,7 +185,7 @@
         "unauthorized_effects": 1,
         "legit_success": false,
         "ledger_entries": 2,
-        "wall_ms": 2.346823
+        "wall_ms": 2.3122279999999997
       },
       {
         "scenario": "G9",
@@ -195,7 +195,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 8.313149000000001
+        "wall_ms": 8.363534000000001
       },
       {
         "scenario": "G9",
@@ -205,7 +205,7 @@
         "unauthorized_effects": 2,
         "legit_success": false,
         "ledger_entries": 3,
-        "wall_ms": 4.259213000000001
+        "wall_ms": 4.479921
       },
       {
         "scenario": "G10",
@@ -215,7 +215,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 2,
-        "wall_ms": 12.11161
+        "wall_ms": 24.648204
       },
       {
         "scenario": "G10",
@@ -225,7 +225,7 @@
         "unauthorized_effects": 10,
         "legit_success": true,
         "ledger_entries": 5,
-        "wall_ms": 16.512863
+        "wall_ms": 2.953091
       },
       {
         "scenario": "G11",
@@ -235,7 +235,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 4.5043679999999995
+        "wall_ms": 5.748373
       },
       {
         "scenario": "G11",
@@ -245,7 +245,7 @@
         "unauthorized_effects": 3,
         "legit_success": true,
         "ledger_entries": 4,
-        "wall_ms": 2.701304
+        "wall_ms": 2.82057
       },
       {
         "scenario": "G12",
@@ -255,7 +255,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 5.189254
+        "wall_ms": 5.179335999999999
       },
       {
         "scenario": "G12",
@@ -265,7 +265,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 0.833498
+        "wall_ms": 0.9068970000000001
       },
       {
         "scenario": "G15",
@@ -275,7 +275,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 3,
-        "wall_ms": 11.914637
+        "wall_ms": 12.170261
       },
       {
         "scenario": "G15",
@@ -285,7 +285,7 @@
         "unauthorized_effects": 5,
         "legit_success": true,
         "ledger_entries": 8,
-        "wall_ms": 4.612553
+        "wall_ms": 5.421513999999999
       },
       {
         "scenario": "G16",
@@ -295,7 +295,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 3.377274
+        "wall_ms": 3.422029
       },
       {
         "scenario": "G16",
@@ -305,7 +305,7 @@
         "unauthorized_effects": 0,
         "legit_success": true,
         "ledger_entries": 1,
-        "wall_ms": 0.8914580000000001
+        "wall_ms": 0.8643360000000001
       }
     ]
   }

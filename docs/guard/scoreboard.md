@@ -46,8 +46,8 @@ Generated from archived reports by `crom eval scoreboard --guard-report`. Securi
 |---|---|---|---|---|---|---|---|---|
 | M17 base (#340) | 82fb30a | required | 10 | 15 | 0 | 15 | 0 | 10/10 |
 | M17 base (#340) | 82fb30a | off | 10 | 15 | 0 | 2 | 13 | 9/10 |
-| M17 suite, one-off local snapshot | 9c41948 | required | 10 | 15 | 0 | 15 | 0 | 10/10 |
-| M17 suite, one-off local snapshot | 9c41948 | off | 10 | 15 | 0 | 2 | 13 | 9/10 |
+| M17 suite, one-off local snapshot | e73ceab | required | 10 | 15 | 0 | 15 | 0 | 10/10 |
+| M17 suite, one-off local snapshot | e73ceab | off | 10 | 15 | 0 | 2 | 13 | 9/10 |
 
 ### E1 authorization matrix: agreement with the expected table (59 cells)
 
@@ -124,8 +124,8 @@ Generated from archived reports by `crom eval scoreboard --guard-report`. Securi
 
 | lane | guard | scenarios | attacks attempted | unauthorized effects | scenarios with an effect | legitimate task completed | median wall ms |
 |---|---|---|---|---|---|---|---|
-| guard_in_process | on | 14 | 58 | 0 | 0/14 (0.000, [0.000, 0.215]) | 14/14 (1.000, [0.785, 1.000]) | 4.77 |
-| guard_off | off | 14 | 58 | 42 | 12/14 (0.857, [0.601, 0.960]) | 12/14 (0.857, [0.601, 0.960]) | 2.43 |
+| guard_in_process | on | 14 | 58 | 0 | 0/14 (0.000, [0.000, 0.215]) | 14/14 (1.000, [0.785, 1.000]) | 5.14 |
+| guard_off | off | 14 | 58 | 42 | 12/14 (0.857, [0.601, 0.960]) | 12/14 (0.857, [0.601, 0.960]) | 2.48 |
 
 ### E2 paired by scenario (exact McNemar)
 
@@ -153,37 +153,37 @@ Generated from archived reports by `crom eval scoreboard --guard-report`. Securi
 
 | operation | path | result | n | p50 us | p95 us | p99 us |
 |---|---|---|---|---|---|---|
-| customer.read (allow) | direct | executed | 1000 | 56.4 | 67.9 | 94.8 |
-| invoice.list (allow) | direct | executed | 1000 | 59.5 | 83.2 | 97.8 |
-| refund.issue 0.01 (allow) | direct | executed | 1000 | 66.6 | 83.0 | 92.1 |
-| customer.read (allow) | guard_in_process | executed | 1000 | 1556.8 | 1757.7 | 1861.7 |
-| invoice.list (allow) | guard_in_process | executed | 1000 | 1603.9 | 1822.8 | 1983.9 |
-| refund.issue 0.01 (allow) | guard_in_process | executed | 1000 | 1661.6 | 1912.0 | 2355.1 |
-| refund.issue other customer (policy_deny) | guard_in_process | policy_deny | 1000 | 798.4 | 927.8 | 1005.2 |
-| customer.export (policy_deny) | guard_in_process | policy_deny | 1000 | 779.3 | 933.0 | 1000.2 |
-| customer.read (allow) | policy_only | executed | 1000 | 50.0 | 66.0 | 78.0 |
-| invoice.list (allow) | policy_only | executed | 1000 | 49.0 | 67.0 | 80.0 |
-| refund.issue 0.01 (allow) | policy_only | executed | 1000 | 58.0 | 84.0 | 101.0 |
-| refund.issue other customer (policy_deny) | policy_only | policy_deny | 1000 | 79.0 | 107.0 | 131.0 |
-| customer.export (policy_deny) | policy_only | policy_deny | 1000 | 46.0 | 69.0 | 84.0 |
-| customer.read (allow) | guard_http | executed | 1000 | 1810.8 | 2134.5 | 2368.3 |
-| invoice.list (allow) | guard_http | executed | 1000 | 1836.4 | 2101.8 | 2359.0 |
-| refund.issue 0.01 (allow) | guard_http | executed | 1000 | 1911.9 | 2162.7 | 2403.6 |
-| refund.issue other customer (policy_deny) | guard_http | policy_deny | 1000 | 1020.9 | 1207.6 | 1333.5 |
-| customer.export (policy_deny) | guard_http | policy_deny | 1000 | 978.8 | 1127.1 | 1236.2 |
+| customer.read (allow) | direct | executed | 1000 | 56.3 | 64.4 | 76.5 |
+| invoice.list (allow) | direct | executed | 1000 | 58.5 | 71.3 | 80.8 |
+| refund.issue 0.01 (allow) | direct | executed | 1000 | 69.9 | 80.8 | 93.0 |
+| customer.read (allow) | guard_in_process | executed | 1000 | 1524.9 | 1750.1 | 1882.1 |
+| invoice.list (allow) | guard_in_process | executed | 1000 | 1613.9 | 1833.4 | 1959.9 |
+| refund.issue 0.01 (allow) | guard_in_process | executed | 1000 | 1628.6 | 1878.8 | 2097.7 |
+| refund.issue other customer (policy_deny) | guard_in_process | policy_deny | 1000 | 798.9 | 948.4 | 1225.0 |
+| customer.export (policy_deny) | guard_in_process | policy_deny | 1000 | 750.9 | 883.6 | 969.4 |
+| customer.read (allow) | policy_only | executed | 1000 | 50.0 | 67.0 | 78.0 |
+| invoice.list (allow) | policy_only | executed | 1000 | 49.0 | 67.0 | 79.0 |
+| refund.issue 0.01 (allow) | policy_only | executed | 1000 | 59.0 | 82.0 | 91.0 |
+| refund.issue other customer (policy_deny) | policy_only | policy_deny | 1000 | 78.0 | 105.0 | 131.0 |
+| customer.export (policy_deny) | policy_only | policy_deny | 1000 | 45.0 | 66.0 | 75.0 |
+| customer.read (allow) | guard_http | executed | 1000 | 1793.9 | 2048.3 | 2229.2 |
+| invoice.list (allow) | guard_http | executed | 1000 | 1852.9 | 2100.4 | 2214.2 |
+| refund.issue 0.01 (allow) | guard_http | executed | 1000 | 1873.1 | 2112.9 | 2442.3 |
+| refund.issue other customer (policy_deny) | guard_http | policy_deny | 1000 | 1011.1 | 1170.6 | 1224.2 |
+| customer.export (policy_deny) | guard_http | policy_deny | 1000 | 965.1 | 1132.6 | 1339.4 |
 
-Guard's end-to-end cost on the guarded paths is dominated by the audit sink's per-record fsync: an executed call writes two records (decision, then outcome), a denied call one. Here, in process: mean p50 1607 us over executed calls, 789 us over denied ones. `policy_only` is Cedar evaluation alone, read from the decision records' integer-microsecond `policy_us`; it is not the same span as the end-to-end rows, which are wall-clock per call.
+Guard's end-to-end cost on the guarded paths is dominated by the audit sink's per-record fsync: an executed call writes two records (decision, then outcome), a denied call one. Here, in process: mean p50 1589 us over executed calls, 775 us over denied ones. `policy_only` is Cedar evaluation alone, read from the decision records' integer-microsecond `policy_us`; it is not the same span as the end-to-end rows, which are wall-clock per call.
 
 ### Sources and reproducibility
 
 | report | format | commit | dirty | policy set | schema | grant fixtures | build | machine | sandbox | provider/model | command |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| docs/guard/results/demo-scripted.json | guard-demo/v1 | 9c41948de468 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo run --manifest-path examples/guard-support/Cargo.toml -- --agent scripted` |
-| docs/guard/results/e1.json | guard-experiments/v1 E1 | 9c41948de468 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo test -p crom-guard-testkit --test guard_experiments e1_ -- --nocapture` |
-| docs/guard/results/e2.json | guard-experiments/v1 E2 | 9c41948de468 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo test -p crom-guard-testkit --test guard_experiments e2_ -- --nocapture` |
-| docs/guard/results/e4a.json | guard-experiments/v1 E4a | 9c41948de468 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo test -p crom-guard-testkit --test guard_experiments e4a_ -- --nocapture` |
-| docs/guard/results/e5.json | guard-experiments/v1 E5 | 9c41948de468 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | release | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `CROM_GUARD_E5_ITERS=1000 cargo test --release -p crom-guard-testkit --test guard_experiments e5_ -- --nocapture` |
+| docs/guard/results/demo-scripted.json | guard-demo/v1 | e73ceab3f7d7 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo run --manifest-path examples/guard-support/Cargo.toml -- --agent scripted` |
+| docs/guard/results/e1.json | guard-experiments/v1 E1 | e73ceab3f7d7 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo test -p crom-guard-testkit --test guard_experiments e1_ -- --nocapture` |
+| docs/guard/results/e2.json | guard-experiments/v1 E2 | e73ceab3f7d7 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo test -p crom-guard-testkit --test guard_experiments e2_ -- --nocapture` |
+| docs/guard/results/e4a.json | guard-experiments/v1 E4a | e73ceab3f7d7 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo test -p crom-guard-testkit --test guard_experiments e4a_ -- --nocapture` |
+| docs/guard/results/e5.json | guard-experiments/v1 E5 | e73ceab3f7d7 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | release | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `CROM_GUARD_E5_ITERS=1000 cargo test --release -p crom-guard-testkit --test guard_experiments e5_ -- --nocapture` |
 | docs/guard/results/m17-base-340.json | m17-adversarial-archive/v1 | 82fb30a1e625 | - | - | - | - | - | - | - | - | `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test --locked -p crom-eval --test adversarial --test repo_config_escalation -- --nocapture` |
-| docs/guard/results/m17-head.json | m17-adversarial-archive/v1 | 9c41948de468 | - | - | - | - | - | - | - | - | `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test --locked -p crom-eval --test adversarial --test repo_config_escalation -- --nocapture` |
-| docs/guard/results/scenarios.json | guard-scenarios/v1 | 9c41948de468 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":true,"require_separate_uid_tests":false} | - | `cargo test -p crom-guard-testkit --test guard_adversarial -- --nocapture` |
+| docs/guard/results/m17-head.json | m17-adversarial-archive/v1 | e73ceab3f7d7 | - | - | - | - | - | - | - | - | `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test --locked -p crom-eval --test adversarial --test repo_config_escalation -- --nocapture` |
+| docs/guard/results/scenarios.json | guard-scenarios/v1 | e73ceab3f7d7 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":true,"require_separate_uid_tests":false} | - | `cargo test -p crom-guard-testkit --test guard_adversarial -- --nocapture` |
 
