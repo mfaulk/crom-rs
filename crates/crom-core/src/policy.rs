@@ -322,7 +322,8 @@ impl PolicyEngine {
         // (e.g. acceptEdits-on-Edit, default-on-readonly). Track the demand.
         let mut force_callback = false;
         // A hook Allow skips allow rules and the approval callback, but never
-        // disallow rules, deny-for-session memory, or plan mode.
+        // disallow rules, deny-for-session memory, plan mode, or the MCP
+        // external-effect floor.
         let mut hook_allowed = false;
         if !self.hooks.is_empty() {
             let mut input = HookInput::new(
@@ -382,6 +383,14 @@ impl PolicyEngine {
                 PolicyDecisionSource::PermissionMode,
                 "plan mode does not execute tools".into(),
             );
+        }
+
+        // 3a'. MCP external-effect floor. Runs before every allow return
+        // (hook Allow, dontAsk name list, permission modes, approval memory,
+        // callback) so only an explicit allow rule can satisfy it.
+        if let Some(d) = self.external_effect_floor(ctx.tool_name, ctx.permission_kind, &tool_input)
+        {
+            return d;
         }
 
         if hook_allowed {
@@ -456,43 +465,9 @@ impl PolicyEngine {
 
         // 4. Allow rules. Hook-`Ask` forces a user prompt, so we skip
         // structured allow-rule auto-allow when force_callback is set.
-        let mut matched_allow_rule = false;
         if !force_callback {
             if let Some(d) = self.match_allow(ctx.tool_name, &tool_input) {
                 return d;
-            }
-            matched_allow_rule = self
-                .config
-                .allowed_tools
-                .iter()
-                .any(|r| r.matches(ctx.tool_name, &tool_input));
-        }
-
-        // 4a. MCP external-effect policy. MCP tools are external even when
-        // their remote names look read-only; never let permission modes like
-        // acceptEdits imply access to them.
-        if matches!(ctx.permission_kind, PermissionKind::External) {
-            match self.config.mcp_external_effect_policy {
-                crom_mcp::McpExternalEffectPolicy::AllowWithApproval => {}
-                crom_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule => {
-                    if !matched_allow_rule {
-                        return PolicyDecision::deny(
-                            PolicyDecisionSource::ExternalEffectPolicy,
-                            "MCP external tools require an explicit allow rule".into(),
-                        );
-                    }
-                }
-                crom_mcp::McpExternalEffectPolicy::DenyMutatingNameByDefault => {
-                    if crom_mcp::registry::parse_agent_tool_name(ctx.tool_name)
-                        .map(|p| crom_mcp::registry::mutating_tool_name(&p.remote_tool_name))
-                        .unwrap_or(false)
-                    {
-                        return PolicyDecision::deny(
-                            PolicyDecisionSource::ExternalEffectPolicy,
-                            "MCP tool may modify external state and is denied by policy".into(),
-                        );
-                    }
-                }
             }
         }
 
@@ -553,6 +528,48 @@ impl PolicyEngine {
             PolicyDecisionSource::DefaultDeny,
             "no policy rule allowed this tool".into(),
         )
+    }
+
+    /// MCP tools are external even when their remote names look read-only.
+    /// An explicit `allowed_tools` rule is the only thing that satisfies
+    /// the floor; hooks and permission modes cannot.
+    fn external_effect_floor(
+        &self,
+        tool_name: &str,
+        kind: PermissionKind,
+        input: &Value,
+    ) -> Option<PolicyDecision> {
+        if !matches!(kind, PermissionKind::External) {
+            return None;
+        }
+        let explicitly_allowed = self
+            .config
+            .allowed_tools
+            .iter()
+            .any(|r| r.matches(tool_name, input));
+        if explicitly_allowed {
+            return None;
+        }
+        match self.config.mcp_external_effect_policy {
+            crom_mcp::McpExternalEffectPolicy::AllowWithApproval => None,
+            crom_mcp::McpExternalEffectPolicy::RequireExplicitAllowRule => {
+                Some(PolicyDecision::deny(
+                    PolicyDecisionSource::ExternalEffectPolicy,
+                    "MCP external tools require an explicit allow rule".into(),
+                ))
+            }
+            crom_mcp::McpExternalEffectPolicy::DenyMutatingNameByDefault => {
+                let mutating = crom_mcp::registry::parse_agent_tool_name(tool_name)
+                    .map(|p| crom_mcp::registry::mutating_tool_name(&p.remote_tool_name))
+                    .unwrap_or(false);
+                mutating.then(|| {
+                    PolicyDecision::deny(
+                        PolicyDecisionSource::ExternalEffectPolicy,
+                        "MCP tool may modify external state and is denied by policy".into(),
+                    )
+                })
+            }
+        }
     }
 
     fn match_allow(&self, tool_name: &str, input: &Value) -> Option<PolicyDecision> {
@@ -1408,5 +1425,148 @@ mod tests {
             .await;
         assert_eq!(d.outcome, PolicyOutcome::Allow);
         assert_eq!(d.updated_tool_input.unwrap()["file_path"], "rewritten.rs");
+    }
+
+    struct AllowAllHook;
+    #[async_trait]
+    impl Hook for AllowAllHook {
+        async fn call(&self, _: HookInput) -> Result<HookOutput, HookError> {
+            Ok(HookOutput::Allow {
+                updated_input: None,
+            })
+        }
+    }
+
+    struct AskHook;
+    #[async_trait]
+    impl Hook for AskHook {
+        async fn call(&self, _: HookInput) -> Result<HookOutput, HookError> {
+            Ok(HookOutput::Ask {
+                reason: "confirm".into(),
+            })
+        }
+    }
+
+    fn allow_all_hooks() -> Hooks {
+        Hooks::new()
+            .pre_tool_use("*", Arc::new(AllowAllHook))
+            .expect("\"*\" is a valid hook pattern")
+    }
+
+    async fn eval_mcp(engine: &PolicyEngine, tool: &str) -> PolicyDecision {
+        let sid = sid();
+        let rid = rid();
+        engine
+            .evaluate_tool(ctx_for(
+                &sid,
+                &rid,
+                std::path::Path::new("."),
+                tool,
+                PermissionKind::External,
+                serde_json::json!({}),
+            ))
+            .await
+    }
+
+    #[tokio::test]
+    // A PreToolUse hook Allow cannot run an MCP tool that has no explicit allow rule under RequireExplicitAllowRule.
+    async fn hook_allow_does_not_bypass_mcp_external_effect_policy() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::Default,
+            callback: Some(Arc::new(crate::permission::AlwaysAllow)),
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, allow_all_hooks());
+        let d = eval_mcp(&engine, "mcp__x__write").await;
+        assert_eq!(d.outcome, PolicyOutcome::Deny);
+        assert_eq!(d.source, PolicyDecisionSource::ExternalEffectPolicy);
+    }
+
+    #[tokio::test]
+    // A PreToolUse hook Allow still allows an MCP tool once an explicit allow rule satisfies the external-effect floor.
+    async fn hook_allow_with_mcp_allow_rule_is_allowed() {
+        let cfg = PolicyConfig {
+            allowed_tools: vec![ToolRule::ExactTool("mcp__x__write".into())],
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, allow_all_hooks());
+        let d = eval_mcp(&engine, "mcp__x__write").await;
+        assert_eq!(d.outcome, PolicyOutcome::Allow);
+        assert_eq!(d.source, PolicyDecisionSource::Hook);
+    }
+
+    #[tokio::test]
+    // A PreToolUse hook Allow cannot run a mutating-named MCP tool under DenyMutatingNameByDefault without an allow rule.
+    async fn hook_allow_does_not_bypass_mcp_deny_mutating_name_policy() {
+        let cfg = PolicyConfig {
+            mcp_external_effect_policy:
+                crom_mcp::McpExternalEffectPolicy::DenyMutatingNameByDefault,
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, allow_all_hooks());
+        let d = eval_mcp(&engine, "mcp__x__delete_issue").await;
+        assert_eq!(d.outcome, PolicyOutcome::Deny);
+        assert_eq!(d.source, PolicyDecisionSource::ExternalEffectPolicy);
+    }
+
+    #[tokio::test]
+    // dontAsk's simple tool-name allowlist cannot run an MCP tool that has no explicit allow rule.
+    async fn dont_ask_name_list_does_not_bypass_mcp_external_effect_policy() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::DontAsk,
+            allowed_tool_names: vec!["mcp__x__write".into()],
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, Hooks::new());
+        let d = eval_mcp(&engine, "mcp__x__write").await;
+        assert_eq!(d.outcome, PolicyOutcome::Deny);
+        assert_eq!(d.source, PolicyDecisionSource::ExternalEffectPolicy);
+    }
+
+    #[tokio::test]
+    // dontAsk allows an MCP tool when an explicit allow rule names it.
+    async fn dont_ask_allows_mcp_with_explicit_allow_rule() {
+        let cfg = PolicyConfig {
+            permission_mode: PermissionMode::DontAsk,
+            allowed_tool_names: vec!["mcp__x__write".into()],
+            allowed_tools: vec![ToolRule::McpServerGlob {
+                server: "x".into(),
+                tool_glob: "*".into(),
+            }],
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, Hooks::new());
+        let d = eval_mcp(&engine, "mcp__x__write").await;
+        assert_eq!(d.outcome, PolicyOutcome::Allow);
+        assert_eq!(d.source, PolicyDecisionSource::AllowRule);
+    }
+
+    #[tokio::test]
+    // A disallow rule still wins over a hook Allow and an MCP allow rule.
+    async fn disallow_rule_wins_over_hook_allow_for_mcp() {
+        let cfg = PolicyConfig {
+            allowed_tools: vec![ToolRule::ExactTool("mcp__x__write".into())],
+            disallowed_tools: vec![ToolRule::ExactTool("mcp__x__write".into())],
+            ..PolicyConfig::default()
+        };
+        let engine = PolicyEngine::new(cfg, allow_all_hooks());
+        let d = eval_mcp(&engine, "mcp__x__write").await;
+        assert_eq!(d.outcome, PolicyOutcome::Deny);
+        assert_eq!(d.source, PolicyDecisionSource::DisallowRule);
+    }
+
+    #[tokio::test]
+    // A hook Ask on an MCP tool with an explicit allow rule reaches the approval callback rather than auto-allowing.
+    async fn hook_ask_with_mcp_allow_rule_reaches_callback() {
+        let cfg = PolicyConfig {
+            allowed_tools: vec![ToolRule::ExactTool("mcp__x__write".into())],
+            callback: Some(Arc::new(crate::permission::AlwaysAllow)),
+            ..PolicyConfig::default()
+        };
+        let hooks = Hooks::new().pre_tool_use("*", Arc::new(AskHook)).unwrap();
+        let engine = PolicyEngine::new(cfg, hooks);
+        let d = eval_mcp(&engine, "mcp__x__write").await;
+        assert_eq!(d.outcome, PolicyOutcome::Allow);
+        assert_eq!(d.source, PolicyDecisionSource::ApprovalCallback);
     }
 }

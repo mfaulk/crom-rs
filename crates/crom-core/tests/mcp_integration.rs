@@ -183,6 +183,77 @@ async fn mcp_tool_call_runs_through_agent_loop() {
     }));
 }
 
+#[tokio::test]
+// McpResultSizeLimitHook's post-tool deny withholds an oversized MCP result from the model and records it as blocked.
+async fn mcp_result_size_limit_hook_blocks_oversized_result() {
+    ensure_fake_server_built();
+    let provider = Arc::new(CapturingProvider::new(vec![
+        vec![
+            ModelEvent::ToolCall(crom_core::ToolCall {
+                id: "toolu_1".into(),
+                name: "mcp__fake__list_issues".into(),
+                input: serde_json::json!({}),
+            }),
+            ModelEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ],
+        vec![
+            ModelEvent::TextDelta {
+                text: "summarized".into(),
+            },
+            ModelEvent::MessageStop {
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            },
+        ],
+    ]));
+    let options = AgentOptions {
+        mcp: fake_mcp_options(),
+        allowed_tools: vec!["mcp__fake__list_issues".into()],
+        allowed_tool_rules: vec![ToolRule::ExactTool("mcp__fake__list_issues".into())],
+        permission_mode: PermissionMode::Default,
+        max_turns: Some(3),
+        ..AgentOptions::default()
+    };
+    let hooks = crom_core::Hooks::new()
+        .post_tool_use(
+            "mcp__*",
+            Arc::new(crom_core::McpResultSizeLimitHook::new(8)),
+        )
+        .unwrap();
+    let agent = crom_core::AgentBuilder::new()
+        .options(options)
+        .provider(provider)
+        .tools(ToolRegistry::new())
+        .hooks(hooks)
+        .build()
+        .unwrap();
+    let events: Vec<_> = agent.run("use mcp").collect().await;
+    let result = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::UserToolResult(r) if r.tool_use_id == "toolu_1" => Some(r.clone()),
+            _ => None,
+        })
+        .expect("tool result for toolu_1");
+    assert!(result.is_error);
+    assert!(!result.content.contains("Parser trims too late"));
+    assert!(result.content.contains("exceeds 8"));
+    let decision = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::SecurityDecision(d) if d.tool_use_id == "toolu_1" => Some(d.clone()),
+            _ => None,
+        })
+        .expect("security decision for toolu_1");
+    assert_eq!(
+        decision.outcome,
+        crom_core::events::SecurityOutcome::Blocked
+    );
+}
+
 /// Tiny MCP server whose `initialize` handler rendezvouses on a shared
 /// barrier before responding. When several of these are discovered in
 /// parallel every `initialize` reaches the barrier and all are released

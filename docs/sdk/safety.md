@@ -31,6 +31,8 @@ Every layer enforces:
 
 1. `SideEffectPolicy` blocks the broad category (writes, exec, network).
 2. `ToolPolicy.enable_builtin_tools` controls which built-ins register.
+   `ToolPolicy.disallowed_tools` / `allowed_tools` then gate individual
+   calls (see [Host tool rules](#host-tool-rules)).
 3. `AgentRequest.approval_policy` chooses how the policy engine decides.
 4. `WorkspaceCapabilities` lets the runtime reject operations the workspace
    itself does not support.
@@ -51,6 +53,31 @@ Built-in file and shell tools are bound to the workspace, never to the
 host process cwd: `ReturnOnly`/`RejectMutations` run them in a private
 scratch copy, apply policies use the real root, and a rootless workspace
 under an apply policy gets none (see [Workspaces](workspaces.md)).
+
+## Host tool rules
+
+`ToolPolicy.disallowed_tools` and `ToolPolicy.allowed_tools` take
+`crom_sdk::policy::ToolRule` values (`ExactTool`, `ToolGlob`,
+`BashCommandRegex`, `FilePathGlob`, `McpServerGlob`, `AgentNameGlob`) and are
+passed to the core policy engine for every run, including the act phase of
+`PlanThenAct`:
+
+- **`disallowed_tools`** — a matching call is blocked before execution,
+  regardless of approval callback, interactivity mode, or
+  `SideEffectPolicy`. It applies to built-in, custom, and MCP tools. The
+  emitted `SecurityDecision` has `policy_source: disallow_rule`,
+  `outcome: blocked`.
+- **`allowed_tools`** — a matching call is allowed without consulting the
+  approval callback (`policy_source: allow_rule`). Calls that match no rule
+  follow the normal approval path; an empty list keeps that behaviour for
+  every call. Allow rules cannot enable a tool that `enable_builtin_tools` or
+  `SideEffectPolicy` left unregistered.
+
+Disallow is evaluated before allow, so a call matching both is blocked.
+`AgentRuntimeBuilder::build` validates every rule and fails with an
+`InvalidRequest` error carrying the `policy.invalid_tool_rule` diagnostic if
+a glob or regex does not compile, rather than letting a malformed disallow
+rule silently never match. Tests: `crates/crom-sdk/tests/tool_policy_rules.rs`.
 
 ## Repository-local configuration
 
@@ -81,3 +108,10 @@ consults the trust store) or `load_with_trust`, and MCP options with
 - **Resource exhaustion**: `RunBudgets` caps tokens/turns/time/patch size.
 - **Path traversal**: `WorkspacePath` rejects absolute paths, `..` and
   symlink escapes.
+- **Unapproved MCP effects**: the MCP external-effect policy (default
+  `RequireExplicitAllowRule`) is a floor in the policy engine. A
+  `PreToolUse` hook `Allow`, the `dontAsk` tool-name list, permission modes
+  and approval memory cannot run an MCP tool that no explicit allow rule
+  names; the denial is audited with `policy_source: external_effect_policy`.
+  A `PostToolUse` hook `Deny` (e.g. `McpResultSizeLimitHook`) withholds
+  the result from the model but cannot undo an effect the tool already had.

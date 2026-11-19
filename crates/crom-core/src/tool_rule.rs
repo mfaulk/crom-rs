@@ -73,6 +73,25 @@ impl ToolRule {
         Ok(ToolRule::AgentNameGlob { pattern: p })
     }
 
+    /// Checks that every pattern in the rule compiles. A rule that fails this
+    /// never matches, so a malformed disallow rule would silently fail open.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            ToolRule::ExactTool(_) => Ok(()),
+            ToolRule::ToolGlob(g) => Self::try_tool_glob(g.clone()).map(drop),
+            ToolRule::BashCommandRegex(re) => Self::try_bash_command_regex(re.clone()).map(drop),
+            ToolRule::FilePathGlob { tool, pattern } => {
+                Self::try_file_path_glob(tool.clone(), pattern.clone()).map(drop)
+            }
+            ToolRule::McpServerGlob { server, tool_glob } => {
+                Self::try_mcp_server_glob(server.clone(), tool_glob.clone()).map(drop)
+            }
+            ToolRule::AgentNameGlob { pattern } => {
+                Self::try_agent_name_glob(pattern.clone()).map(drop)
+            }
+        }
+    }
+
     /// Returns true if this rule matches the requested tool name and input.
     pub fn matches(&self, tool_name: &str, input: &Value) -> bool {
         match self {
@@ -287,6 +306,32 @@ impl<'de> Deserialize<'de> for ToolRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // validate accepts well-formed rules and rejects each malformed pattern kind.
+    fn validate_rejects_malformed_patterns() {
+        assert!(ToolRule::ExactTool("Bash".into()).validate().is_ok());
+        assert!(ToolRule::BashCommandRegex("^git ".into())
+            .validate()
+            .is_ok());
+        for bad in [
+            ToolRule::ToolGlob("[".into()),
+            ToolRule::BashCommandRegex("(".into()),
+            ToolRule::FilePathGlob {
+                tool: "Write".into(),
+                pattern: "[".into(),
+            },
+            ToolRule::McpServerGlob {
+                server: "bad server".into(),
+                tool_glob: "*".into(),
+            },
+            ToolRule::AgentNameGlob {
+                pattern: "[".into(),
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?} should be rejected");
+        }
+    }
 
     #[test]
     // Parses simple string into ExactTool when no wildcards present.
