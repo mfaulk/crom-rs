@@ -68,8 +68,9 @@ Several important pieces are not built yet:
   is proposed in [ADR 0002](docs/security/decisions/0002-guard-architecture.md),
   and the Cedar policy model in
   [ADR 0003](docs/security/decisions/0003-guard-policy-engine.md).
-  `crates/crom-guard` and `crates/crom-guard-server` are empty skeletons so
-  far. `crates/crom-guard-testkit` provides the controlled business API and
+  `crates/crom-guard` defines the core types and traits
+  ([docs/guard/README.md](docs/guard/README.md)), with no enforcement yet;
+  `crates/crom-guard-server` is an empty skeleton. `crates/crom-guard-testkit` provides the controlled business API and
   effect ledger the M18 tests measure against, and the reference policy set
   (`examples/guard-support/policies/`) is validated in CI by
   `scripts/validate-guard-policies.sh`.

@@ -573,6 +573,11 @@ dependencies = [
 [[package]]
 name = "crom-guard"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "crom-guard-server"

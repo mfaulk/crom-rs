@@ -10,3 +10,6 @@ publish = false
 # Must never depend on another crom-* crate (ADR 0002; checked by
 # scripts/check-guard-deps.sh in CI).
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
