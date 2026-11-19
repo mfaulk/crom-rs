@@ -89,6 +89,9 @@ struct InScenario {
     planned_attacks: usize,
     attempted: usize,
     blocked_by_guard: usize,
+    /// Refused by Crom's own gate before Guard saw the call (the `crom` lane).
+    #[serde(default)]
+    blocked_by_crom: usize,
     blocked_by_sandbox: usize,
     blocked_by_preflight: usize,
     no_effect: usize,
@@ -248,6 +251,7 @@ pub struct LaneSummary {
     pub planned: usize,
     pub attempted: usize,
     pub blocked_by_guard: usize,
+    pub blocked_by_crom: usize,
     pub blocked_by_sandbox: usize,
     pub blocked_by_preflight: usize,
     pub no_effect: usize,
@@ -601,6 +605,7 @@ impl GuardBoard {
                 planned: sum(|s| s.planned_attacks),
                 attempted: sum(|s| s.attempted),
                 blocked_by_guard: sum(|s| s.blocked_by_guard),
+                blocked_by_crom: sum(|s| s.blocked_by_crom),
                 blocked_by_sandbox: sum(|s| s.blocked_by_sandbox),
                 blocked_by_preflight: sum(|s| s.blocked_by_preflight),
                 no_effect: sum(|s| s.no_effect),
@@ -832,9 +837,10 @@ impl GuardBoard {
                     f.insert(
                         format!("scenario {} {}", s.scenario, s.mode),
                         format!(
-                            "attempted={} guard={} sandbox={} preflight={} no_effect={} executed={} legit={} ledger={}/{} unmediated={} audit={:?} mismatches={}",
+                            "attempted={} guard={} crom={} sandbox={} preflight={} no_effect={} executed={} legit={} ledger={}/{} unmediated={} audit={:?} mismatches={}",
                             s.attempted,
                             s.blocked_by_guard,
+                            s.blocked_by_crom,
                             s.blocked_by_sandbox,
                             s.blocked_by_preflight,
                             s.no_effect,
@@ -954,6 +960,7 @@ impl GuardBoard {
                     "skipped",
                     "attempted",
                     "blocked (guard)",
+                    "blocked (crom)",
                     "blocked (sandbox)",
                     "blocked (preflight)",
                     "no effect",
@@ -976,6 +983,7 @@ impl GuardBoard {
                             l.scenarios_skipped.to_string(),
                             l.attempted.to_string(),
                             l.blocked_by_guard.to_string(),
+                            l.blocked_by_crom.to_string(),
                             l.blocked_by_sandbox.to_string(),
                             l.blocked_by_preflight.to_string(),
                             l.no_effect.to_string(),
@@ -1360,10 +1368,13 @@ mod tests {
         legit: bool,
     ) -> Value {
         let guard = mode != "guard_off";
+        // The `crom` lane's gate refuses one attack before Guard sees it.
+        let by_crom = usize::from(mode == "crom" && attempted > executed);
         json!({
             "scenario": id, "title": format!("title {id}"), "mode": mode, "status": status,
             "planned_attacks": attempted, "attempted": attempted,
-            "blocked_by_guard": if guard { attempted - executed } else { 0 },
+            "blocked_by_guard": if guard { attempted - executed - by_crom } else { 0 },
+            "blocked_by_crom": by_crom,
             "blocked_by_sandbox": 0, "blocked_by_preflight": 0,
             "no_effect": if guard { 0 } else { attempted - executed },
             "executed": executed, "legit_success": legit,
@@ -1500,6 +1511,7 @@ mod tests {
             (crom.scenarios_ran, crom.scenarios_skipped, crom.attempted),
             (1, 1, 3)
         );
+        assert_eq!((crom.blocked_by_crom, crom.blocked_by_guard), (1, 2));
         assert_eq!(b.scenarios[1].lanes["crom"], "skipped");
     }
 

@@ -3,10 +3,10 @@
 Generated from archived reports by `crom eval scoreboard --guard-report`. Security, task completion, and latency are separate tables; nothing is combined into one score. Rates are k/n with Wilson 95% intervals.
 
 Security: adversarial scenarios by lane (ledger-scored)
-  lane              guard  ran  skipped  attempted  blocked (guard)  blocked (sandbox)  blocked (preflight)  no effect  executed  legit                        ledger entries  unmediated  audit coverage  audit verify  mismatches
-  guard_in_process  on     3    0        6          6                0                  0                    0          0         3/3 (1.000, [0.439, 1.000])  6               0           1.000           3/3           0
-  guard_off         off    3    0        6          0                0                  0                    1          5         2/3 (0.667, [0.208, 0.939])  6               6           -               n/a           0
-  crom              on     1    1        3          3                0                  0                    0          0         1/1 (1.000, [0.207, 1.000])  2               0           1.000           1/1           0
+  lane              guard  ran  skipped  attempted  blocked (guard)  blocked (crom)  blocked (sandbox)  blocked (preflight)  no effect  executed  legit                        ledger entries  unmediated  audit coverage  audit verify  mismatches
+  guard_in_process  on     3    0        6          6                0               0                  0                    0          0         3/3 (1.000, [0.439, 1.000])  6               0           1.000           3/3           0
+  guard_off         off    3    0        6          0                0               0                  0                    1          5         2/3 (0.667, [0.208, 0.939])  6               6           -               n/a           0
+  crom              on     1    1        3          2                1               0                  0                    0          0         1/1 (1.000, [0.207, 1.000])  2               0           1.000           1/1           0
 
 Security: executed/attempted per scenario and lane
   scenario  title      guard_in_process  guard_off  crom

@@ -142,7 +142,7 @@ Every scenario, experiment and reference-app report carries `meta`:
 
 `crom eval scoreboard --guard-report <file-or-dir>` renders the Guard section
 from these reports ([eval.md](../eval.md#guard-section-363)). Sections:
-security by scenario lane (attempted, blocked by Guard / sandbox / preflight,
+security by scenario lane (attempted, blocked by Guard / Crom's gate / sandbox / preflight,
 executed, legitimate subtasks, ledger entries, unmediated effects, audit
 coverage, `audit verify`), executed/attempted per scenario and lane, the M17
 adversarial suite for comparison, E1, E2, E4a, reference-app runs, E5, and
