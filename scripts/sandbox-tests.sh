@@ -25,6 +25,9 @@ fi
 # Compile outside the scope: a parallel build legitimately needs more tasks.
 cargo test --locked -p crom-tools "${tests[@]}" --no-run
 
+# One test at a time: RLIMIT_NPROC is per uid and the sandbox sets it to the
+# uid's current task count plus max_processes, so processes from a concurrent
+# test exiting mid-call would loosen the bound the P6 tests assert.
 exec systemd-run --user --scope --quiet \
   -p "TasksMax=${tasks_max}" -p "MemoryMax=${memory_max}" -p MemorySwapMax=0 \
-  cargo test --locked -p crom-tools "${tests[@]}" -- --include-ignored "$@"
+  cargo test --locked -p crom-tools "${tests[@]}" -- --include-ignored --test-threads=1 "$@"
