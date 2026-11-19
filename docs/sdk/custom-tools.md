@@ -48,6 +48,9 @@ Custom tools participate in:
 
 - Permission gating via `permission_kind()`.
 - Side-effect policy enforcement.
+- Host tool rules: `ToolPolicy.disallowed_tools` blocks a custom tool by
+  name or glob, and `allowed_tools` can pre-approve it
+  ([Host tool rules](safety.md#host-tool-rules)).
 - Approval callbacks (when `ApprovalPolicy::CallbackRequired`).
 - The tool catalog (visible to `SearchTools` if enabled).
 

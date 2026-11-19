@@ -19,6 +19,10 @@ explicitly via `AgentRuntimeBuilder`:
 - in-memory or no-op storage
 - patch-only output (`PatchPolicy::ReturnOnly`)
 
+`ToolPolicy.disallowed_tools` blocks matching tool calls regardless of
+approvals; `allowed_tools` pre-approves matching calls. Malformed rules fail
+`build()`.
+
 `RunBudgets` caps turns, tool calls, duration, patch size, cumulative
 input/output tokens, and nominal cost (`with_max_cost_usd`, which needs
 `AgentRuntimeBuilder::pricing`). A breach fails the run with a `budget.*`
