@@ -1,20 +1,22 @@
 name: Guard (live)
 
 # MILESTONE_18 §13.4 E3 (model-generated attacks) and E4b (live provider
-# independence), #363. Manual only: never runs on push/PR. Each provider runs
-# the reference app (examples/guard-support) with a real model against Guard,
-# under a per-run spend cap no larger than GUARD_LIVE_CEILING_USD. Secrets come
-# from the `eval-live` environment (required reviewers). A provider whose key
-# is missing is skipped with a warning.
+# independence), #363. Manual only: never runs on push/PR. Each selected
+# provider runs the reference app (examples/guard-support) with a real model
+# against Guard. The spend cap is a total for the whole dispatch, no larger
+# than GUARD_LIVE_CEILING_USD, split evenly across the selected providers.
+# Secrets come from the `eval-live` environment (required reviewers); each
+# provider's step sees only its own key. A provider whose key is missing is
+# skipped with a warning (its share of the cap is not reassigned).
 on:
   workflow_dispatch:
     inputs:
-      max_run_cost_usd:
-        description: 'Required. Spend cap per provider run in USD (<= 2)'
+      max_total_cost_usd:
+        description: 'Required. Total spend cap in USD across all providers (<= 2)'
         required: true
         type: string
       providers:
-        description: 'Space-separated provider profile ids; low-cost first (deepseek, then anthropic, openai, gemini)'
+        description: 'Space-separated provider profile ids from: deepseek anthropic openai gemini (run in that order, low-cost first)'
         required: false
         default: 'deepseek'
       model:
@@ -42,44 +44,56 @@ jobs:
       # Inputs reach the shell only through env, never inline interpolation.
       PROVIDERS: ${{ inputs.providers }}
       MODEL: ${{ inputs.model }}
-      MAX_RUN_COST_USD: ${{ inputs.max_run_cost_usd }}
+      MAX_TOTAL_COST_USD: ${{ inputs.max_total_cost_usd }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Check spend cap
-        run: .github/scripts/check-spend-cap.sh "$MAX_RUN_COST_USD" "$GUARD_LIVE_CEILING_USD"
+      - name: Check spend cap and split it across providers
+        run: |
+          .github/scripts/check-spend-cap.sh "$MAX_TOTAL_COST_USD" "$GUARD_LIVE_CEILING_USD"
+          n=0
+          for p in $PROVIDERS; do
+            case "$p" in
+              deepseek|anthropic|openai|gemini) n=$((n + 1)) ;;
+              *) echo "::error::unknown provider $p"; exit 1 ;;
+            esac
+          done
+          if [ "$n" -eq 0 ]; then echo "::error::no provider selected"; exit 1; fi
+          # Round down to the cent so the runs never sum past the total.
+          per_run=$(awk -v t="$MAX_TOTAL_COST_USD" -v n="$n" 'BEGIN { printf "%.2f", int(t * 100 / n) / 100 }')
+          if ! awk -v c="$per_run" 'BEGIN { exit !(c > 0) }'; then
+            echo "::error::total \$$MAX_TOTAL_COST_USD over $n providers leaves less than \$0.01 per run"
+            exit 1
+          fi
+          echo "per-run cap: \$$per_run ($n providers, total \$$MAX_TOTAL_COST_USD)"
+          echo "PER_RUN_COST_USD=$per_run" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: guard-live
-      - name: Reference app with live models
+      - name: Build the reference app
+        run: cargo build --locked --manifest-path examples/guard-support/Cargo.toml
+      - name: DeepSeek
+        if: ${{ !cancelled() && contains(format(' {0} ', inputs.providers), ' deepseek ') }}
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: scripts/guard-live-run.sh deepseek DEEPSEEK_API_KEY
+      - name: Anthropic
+        if: ${{ !cancelled() && contains(format(' {0} ', inputs.providers), ' anthropic ') }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: scripts/guard-live-run.sh anthropic ANTHROPIC_API_KEY
+      - name: OpenAI
+        if: ${{ !cancelled() && contains(format(' {0} ', inputs.providers), ' openai ') }}
+        env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: scripts/guard-live-run.sh openai OPENAI_API_KEY
+      - name: Gemini
+        if: ${{ !cancelled() && contains(format(' {0} ', inputs.providers), ' gemini ') }}
+        env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          mkdir -p target/guard-live
-          status=0
-          for p in $PROVIDERS; do
-            case "$p" in
-              anthropic) key="$ANTHROPIC_API_KEY" ;;
-              openai) key="$OPENAI_API_KEY" ;;
-              deepseek) key="$DEEPSEEK_API_KEY" ;;
-              gemini) key="$GEMINI_API_KEY" ;;
-              *) echo "::error::unknown provider $p"; exit 1 ;;
-            esac
-            if [ -z "$key" ]; then
-              echo "::warning::no API key secret for $p; skipped"
-              continue
-            fi
-            args=(--agent live --provider "$p" --supervisor deny
-                  --max-run-cost-usd "$MAX_RUN_COST_USD" --out "target/guard-live/$p")
-            if [ -n "$MODEL" ]; then args+=(--model "$MODEL"); fi
-            cargo run --manifest-path examples/guard-support/Cargo.toml -- "${args[@]}" || status=1
-          done
-          exit "$status"
+        run: scripts/guard-live-run.sh gemini GEMINI_API_KEY
       - name: Scoreboard
         if: always()
         run: |
