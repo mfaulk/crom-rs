@@ -12,7 +12,7 @@
 //! - read-only side-effect policy (no Bash, no Edit/Write)
 //! - `InteractivityMode::HeadlessDeny` (no approval prompts)
 //! - no global credential lookup
-//! - no plugin/MCP/skill loading
+//! - no plugin/MCP/skill loading (except Crom Guard via `ToolPolicy::guard`)
 //! - in-memory or no-op storage
 //! - patch-only output (`PatchPolicy::ReturnOnly`)
 //!
@@ -84,8 +84,8 @@ pub use patch::{
 };
 pub use plan::{ActRequest, PlanRequest as SdkPlanRequest, PlanResult};
 pub use policy::{
-    BuiltinToolSet, InteractivityMode, SideEffectLevel, SideEffectPolicy, ToolLoadingMode,
-    ToolPolicy,
+    BuiltinToolSet, GuardConnection, InteractivityMode, SideEffectLevel, SideEffectPolicy,
+    ToolLoadingMode, ToolPolicy, GUARD_SERVER_NAME,
 };
 pub use provider::{ProviderConfig, ProviderSelection, SecretString};
 pub use request::{

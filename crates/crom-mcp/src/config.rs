@@ -86,6 +86,9 @@ impl McpOptions {
                     for (key, value) in &cfg.headers {
                         if looks_like_secret_key(key) || should_redact_value(value) {
                             out.push(value.clone());
+                            if let Some(credential) = auth_scheme_credential(value) {
+                                out.push(credential.to_string());
+                            }
                         }
                     }
                 }
@@ -167,6 +170,11 @@ impl McpServerConfig {
         }
     }
 
+    /// Whether this server is a Crom Guard endpoint (`guard: true`).
+    pub fn is_guard(&self) -> bool {
+        matches!(self, Self::StreamableHttp(c) if c.guard)
+    }
+
     pub fn redacted_value(&self) -> Value {
         match self {
             Self::Stdio(c) => {
@@ -207,6 +215,7 @@ impl McpServerConfig {
                     "type": "http",
                     "url": c.url,
                     "headers": headers,
+                    "guard": c.guard,
                     "startup_timeout_seconds": c.startup_timeout.map(|d| d.as_secs()),
                     "request_timeout_seconds": c.request_timeout.map(|d| d.as_secs()),
                 })
@@ -249,6 +258,10 @@ pub struct StreamableHttpMcpServerConfig {
     pub startup_timeout: Option<Duration>,
     #[serde(default, with = "option_duration_seconds")]
     pub request_timeout: Option<Duration>,
+    /// Crom Guard endpoint: tool results are read as Guard decisions and
+    /// audited at the `guard` enforcement layer (`docs/sdk/guard.md`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guard: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -352,6 +365,18 @@ pub fn load_mcp_options(
                         format!(
                             "{field} uses ${{VAR}} interpolation; repository config never reads \
                              host environment variables (use --mcp-config or user settings)"
+                        ),
+                    ));
+                }
+                // `guard: true` changes how results are audited and lets
+                // allow rules for `mcp__guard__*` apply; only operator
+                // config may set it.
+                if let Some((name, _)) = file.mcp_servers.iter().find(|(_, c)| c.is_guard()) {
+                    return Err(McpError::config(
+                        absolute,
+                        format!(
+                            "mcpServers.{name} sets `guard: true`; repository config may not \
+                             declare a Crom Guard server (use --mcp-config or user settings)"
                         ),
                     ));
                 }
@@ -601,6 +626,8 @@ struct RawServerConfig {
     startup_timeout_seconds: Option<u64>,
     #[serde(default)]
     request_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    guard: bool,
 }
 
 impl RawServerConfig {
@@ -608,6 +635,9 @@ impl RawServerConfig {
         let startup_timeout = self.startup_timeout_seconds.map(Duration::from_secs);
         let request_timeout = self.request_timeout_seconds.map(Duration::from_secs);
         match self.kind.as_str() {
+            "stdio" if self.guard => {
+                Err("`guard` requires an http MCP server; Guard has no stdio transport".into())
+            }
             "stdio" => Ok(McpServerConfig::Stdio(StdioMcpServerConfig {
                 command: self
                     .command
@@ -626,6 +656,7 @@ impl RawServerConfig {
                     headers: self.headers,
                     startup_timeout,
                     request_timeout,
+                    guard: self.guard,
                 },
             )),
             other => Err(format!(
@@ -761,17 +792,24 @@ fn should_redact_value(value: &str) -> bool {
 }
 
 fn starts_with_auth_scheme(s: &str) -> bool {
+    auth_scheme_credential(s).is_some()
+}
+
+/// The credential after a `Bearer ` / `Basic ` / `Token ` prefix.
+fn auth_scheme_credential(s: &str) -> Option<&str> {
     const SCHEMES: &[&str] = &["bearer ", "basic ", "token "];
+    let s = s.trim();
     for scheme in SCHEMES {
         if s.len() >= scheme.len() && s[..scheme.len()].eq_ignore_ascii_case(scheme) {
             // Require a non-trivial single-token credential after the scheme.
             // Otherwise `Bearer permission denied` would still poison the
             // redaction list with the literal text "permission denied".
             let credential = s[scheme.len()..].trim();
-            return credential.len() >= 8 && !credential.chars().any(|c| c.is_whitespace());
+            return (credential.len() >= 8 && !credential.chars().any(char::is_whitespace))
+                .then_some(credential);
         }
     }
-    false
+    None
 }
 
 mod duration_seconds {
@@ -863,6 +901,25 @@ mod tests {
             assert!(msg.contains("never reads host environment"), "{msg}");
             assert!(!msg.contains("hostsecretvalue"));
         });
+    }
+
+    /// A repo `.agent/mcp.json` may not mark a server `guard: true`, even in a trusted workspace; an operator config may.
+    #[test]
+    fn repo_mcp_json_cannot_mark_guard() {
+        let dir = TempDir::new().unwrap();
+        let cfg = serde_json::json!({"mcpServers": {
+            "guard": {"type": "http", "url": "http://127.0.0.1:9/mcp", "guard": true}
+        }});
+        write_repo_mcp(dir.path(), cfg.clone());
+        let err = load_mcp_options(dir.path(), None, None, None, None, None, true).unwrap_err();
+        assert!(err.to_string().contains("guard"), "{err}");
+
+        let ops = TempDir::new().unwrap();
+        let path = ops.path().join("mcp.json");
+        std::fs::write(&path, cfg.to_string()).unwrap();
+        let options =
+            load_mcp_options(dir.path(), None, Some(&path), None, None, None, true).unwrap();
+        assert!(options.servers["guard"].is_guard());
     }
 
     #[test]
@@ -1018,6 +1075,7 @@ mod tests {
                     headers: BTreeMap::from([("Authorization".into(), "Bearer abc".into())]),
                     startup_timeout: None,
                     request_timeout: None,
+                    guard: false,
                 }),
             )]),
             ..McpOptions::default()
@@ -1107,6 +1165,7 @@ mod tests {
                     ]),
                     startup_timeout: None,
                     request_timeout: None,
+                    guard: false,
                 }),
             )]),
             ..McpOptions::default()
@@ -1198,11 +1257,63 @@ mod tests {
                     ]),
                     startup_timeout: None,
                     request_timeout: None,
+                    guard: false,
                 }),
             )]),
             ..McpOptions::default()
         };
         let secrets = options.secret_values();
         assert!(secrets.is_empty(), "unexpected secrets: {secrets:?}");
+    }
+    /// The bare credential after an auth scheme is a secret too, so a handle echoed without `Bearer ` is still redacted.
+    #[test]
+    fn secret_values_include_bare_bearer_credential() {
+        let options = McpOptions {
+            enabled: true,
+            servers: BTreeMap::from([(
+                "guard".into(),
+                McpServerConfig::StreamableHttp(StreamableHttpMcpServerConfig {
+                    url: "http://127.0.0.1/mcp".into(),
+                    headers: BTreeMap::from([(
+                        "Authorization".into(),
+                        "Bearer gsh_0123456789abcdef".into(),
+                    )]),
+                    startup_timeout: None,
+                    request_timeout: None,
+                    guard: true,
+                }),
+            )]),
+            ..McpOptions::default()
+        };
+        let secrets = options.secret_values();
+        assert!(secrets.contains(&"Bearer gsh_0123456789abcdef".to_string()));
+        assert!(secrets.contains(&"gsh_0123456789abcdef".to_string()));
+    }
+
+    /// `guard: true` parses on an http server, defaults to false, and shows in the redacted summary.
+    #[test]
+    fn http_server_guard_flag_parses_and_defaults_off() {
+        let file: McpConfigFile = serde_json::from_value(serde_json::json!({"mcpServers": {
+            "guard": {"type": "http", "url": "http://127.0.0.1:8470/mcp", "guard": true},
+            "docs": {"type": "http", "url": "http://127.0.0.1:9000/mcp"}
+        }}))
+        .unwrap();
+        let McpServerConfig::StreamableHttp(g) = &file.mcp_servers["guard"] else {
+            panic!("not http");
+        };
+        assert!(g.guard);
+        assert!(file.mcp_servers["guard"].is_guard());
+        assert!(!file.mcp_servers["docs"].is_guard());
+        assert_eq!(file.mcp_servers["guard"].redacted_value()["guard"], true);
+    }
+
+    /// `guard` on a stdio server is rejected: Guard is only reachable over HTTP.
+    #[test]
+    fn stdio_server_guard_flag_is_rejected() {
+        let err = serde_json::from_value::<McpConfigFile>(serde_json::json!({"mcpServers": {
+            "guard": {"type": "stdio", "command": "x", "guard": true}
+        }}))
+        .unwrap_err();
+        assert!(err.to_string().contains("guard"), "{err}");
     }
 }

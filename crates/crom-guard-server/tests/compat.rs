@@ -15,6 +15,7 @@ async fn connect(f: &Fixture, handle: &str) -> McpClient {
         headers: BTreeMap::from([("Authorization".into(), format!("Bearer {handle}"))]),
         startup_timeout: None,
         request_timeout: None,
+        guard: false,
     });
     McpClient::connect(
         "guard",

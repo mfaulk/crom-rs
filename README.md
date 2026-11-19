@@ -80,7 +80,11 @@ Several important pieces are not built yet:
   `crates/crom-guard-server` (binary `crom-guard`) serves it to any MCP client
   over Streamable HTTP, with a separate admin API for grants and approvals
   ([docs/guard/server.md](docs/guard/server.md)): `crom-guard serve --config
-  guard.toml`, `crom-guard policy validate`, `crom-guard audit verify <log>`. `crates/crom-guard-testkit` provides the controlled business API and
+  guard.toml`, `crom-guard policy validate`, `crom-guard audit verify <log>`.
+  Crom itself connects to Guard as an MCP client (`ToolPolicy::guard` in the
+  SDK, or `"guard": true` on an http MCP server) and records each call at the
+  `guard` audit layer with Guard's decision id
+  ([docs/sdk/guard.md](docs/sdk/guard.md)). `crates/crom-guard-testkit` provides the controlled business API and
   effect ledger the M18 tests measure against, a standard-library Python
   MCP client runs the reference matrix against a real Guard in CI
   ([docs/guard/reference-deployment.md](docs/guard/reference-deployment.md)),

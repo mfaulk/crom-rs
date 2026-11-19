@@ -418,6 +418,26 @@ pub(crate) async fn run_loop(
         .unwrap_or_else(SessionId::default);
 
     let mut tools = tools;
+    if let Err(reason) =
+        crate::guard::check_guard_allow_rules(&options.allowed_tool_rules, &options.mcp)
+    {
+        emit(
+            &tx,
+            &session_sink,
+            &session_id,
+            AgentEvent::Result(AgentResult {
+                subtype: ResultSubtype::ErrorDuringExecution,
+                result: Some(reason),
+                session_id: session_id.clone(),
+                run_id: Some(cfg.run_id.clone()),
+                num_turns: 0,
+                usage: None,
+                total_cost_usd: None,
+            }),
+        )
+        .await;
+        return Ok(());
+    }
     let mcp_report = register_mcp_tools(&mut tools, &options.mcp).await;
     if options.mcp.enabled {
         emit_telemetry(
@@ -2181,6 +2201,15 @@ pub(crate) async fn run_loop(
                     _ if is_error => SecurityOutcome::Failed,
                     _ => SecurityOutcome::Executed,
                 };
+                // Only tools registered from a `guard: true` server can
+                // carry a Guard verdict; other tools' metadata is ignored.
+                if mcp_report.guard_tools.contains(&call.name) {
+                    if let Some(verdict) =
+                        tool_result_obj.as_ref().and_then(crate::guard::verdict_of)
+                    {
+                        crate::guard::apply_verdict(&mut audit, verdict);
+                    }
+                }
                 if let Some(reason) = &post_hook_denial {
                     audit.decision = PolicyOutcome::Deny;
                     audit.policy_source = Some(PolicyDecisionSource::Hook);

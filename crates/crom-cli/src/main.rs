@@ -1111,13 +1111,21 @@ fn parse_cli_rule(s: &str) -> Result<ToolRule> {
     if s.contains('*') || s.contains('?') {
         ToolRule::try_tool_glob(s).map_err(err)
     } else {
-        Ok(ToolRule::ExactTool(s.to_string()))
+        ToolRule::try_exact_tool(s).map_err(err)
     }
 }
 
 #[cfg(test)]
 mod parse_cli_rule_tests {
     use super::*;
+
+    /// A CLI rule naming a dotted MCP tool is rejected, since agent names map `.` to `_`.
+    #[test]
+    fn dotted_mcp_tool_rule_is_rejected() {
+        assert!(parse_cli_rule("mcp__guard__customer.read").is_err());
+        assert!(parse_cli_rule("guard::mcp_tool_glob:refund.*").is_err());
+        assert!(parse_cli_rule("mcp__guard__customer_read").is_ok());
+    }
 
     #[test]
     // Malformed Bash command regex from the CLI must error, not silently produce a fail-open rule.

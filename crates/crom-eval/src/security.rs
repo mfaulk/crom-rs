@@ -99,6 +99,7 @@ mod tests {
             enforcement: layer,
             outcome,
             reason: None,
+            guard_decision_id: None,
         })
     }
 

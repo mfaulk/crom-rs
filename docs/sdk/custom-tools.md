@@ -54,5 +54,7 @@ Custom tools participate in:
 - Approval callbacks (when `ApprovalPolicy::CallbackRequired`).
 - The tool catalog (visible to `SearchTools` if enabled).
 
-Use `ToolHost` for purely host-managed tools that need richer context
-(tenant ids, request ids, metadata) than `ToolContext` carries.
+`ToolHost` (`AgentRuntimeBuilder::tool_host`) is **not implemented**: the
+builder stores it, but the runtime never calls `execute_host_tool`. Register
+host tools as custom tools instead. To route protected business operations
+through Crom Guard, use [`ToolPolicy::guard`](guard.md), not `ToolHost`.

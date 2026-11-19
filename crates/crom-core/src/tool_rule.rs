@@ -46,9 +46,21 @@ impl ToolRule {
         })
     }
 
+    /// Construct an `ExactTool` rule, rejecting MCP names that can never match.
+    pub fn try_exact_tool(name: impl Into<String>) -> Result<Self, String> {
+        let n = name.into();
+        if n.starts_with("mcp__") {
+            reject_dotted_mcp_name(&n)?;
+        }
+        Ok(ToolRule::ExactTool(n))
+    }
+
     /// Construct a `ToolGlob` rule, validating the glob string.
     pub fn try_tool_glob(pattern: impl Into<String>) -> Result<Self, String> {
         let p = pattern.into();
+        if p.starts_with("mcp__") {
+            reject_dotted_mcp_name(&p)?;
+        }
         Glob::new(&p).map_err(|e| format!("invalid tool glob {:?}: {e}", p))?;
         Ok(ToolRule::ToolGlob(p))
     }
@@ -62,6 +74,7 @@ impl ToolRule {
         if !crom_mcp::is_identifier_safe(&server) {
             return Err(format!("invalid MCP server name {:?}", server));
         }
+        reject_dotted_mcp_name(&tool_glob)?;
         Glob::new(&tool_glob).map_err(|e| format!("invalid MCP tool_glob {:?}: {e}", tool_glob))?;
         Ok(ToolRule::McpServerGlob { server, tool_glob })
     }
@@ -77,7 +90,7 @@ impl ToolRule {
     /// never matches, so a malformed disallow rule would silently fail open.
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            ToolRule::ExactTool(_) => Ok(()),
+            ToolRule::ExactTool(n) => Self::try_exact_tool(n.clone()).map(drop),
             ToolRule::ToolGlob(g) => Self::try_tool_glob(g.clone()).map(drop),
             ToolRule::BashCommandRegex(re) => Self::try_bash_command_regex(re.clone()).map(drop),
             ToolRule::FilePathGlob { tool, pattern } => {
@@ -184,6 +197,19 @@ impl Serialize for ToolRule {
     }
 }
 
+/// Agent-visible MCP tool names map `.` to `_` (`crom_mcp::agent_tool_name`),
+/// so a rule naming a dotted tool would silently never match: an allow rule
+/// would not allow, and a deny rule would not deny.
+fn reject_dotted_mcp_name(name: &str) -> Result<(), String> {
+    if name.contains('.') {
+        return Err(format!(
+            "MCP tool rule {name:?} contains `.`: Crom exposes MCP tools with `.` mapped to `_` \
+             (e.g. Guard's customer.read is mcp__guard__customer_read); write the rule with `_`"
+        ));
+    }
+    Ok(())
+}
+
 impl<'de> Deserialize<'de> for ToolRule {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -202,7 +228,7 @@ impl<'de> Deserialize<'de> for ToolRule {
                 if value.contains('*') || value.contains('?') {
                     ToolRule::try_tool_glob(value).map_err(de::Error::custom)
                 } else {
-                    Ok(ToolRule::ExactTool(value.to_string()))
+                    ToolRule::try_exact_tool(value).map_err(de::Error::custom)
                 }
             }
 
@@ -294,7 +320,7 @@ impl<'de> Deserialize<'de> for ToolRule {
                     (None, Some(p)) => {
                         ToolRule::try_file_path_glob(tool, p).map_err(de::Error::custom)
                     }
-                    (None, None) => Ok(ToolRule::ExactTool(tool)),
+                    (None, None) => ToolRule::try_exact_tool(tool).map_err(de::Error::custom),
                 }
             }
         }
@@ -331,6 +357,40 @@ mod tests {
         ] {
             assert!(bad.validate().is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    /// MCP rules naming a dotted remote tool are rejected: agent names map `.` to `_`, so they could never match.
+    #[test]
+    fn dotted_mcp_tool_names_are_rejected() {
+        for bad in [
+            ToolRule::ExactTool("mcp__guard__customer.read".into()),
+            ToolRule::ToolGlob("mcp__guard__refund.*".into()),
+            ToolRule::McpServerGlob {
+                server: "guard".into(),
+                tool_glob: "customer.*".into(),
+            },
+        ] {
+            let err = bad.validate().unwrap_err();
+            assert!(err.contains("mcp__guard__customer_read"), "{err}");
+        }
+        assert!(serde_json::from_value::<ToolRule>(serde_json::json!("mcp__guard__a.b")).is_err());
+        assert!(serde_json::from_value::<ToolRule>(
+            serde_json::json!({"server": "guard", "tool_glob": "refund.issue"})
+        )
+        .is_err());
+        assert!(
+            serde_json::from_value::<ToolRule>(serde_json::json!({"tool": "mcp__guard__a.b"}))
+                .is_err()
+        );
+        assert!(ToolRule::ExactTool("mcp__guard__customer_read".into())
+            .validate()
+            .is_ok());
+        assert!(ToolRule::FilePathGlob {
+            tool: "Read".into(),
+            pattern: "*.rs".into()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

@@ -150,7 +150,7 @@ All routes need `Authorization: Bearer <admin token>`, compared in constant time
 | `GET /admin/approvals/{action_digest}` | — | `200` pending request: `action_digest`, `tenant`, `grant_id`, `action`, `resource`, `resource_version`, `args`, `fields`, `role`, `created_at`, `expires_at` | `404 unknown_request` (unknown, expired, already approved, another app's, or not 64 hex digits) |
 | `POST /admin/approvals` | `{"action_digest", "approver": Delegator, "approver_tenant", "ttl_seconds"}` | `201 {"approval_id": "ap_…", "expires_at"}` | `400 invalid_spec` (TTL 0 or above `approvals.max_ttl_seconds`), `404 unknown_request`, `4xx invalid_request`, `503 store_unavailable` |
 
-The issue response is the only place a session handle leaves Guard. The trusted application passes it to the agent out of band. Grants and approvals are issued with `admin.app_id` as issuer, so revoke, `GET` and approve reach only grants and pending requests from this listener's credential.
+The issue response is the only place a session handle leaves Guard. The trusted application passes it to the agent out of band: for Crom, as `GuardConnection`'s handle ([docs/sdk/guard.md](../sdk/guard.md)), which Crom sends only as the bearer header. Grants and approvals are issued with `admin.app_id` as issuer, so revoke, `GET` and approve reach only grants and pending requests from this listener's credential.
 
 **Approval flow** ([approvals.md](approvals.md)). The agent's call returns `approval_required` with an `action_digest`. The application fetches `GET /admin/approvals/{digest}` and shows a human exactly what was evaluated. On approval it calls `POST /admin/approvals`. The admin request names the approver (`Delegator`: `id`, `role`, Cedar `attrs`) and the approver's tenant; the admin is trusted for that, and the approver's tenant must equal the grant's at use. What is approved (action, resource, version, args, fields) comes only from Guard's pending request, which approving consumes. The agent retries the same call with `_meta.approval_id`. That approval is single-use and is consumed in `verify`, before Cedar.
 
@@ -207,7 +207,7 @@ cargo test -p crom-guard-server
   - the 0600 unix admin socket.
 - `tests/approvals.rs`: `approval_required`, then admin `GET` and approve, then a retry with `_meta.approval_id` that executes once (a replay is `approval_invalid`); pending requests consumed by approve; route errors; session handles refused; a cross-tenant approver rejected at use.
 - `tests/hardening.rs`: an admin socket directory writable by group is refused; a live socket is not replaced, and a stale one is; the agent connection cap; the deny rate limit (rate-limited calls write no audit record, and allowed calls are never limited); the admin TCP `Host` allowlist.
-- `tests/compat.rs`: `crom-mcp`'s Streamable HTTP client, used only as a transport.
+- `tests/compat.rs`: `crom-mcp`'s Streamable HTTP client, used only as a transport. The full Crom client (`ToolPolicy::guard`, audit correlation on `decision_id`) is tested from the Crom side in `crates/crom-sdk/tests/guard_client.rs`; see [docs/sdk/guard.md](../sdk/guard.md).
 - `tests/canary.rs`: the session handle, admin token and downstream secret appear in no response (other than the issue response), no audit line, and no `tracing` output captured at `TRACE` from every crate, `rmcp` included.
 - `tests/cli.rs`: `serve` from a config file, with the unix admin socket and exit 0 on SIGTERM; `policy validate`; `audit verify`; usage errors.
 - Unit tests:

@@ -10,6 +10,8 @@ use std::sync::Arc;
 use crom_core::Tool;
 pub use crom_core::ToolRule;
 
+use crate::provider::SecretString;
+
 /// Highest side-effect level a tool may produce. Strict ordering (None <
 /// WorkspaceRead < WorkspaceWrite < CommandExecution < ExternalNetwork <
 /// ExternalMutation).
@@ -239,6 +241,59 @@ pub struct ToolPolicy {
     /// OS sandbox for built-in Bash child processes (M17.3). Defaults to
     /// `off`; `required` refuses a command the host cannot sandbox.
     pub sandbox: crom_core::SandboxConfig,
+    /// Crom Guard as the run's only MCP server (`docs/sdk/guard.md`).
+    pub guard: Option<GuardConnection>,
+}
+
+/// MCP server name Guard is registered under; its tools are `mcp__guard__*`.
+pub const GUARD_SERVER_NAME: &str = crom_core::guard::GUARD_SERVER_NAME;
+
+/// A Crom Guard agent endpoint and the session handle the trusted
+/// application obtained from Guard's admin API. The handle is sent only as
+/// the `Authorization` header and is redacted from `Debug`.
+#[derive(Clone)]
+pub struct GuardConnection {
+    /// Streamable HTTP endpoint, e.g. `http://127.0.0.1:8470/mcp`.
+    pub url: String,
+    handle: SecretString,
+    /// Per-request timeout; `None` uses the MCP default (60 s).
+    pub request_timeout: Option<std::time::Duration>,
+}
+
+impl GuardConnection {
+    pub fn new(url: impl Into<String>, handle: SecretString) -> Self {
+        Self {
+            url: url.into(),
+            handle,
+            request_timeout: None,
+        }
+    }
+
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !(self.url.starts_with("http://") || self.url.starts_with("https://")) {
+            return Err("guard url must be http(s)".into());
+        }
+        let h = self.handle.expose();
+        if h.is_empty() || h.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("guard session handle is empty or not a single token".into());
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for GuardConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardConnection")
+            .field("url", &self.url)
+            .field("handle", &"[REDACTED]")
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
 }
 
 impl ToolPolicy {
@@ -262,6 +317,64 @@ impl ToolPolicy {
         self.custom_tools.push(tool);
         self
     }
+
+    /// Read-only builtins, sandbox `required`, and Guard as the only MCP
+    /// server with an explicit allow rule for `mcp__guard__*`. The allow rule
+    /// satisfies only Crom's gate; Guard still decides every call.
+    pub fn guard(connection: GuardConnection) -> Self {
+        Self {
+            allowed_tools: vec![ToolRule::McpServerGlob {
+                server: GUARD_SERVER_NAME.into(),
+                tool_glob: "*".into(),
+            }],
+            sandbox: crom_core::SandboxConfig {
+                mode: crom_core::SandboxMode::Required,
+                ..Default::default()
+            },
+            guard: Some(connection),
+            ..Self::read_only()
+        }
+    }
+
+    /// The core allowlist: the registry's tools plus, with Guard, the
+    /// `mcp__guard__*` tools the core loop discovers at run start.
+    pub(crate) fn allowed_tool_names(&self, tools: &crom_core::ToolRegistry) -> Vec<String> {
+        let mut names = tools.names();
+        if self.guard.is_some() {
+            names.push(format!("mcp__{GUARD_SERVER_NAME}__*"));
+        }
+        names
+    }
+
+    /// The MCP options a run uses: only the Guard server, or MCP disabled.
+    pub(crate) fn mcp_options(&self) -> crom_mcp::McpOptions {
+        let Some(g) = &self.guard else {
+            return crom_mcp::McpOptions::default();
+        };
+        let server = crom_mcp::StreamableHttpMcpServerConfig {
+            url: g.url.clone(),
+            headers: [(
+                "Authorization".to_string(),
+                format!("Bearer {}", g.handle.expose()),
+            )]
+            .into(),
+            startup_timeout: None,
+            request_timeout: g.request_timeout,
+            guard: true,
+        };
+        crom_mcp::McpOptions {
+            enabled: true,
+            // A Guard that cannot be reached or lists nothing for this
+            // handle fails the run instead of running without its tools.
+            strict: true,
+            servers: [(
+                GUARD_SERVER_NAME.to_string(),
+                crom_mcp::McpServerConfig::StreamableHttp(server),
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
 }
 
 impl std::fmt::Debug for ToolPolicy {
@@ -273,6 +386,7 @@ impl std::fmt::Debug for ToolPolicy {
             .field("custom_tool_count", &self.custom_tools.len())
             .field("enable_builtin_tools", &self.enable_builtin_tools)
             .field("side_effect_policy", &self.side_effect_policy)
+            .field("guard", &self.guard)
             .finish()
     }
 }
@@ -343,6 +457,56 @@ mod tests {
         assert!(s.read);
         assert!(s.glob);
         assert!(s.grep);
+    }
+
+    const HANDLE: &str = "gsh_CANARY_0123456789abcdef";
+
+    fn guard_policy() -> ToolPolicy {
+        ToolPolicy::guard(GuardConnection::new(
+            "http://127.0.0.1:8470/mcp",
+            SecretString::new(HANDLE.into()),
+        ))
+    }
+
+    /// `ToolPolicy::guard` allows only Guard's MCP tools, keeps read-only builtins, and requires the sandbox.
+    #[test]
+    fn guard_policy_allows_guard_tools_and_requires_sandbox() {
+        let p = guard_policy();
+        assert!(matches!(
+            p.allowed_tools.as_slice(),
+            [ToolRule::McpServerGlob { server, tool_glob }]
+                if server == GUARD_SERVER_NAME && tool_glob == "*"
+        ));
+        assert_eq!(p.sandbox.mode, crom_core::SandboxMode::Required);
+        assert!(!p.enable_builtin_tools.bash);
+        assert!(!p.side_effect_policy.allow_workspace_write);
+        assert!(p.guard.is_some());
+    }
+
+    /// The Guard connection becomes the only MCP server, marked `guard`, with the handle as a bearer header.
+    #[test]
+    fn guard_policy_mcp_options_hold_one_guard_server() {
+        let opts = guard_policy().mcp_options();
+        assert!(opts.enabled);
+        assert!(opts.strict);
+        assert_eq!(opts.servers.len(), 1);
+        let crom_mcp::McpServerConfig::StreamableHttp(c) = &opts.servers[GUARD_SERVER_NAME] else {
+            panic!("not http");
+        };
+        assert!(c.guard);
+        assert_eq!(c.url, "http://127.0.0.1:8470/mcp");
+        assert_eq!(c.headers["Authorization"], format!("Bearer {HANDLE}"));
+        assert!(opts.secret_values().contains(&HANDLE.to_string()));
+        assert!(!ToolPolicy::default().mcp_options().enabled);
+    }
+
+    /// Debug output of the connection and the policy never shows the handle.
+    #[test]
+    fn guard_connection_debug_redacts_handle() {
+        let p = guard_policy();
+        let dbg = format!("{p:?} {:?}", p.guard);
+        assert!(!dbg.contains(HANDLE), "{dbg}");
+        assert!(dbg.contains("127.0.0.1:8470"), "{dbg}");
     }
 
     /// InteractivityMode::HeadlessDeny is the SDK default.

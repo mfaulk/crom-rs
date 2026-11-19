@@ -28,7 +28,9 @@ events without touching the CLI, TUI, terminal, or global credentials.
 - No global credential lookup by default. Bring your own keys.
 - No filesystem mutation by default. Patches are returned, not applied.
 - No Bash execution by default. Opt in explicitly.
-- No plugin/MCP/skill loading by default. Opt in via features.
+- No plugin/MCP/skill loading by default. Opt in via features. The one
+  exception is [`ToolPolicy::guard`](guard.md), which connects to a Crom
+  Guard MCP server when the host asks for it.
 
 ## Feature flags
 

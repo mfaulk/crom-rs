@@ -706,6 +706,10 @@ pub struct SecurityDecision {
     pub outcome: SecurityOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Guard's `decision_id` from the tool result's `_meta`, the join key to
+    /// Guard's audit log. Only set for servers configured with `guard: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_decision_id: Option<String>,
 }
 
 /// Who issued the tool call.
@@ -732,6 +736,10 @@ pub enum EnforcementLayer {
     /// Tool-level guard that refused at execution time
     /// (`ToolError::PermissionDenied`, e.g. the Read/Write/Edit path sandbox).
     Sandbox,
+    /// Crom Guard, reached as an MCP server marked `guard: true`. Set on
+    /// every call that reached Guard, including Guard denials and Guard
+    /// being unreachable.
+    Guard,
 }
 
 /// What actually happened to the call.
@@ -1087,5 +1095,42 @@ mod tests {
             json.contains("\"text\":\"hi\""),
             "missing text field: {json}"
         );
+    }
+
+    fn pre_guard_record() -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "s1",
+            "run_id": "run-1",
+            "turn_index": 1,
+            "principal": {"kind": "session"},
+            "tool_use_id": "t1",
+            "tool_name": "Write",
+            "decision": "allow",
+            "enforcement": "policy",
+            "outcome": "executed"
+        })
+    }
+
+    /// A SecurityDecision written before the guard fields existed still deserializes, with no decision id.
+    #[test]
+    fn security_decision_without_guard_fields_deserializes() {
+        let d: SecurityDecision = serde_json::from_value(pre_guard_record()).unwrap();
+        assert_eq!(d.enforcement, EnforcementLayer::Policy);
+        assert_eq!(d.guard_decision_id, None);
+        let back = serde_json::to_value(&d).unwrap();
+        assert!(back.get("guard_decision_id").is_none(), "{back}");
+    }
+
+    /// The guard layer serializes as `guard` and the guard decision id round-trips.
+    #[test]
+    fn security_decision_guard_layer_round_trips() {
+        let mut v = pre_guard_record();
+        v["enforcement"] = "guard".into();
+        v["outcome"] = "blocked".into();
+        v["guard_decision_id"] = "dec-123".into();
+        let d: SecurityDecision = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(d.enforcement, EnforcementLayer::Guard);
+        assert_eq!(d.guard_decision_id.as_deref(), Some("dec-123"));
+        assert_eq!(serde_json::to_value(&d).unwrap(), v);
     }
 }
