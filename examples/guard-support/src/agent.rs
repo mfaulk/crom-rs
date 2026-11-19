@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use crom_core::{
     ContentBlock, ModelEvent, ModelProvider, ModelRequest, ProviderError, ToolCall,
@@ -164,6 +164,64 @@ pub struct RunSpec<'a> {
     pub max_turns: u32,
 }
 
+/// The agent's tool policy: Guard as the only MCP server, sandbox
+/// `required`, and optionally sandboxed Bash.
+pub fn policy(connection: GuardConnection, bash: bool) -> ToolPolicy {
+    let mut policy = ToolPolicy::guard(connection);
+    if bash {
+        policy.enable_builtin_tools.bash = true;
+        policy.side_effect_policy = SideEffectPolicy::command_execution();
+        policy
+            .allowed_tools
+            .push(ToolRule::ExactTool("Bash".into()));
+    }
+    policy
+}
+
+/// The agent's [`policy`] as the Crom settings file `crom-guard check`
+/// reads. The in-process SDK agent reads no settings file, so the preflight
+/// checks this rendering of the policy it actually runs with.
+pub fn crom_settings(guard_url: &str, bash: bool) -> Result<serde_json::Value> {
+    // The handle is never written: the settings interpolate it, as
+    // agent/crom-settings.json does.
+    let header = format!("Bearer ${{{HANDLE_VAR}}}");
+    let placeholder = SecretString::new(format!("${{{HANDLE_VAR}}}"));
+    let p = policy(GuardConnection::new(guard_url, placeholder), bash);
+    let guard = p.guard.as_ref().context("policy has no Guard connection")?;
+    let mut allowed = Vec::new();
+    for rule in &p.allowed_tools {
+        allowed.push(match rule {
+            ToolRule::McpServerGlob { server, tool_glob } => format!("mcp__{server}__{tool_glob}"),
+            ToolRule::ExactTool(name) => name.clone(),
+            other => anyhow::bail!("no settings form for allow rule {other:?}"),
+        });
+    }
+    Ok(serde_json::json!({
+        "sandbox": {
+            "mode": p.sandbox.mode.as_str(),
+            "network": p.sandbox.network,
+            "read_paths": p.sandbox.read_paths,
+            "env_allow": p.sandbox.env_allow,
+        },
+        "mcp": {
+            "enabled": true,
+            "servers": {
+                crom_sdk::GUARD_SERVER_NAME: {
+                    "type": "http",
+                    "url": guard.url,
+                    "headers": {"Authorization": header},
+                    "guard": true,
+                }
+            }
+        },
+        // The SDK loads no plugins.
+        "plugins": {"allow_plugin_mcp": false},
+        "allowed_tools": allowed,
+    }))
+}
+
+const HANDLE_VAR: &str = "CROM_GUARD_HANDLE";
+
 /// Runs one Crom session for the ticket. The handle reaches only Crom's
 /// MCP client; the model never sees it.
 pub async fn run(spec: RunSpec<'_>, model: Model) -> Result<AgentRun> {
@@ -172,14 +230,7 @@ pub async fn run(spec: RunSpec<'_>, model: Model) -> Result<AgentRun> {
         SecretString::new(spec.handle.expose().to_owned()),
     )
     .with_approver(spec.app.clone());
-    let mut policy = ToolPolicy::guard(connection);
-    if spec.bash {
-        policy.enable_builtin_tools.bash = true;
-        policy.side_effect_policy = SideEffectPolicy::command_execution();
-        policy
-            .allowed_tools
-            .push(ToolRule::ExactTool("Bash".into()));
-    }
+    let policy = policy(connection, spec.bash);
     let sessions = spec.out.join("crom-sessions");
     std::fs::create_dir_all(&sessions)?;
     let marks = Arc::new(Mutex::new(Vec::new()));
@@ -251,4 +302,39 @@ pub async fn run(spec: RunSpec<'_>, model: Model) -> Result<AgentRun> {
         results,
         usage: result.usage,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The checked settings render the agent's policy: sandbox required without network, Guard as the only MCP server, and the matching allow rules, with no handle value.
+    #[test]
+    fn crom_settings_render_the_agent_policy() {
+        let s = crom_settings("http://127.0.0.1:9999/mcp", true).unwrap();
+        assert_eq!(s["sandbox"]["mode"], "required");
+        assert_eq!(s["sandbox"]["network"], false);
+        let servers = s["mcp"]["servers"].as_object().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers["guard"]["url"], "http://127.0.0.1:9999/mcp");
+        assert_eq!(servers["guard"]["guard"], true);
+        assert_eq!(s["allowed_tools"], json!(["mcp__guard__*", "Bash"]));
+        assert_eq!(
+            servers["guard"]["headers"]["Authorization"],
+            format!("Bearer ${{{HANDLE_VAR}}}")
+        );
+    }
+
+    /// Without Bash the rendering matches the reference settings in agent/crom-settings.json, apart from the empty sandbox lists.
+    #[test]
+    fn crom_settings_match_the_reference_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/crom-settings.json");
+        let reference: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut s = crom_settings("http://127.0.0.1:8470/mcp", false).unwrap();
+        let sandbox = s["sandbox"].as_object_mut().unwrap();
+        assert_eq!(sandbox.remove("read_paths"), Some(json!([])));
+        assert_eq!(sandbox.remove("env_allow"), Some(json!([])));
+        assert_eq!(s, reference);
+    }
 }

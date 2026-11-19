@@ -51,6 +51,26 @@ The first run builds `crom-guard-support` from the workspace
 | `approvals.jsonl` | Each approval request the supervisor was shown (from Guard's pending record) and the decision |
 | `crom-events.jsonl`, `crom-sessions/`, `model-requests.jsonl`, `crom-trace.log` | Everything Crom emitted or sent to the model, kept for the leak checks |
 | `guard.log` | Guard's own log |
+| `guard-check.txt`, `crom-settings.checked.json` | `crom-guard check` output and the Crom settings it checked (scripted and live) |
+
+## Isolation preflight (`crom-guard check`)
+
+Before Guard starts, the scripted and live modes run
+`crom-guard-support check --config <state>/guard.toml --crom-settings <settings.json>
+--crom-workspace <workspace>` ([deployment.md](../../docs/guard/deployment.md), #360)
+against the deployment they are about to start, and refuse to start Guard if it
+fails. The Crom agent is agent (a) in that profile: on Guard's uid, Bash
+sandbox `required` without network, Guard as its only MCP server. The agent
+port is written into the state directory's `guard.toml`, so `check` and
+`serve` read the same file. The SDK agent reads no settings file, so the
+driver renders the agent's actual `ToolPolicy` as Crom settings
+(`agent::crom_settings`; equal to `agent/crom-settings.json` without Bash) in a
+fresh `CROM_CONFIG_HOME`, with a fresh, untrusted workspace. `check`'s output is
+`guard-check.txt`, and `report.json` has a `crom-guard check` row.
+
+`--agent python` is the exception: `run-python-client.sh` runs the Python
+agent unsandboxed on Guard's uid, outside the profile, so `check` would fail
+and is not run (see [reference-deployment.md](../../docs/guard/reference-deployment.md)).
 
 ## Scripted run (CI)
 
@@ -79,7 +99,8 @@ with Guard's session error for that handle; `blocked` is a Bash or `Read` call
 that failed (sandbox: no sockets, no reads outside the workspace). Ledger
 effects are attributed per call and must carry that call's Guard decision id.
 
-Evidence checks after the run: `crom-guard audit verify` passes; every ledger
+Evidence checks after the run: `crom-guard check` passed before Guard
+started; `crom-guard audit verify` passes; every ledger
 effect has exactly one Guard `executed` record; exactly 4 effects; no session
 handle (agent, earlier ticket, subagent), admin token or business-API
 credential in any artifact, log or the agent's workspace; no canary of a
@@ -87,9 +108,9 @@ record outside the grant in anything Crom emitted or sent to the model; the
 matrix equals `snapshots/scripted-matrix.txt`. After an intended change, rerun
 with `--update-snapshot` and review the diff.
 
-Not covered: Guard's isolation preflight (#360) and a separate-uid agent.
-Bash bypass attempts here show only that these calls fail and leave no
-effect; the adversarial bypass suite is #360/#361.
+Not covered: a separate-uid agent (agent (b)). Bash bypass attempts here
+show only that these calls fail and leave no effect; the adversarial bypass
+suite is #360/#361.
 
 ## Live run (manual, never in CI)
 

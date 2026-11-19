@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::admin::{Issued, Secret};
 use crate::agent::{AgentRun, Model, RunSpec, ScriptedCall};
-use crate::deployment::Deployment;
+use crate::deployment::{CromAgent, Deployment};
 use crate::report::{Check, Row};
 use crate::trusted_app::{Supervisor, TrustedApp};
 
@@ -436,7 +436,14 @@ async fn scripted(ctx: &Ctx) -> Result<bool> {
     let bin = deployment::guard_binary(&ctx.root)?;
     capture_traces(&ctx.out)?;
     let ledger = ctx.out.join("ledger.jsonl");
-    let mut dep = Deployment::start(&ctx.example, bin, &ledger).await?;
+    let workspace = tempfile::Builder::new().prefix("guard-agent-").tempdir()?;
+    std::fs::write(workspace.path().join("TICKET.md"), DEFAULT_TASK)?;
+    let crom = CromAgent {
+        workspace: workspace.path(),
+        bash: true,
+    };
+    let mut dep = Deployment::start(&ctx.example, bin, &ledger, &ctx.out, crom).await?;
+    println!("crom-guard check: {}", dep.preflight);
     println!(
         "Guard agent endpoint {} (business API {})",
         dep.agent_url, dep.api_url
@@ -454,8 +461,6 @@ async fn scripted(ctx: &Ctx) -> Result<bool> {
         ticket.grant_id
     );
 
-    let workspace = tempfile::Builder::new().prefix("guard-agent-").tempdir()?;
-    std::fs::write(workspace.path().join("TICKET.md"), DEFAULT_TASK)?;
     let s = Session {
         ctx,
         dep: &dep,
@@ -620,6 +625,12 @@ async fn finish(
     std::fs::write(out.join("approvals.jsonl"), approvals_log)?;
 
     let mut checks = vec![
+        // Deployment::start fails unless the preflight passed.
+        Check::new(
+            "crom-guard check (isolation profile, before Guard started)",
+            true,
+            dep.preflight.clone(),
+        ),
         Check::new(
             "crom-guard audit verify",
             dep.verify_audit()?,
@@ -773,7 +784,13 @@ async fn live(ctx: &Ctx) -> Result<bool> {
     let bin = deployment::guard_binary(&ctx.root)?;
     capture_traces(&ctx.out)?;
     let ledger = ctx.out.join("ledger.jsonl");
-    let mut dep = Deployment::start(&ctx.example, bin, &ledger).await?;
+    let workspace = tempfile::Builder::new().prefix("guard-agent-").tempdir()?;
+    let crom = CromAgent {
+        workspace: workspace.path(),
+        bash: false,
+    };
+    let mut dep = Deployment::start(&ctx.example, bin, &ledger, &ctx.out, crom).await?;
+    println!("crom-guard check: {}", dep.preflight);
     let app = TrustedApp::new(dep.admin.clone(), dep.agent_url.clone(), supervisor);
     let ticket: Issued = app
         .open_ticket(&ctx.example.join(GRANT_SPEC), "run-tck-1001-live")
@@ -782,7 +799,6 @@ async fn live(ctx: &Ctx) -> Result<bool> {
         "support-app: opened ticket TCK-1001 (grant {})",
         ticket.grant_id
     );
-    let workspace = tempfile::Builder::new().prefix("guard-agent-").tempdir()?;
     let task = ctx.args.task.clone().unwrap_or_else(|| DEFAULT_TASK.into());
     let spec = RunSpec {
         label: "ticket",

@@ -22,6 +22,7 @@ The app makes no authorization decision. A human (scripted, or `--supervisor pro
 
 ## One ticket, end to end
 
+0. Before Guard starts, the driver runs `crom-guard check` for this deployment, with the Crom agent's policy as its settings (agent (a) in [deployment.md](deployment.md): Guard's uid, sandbox `required` without network, Guard the only MCP server, untrusted workspace), and stops if it fails. The Python mode skips it: that client runs unsandboxed on Guard's uid, outside the profile ([reference-deployment.md](reference-deployment.md)).
 1. The app issues the grant in `grants/acme-agent-operator.json` (acme operator, customer `acme-cus-000`, refunds up to 100.00, operator limit 50.00) and keeps the handle.
 2. Crom connects to Guard with the handle and lists only the granted operations as `mcp__guard__*` tools (`guard.delegate` is never exposed to Crom).
 3. The model calls tools. Guard allows, denies (`resource_not_found`, `policy_deny`, `invalid_arguments`, ...) or answers `approval_required` for a refund above the operator's limit.
@@ -35,7 +36,8 @@ Artifacts land in `target/guard-demo/`.
 
 ```sh
 cat target/guard-demo/matrix.txt                  # one row per attempted action
-jq '.checks' target/guard-demo/report.json         # audit verify, ledger attribution, leak scans
+cat target/guard-demo/guard-check.txt              # the isolation preflight, one line per check
+jq '.checks' target/guard-demo/report.json         # preflight, audit verify, ledger attribution, leak scans
 jq -c '{kind, guard_decision_id}' target/guard-demo/ledger.jsonl
 jq -c 'select(.approver) | {record, decision_id, action, args_logged, approver, outcome}' \
   target/guard-demo/audit.jsonl                    # the approved refund names its approver
@@ -50,6 +52,7 @@ Edit a policy in `examples/guard-support/policies/` or the grant in `grants/`, r
 
 ## Limits
 
-- The scripted Bash attempts show only that those calls fail and leave no ledger effect. The isolation profile, `crom-guard check` and the bypass suite are #360; the scored adversarial scenarios are #361.
+- The scripted Bash attempts show only that those calls fail and leave no ledger effect. The bypass suite is #360; the scored adversarial scenarios are #361.
+- The SDK agent reads no settings file, so `check` sees the driver's rendering of the agent's `ToolPolicy` (`agent::crom_settings`), not a file Crom loads. A unit test pins that rendering to `agent/crom-settings.json`.
 - Guard's session errors at tool discovery (`grant_revoked`, `no_grant`) end the Crom run but are not surfaced by Crom; the driver labels those rows with Guard's code from its own `tools/list` probe.
 - `crom run` (CLI) sets no Guard approver: there, `approval_required` stays a tool error.

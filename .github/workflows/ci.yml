@@ -458,10 +458,14 @@ jobs:
       # #362: no lockfile flag, as in `examples / check` (the example ships its own Cargo.lock).
       - name: Reference app unit tests
         run: cargo test --manifest-path examples/guard-support/Cargo.toml
-      # Scripted Crom agent, offline: the MILESTONE_18 §14.2 matrix must match
+      # Scripted Crom agent, offline: `crom-guard check` must pass before Guard
+      # starts, the MILESTONE_18 §14.2 matrix must match
       # examples/guard-support/snapshots/scripted-matrix.txt and every evidence check must pass.
       - name: Scripted demo (MILESTONE_18 §14.2 matrix)
-        run: cargo run --manifest-path examples/guard-support/Cargo.toml -- --agent scripted
+        run: |
+          cargo run --manifest-path examples/guard-support/Cargo.toml -- --agent scripted
+          jq -e '.checks[] | select(.check | startswith("crom-guard check")) | .pass' target/guard-demo/report.json
+          ! grep -q '^FAIL' target/guard-demo/guard-check.txt
       - name: Upload demo artifacts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
