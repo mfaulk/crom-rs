@@ -313,10 +313,13 @@ fn fail_closed(failed: &AtomicBool, decision_id: &DecisionId, why: &str) {
 }
 
 /// What the agent sees for `reason`. Audit unavailability is reported as
-/// `engine_unavailable` (§12.3), so agents cannot tell the log is down.
+/// `engine_unavailable` (§12.3), so agents cannot tell the log is down, and
+/// an unknown tool as `action_not_granted`, so they cannot tell which
+/// operations exist.
 fn agent_code(reason: &DenyReason) -> &'static str {
     match reason {
         DenyReason::AuditUnavailable => DenyReason::EngineUnavailable.code(),
+        DenyReason::UnknownAction => DenyReason::ActionNotGranted.code(),
         r => r.code(),
     }
 }
@@ -368,17 +371,14 @@ impl Call<'_> {
         drop(handle);
         self.rec.identity = Some(AuditIdentity::from(ctx.principal()));
 
-        // 2. Normalize and validate.
+        // 2. Look up, check the grant, then validate. The grant check comes
+        // before validation, and unknown tools look ungranted to the agent,
+        // so a session cannot enumerate operations or probe their schemas.
         let Some(entry) = g.registry.get(tool) else {
             self.rec.untrusted.requested_tool = Some(truncate(tool));
             return self.deny(DenyReason::UnknownAction).await;
         };
         self.rec.action = Some(entry.action.clone());
-        let Some(args) = entry.validate(arguments) else {
-            return self.deny(DenyReason::InvalidArguments).await;
-        };
-        self.rec.args_digest = Some(crate::pdp::args_digest_hex(&args));
-        self.rec.args_logged = logged(entry, &args);
         if !ctx
             .chain()
             .iter()
@@ -386,6 +386,11 @@ impl Call<'_> {
         {
             return self.deny(DenyReason::ActionNotGranted).await;
         }
+        let Some(args) = entry.validate(arguments) else {
+            return self.deny(DenyReason::InvalidArguments).await;
+        };
+        self.rec.args_digest = Some(crate::pdp::args_digest_hex(&args));
+        self.rec.args_logged = logged(entry, &args);
         let op = match &entry.kind {
             OpKind::Protected(op) => op.clone(),
             OpKind::Builtin(_) => return self.run_builtin(entry, ctx, args).await,

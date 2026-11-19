@@ -153,7 +153,6 @@ async fn broker_secret_never_leaves_guard() {
         "policy_deny",
         "resource_not_found",
         "invalid_arguments",
-        "unknown_action",
         "no_grant",
         "precondition_failed",
         "execution_failed",

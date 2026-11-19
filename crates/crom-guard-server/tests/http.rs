@@ -81,7 +81,7 @@ async fn tools_list_requires_a_live_handle() {
     assert_eq!(r["error"]["data"], json!({"code": "grant_revoked"}));
 }
 
-/// Unknown tool names, aliases, and case variants are denied with `unknown_action`.
+/// Unknown tool names, aliases, and case variants are denied with `action_not_granted`, the same code as an ungranted tool.
 #[tokio::test]
 async fn unknown_tool_is_denied() {
     let f = Fixture::start().await;
@@ -99,8 +99,8 @@ async fn unknown_tool_is_denied() {
             )
             .await;
         assert_eq!(r["isError"], true, "{r}");
-        assert_eq!(code_of(&r), "unknown_action");
-        assert_eq!(r["content"][0]["text"], "unknown_action");
+        assert_eq!(code_of(&r), "action_not_granted");
+        assert_eq!(r["content"][0]["text"], "action_not_granted");
         assert!(r["_meta"]["decision_id"].is_string());
     }
 }

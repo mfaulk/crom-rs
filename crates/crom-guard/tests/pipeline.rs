@@ -537,7 +537,18 @@ impl Fixture {
     /// Asserts a pre-execution deny with `code`: one decision record, no
     /// outcome record, nothing leased or executed.
     fn assert_denied(&self, out: &CallOutcome, code: &str) -> AuditRecord {
-        assert_eq!(out.result, CallResult::Denied { code: leak(code) });
+        self.assert_denied_as(out, code, code)
+    }
+
+    /// Like [`assert_denied`](Self::assert_denied), for denials the agent
+    /// sees as `agent_code` but the audit record keeps as `recorded`.
+    fn assert_denied_as(&self, out: &CallOutcome, agent_code: &str, code: &str) -> AuditRecord {
+        assert_eq!(
+            out.result,
+            CallResult::Denied {
+                code: leak(agent_code)
+            }
+        );
         assert_eq!(self.executed(), 0);
         assert_eq!(self.leased(), 0);
         let (d, o) = self.records_for(out);
@@ -655,7 +666,7 @@ fn revoked_grant_denied() {
     assert_eq!(f.resolved(), 0);
 }
 
-/// Tool names match exactly: case variants, whitespace, near-misses, and Guard-reserved names are `unknown_action` before resolution.
+/// Tool names match exactly: case variants, whitespace, near-misses, and Guard-reserved names are recorded as `unknown_action` before resolution, while the agent sees `action_not_granted`.
 #[test]
 fn unknown_tool_names_denied_before_resolution() {
     let f = fixture(Opts::default());
@@ -669,12 +680,49 @@ fn unknown_tool_names_denied_before_resolution() {
         "guard.delegate",
         "",
     ] {
-        let d = f.assert_denied(&f.call(tool, refund(1_000)), "unknown_action");
+        let d = f.assert_denied_as(
+            &f.call(tool, refund(1_000)),
+            "action_not_granted",
+            "unknown_action",
+        );
         assert_eq!(d.untrusted.requested_tool.as_deref(), Some(tool));
         assert_eq!(d.action, None);
     }
     assert_eq!(f.resolved(), 0);
     assert_eq!(f.probe.contexts.load(Ordering::SeqCst), 0);
+}
+
+/// An unknown tool and a registered but ungranted tool give the agent identical results; only the audit record tells them apart.
+#[test]
+fn unknown_and_ungranted_tools_look_identical() {
+    let f = fixture(Opts {
+        actions: &["customer.read"],
+        ..Opts::default()
+    });
+    let unknown = f.call("payroll.run", refund(1_000));
+    let ungranted = f.call("refund.issue", refund(1_000));
+    assert_eq!(unknown.result, ungranted.result);
+    assert_eq!(unknown.code(), ungranted.code());
+    f.assert_denied_as(&unknown, "action_not_granted", "unknown_action");
+    f.assert_denied_as(&ungranted, "action_not_granted", "action_not_granted");
+}
+
+/// Invalid arguments to an ungranted tool are `action_not_granted`, so an agent cannot probe the schemas of operations it does not hold.
+#[test]
+fn ungranted_tool_arguments_are_not_validated() {
+    let f = fixture(Opts {
+        actions: &["customer.read"],
+        ..Opts::default()
+    });
+    for args in [
+        json!({"invoice_id": "acme-inv-001", "amount_cents": 100, "tenant_id": "globex"}),
+        json!({"invoice_id": 7}),
+        json!(null),
+    ] {
+        let d = f.assert_denied(&f.call("refund.issue", args), "action_not_granted");
+        assert_eq!(d.args_digest, None);
+    }
+    assert_eq!(f.resolved(), 0);
 }
 
 /// Extra fields (a forged `tenant_id`), missing or ill-typed fields, non-objects, and oversized input are `invalid_arguments` before resolution.

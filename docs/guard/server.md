@@ -21,7 +21,7 @@ crom-guard audit verify audit.jsonl [--anchor <seq>:<hash>]...
 
 Exit codes: 0 success; 1 refused to start, invalid policy, or broken audit chain; 2 usage error. `serve` stops on SIGINT or SIGTERM (see "Shutdown").
 
-The stock binary compiles in **no protected operations**: every `tools/call` is `unknown_action` and no grant can be issued. A deployment builds its own small binary that registers its operations and hands over to the same CLI:
+The stock binary compiles in **no protected operations**: every `tools/call` is denied (`action_not_granted`) and no grant can be issued. A deployment builds its own small binary that registers its operations and hands over to the same CLI:
 
 ```rust
 fn main() -> std::process::ExitCode {
@@ -124,7 +124,7 @@ MCP Streamable HTTP, served by `rmcp` (pinned `~3.11`) in stateless mode with JS
 | `approval_required` | `true` | `{"status": "approval_required", "role": "…", "action_digest": "…"}` | `approval_required` |
 | `failed` | `true` | `{"status": "failed", "code": "precondition_failed" \| "execution_failed"}` | the code |
 
-`audit_head` is omitted if nothing could be written. Agents see only these stable codes. Unknown tools, aliases and case variants are `unknown_action`.
+`audit_head` is omitted if nothing could be written. Agents see only these stable codes. Unknown tools, aliases and case variants are `action_not_granted`, the same as a registered tool the grant lacks, so a session cannot tell which operations exist (#405).
 
 **Accepted side channel.** `audit_head.seq` is the position in the one, server-wide audit log. An agent that calls twice learns how many records other callers, including other tenants, wrote in between: a call-volume signal. This is accepted. It reveals no content, and the receipt is what lets the agent anchor the log (MILESTONE_18 §12.2).
 

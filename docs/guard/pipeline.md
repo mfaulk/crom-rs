@@ -56,9 +56,9 @@ flowchart TD
 | Step | Check | Deny code | `enforcement` |
 |---|---|---|---|
 | 1 | `SessionHandle::parse`, then `GrantStore::authenticate(handle, clock.now())` | `no_grant`, `grant_not_yet_valid`, `grant_expired`, `grant_revoked` | `guard_session` |
-| 2 | Exact, case-sensitive tool-name lookup. No normalization, no aliases | `unknown_action` | `guard_validation` |
-| 2 | Serialized size ≤ `MAX_ARGUMENT_BYTES` (64 KiB), object, operation schema | `invalid_arguments` | `guard_validation` |
+| 2 | Exact, case-sensitive tool-name lookup. No normalization, no aliases | `action_not_granted` (internal reason `unknown_action`) | `guard_validation` |
 | 2 | Action listed by every grant in the chain (ADR 0003 §4.3) | `action_not_granted` | `guard_validation` |
+| 2 | Serialized size ≤ `MAX_ARGUMENT_BYTES` (64 KiB), object, operation schema | `invalid_arguments` | `guard_validation` |
 | 2 | `ProtectedOperation::context` (typed parse). `AuthorizationContext` refuses `grant` and `approval` | the operation's reason, usually `invalid_arguments` | `guard_validation` |
 | 3 | Resolver, bounded by any `TimeoutResolver` and by `with_resolve_timer` | `resource_not_found` (missing and other-tenant alike), `engine_unavailable` | `guard_validation`, `guard_policy` |
 | — | Presented `approval_id` checked by the `ApprovalVerifier` | `approval_invalid` | `guard_approval` |
@@ -92,7 +92,7 @@ The recheck runs after the decision record is durable and the credential is leas
 | `approval_required` | `role`, `action_digest` | Nothing ran (§9.4) |
 | `failed` | `code` | The executor ran and failed: `precondition_failed` or `execution_failed` |
 
-No result carries internal detail. `chain_deny` omits the ancestor grant id, which is only in the audit record. `ExecuteError::Failed` text is never emitted anywhere. The `debug` trace event carries only its length and a 16-hex-digit SHA-256 prefix, for matching against the operation's own logs. Missing and other-tenant resources give byte-identical results apart from `decision_id`. `audit_head` is the receipt of the last record written for the call, for anchoring (§12.2). The server maps `CallOutcome` to an MCP `CallToolResult` ([server.md](server.md)).
+No result carries internal detail. `chain_deny` omits the ancestor grant id, which is only in the audit record. `ExecuteError::Failed` text is never emitted anywhere. The `debug` trace event carries only its length and a 16-hex-digit SHA-256 prefix, for matching against the operation's own logs. Missing and other-tenant resources give byte-identical results apart from `decision_id`. An unknown tool and a registered tool the grant lacks both give `action_not_granted`, and the grant is checked before arguments are validated, so a session cannot enumerate operations or probe their schemas (#405). The audit record keeps `unknown_action` for the former. `audit_head` is the receipt of the last record written for the call, for anchoring (§12.2). The server maps `CallOutcome` to an MCP `CallToolResult` ([server.md](server.md)).
 
 ## Audit records
 
