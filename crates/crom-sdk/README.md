@@ -26,7 +26,9 @@ approvals; `allowed_tools` pre-approves matching calls. Malformed rules fail
 `ToolPolicy::guard(GuardConnection::new(url, handle))` connects the run to a
 Crom Guard agent endpoint as its only MCP server. Guard decides every
 protected operation; Crom records each call at the `guard` audit layer with
-Guard's decision id. See [`docs/sdk/guard.md`](../../docs/sdk/guard.md)
+Guard's decision id. `GuardConnection::with_approver` lets the trusted
+application answer Guard's `approval_required` (Crom then retries the call
+once with `_meta.approval_id`). See [`docs/sdk/guard.md`](../../docs/sdk/guard.md)
 (`cargo test -p crom-sdk --features fake-provider --test guard_client`).
 
 `RunBudgets` caps turns, tool calls, duration, patch size, cumulative
