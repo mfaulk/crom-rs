@@ -64,7 +64,10 @@ Several important pieces are not built yet:
   agents, and enforcement usable from other agent frameworks. It is the goal
   of **Crom Guard**, planned for milestone M18
   ([plan](docs/milestones/MILESTONE_18.md),
-  [issues](https://github.com/mfaulk/crom-rs/milestone/2)).
+  [issues](https://github.com/mfaulk/crom-rs/milestone/2)). The architecture
+  is proposed in [ADR 0002](docs/security/decisions/0002-guard-architecture.md);
+  `crates/crom-guard` and `crates/crom-guard-server` are empty skeletons so
+  far.
 - **The sandbox is opt-in and Linux-only.** `sandbox.mode` defaults to `off`.
   It covers agent shell commands, not MCP servers or validation commands.
   Other platforms refuse sandboxed commands rather than run them unprotected.

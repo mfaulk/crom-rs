@@ -523,6 +523,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crom-guard"
+version = "0.1.0"
+
+[[package]]
+name = "crom-guard-server"
+version = "0.1.0"
+dependencies = [
+ "crom-guard",
+]
+
+[[package]]
 name = "crom-mcp"
 version = "0.1.0"
 dependencies = [

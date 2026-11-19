@@ -1,0 +1,12 @@
+[package]
+name = "crom-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Authorization, credential isolation, and audit for agent-initiated operations (Crom Guard)."
+publish = false
+
+# Must never depend on another crom-* crate (ADR 0002; checked by
+# scripts/check-guard-deps.sh in CI).
+[dependencies]
