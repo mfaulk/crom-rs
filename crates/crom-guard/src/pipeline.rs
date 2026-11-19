@@ -53,6 +53,8 @@ pub struct CallMeta {
 /// carry no internal detail: no ancestor grant id, no downstream error
 /// text, and the same `resource_not_found` for missing and other-tenant
 /// resources.
+///
+/// The `result` may hold a secret; see [`CallResult`] ("Secrets").
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct CallOutcome {
@@ -63,11 +65,21 @@ pub struct CallOutcome {
     pub audit_head: Option<AuditReceipt>,
 }
 
+/// The agent-visible result of one call.
+///
+/// # Secrets
+///
+/// `Executed { content }` can hold a secret: the child session handle
+/// returned by `guard.delegate`. Return it to the calling agent only. Do
+/// not log, trace, or persist a `CallResult` or `CallOutcome`, including
+/// through its `Debug` or `Serialize` output; log [`CallOutcome::code`]
+/// instead.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum CallResult {
-    /// The operation ran; `content` is its structured result.
+    /// The operation ran; `content` is its structured result. For
+    /// `guard.delegate` it holds the child session handle, a secret.
     Executed { content: Value },
     /// Nothing ran. `code` is a [`DenyReason::code`].
     Denied { code: &'static str },
@@ -560,10 +572,14 @@ impl Call<'_> {
                 .blocked_after_decision(DenyReason::AuditUnavailable)
                 .await;
         }
-        let now = g.clock.now();
         let t = Instant::now();
         let result = guarded(|| op.run(&ctx, g.store.as_ref(), &args, now)).await;
         let execute_us = micros(t);
+        let result = match result {
+            Ok(Err(reason)) => return self.blocked_after_decision(reason).await,
+            Ok(Ok(out)) => Ok(Ok(out)),
+            Err(Panicked) => Err(Panicked),
+        };
         self.finish(result, execute_us).await
     }
 
@@ -909,7 +925,7 @@ mod tests {
             _store: &'a dyn GrantStore,
             _args: &'a ValidatedArgs,
             _now: Timestamp,
-        ) -> BoxFuture<'a, Result<ExecutionOutput, ExecuteError>> {
+        ) -> BoxFuture<'a, Result<ExecutionOutput, DenyReason>> {
             Box::pin(async move {
                 self.runs.fetch_add(1, Ordering::SeqCst);
                 Ok(ExecutionOutput {

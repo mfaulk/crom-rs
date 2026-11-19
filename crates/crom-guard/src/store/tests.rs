@@ -509,6 +509,105 @@ fn multi_level_delegation() {
     );
 }
 
+fn quota_store(f: impl FnOnce(&mut GrantStoreConfig)) -> MemoryGrantStore {
+    let mut cfg = GrantStoreConfig::new([action("customer.read")].into());
+    f(&mut cfg);
+    MemoryGrantStore::new(cfg)
+}
+
+fn deep_root() -> GrantSpec {
+    GrantSpec {
+        max_depth: u8::MAX,
+        ..spec()
+    }
+}
+
+/// Recursive and sibling delegation under one root stops at `max_descendants_per_root`, while another root keeps its own budget.
+#[test]
+fn recursive_delegation_stops_at_per_root_cap() {
+    let s = quota_store(|c| c.max_descendants_per_root = 5);
+    let root = issue(&s, deep_root()).unwrap();
+    let mut ctx = auth(&s, &root.handle, T0).unwrap();
+    let mut made = 0;
+    for i in 0..20 {
+        let depth = ctx.leaf().max_depth() - 1;
+        let d = child(&["customer.read"], &["acme-cus-001"], 1, 60, depth);
+        match now_ready(s.delegate(&ctx, d, T0)) {
+            Ok(c) => {
+                made += 1;
+                // Alternate between going deeper and adding a sibling.
+                if i % 2 == 0 {
+                    ctx = auth(&s, &c.handle, T0).unwrap();
+                }
+            }
+            Err(e) => {
+                assert!(matches!(e, GrantStoreError::InvalidSpec(_)), "{e:?}");
+                break;
+            }
+        }
+    }
+    assert_eq!(made, 5);
+    let other = issue(&s, deep_root()).unwrap();
+    let octx = auth(&s, &other.handle, T0).unwrap();
+    let d = child(&["customer.read"], &["acme-cus-001"], 1, 60, 0);
+    assert!(now_ready(s.delegate(&octx, d, T0)).is_ok());
+}
+
+/// A tenant at its grant quota cannot issue or delegate, and another tenant's `issue` still succeeds.
+#[test]
+fn tenant_quota_does_not_block_other_tenants() {
+    let s = quota_store(|c| c.max_grants_per_tenant = 2);
+    let root = issue(&s, deep_root()).unwrap();
+    issue(&s, spec()).unwrap();
+    assert!(matches!(
+        issue(&s, spec()),
+        Err(GrantStoreError::InvalidSpec(_))
+    ));
+    let ctx = auth(&s, &root.handle, T0).unwrap();
+    let d = child(&["customer.read"], &["acme-cus-001"], 1, 60, 0);
+    assert!(matches!(
+        now_ready(s.delegate(&ctx, d, T0)),
+        Err(GrantStoreError::InvalidSpec(_))
+    ));
+    let globex = GrantSpec {
+        tenant: crate::ids::TenantId::new("globex").unwrap(),
+        ..spec()
+    };
+    assert!(issue(&s, globex).is_ok());
+}
+
+/// A sweep frees revoked grants and their whole subtrees: until then they deny with `GrantRevoked`, afterwards with `NoGrant`.
+#[test]
+fn sweep_frees_revoked_subtrees() {
+    let s = quota_store(|c| c.max_grants = 3);
+    let root = issue(&s, deep_root()).unwrap();
+    let rctx = auth(&s, &root.handle, T0).unwrap();
+    let mid = now_ready(s.delegate(
+        &rctx,
+        child(&["customer.read"], &["acme-cus-001"], 1, 60, 1),
+        T0,
+    ))
+    .unwrap();
+    let mctx = auth(&s, &mid.handle, T0).unwrap();
+    let leaf = now_ready(s.delegate(
+        &mctx,
+        child(&["customer.read"], &["acme-cus-001"], 1, 60, 0),
+        T0,
+    ))
+    .unwrap();
+    assert_eq!(issue(&s, spec()).err(), Some(GrantStoreError::Unavailable));
+    now_ready(s.revoke(&app(), root.grant.grant_id(), T0)).unwrap();
+    assert_eq!(
+        auth(&s, &leaf.handle, T0).unwrap_err(),
+        DenyReason::GrantRevoked
+    );
+    let fresh = issue(&s, spec()).unwrap();
+    for h in [&root.handle, &mid.handle, &leaf.handle] {
+        assert_eq!(auth(&s, h, T0).unwrap_err(), DenyReason::NoGrant);
+    }
+    assert!(auth(&s, &fresh.handle, T0).is_ok());
+}
+
 fn arb_spec() -> impl Strategy<Value = GrantSpec> {
     let actions = prop::collection::btree_set(
         prop::sample::select(vec![

@@ -8,7 +8,7 @@ use crate::context::ExecutionContext;
 use crate::decision::DenyReason;
 use crate::ids::ActionId;
 use crate::time::Timestamp;
-use crate::traits::{BoxFuture, ExecuteError, ExecutionOutput, GrantStore, ProtectedOperation};
+use crate::traits::{BoxFuture, ExecutionOutput, GrantStore, ProtectedOperation};
 
 /// Tool names Guard keeps for its own operations (e.g. `guard.delegate`,
 /// #353). Application operations cannot register under it.
@@ -54,13 +54,17 @@ pub(crate) trait BuiltinOperation: Send + Sync {
         args: &ValidatedArgs,
         now: Timestamp,
     ) -> Result<(), DenyReason>;
+    /// `now` is the same reading `check` was given, so a rule that passed
+    /// there (e.g. an expiry bound) is applied at the same instant here.
+    /// `Err` means nothing took effect: the outcome record is `blocked` with
+    /// that reason, and the agent sees its code. A panic is `failed`.
     fn run<'a>(
         &'a self,
         ctx: &'a ExecutionContext,
         store: &'a dyn GrantStore,
         args: &'a ValidatedArgs,
         now: Timestamp,
-    ) -> BoxFuture<'a, Result<ExecutionOutput, ExecuteError>>;
+    ) -> BoxFuture<'a, Result<ExecutionOutput, DenyReason>>;
 }
 
 pub(crate) enum OpKind {

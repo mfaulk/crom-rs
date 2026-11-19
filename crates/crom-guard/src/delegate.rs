@@ -18,7 +18,7 @@ use crate::ids::{ActionId, MAX_ID_LEN};
 use crate::registry::BuiltinOperation;
 use crate::store::check_narrowing;
 use crate::time::Timestamp;
-use crate::traits::{BoxFuture, ExecuteError, ExecutionOutput, GrantStore};
+use crate::traits::{BoxFuture, ExecutionOutput, GrantStore, GrantStoreError};
 use crate::value::EntityUid;
 
 /// The tool name of Guard's delegate operation. Grants must list it in
@@ -127,6 +127,27 @@ fn parse(parent: &Grant, args: &ValidatedArgs) -> Result<DelegationSpec, DenyRea
     })
 }
 
+/// The audit reason for a store refusal after the `allow` record. Nothing
+/// was created in any case. A parent that is no longer live (a revoke that
+/// raced this call) keeps its own reason; a per-grant, per-root, or tenant
+/// limit is `PolicyDeny`; a full or failing store is `EngineUnavailable`.
+async fn classify(
+    ctx: &ExecutionContext,
+    store: &dyn GrantStore,
+    e: &GrantStoreError,
+    now: Timestamp,
+) -> DenyReason {
+    if let Err(reason) = store.recheck(ctx, now).await {
+        return reason;
+    }
+    match e {
+        GrantStoreError::InvalidSpec(_) => DenyReason::PolicyDeny,
+        GrantStoreError::UnknownGrant | GrantStoreError::Unavailable => {
+            DenyReason::EngineUnavailable
+        }
+    }
+}
+
 impl BuiltinOperation for Delegate {
     fn action(&self) -> &ActionId {
         &self.action
@@ -164,16 +185,15 @@ impl BuiltinOperation for Delegate {
         store: &'a dyn GrantStore,
         args: &'a ValidatedArgs,
         now: Timestamp,
-    ) -> BoxFuture<'a, Result<ExecutionOutput, ExecuteError>> {
+    ) -> BoxFuture<'a, Result<ExecutionOutput, DenyReason>> {
         Box::pin(async move {
-            let spec = parse(ctx.leaf(), args)
-                .map_err(|r| ExecuteError::Failed(format!("arguments rejected: {r}")))?;
+            let spec = parse(ctx.leaf(), args)?;
             // The store re-reads the parent and applies the same rules under
             // its write lock, so `check` racing a revoke cannot widen.
-            let issued = store
-                .delegate(ctx, spec, now)
-                .await
-                .map_err(|e| ExecuteError::Failed(e.to_string()))?;
+            let issued = match store.delegate(ctx, spec, now).await {
+                Ok(i) => i,
+                Err(e) => return Err(classify(ctx, store, &e, now).await),
+            };
             let g = &issued.grant;
             Ok(ExecutionOutput {
                 content: json!({
@@ -187,5 +207,34 @@ impl BuiltinOperation for Delegate {
                 downstream_ref: Some(g.grant_id().as_str().to_owned()),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::executor::block_on;
+
+    use super::*;
+    use crate::grant::tests::spec;
+    use crate::grant::GrantSpec;
+    use crate::ids::AppId;
+    use crate::store::{GrantStoreConfig, MemoryGrantStore};
+
+    /// A revoke between `check` and the store write is reported as `GrantRevoked` (blocked), and creates no child.
+    #[test]
+    fn revoke_racing_run_is_blocked_as_revoked() {
+        let op = Delegate::new();
+        let mut actions = spec().actions;
+        actions.insert(op.action.clone());
+        let store = MemoryGrantStore::new(GrantStoreConfig::new(actions.clone()));
+        let app = AppId::new("support-app").unwrap();
+        let now = Timestamp::from_unix_millis(5_000);
+        let parent = block_on(store.issue(&app, GrantSpec { actions, ..spec() }, now)).unwrap();
+        let ctx = block_on(store.authenticate(&parent.handle, now)).unwrap();
+        let args = ValidatedArgs::new(json!({"actions": ["customer.read"], "ttl_seconds": 60}));
+        assert_eq!(op.check(&ctx, &args, now), Ok(()));
+        block_on(store.revoke(&app, parent.grant.grant_id(), now)).unwrap();
+        let out = block_on(op.run(&ctx, &store, &args, now));
+        assert_eq!(out.err(), Some(DenyReason::GrantRevoked));
     }
 }

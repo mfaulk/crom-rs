@@ -20,11 +20,13 @@ const CUSTOMERS: [&str; 3] = ["acme-c1", "acme-c2", "acme-c3"];
 
 // ---------------------------------------------------------------- fixtures
 
-struct TestClock(AtomicU64);
+/// Current time, and how far every reading advances it (0: fixed).
+struct TestClock(AtomicU64, AtomicU64);
 
 impl Clock for TestClock {
     fn now(&self) -> Timestamp {
-        Timestamp::from_unix_millis(self.0.load(Ordering::SeqCst))
+        let tick = self.1.load(Ordering::SeqCst);
+        Timestamp::from_unix_millis(self.0.fetch_add(tick, Ordering::SeqCst))
     }
 }
 
@@ -183,6 +185,10 @@ fn app() -> AppId {
 }
 
 fn fixture() -> Fx {
+    fixture_with(|_| {})
+}
+
+fn fixture_with(f: impl FnOnce(&mut GrantStoreConfig)) -> Fx {
     let executed = Arc::new(AtomicUsize::new(0));
     let mut reg = OperationRegistry::new();
     reg.register(Arc::new(op(
@@ -204,9 +210,11 @@ fn fixture() -> Fx {
     reg.register_delegate().unwrap();
     let mut config = GrantStoreConfig::new(reg.action_ids());
     config.max_grants = 1_000_000;
+    config.max_grants_per_tenant = 1_000_000;
+    f(&mut config);
     let store = Arc::new(MemoryGrantStore::new(config));
     let sink = Arc::new(MemorySink::default());
-    let clock = Arc::new(TestClock(AtomicU64::new(START_MS)));
+    let clock = Arc::new(TestClock(AtomicU64::new(START_MS), AtomicU64::new(0)));
     let guard = Guard::new(
         reg,
         store.clone(),
@@ -441,6 +449,76 @@ fn widening_attempts_are_denied() {
     for _ in 0..16 {
         assert!(!fx.delegate(&root, read_only_on_c1()).is_error());
     }
+}
+
+/// Store limits hit after the allow record are a `blocked` outcome with a distinct reason: a per-grant or per-root limit is `policy_deny`, a full store `engine_unavailable`.
+#[test]
+fn store_limits_after_allow_are_blocked_with_distinct_reasons() {
+    for (name, cfg, ok, code, reason) in [
+        (
+            "children per grant",
+            (|c: &mut GrantStoreConfig| c.max_children_per_grant = 2) as fn(&mut GrantStoreConfig),
+            2,
+            "policy_deny",
+            DenyReason::PolicyDeny,
+        ),
+        (
+            "descendants per root",
+            |c| c.max_descendants_per_root = 1,
+            1,
+            "policy_deny",
+            DenyReason::PolicyDeny,
+        ),
+        (
+            "tenant quota",
+            |c| c.max_grants_per_tenant = 3,
+            2,
+            "policy_deny",
+            DenyReason::PolicyDeny,
+        ),
+        (
+            "store capacity",
+            |c| c.max_grants = 2,
+            1,
+            "engine_unavailable",
+            DenyReason::EngineUnavailable,
+        ),
+    ] {
+        let fx = fixture_with(cfg);
+        let (root, _) = fx.issue(root_spec());
+        for _ in 0..ok {
+            assert!(!fx.delegate(&root, read_only_on_c1()).is_error(), "{name}");
+        }
+        let out = fx.delegate(&root, read_only_on_c1());
+        assert_eq!(out.code(), Some(code), "{name}");
+        let recs = fx.sink.records();
+        let (decision, outcome) = (&recs[recs.len() - 2], &recs[recs.len() - 1]);
+        assert_eq!(decision.decision, Some(DecisionKind::Allow), "{name}");
+        assert_eq!(outcome.outcome, Some(Outcome::Blocked), "{name}");
+        assert_eq!(outcome.reason, Some(reason), "{name}");
+        assert!(!fx.guard.is_failed_closed(), "{name}");
+    }
+}
+
+/// A child whose ttl is exactly the parent's remaining time succeeds even though the clock moves during the call, because check and store use one clock reading.
+#[test]
+fn ttl_equal_to_parent_remaining_time_is_accepted() {
+    let fx = fixture();
+    let (root, _) = fx.issue(root_spec());
+    let parent_expiry = START_MS + ROOT_TTL * 1000;
+    // The call's first reading is START + 100 s; every later one is 1 s on.
+    fx.clock.0.store(START_MS + 100_000, Ordering::SeqCst);
+    fx.clock.1.store(1_000, Ordering::SeqCst);
+    let out = fx.delegate(
+        &root,
+        json!({"actions": ["customer.read"], "ttl_seconds": ROOT_TTL - 100}),
+    );
+    assert_eq!(
+        content(&out)["expires_at"],
+        json!(parent_expiry),
+        "{:?}",
+        out.code()
+    );
 }
 
 /// A grant whose actions lack `guard.delegate`, or whose depth is 0, cannot delegate at all.
@@ -800,7 +878,7 @@ fn child_authority_implies_parent_authority() {
             let (parent, _) = fx.issue(parent_spec(&p));
             let out = fx.delegate(&parent, child_args(&c));
             let expect = narrows(&p, &c);
-            prop_assert_eq!(!out.is_error(), expect, "delegate: {:?}", out);
+            prop_assert_eq!(!out.is_error(), expect, "delegate: {:?}", out.code());
             if !expect {
                 let held = p.actions[2] || p.depth > 0;
                 let code = if held {
@@ -827,7 +905,7 @@ fn child_authority_implies_parent_authority() {
                 prop_assert!(
                     !parent_out.is_error(),
                     "child allowed, parent {:?}",
-                    parent_out
+                    parent_out.code()
                 );
             }
             Ok(())
