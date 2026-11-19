@@ -450,6 +450,11 @@ dominated by entity-store construction. Mitigation: only `crom-guard` and
 
 ### 9.2 Decision interface (illustrative; frozen in [#347](https://github.com/mfaulk/crom-rs/issues/347)/[#349](https://github.com/mfaulk/crom-rs/issues/349))
 
+The types are now defined in `crates/crom-guard` ([#347](https://github.com/mfaulk/crom-rs/issues/347); see
+[`docs/guard/README.md`](../guard/README.md)). `DenyReason` there also has
+`GrantNotYetValid`, `ActionNotGranted` (ADR 0003 §4.3), `ApprovalInvalid`, and
+`AuditUnavailable`. The sketch below is kept for reference.
+
 ```rust
 // Only constructible inside crom-guard from a validated grant. No public
 // constructor, no Deserialize.
