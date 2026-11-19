@@ -1,6 +1,6 @@
 # Crom Guard core types
 
-`crates/crom-guard` (#347) defines the types and traits the rest of M18 builds on. The architecture is in [ADR 0002](../security/decisions/0002-guard-architecture.md), and the policy model is in [ADR 0003](../security/decisions/0003-guard-policy-engine.md). The spec is [MILESTONE_18](../milestones/MILESTONE_18.md) §8–§10 and §12. Run `cargo doc -p crom-guard --open` for the full API.
+`crates/crom-guard` (#347) defines the types and traits the rest of M18 builds on. The architecture is in [ADR 0002](../security/decisions/0002-guard-architecture.md), and the policy model is in [ADR 0003](../security/decisions/0003-guard-policy-engine.md). The spec is [MILESTONE_18](../milestones/MILESTONE_18.md) §8–§10 and §12. Run `cargo doc -p crom-guard --open` for the full API. The Cedar policy decision point (#349) is described in [policies.md](policies.md).
 
 This PR freezes the public API. Signature changes after it merges need owner approval.
 
@@ -15,6 +15,8 @@ Only three kinds of value carry authority, and only `crom-guard` can construct t
 | `AuthorizedAction` | the pipeline (#351): `bind(decision_id, &Decision, &AuthorizationRequest)` returns `None` unless the decision is `Allow`, and copies the action, resource, version, args and principal from that request | Proof that one request was allowed. Not `Clone`. It is the only input an executor accepts |
 
 All of `ValidatedArgs`, `AuthorizationRequest` and `ApprovalContext` are crate-built too. So resolvers, the policy decision point (PDP) and executors only ever see schema-validated input and approvals that matched.
+
+**Approver tenant.** `ApprovalContext` has no approver tenant, so the PDP gives the approver the principal's tenant. The approval store (#354) must reject approvers from another tenant before it builds an `ApprovalContext`. The `approver.tenant == principal.tenant` test in the Cedar policies is defense in depth only (see [policies.md](policies.md)).
 
 Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are publicly constructible, and `Grant` can be deserialized so the store can persist it. None of them authorizes anything by itself.
 
@@ -33,13 +35,14 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | credential | `CredentialLease`, `CredentialBroker`, `FileCredentialBroker`, `EnvCredentialBroker` | The lease exposes its secret only inside `with_secret(\|s\| ..)` and zeroizes it on drop. See [credentials.md](credentials.md) |
 | audit | `AuditRecord`, `AuditSink`, `AuditReceipt`, `FileAuditSink`, `verify_log`, … | The `guard-audit/v1` fields from §12.1. `FileAuditSink` adds `seq`, `prev_hash` and `hash`, and `verify_log` checks the chain (#352). See [audit.md](audit.md) |
 | time | `Timestamp`, `Clock`, `SystemClock` | Unix milliseconds on Guard's clock |
+| pdp | `CedarPdp`, `Evaluation`, `GrantEvaluation`, `PdpLoadError` | The Cedar PDP (#349): load-time checks, per-grant evaluation, the approval probe, and `ActionDigest::compute`. See [policies.md](policies.md) |
 
 ## Traits
 
 | Trait | Sealed | Implemented in | Notes |
 |---|---|---|---|
 | `GrantStore` | yes | `MemoryGrantStore` ([grants.md](grants.md)) | Async: `issue`, `delegate`, `authenticate`, `recheck` (just before execution), and `revoke`, which is scoped to the issuing app |
-| `PolicyDecisionPoint` | yes | #349 | Sync, because evaluation is CPU-only. `authorize` returns a `Decision` and cannot return an error. Engine errors become `Deny` |
+| `PolicyDecisionPoint` | yes | `CedarPdp` ([policies.md](policies.md)) | Sync, because evaluation is CPU-only. `authorize` returns a `Decision` and cannot return an error. Engine errors become `Deny` |
 | `ResourceResolver` | no | app code, #350 | Async (`BoxFuture`). Not-found and other-tenant both return the same `ResolveError::NotFound` |
 | `ProtectedOperation` | no | app code, #351, #356 | One `ActionId` per MCP tool. Provides the input schema, resolver, Cedar context, and `execute(AuthorizedAction, CredentialLease)` |
 | `CredentialBroker` | no | `FileCredentialBroker`, `EnvCredentialBroker` ([credentials.md](credentials.md)) | Async. Hands out leases. The agent never receives one |
@@ -71,4 +74,6 @@ Sealed traits produce authority, so implementations outside this crate are rejec
 cargo test -p crom-guard          # unit tests, compile_fail doctests, tests/audit.rs (tamper, durability, schema)
 cargo test -p crom-guard-server   # `crom-guard audit verify` CLI
 scripts/check-guard-deps.sh       # no other crom-* dependency
+# PDP latency on the support set (release build, prints p50/p95/p99)
+cargo test --release -p crom-guard pdp_latency -- --ignored --nocapture
 ```

@@ -87,7 +87,7 @@ pub fn response_value(response: JsonRpcResponse) -> McpResult<Value> {
     if let Some(error) = response.error {
         return Err(crate::errors::McpError::JsonRpc {
             id: response.id,
-            error,
+            error: Box::new(error),
         });
     }
     response

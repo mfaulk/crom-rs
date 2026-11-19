@@ -73,7 +73,7 @@ impl fmt::Display for DenyReason {
 }
 
 /// SHA-256 over the canonical (grant id, action, resolved resource uid,
-/// validated arguments). Computed in #354.
+/// validated arguments); see [`ActionDigest::compute`] for the encoding.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ActionDigest([u8; 32]);
 

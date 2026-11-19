@@ -3,49 +3,49 @@ source: crates/crom-provider-openai/src/lib.rs
 expression: body
 ---
 {
-  "max_tokens": 512,
+  "model": "gpt-4.1",
   "messages": [
     {
-      "content": "You are a careful coding agent.",
-      "role": "system"
+      "role": "system",
+      "content": "You are a careful coding agent."
     },
     {
-      "content": "read foo and bar",
-      "role": "user"
+      "role": "user",
+      "content": "read foo and bar"
     },
     {
-      "content": "On it.",
       "role": "assistant",
+      "content": "On it.",
       "tool_calls": [
         {
-          "function": {
-            "arguments": "{\"path\":\"foo\"}",
-            "name": "Read"
-          },
           "id": "call_42",
-          "type": "function"
+          "type": "function",
+          "function": {
+            "name": "Read",
+            "arguments": "{\"path\":\"foo\"}"
+          }
         }
       ]
     },
     {
-      "content": "hello world",
       "role": "tool",
+      "content": "hello world",
       "tool_call_id": "call_42"
     },
     {
-      "content": "ERROR: permission denied",
       "role": "tool",
+      "content": "ERROR: permission denied",
       "tool_call_id": "call_43"
     }
   ],
-  "model": "gpt-4.1",
-  "stream": false,
   "tools": [
     {
+      "type": "function",
       "function": {
-        "description": "read a file",
         "name": "Read",
+        "description": "read a file",
         "parameters": {
+          "type": "object",
           "properties": {
             "path": {
               "type": "string"
@@ -53,11 +53,11 @@ expression: body
           },
           "required": [
             "path"
-          ],
-          "type": "object"
+          ]
         }
-      },
-      "type": "function"
+      }
     }
-  ]
+  ],
+  "max_tokens": 512,
+  "stream": false
 }

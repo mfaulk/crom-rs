@@ -5,62 +5,60 @@ expression: body
 {
   "contents": [
     {
+      "role": "user",
       "parts": [
         {
           "text": "read foo"
         }
-      ],
-      "role": "user"
+      ]
     },
     {
+      "role": "model",
       "parts": [
         {
           "text": "Reading."
         },
         {
           "functionCall": {
+            "name": "Read",
             "args": {
               "path": "foo"
-            },
-            "name": "Read"
+            }
           }
         }
-      ],
-      "role": "model"
+      ]
     },
     {
+      "role": "user",
       "parts": [
         {
           "functionResponse": {
             "name": "Read",
             "response": {
-              "isError": false,
-              "output": "hello world"
+              "output": "hello world",
+              "isError": false
             }
           }
         }
-      ],
-      "role": "user"
+      ]
     }
   ],
-  "generationConfig": {
-    "maxOutputTokens": 512
-  },
   "system_instruction": {
+    "role": "system",
     "parts": [
       {
         "text": "You are a careful coding agent."
       }
-    ],
-    "role": "system"
+    ]
   },
   "tools": [
     {
       "functionDeclarations": [
         {
-          "description": "read a file",
           "name": "Read",
+          "description": "read a file",
           "parameters": {
+            "type": "object",
             "properties": {
               "path": {
                 "type": "string"
@@ -68,11 +66,13 @@ expression: body
             },
             "required": [
               "path"
-            ],
-            "type": "object"
+            ]
           }
         }
       ]
     }
-  ]
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 512
+  }
 }

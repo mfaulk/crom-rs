@@ -44,7 +44,10 @@ tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` is required by cedar-policy-core (crom-guard). Enabled for
+# every crate so JSON object order does not depend on which packages a cargo
+# invocation builds together (feature unification).
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -66,6 +69,8 @@ tempfile = "3"
 fs4 = "1"
 temp-env = { version = "0.3", features = ["async_closure"] }
 sha2 = "0.11"
+# Guard policy engine (ADR 0003 §4.1). Exact pin; only crom-guard uses it.
+cedar-policy = "=4.15.0"
 hex = "0.4"
 rand = { version = "0.10", features = ["sys_rng"] }
 insta = { version = "1", features = ["json"] }
