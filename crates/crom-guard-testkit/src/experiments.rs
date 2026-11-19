@@ -463,8 +463,35 @@ pub struct LatencyRow {
 pub struct E5Results {
     pub iterations: usize,
     pub warmup: usize,
-    pub audit_sink: &'static str,
+    /// The audit sink and where its log lives: on `tmpfs`, `fsync` is
+    /// close to free.
+    pub audit_sink: String,
     pub rows: Vec<LatencyRow>,
+}
+
+/// The temp directory (where E5's audit logs live) and its filesystem type
+/// from `/proc/self/mounts`, e.g. `/tmp (tmpfs)`.
+pub fn temp_dir_fs() -> String {
+    let dir = std::env::temp_dir();
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let fs = std::fs::read_to_string("/proc/self/mounts")
+        .ok()
+        .and_then(|m| {
+            m.lines()
+                .filter_map(|l| {
+                    let mut f = l.split_whitespace();
+                    let (_, target, fstype) = (f.next()?, f.next()?, f.next()?);
+                    dir.starts_with(target)
+                        .then(|| (target.len(), fstype.to_owned()))
+                })
+                .max_by_key(|(len, _)| *len)
+                .map(|(_, t)| t)
+        });
+    format!(
+        "{} ({})",
+        dir.display(),
+        fs.as_deref().unwrap_or("unknown fs")
+    )
 }
 
 /// `policy_us` of every decision record for `action` (µs resolution).

@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crom_guard_testkit::experiments::{
-    decision_sequence, latency_stats, policy_samples_ns, CellResult, E4aResults, E5Results,
-    ExperimentReport, LatencyRow, Matrix, OnOffRun, ProviderReplay,
+    decision_sequence, latency_stats, policy_samples_ns, temp_dir_fs, CellResult, E4aResults,
+    E5Results, ExperimentReport, LatencyRow, Matrix, OnOffRun, ProviderReplay,
 };
 use crom_guard_testkit::scenario::{
     fixtures, run, unmediated_effects, AuditView, CallRequest, DirectEnv, InProcessEnv,
@@ -277,7 +277,10 @@ async fn e5_latency() {
     let results = E5Results {
         iterations: iters,
         warmup,
-        audit_sink: "FileAuditSink (hash-chained JSONL, fsync per record)",
+        audit_sink: format!(
+            "FileAuditSink (hash-chained JSONL, fsync per record) in {}",
+            temp_dir_fs()
+        ),
         rows,
     };
     for r in &results.rows {
