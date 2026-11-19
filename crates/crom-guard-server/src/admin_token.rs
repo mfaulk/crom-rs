@@ -90,7 +90,8 @@ impl AdminToken {
                 path: path.to_owned(),
             });
         }
-        let mode = st.st_mode & 0o777;
+        // `mode_t` is u16 on macOS and u32 on Linux.
+        let mode = st.st_mode as u32 & 0o777;
         if mode & 0o077 != 0 {
             return Err(AdminTokenError::Permissions {
                 path: path.to_owned(),
