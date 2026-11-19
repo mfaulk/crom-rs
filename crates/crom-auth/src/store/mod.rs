@@ -1005,12 +1005,12 @@ mod tests {
         let counter: Arc<AtomicUsize> = Default::default();
         let c = counter.clone();
         let t = std::thread::spawn(move || {
-            for _ in 0..10 {
-                std::thread::sleep(std::time::Duration::from_millis(40));
+            for _ in 0..100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
                 c.fetch_add(1, Ordering::SeqCst);
             }
         });
-        let r = wait_while_progressing(&[counter], 10, std::time::Duration::from_millis(150));
+        let r = wait_while_progressing(&[counter], 100, std::time::Duration::from_secs(1));
         t.join().unwrap();
         assert_eq!(r, Ok(()));
     }
