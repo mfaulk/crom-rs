@@ -297,6 +297,18 @@ impl Fixture {
         (status, resp.json().await.unwrap_or(Value::Null))
     }
 
+    pub async fn admin_get(&self, path: &str, token: &str) -> (u16, Value) {
+        let resp = self
+            .http
+            .get(self.admin_url(path))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
     /// Issues a grant through the admin API; returns (grant id, handle).
     pub async fn issue(&self, actions: &[&str]) -> (String, String) {
         let (status, body) = self

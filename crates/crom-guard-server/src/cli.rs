@@ -96,9 +96,34 @@ fn refuse(e: &dyn std::fmt::Display) -> ExitCode {
     ExitCode::from(1)
 }
 
+/// The `tracing` filter: `CROM_GUARD_LOG` (default `info`) with every
+/// `rmcp` directive replaced by `rmcp=<CROM_GUARD_RMCP_LOG or warn>`.
+/// rmcp at `debug` logs whole JSON-RPC messages (tool arguments, and any
+/// secret an operation returns), so raising it takes a separate, explicit
+/// variable.
+pub fn log_filter(guard_log: Option<&str>, rmcp_log: Option<&str>) -> String {
+    let mut directives: Vec<&str> = guard_log
+        .unwrap_or("info")
+        .split(',')
+        .map(str::trim)
+        .filter(|d| {
+            let target = d.split(['=', '[']).next().unwrap_or("");
+            !d.is_empty() && target != "rmcp" && !target.starts_with("rmcp::")
+        })
+        .collect();
+    let rmcp = format!("rmcp={}", rmcp_log.unwrap_or("warn"));
+    directives.push(&rmcp);
+    directives.join(",")
+}
+
 fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("CROM_GUARD_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rmcp=warn"));
+    let guard = std::env::var("CROM_GUARD_LOG").ok();
+    let rmcp = std::env::var("CROM_GUARD_RMCP_LOG").ok();
+    let spec = log_filter(guard.as_deref(), rmcp.as_deref());
+    let filter = tracing_subscriber::EnvFilter::try_new(&spec).unwrap_or_else(|e| {
+        eprintln!("crom-guard: invalid log filter ({e}); using info,rmcp=warn");
+        tracing_subscriber::EnvFilter::new("info,rmcp=warn")
+    });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -194,4 +219,46 @@ fn parse_anchor(s: &str) -> Option<AuditReceipt> {
         seq: seq.parse().ok()?,
         head_hash: hash.to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_filter;
+
+    /// rmcp is pinned to `warn` whatever `CROM_GUARD_LOG` says, including explicit rmcp directives.
+    #[test]
+    fn rmcp_stays_at_warn_unless_explicit() {
+        assert_eq!(log_filter(None, None), "info,rmcp=warn");
+        assert_eq!(log_filter(Some("debug"), None), "debug,rmcp=warn");
+        assert_eq!(
+            log_filter(
+                Some("trace,rmcp=trace,rmcp::service=debug,crom_guard=debug"),
+                None
+            ),
+            "trace,crom_guard=debug,rmcp=warn"
+        );
+        assert_eq!(log_filter(Some("debug"), Some("debug")), "debug,rmcp=debug");
+    }
+
+    /// The pinned filter actually disables rmcp debug events.
+    #[test]
+    fn pinned_filter_disables_rmcp_debug() {
+        use tracing::subscriber::with_default;
+        let filter = tracing_subscriber::EnvFilter::new(log_filter(Some("trace"), None));
+        let sub = tracing_subscriber::fmt().with_env_filter(filter).finish();
+        with_default(sub, || {
+            assert!(!tracing::enabled!(
+                target: "rmcp::service",
+                tracing::Level::DEBUG
+            ));
+            assert!(tracing::enabled!(
+                target: "rmcp::service",
+                tracing::Level::WARN
+            ));
+            assert!(tracing::enabled!(
+                target: "crom_guard",
+                tracing::Level::TRACE
+            ));
+        });
+    }
 }

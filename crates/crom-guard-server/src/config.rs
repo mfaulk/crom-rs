@@ -11,6 +11,11 @@ pub const DEFAULT_MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const DEFAULT_ADMIN_MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const DEFAULT_REQUEST_READ_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_RESOLVE_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+pub const DEFAULT_ADMIN_MAX_CONNECTIONS: usize = 16;
+/// Denied agent requests a peer may make before it is throttled.
+pub const DEFAULT_DENY_BURST: u32 = 20;
+pub const DEFAULT_DENY_REFILL_PER_SECOND: f64 = 2.0;
 /// Admin tokens shorter than this are refused at startup.
 pub const MIN_ADMIN_TOKEN_LEN: usize = 32;
 
@@ -69,8 +74,6 @@ pub struct AdminConfig {
     /// The application the admin credential authenticates as; recorded as
     /// the issuer of every grant created through this listener.
     pub app_id: AppId,
-    #[serde(default)]
-    pub allow_non_loopback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +175,20 @@ pub struct LimitsConfig {
     /// Bound on each resource resolution (`Guard::with_resolve_timer`).
     #[serde(default = "default_resolve_timeout")]
     pub resolve_timeout_ms: u64,
+    /// Concurrent connections served per listener; further connections
+    /// wait in the accept backlog.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    #[serde(default = "default_admin_max_connections")]
+    pub admin_max_connections: usize,
+    /// Per-peer token bucket for denied agent requests (`tools/call`
+    /// denials and `tools/list` session errors). An empty bucket refuses
+    /// the peer's requests with `rate_limited` before Guard runs, so a
+    /// flood of bad handles cannot flood the audit log.
+    #[serde(default = "default_deny_burst")]
+    pub deny_burst: u32,
+    #[serde(default = "default_deny_refill")]
+    pub deny_refill_per_second: f64,
 }
 
 impl Default for LimitsConfig {
@@ -181,6 +198,10 @@ impl Default for LimitsConfig {
             admin_max_request_bytes: default_admin_max_request_bytes(),
             request_read_timeout_ms: default_read_timeout(),
             resolve_timeout_ms: default_resolve_timeout(),
+            max_connections: default_max_connections(),
+            admin_max_connections: default_admin_max_connections(),
+            deny_burst: default_deny_burst(),
+            deny_refill_per_second: default_deny_refill(),
         }
     }
 }
@@ -202,6 +223,18 @@ fn default_read_timeout() -> u64 {
 }
 fn default_resolve_timeout() -> u64 {
     DEFAULT_RESOLVE_TIMEOUT_MS
+}
+fn default_max_connections() -> usize {
+    DEFAULT_MAX_CONNECTIONS
+}
+fn default_admin_max_connections() -> usize {
+    DEFAULT_ADMIN_MAX_CONNECTIONS
+}
+fn default_deny_burst() -> u32 {
+    DEFAULT_DENY_BURST
+}
+fn default_deny_refill() -> f64 {
+    DEFAULT_DENY_REFILL_PER_SECOND
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -264,8 +297,10 @@ impl Config {
             );
         }
         if let AdminListen::Tcp(a) = &self.admin.listen {
-            if !a.ip().is_loopback() && !self.admin.allow_non_loopback {
-                return invalid("admin.listen is not a loopback address or unix socket");
+            // No TLS and a bearer token: TCP admin is loopback-only. Reach
+            // it remotely through a unix socket and an external tunnel.
+            if !a.ip().is_loopback() {
+                return invalid("admin.listen must be a loopback address or a unix socket");
             }
             if *a == self.agent.listen && a.port() != 0 {
                 return invalid("admin.listen must differ from agent.listen");
@@ -285,6 +320,20 @@ impl Config {
         }
         if l.request_read_timeout_ms == 0 || l.resolve_timeout_ms == 0 {
             return invalid("timeouts must be positive");
+        }
+        if l.max_connections == 0 || l.admin_max_connections == 0 {
+            return invalid("connection limits must be positive");
+        }
+        let refill = l.deny_refill_per_second;
+        if l.deny_burst == 0 || !refill.is_finite() || refill <= 0.0 {
+            return invalid("limits.deny_burst and limits.deny_refill_per_second must be positive");
+        }
+        let ttl = self.grants.max_ttl_seconds;
+        if ttl == 0 || ttl > crom_guard::DEFAULT_MAX_TTL_SECONDS {
+            return Err(ConfigError::Invalid(format!(
+                "grants.max_ttl_seconds must be between 1 and {}",
+                crom_guard::DEFAULT_MAX_TTL_SECONDS
+            )));
         }
         Ok(())
     }
@@ -359,6 +408,39 @@ mod tests {
         assert!(c.validate().is_err());
         c.admin.token_file = None;
         c.admin.token_env = None;
+        assert!(c.validate().is_err());
+    }
+
+    /// `grants.max_ttl_seconds` must be within 1..=DEFAULT_MAX_TTL_SECONDS.
+    #[test]
+    fn grant_ttl_bounds() {
+        let mut c = Config::parse(MINIMAL).unwrap();
+        c.grants.max_ttl_seconds = 0;
+        assert!(c.validate().is_err());
+        c.grants.max_ttl_seconds = crom_guard::DEFAULT_MAX_TTL_SECONDS + 1;
+        assert!(c.validate().is_err());
+        c.grants.max_ttl_seconds = crom_guard::DEFAULT_MAX_TTL_SECONDS;
+        c.validate().unwrap();
+    }
+
+    /// `admin.allow_non_loopback` no longer exists, so a config naming it is rejected.
+    #[test]
+    fn admin_non_loopback_opt_in_is_gone() {
+        let text = MINIMAL.replace(
+            "app_id = \"app\"",
+            "app_id = \"app\"\nallow_non_loopback = true",
+        );
+        assert!(Config::parse(&text).is_err());
+    }
+
+    /// Zero connection caps and deny budgets are refused.
+    #[test]
+    fn limits_must_be_positive() {
+        let mut c = Config::parse(MINIMAL).unwrap();
+        c.limits.max_connections = 0;
+        assert!(c.validate().is_err());
+        let mut c = Config::parse(MINIMAL).unwrap();
+        c.limits.deny_refill_per_second = f64::NAN;
         assert!(c.validate().is_err());
     }
 

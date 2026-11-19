@@ -17,11 +17,15 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
+use crate::net::Peer;
 use crate::Shared;
 
 /// JSON-RPC error code for a `tools/list` the session may not make. The
 /// message and `data.code` are the pipeline's deny code.
 pub const SESSION_ERROR: ErrorCode = ErrorCode(-32001);
+/// JSON-RPC error code when a peer has used up its deny budget
+/// (`limits.deny_burst`). The message is `rate_limited`; Guard did not run.
+pub const RATE_LIMITED: ErrorCode = ErrorCode(-32002);
 
 #[derive(Clone)]
 pub(crate) struct AgentHandler {
@@ -37,6 +41,21 @@ fn bearer(ctx: &RequestContext<RoleServer>) -> Zeroizing<String> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     Zeroizing::new(crate::strip_bearer(value).unwrap_or("").to_owned())
+}
+
+fn peer(ctx: &RequestContext<RoleServer>) -> Peer {
+    ctx.extensions
+        .get::<http::request::Parts>()
+        .and_then(|p| p.extensions.get::<Peer>().copied())
+        .unwrap_or(Peer::Unix)
+}
+
+fn rate_limited() -> ErrorData {
+    ErrorData::new(
+        RATE_LIMITED,
+        "rate_limited",
+        Some(json!({ "code": "rate_limited" })),
+    )
 }
 
 fn session_error(reason: &DenyReason) -> ErrorData {
@@ -116,11 +135,68 @@ impl ServerHandler for AgentHandler {
         _request: Option<PaginatedRequestParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let peer = peer(&ctx);
+        if !self.shared.limiter.permits(peer) {
+            return Err(rate_limited());
+        }
+        let listed = self.list_granted(&ctx).await;
+        if listed.is_err() {
+            self.shared.limiter.charge(peer);
+        }
+        listed
+    }
+
+    /// Runs `Guard::call` on its own task and awaits it. Cancellation or a
+    /// client disconnect drops only this wrapper; the call still completes,
+    /// so Guard never latches closed for an agent-side cancel
+    /// (`docs/guard/pipeline.md`, "Cancellation").
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let s = self.shared.clone();
+        let peer = peer(&ctx);
+        if !s.limiter.permits(peer) {
+            return Err(rate_limited());
+        }
+        let mut bearer = bearer(&ctx);
+        if s.admin_token.verify(&bearer) {
+            // Never usable here; the pipeline then denies it as `no_grant`.
+            tracing::warn!("admin credential presented to the agent endpoint; rejected");
+            bearer = Zeroizing::new(String::new());
+        }
+        let meta = call_meta(&request, &ctx);
+        let args = Value::Object(request.arguments.unwrap_or_default());
+        let tool = request.name.into_owned();
+        let task = s.calls.spawn({
+            let s = s.clone();
+            async move {
+                let outcome = s.guard.call(&bearer, &tool, args, meta).await;
+                if matches!(outcome.result, CallResult::Denied { .. }) {
+                    s.limiter.charge(peer);
+                }
+                outcome
+            }
+        });
+        match task.await {
+            Ok(outcome) => Ok(to_result(outcome).into()),
+            // Only reachable if the runtime is shutting down under the call.
+            Err(_) => Err(session_error(&DenyReason::EngineUnavailable)),
+        }
+    }
+}
+
+impl AgentHandler {
+    async fn list_granted(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
         let s = &self.shared;
         if s.guard.is_failed_closed() {
             return Err(session_error(&DenyReason::EngineUnavailable));
         }
-        let bearer = bearer(&ctx);
+        let bearer = bearer(ctx);
         let Ok(handle) = SessionHandle::parse(&bearer) else {
             return Err(session_error(&DenyReason::NoGrant));
         };
@@ -148,35 +224,5 @@ impl ServerHandler for AgentHandler {
         result.cache_scope = Some(CacheScope::Private);
         result.ttl_ms = Some(0);
         Ok(result)
-    }
-
-    /// Runs `Guard::call` on its own task and awaits it. Cancellation or a
-    /// client disconnect drops only this wrapper; the call still completes,
-    /// so Guard never latches closed for an agent-side cancel
-    /// (`docs/guard/pipeline.md`, "Cancellation").
-    async fn call_tool(
-        &self,
-        request: CallToolRequestParams,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, ErrorData> {
-        let s = self.shared.clone();
-        let mut bearer = bearer(&ctx);
-        if s.admin_token.verify(&bearer) {
-            // Never usable here; the pipeline then denies it as `no_grant`.
-            tracing::warn!("admin credential presented to the agent endpoint; rejected");
-            bearer = Zeroizing::new(String::new());
-        }
-        let meta = call_meta(&request, &ctx);
-        let args = Value::Object(request.arguments.unwrap_or_default());
-        let tool = request.name.into_owned();
-        let task = s.calls.spawn({
-            let s = s.clone();
-            async move { s.guard.call(&bearer, &tool, args, meta).await }
-        });
-        match task.await {
-            Ok(outcome) => Ok(to_result(outcome).into()),
-            // Only reachable if the runtime is shutting down under the call.
-            Err(_) => Err(session_error(&DenyReason::EngineUnavailable)),
-        }
     }
 }

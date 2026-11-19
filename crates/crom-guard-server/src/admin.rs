@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use crom_guard::{GrantId, GrantSpec, GrantStore, GrantStoreError};
 use serde_json::json;
 
+use crate::net::Peer;
 use crate::Shared;
 
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
@@ -37,8 +38,20 @@ fn error(status: StatusCode, code: &str, message: Option<String>) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// `Host` names accepted on the admin TCP listener (DNS-rebinding defense).
+const LOOPBACK_HOSTS: [&str; 4] = ["localhost", "127.0.0.1", "[::1]", "::1"];
+
+/// The host part of a `Host` header, without any port.
+fn host_name(value: &str) -> &str {
+    match value.strip_prefix('[') {
+        Some(rest) => rest.find(']').map_or(value, |i| &value[..i + 2]),
+        None => value.rsplit_once(':').map_or(value, |(h, _)| h),
+    }
+}
+
 /// Admin token only, compared in constant time. Browser-originated
 /// requests (any `Origin` header) are refused outright: there is no CORS.
+/// On TCP the `Host` must be a loopback name.
 async fn authenticate(
     State(s): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -47,6 +60,15 @@ async fn authenticate(
 ) -> Response {
     if headers.contains_key(header::ORIGIN) {
         return error(StatusCode::FORBIDDEN, "forbidden", None);
+    }
+    if matches!(req.extensions().get::<Peer>(), Some(Peer::Tcp(_))) {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(host_name);
+        if !host.is_some_and(|h| LOOPBACK_HOSTS.iter().any(|l| h.eq_ignore_ascii_case(l))) {
+            return error(StatusCode::FORBIDDEN, "forbidden", None);
+        }
     }
     let presented = headers
         .get(header::AUTHORIZATION)
@@ -156,4 +178,18 @@ async fn not_implemented() -> Response {
 
 async fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "not_found", None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The port is stripped from `Host`, including bracketed IPv6.
+    #[test]
+    fn host_name_strips_port() {
+        assert_eq!(host_name("localhost:8471"), "localhost");
+        assert_eq!(host_name("127.0.0.1"), "127.0.0.1");
+        assert_eq!(host_name("[::1]:9"), "[::1]");
+        assert_eq!(host_name("evil.example:80"), "evil.example");
+    }
 }

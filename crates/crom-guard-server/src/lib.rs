@@ -12,6 +12,7 @@ mod admin_token;
 mod agent;
 pub mod cli;
 pub mod config;
+mod limiter;
 mod net;
 
 use std::net::SocketAddr;
@@ -30,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 pub use admin_token::{AdminToken, AdminTokenError};
-pub use agent::SESSION_ERROR;
+pub use agent::{RATE_LIMITED, SESSION_ERROR};
 pub use config::{AdminListen, Config, ConfigError};
 
 /// Path of the MCP endpoint on the agent listener.
@@ -69,6 +70,7 @@ pub(crate) struct Shared {
     clock: Arc<dyn Clock>,
     /// Every in-flight `Guard::call`; shutdown waits for all of them.
     calls: TaskTracker,
+    limiter: limiter::DenyLimiter,
 }
 
 /// Why the server refused to start. Messages never carry secrets.
@@ -207,6 +209,10 @@ pub async fn start(
         app_id: config.admin.app_id.clone(),
         clock,
         calls: TaskTracker::new(),
+        limiter: limiter::DenyLimiter::new(
+            config.limits.deny_burst,
+            config.limits.deny_refill_per_second,
+        ),
     });
 
     let bind = |what| move |source| StartError::Bind { what, source };
@@ -238,6 +244,7 @@ pub async fn start(
         move |req, next| net::read_body(limit, read_timeout, req, next)
     }));
 
+    let (agent_conns, admin_conns) = (limits.max_connections, limits.admin_max_connections);
     let stop = CancellationToken::new();
     let done = tokio::spawn({
         let stop = stop.clone();
@@ -248,9 +255,16 @@ pub async fn start(
                     net::Listener::Tcp(agent_listener),
                     agent,
                     read_timeout,
+                    agent_conns,
                     stop.clone()
                 ),
-                net::serve(admin_listener, admin, read_timeout, stop.clone()),
+                net::serve(
+                    admin_listener,
+                    admin,
+                    read_timeout,
+                    admin_conns,
+                    stop.clone()
+                ),
             );
             // Connections are closed; calls spawned from them still finish.
             shared.calls.close();
