@@ -7,6 +7,10 @@ rust-version.workspace = true
 description = "Local Crom Guard service: MCP Streamable HTTP agent endpoint and admin API."
 publish = false
 
+[lib]
+name = "crom_guard_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "crom-guard"
 path = "src/main.rs"
@@ -18,7 +22,32 @@ doc = false
 # scripts/check-guard-deps.sh in CI).
 [dependencies]
 crom-guard = { path = "../crom-guard" }
+# MCP Streamable HTTP server transport (MILESTONE_18 §10.3). Minor pinned:
+# rmcp changes its server API between minors.
+rmcp = { version = "~3.11", default-features = false, features = ["server", "transport-streamable-http-server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+http = "1"
+http-body-util = "0.1"
+tokio = { workspace = true, features = ["net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "1"
+thiserror = { workspace = true }
+subtle = "2.6"
+zeroize = "1.8"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }
 
 [dev-dependencies]
+# Compatibility test against Crom's own Streamable HTTP client (transport
+# only; dev-dependencies are exempt from the dependency boundary).
+crom-mcp = { workspace = true }
 futures = { workspace = true }
+reqwest = { workspace = true }
 tempfile = { workspace = true }

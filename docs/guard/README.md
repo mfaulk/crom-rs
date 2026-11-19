@@ -1,6 +1,6 @@
 # Crom Guard core types
 
-`crates/crom-guard` (#347) defines the types and traits the rest of M18 builds on. The architecture is in [ADR 0002](../security/decisions/0002-guard-architecture.md), and the policy model is in [ADR 0003](../security/decisions/0003-guard-policy-engine.md). The spec is [MILESTONE_18](../milestones/MILESTONE_18.md) §8–§10 and §12. Run `cargo doc -p crom-guard --open` for the full API. The Cedar policy decision point (#349) is described in [policies.md](policies.md). The enforcement pipeline (`Guard::call`) and the operation registry (#351) are described in [pipeline.md](pipeline.md), and approvals (#354) in [approvals.md](approvals.md).
+`crates/crom-guard` (#347) defines the types and traits the rest of M18 builds on. The architecture is in [ADR 0002](../security/decisions/0002-guard-architecture.md), and the policy model is in [ADR 0003](../security/decisions/0003-guard-policy-engine.md). The spec is [MILESTONE_18](../milestones/MILESTONE_18.md) §8–§10 and §12. Run `cargo doc -p crom-guard --open` for the full API. The Cedar policy decision point (#349) is described in [policies.md](policies.md). The enforcement pipeline (`Guard::call`) and the operation registry (#351) are described in [pipeline.md](pipeline.md), and approvals (#354) in [approvals.md](approvals.md). The `crom-guard` service, with its MCP Streamable HTTP agent endpoint and admin API (#357), is described in [server.md](server.md).
 
 This PR freezes the public API. Signature changes after it merges need owner approval.
 
@@ -83,7 +83,7 @@ Sealed traits produce authority, so implementations outside this crate are rejec
 cargo test -p crom-guard          # unit tests, compile_fail doctests, tests/audit.rs, tests/pipeline.rs
 cargo test -p crom-guard-testkit  # business API, ledger, support_ops, end-to-end pipeline, credential canary
 cargo run -p crom-guard --example embedded  # in-process Guard
-cargo test -p crom-guard-server   # `crom-guard audit verify` CLI
+cargo test -p crom-guard-server   # agent endpoint and admin API over HTTP, crom-mcp compatibility, canary, CLI
 scripts/check-guard-deps.sh       # no other crom-* dependency
 # PDP latency on the support set (release build, prints p50/p95/p99)
 cargo test --release -p crom-guard pdp_latency -- --ignored --nocapture

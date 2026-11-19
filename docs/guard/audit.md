@@ -56,7 +56,7 @@ CLI (exit 0 = intact, 1 = broken, which is the §13.2 `AuditChainBroken` probe, 
 crom-guard audit verify /path/to/audit.jsonl [--anchor <seq>:<hash>]...
 ```
 
-Anchors are `AuditReceipt { seq, head_hash }` values that `append` returned. #357 returns them in every response.
+Anchors are `AuditReceipt { seq, head_hash }` values that `append` returned. The server returns them in every `tools/call` result's `_meta.audit_head`, and `GET /admin/audit/head` returns the current head ([server.md](server.md)).
 
 ## Writer (`FileAuditSink`)
 
@@ -85,4 +85,4 @@ Appends go through a mutex, so `seq` is strictly increasing with no gaps. The wr
 ## Not yet
 
 - Log rotation (size-based roll with a chained head) and external anchoring. Both are out of scope for #352.
-- Wiring `audit verify` into the eval harness's `AuditChainBroken` probe (#357, #361).
+- Wiring `audit verify` into the eval harness's `AuditChainBroken` probe (#361).

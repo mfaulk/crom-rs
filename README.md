@@ -76,8 +76,11 @@ Several important pieces are not built yet:
   ([docs/guard/policies.md](docs/guard/policies.md)), and the in-process
   enforcement pipeline and operation registry
   ([docs/guard/pipeline.md](docs/guard/pipeline.md)) with single-use,
-  digest-bound approvals ([docs/guard/approvals.md](docs/guard/approvals.md)), with no network
-  transport yet; `crates/crom-guard-server` only runs `crom-guard audit verify <log>`. `crates/crom-guard-testkit` provides the controlled business API and
+  digest-bound approvals ([docs/guard/approvals.md](docs/guard/approvals.md)).
+  `crates/crom-guard-server` (binary `crom-guard`) serves it to any MCP client
+  over Streamable HTTP, with a separate admin API for grants and approvals
+  ([docs/guard/server.md](docs/guard/server.md)): `crom-guard serve --config
+  guard.toml`, `crom-guard policy validate`, `crom-guard audit verify <log>`. `crates/crom-guard-testkit` provides the controlled business API and
   effect ledger the M18 tests measure against, and the reference policy set
   (`examples/guard-support/policies/`) is validated in CI by
   `scripts/validate-guard-policies.sh`.
@@ -150,6 +153,8 @@ commands on Linux, see the [sandbox guide](docs/security/sandbox.md).
 - Security: [threat model](docs/security/threat-model.md),
   [sandbox](docs/security/sandbox.md), [audit events](docs/security/audit.md),
   [adversarial suite](docs/security/adversarial-suite.md)
+- Crom Guard: [core types](docs/guard/README.md),
+  [pipeline](docs/guard/pipeline.md), [server and admin API](docs/guard/server.md)
 - [Evaluation harness](docs/eval.md)
 - [Examples](examples/README.md)
 - [Milestones](docs/milestones/)

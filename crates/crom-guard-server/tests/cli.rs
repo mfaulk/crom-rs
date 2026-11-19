@@ -83,7 +83,7 @@ fn verify_truncated_log_fails_against_anchor() {
     assert_eq!(out.status.code(), Some(1));
 }
 
-/// Bad usage exits 2, and no arguments still refuses to start without an agent endpoint.
+/// Bad usage exits 2.
 #[test]
 fn usage_errors_exit_2() {
     assert_eq!(guard(&[]).status.code(), Some(2));
@@ -95,4 +95,134 @@ fn usage_errors_exit_2() {
             .code(),
         Some(2)
     );
+    assert_eq!(guard(&["serve"]).status.code(), Some(2));
+    assert_eq!(guard(&["serve", "--bogus", "x"]).status.code(), Some(2));
+    assert_eq!(guard(&["policy", "validate"]).status.code(), Some(2));
+}
+
+const SCHEMA: &str = include_str!("../../../examples/guard-support/policies/support.cedarschema");
+const POLICIES: &str = include_str!("../../../examples/guard-support/policies/support.cedar");
+
+/// `policy validate` exits 0 for the reference policies and 1 for a broken policy.
+#[test]
+fn policy_validate() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = dir.path().join("s.cedarschema");
+    let good = dir.path().join("good.cedar");
+    let bad = dir.path().join("bad.cedar");
+    std::fs::write(&schema, SCHEMA).unwrap();
+    std::fs::write(&good, POLICIES).unwrap();
+    std::fs::write(&bad, "permit (principal, action, resource) when { x };").unwrap();
+    let run = |p: &Path| {
+        guard(&[
+            "policy",
+            "validate",
+            "--namespace",
+            "Support",
+            "--schema",
+            schema.to_str().unwrap(),
+            "--policies",
+            p.to_str().unwrap(),
+        ])
+    };
+    assert_eq!(run(&good).status.code(), Some(0));
+    let out = run(&bad);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8(out.stderr)
+        .unwrap()
+        .contains("policy invalid"));
+}
+
+/// `serve` exits 1 with a reason when its configuration cannot be loaded.
+#[test]
+fn serve_refuses_bad_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.toml");
+    let out = guard(&["serve", "--config", missing.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8(out.stderr)
+        .unwrap()
+        .contains("refusing to start"));
+}
+
+/// `serve` starts from a config file, answers on the unix admin socket, and exits 0 on SIGTERM.
+#[cfg(unix)]
+#[test]
+fn serve_starts_and_stops_on_sigterm() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+
+    let dir = tempfile::tempdir().unwrap();
+    let private = |name: &str, body: &str| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    std::fs::write(dir.path().join("s.cedarschema"), SCHEMA).unwrap();
+    std::fs::write(dir.path().join("p.cedar"), POLICIES).unwrap();
+    private("creds.json", r#"{"credentials": []}"#);
+    let token = "adm_cli_0123456789abcdef0123456789abcdef";
+    private("admin.token", token);
+    let config = dir.path().join("guard.toml");
+    std::fs::write(
+        &config,
+        r#"
+        [admin]
+        listen = "unix:admin.sock"
+        token_file = "admin.token"
+        app_id = "app"
+        [policy]
+        namespace = "Support"
+        schema = "s.cedarschema"
+        policies = "p.cedar"
+        [credentials]
+        file = "creds.json"
+        [audit]
+        path = "audit.jsonl"
+        "#,
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_crom-guard"))
+        .args([
+            "serve",
+            "--config",
+            config.to_str().unwrap(),
+            "--agent-listen",
+            "127.0.0.1:0",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sock = dir.path().join("admin.sock");
+    let mut response = String::new();
+    for _ in 0..500 {
+        if let Ok(mut s) = UnixStream::connect(&sock) {
+            write!(
+                s,
+                "GET /admin/health HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .unwrap();
+            s.read_to_string(&mut response).unwrap();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!stderr.contains(token), "{stderr}");
+    assert!(!sock.exists());
 }
