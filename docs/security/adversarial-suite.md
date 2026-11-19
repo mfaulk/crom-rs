@@ -243,7 +243,8 @@ CI: the `security / OS sandbox (linux)` job runs both tests with
 `CROM_REQUIRE_SANDBOX_TESTS=1` and uploads `report.json` as the
 `adversarial-report` artifact. The `eval` job validates the `adversarial`
 suite. The `guard / adversarial (linux)` job runs the Guard scenarios (with
-`CROM_REQUIRE_SANDBOX_TESTS=1` and `CROM_REQUIRE_SEPARATE_UID_TESTS=1`) and
+`CROM_REQUIRE_SANDBOX_TESTS=1`, `CROM_REQUIRE_SEPARATE_UID_TESTS=1` and
+`CROM_REQUIRE_PYTHON_CLIENT_TESTS=1`) and
 uploads `target/tmp/guard-scenarios/report.json` as `guard-scenarios-report`.
 The Guard scoreboard, with this suite at the #340 base and on the current
 branch for comparison, is [docs/guard/scoreboard.md](../guard/scoreboard.md)

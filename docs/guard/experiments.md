@@ -8,7 +8,7 @@
 | E1 | Authorization matrix: hand-written expected table × Guard in process and the reference server | `tests/guard_experiments.rs` `e1_authorization_matrix`; table `fixtures/experiments/e1-matrix.json` | PR |
 | E2 | Guard on vs off (direct-credential baseline) on the same scripted workflows and attacks | `e2_guard_on_off` | PR |
 | E3 | Scripted attacks (the scenario suite) vs model-generated ones (the reference app with a live model) | scripted: scenarios; live: `.github/workflows/guard-live.yml` | scripted on PR; live manual |
-| E4a | Recorded provider tool calls replayed through Crom against Guard: decision equality | `e4a_provider_replay`; transcripts `fixtures/experiments/e4a/` | PR |
+| E4a | Provider tool calls (3 wire formats / 4 provider profiles) replayed through Crom against Guard: decision equality | `e4a_provider_replay`; transcripts `fixtures/experiments/e4a/` | PR |
 | E4b | The same task across live providers | `guard-live.yml` with several providers | manual |
 | E5 | Latency p50/p95/p99 per operation: direct executor, Guard in process, Guard over HTTP, policy only | `e5_latency` | PR (runs, reports, asserts no threshold) |
 
@@ -71,8 +71,8 @@ and ledger effects, and the scoreboard renders it.
 
 Run it manually, never in PR CI:
 
-- GitHub: Actions → **Guard (live)** (`guard-live.yml`, `workflow_dispatch`). `max_run_cost_usd` is required (≤ 2 per provider run, checked by `.github/scripts/check-spend-cap.sh`); `providers` defaults to `deepseek`, the low-cost model first. Keys come from the `eval-live` environment; a provider without a key is skipped with a warning. The supervisor is `deny`. Reports are uploaded as `guard-live` and rendered into the job summary.
-- Locally: `DEEPSEEK_API_KEY=... cargo run --manifest-path examples/guard-support/Cargo.toml -- --agent live --provider deepseek --max-run-cost-usd 0.25 --supervisor deny`.
+- GitHub: Actions → **Guard (live)** (`guard-live.yml`, `workflow_dispatch`). `max_total_cost_usd` is required: a total for the dispatch, at most $2 (`.github/scripts/check-spend-cap.sh`), split evenly across the selected providers and rounded down to the cent; each run gets that share as `--max-run-cost-usd`. `providers` defaults to `deepseek`; selected providers run in the order deepseek, anthropic, openai, gemini. Keys come from the `eval-live` environment, and each provider's step (`scripts/guard-live-run.sh`) sees only its own key. A provider without a key is skipped with a warning, and its share is not reassigned. The supervisor is `deny`. Reports are uploaded as `guard-live` and rendered into the job summary.
+- Locally: `DEEPSEEK_API_KEY=... cargo run --locked --manifest-path examples/guard-support/Cargo.toml -- --agent live --provider deepseek --max-run-cost-usd 0.25 --supervisor deny`.
 
 To publish a live result, copy its `report.json` into `docs/guard/results/`
 (e.g. `demo-live-deepseek.json`) and regenerate the scoreboard.
@@ -80,7 +80,9 @@ To publish a live result, copy its `report.json` into `docs/guard/results/`
 ## E4a: provider independence, offline
 
 `fixtures/experiments/e4a/<profile>.json` holds one transcript per provider
-profile (`anthropic`, `openai`, `deepseek`, `gemini`) in the
+profile (`anthropic`, `openai`, `deepseek`, `gemini`): four profiles, but
+three wire formats, because OpenAI and DeepSeek share the chat-completions
+path. Each report row names its `wire_format`. The transcripts are in the
 provider-conformance format (`crom-conformance-transcript/v1`): each model
 turn is one Guard tool call in that provider's wire format (Anthropic SSE
 `tool_use`, OpenAI and DeepSeek `tool_calls`, Gemini `functionCall`), then a
@@ -94,7 +96,8 @@ The reference is the same calls sent straight to a fresh reference server.
 Decisions are compared from Guard's audit log, without ids or timings:
 action, resource, `args_digest`, decision, reason, determining policies and
 outcome. The test fails unless every provider's sequence equals the
-reference.
+reference, and `--guard-check` pins every decision view of the reference and
+of each provider against the archive.
 
 The transcripts are `source: "synthetic"`, rendered from the call script in
 the test (`CROM_E4A_REGEN=1` rewrites them, and
@@ -116,6 +119,20 @@ multi-threaded Tokio runtime, each path on its own business API:
 | `guard_in_process` | `Guard::call` with the file credential broker and `FileAuditSink` (hash-chained JSONL, `fsync` per record) |
 | `guard_http` | the reference server over MCP Streamable HTTP on loopback, from a Rust client |
 | `policy_only` | Guard's own `duration_us.policy_us` from the in-process decision records: Cedar evaluation of the whole grant chain, plus the approval probe on a deny. Microsecond resolution |
+
+Each operation's `policy_only` samples are the decision records appended
+while that operation's timed calls ran (exactly one per call), not a slice
+by position.
+
+What dominates: Guard's end-to-end cost on the guarded paths is mostly the
+audit sink's per-record `fsync`. An executed call writes two records
+(decision, then outcome); a denied call writes one. In the archived run
+(btrfs, release), the in-process p50 is about 1.5–1.6 ms for executed calls
+and 0.76–0.81 ms for denied ones, against 43–77 µs for `policy_only`
+([scoreboard.md](scoreboard.md), E5).
+`policy_only` is Cedar evaluation alone, as Guard records it in integer
+microseconds (`policy_us`); it is not the same span as the end-to-end rows,
+which are wall-clock per call measured by the harness.
 
 Percentiles are nearest-rank. E5 asserts only that every call returned the
 expected result: latency depends on the machine and is reported, never
@@ -162,12 +179,17 @@ scripts/guard-scoreboard.sh --check    # fail if it is stale
 
 | File | Produced by |
 |---|---|
-| `scenarios.json` | `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test -p crom-guard-testkit --test guard_adversarial`. The archived run had no passwordless `sudo`, so `separate_uid` is skipped there; CI runs it |
+| `scenarios.json` | `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test -p crom-guard-testkit --test guard_adversarial`. The archived run had no passwordless `sudo`, so `separate_uid` is skipped there; CI runs and requires it (see [CI](#ci)) |
 | `e1.json`, `e2.json`, `e4a.json` | `cargo test -p crom-guard-testkit --test guard_experiments` |
 | `e5.json` | `TMPDIR=/var/tmp CROM_GUARD_E5_ITERS=1000 cargo test --release -p crom-guard-testkit --test guard_experiments e5_` (audit logs on disk, not `tmpfs`; the report's `audit_sink` names the filesystem) |
 | `demo-scripted.json` | `cargo run --manifest-path examples/guard-support/Cargo.toml` (`target/guard-demo/report.json`) |
-| `m17-base-340.json` | The #340 base: the `adversarial-report` artifact of CI run [44459286359](https://github.com/mfaulk/crom-rs/actions/runs/44459286359) at `82fb30a` (MILESTONE_18 §22), unchanged under `report`, wrapped as `m17-adversarial-archive/v1` |
-| `m17-head.json` | The same M17 suite on this branch: `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test -p crom-eval --test adversarial` (`target/tmp/adversarial/report.json`), wrapped the same way |
+| `m17-base-340.json` | The #340 base: the `adversarial-report` artifact of CI run [44459286359](https://github.com/mfaulk/crom-rs/actions/runs/44459286359) at `82fb30a` (MILESTONE_18 §22), wrapped as `m17-adversarial-archive/v1` |
+| `m17-head.json` | A one-off local snapshot of the same M17 suite at the commit in its `commit` field, not regenerated or checked by CI: `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test --locked -p crom-eval --test adversarial --test repo_config_escalation -- --nocapture` (`target/tmp/adversarial/report.json`), wrapped the same way. The current M17 report is CI's `adversarial-report` artifact (`security / OS sandbox (linux)`) |
+
+An `m17-adversarial-archive/v1` file keeps the original report's exact text
+in `report_raw` and its SHA-256 in `report_sha256`; the scoreboard refuses
+the file if they do not match. To check one by hand:
+`jq -j .report_raw m17-base-340.json | sha256sum`.
 
 Each file's `meta.command` (or the table above) is the command that made it.
 To refresh the archive, rerun those commands on a clean checkout, copy the
@@ -179,11 +201,21 @@ reports in, and run `scripts/guard-scoreboard.sh`.
 `guard-scenarios-report` and `guard-experiments-report`, then runs
 `scripts/guard-scoreboard.sh --check` with the fresh reports. That fails if
 `scoreboard.md` does not regenerate from the archive, or if a deterministic
-fact of the fresh run differs from the archive: per-scenario verdict counts,
-ledger and audit results, every E1 cell, E2 counts, and E4a decisions.
-Timings, latency and provenance are not compared, and a scenario lane that
-ran on only one side (for example `separate_uid`, which needs passwordless
-`sudo`) is skipped.
+fact of the fresh run differs from the archive: every (scenario, lane) pair
+with its status and verdict counts, ledger and audit results, every E1 cell,
+E2 counts per lane and per scenario, and every E4a decision view (reference
+and each provider). An archived pair that is missing or skipped in the fresh
+run is a difference, and so is a fresh pair the archive lacks. Timings,
+latency and provenance are not compared.
+
+The one exception is the allowlist `CHECK_OPTIONAL_LANES` in
+`crates/crom-eval/src/guard_board.rs`: `separate_uid` may be absent or
+skipped on either side, because it needs passwordless `sudo -n -u nobody`.
+The archive's machine lacks it, and CI has it and requires it
+(`CROM_REQUIRE_SEPARATE_UID_TESTS=1`), so CI runs the lane without a stored
+counterpart. When both sides ran it, it is compared like any other lane.
+The CI job also sets `CROM_REQUIRE_PYTHON_CLIENT_TESTS=1`, so the Python
+client lane cannot skip there.
 
 ## What these results show and do not show
 

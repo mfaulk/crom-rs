@@ -696,7 +696,8 @@ Guard section is rendered.
 crom eval scoreboard --guard-report docs/guard/results --format md
 crom eval scoreboard --guard-report target/tmp/guard-scenarios/report.json \
   --guard-report target/tmp/guard-experiments --format json
-crom eval scoreboard --guard-report target/tmp/guard-experiments/e1.json \
+crom eval scoreboard --guard-report target/tmp/guard-scenarios/report.json \
+  --guard-report target/tmp/guard-experiments \
   --guard-check docs/guard/results     # exit 1 if a deterministic fact differs
 ```
 
@@ -720,8 +721,9 @@ combined into one score with capability, completion or latency.
 `--guard-check <dir>` compares the deterministic facts of `--guard-report`
 with the reports in `<dir>` (verdict counts, ledger and audit results, E1
 cells, E2 counts, E4a decisions; not timings, latency or provenance) and
-exits non-zero on a difference. A scenario lane present on only one side is
-skipped. Experiments, metadata and the archive:
+exits non-zero on a difference, including an archived (scenario, lane) pair
+that the fresh run lacks or skipped. Only lanes in `CHECK_OPTIONAL_LANES`
+(`separate_uid`) may be absent on either side. Experiments, metadata and the archive:
 [docs/guard/experiments.md](guard/experiments.md); published results:
 [docs/guard/scoreboard.md](guard/scoreboard.md).
 

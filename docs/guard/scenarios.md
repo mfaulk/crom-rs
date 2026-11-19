@@ -71,7 +71,7 @@ with `guard_dependent: true` must show `executed > 0` in this lane. This
 proves the probes fire when nothing prevents the effect.
 
 Without `python3` ≥ 3.10, the Python lane is reported as skipped, with the
-reason.
+reason; `CROM_REQUIRE_PYTHON_CLIENT_TESTS=1` (set in CI) makes that a failure.
 
 ### Isolation lanes (G13, G14, G18) and preflight (G17)
 
