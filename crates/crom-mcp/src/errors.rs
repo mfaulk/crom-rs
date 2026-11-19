@@ -29,7 +29,9 @@ pub enum McpError {
     #[error("JSON-RPC error for request {id:?}: {error}")]
     JsonRpc {
         id: Option<JsonRpcId>,
-        error: JsonRpcError,
+        // Boxed: `JsonRpcError` holds a `serde_json::Value`, which is large
+        // when `serde_json/preserve_order` is enabled in the build.
+        error: Box<JsonRpcError>,
     },
     #[error("HTTP MCP error: status {status}: {body}")]
     Http { status: u16, body: String },

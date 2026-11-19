@@ -3,61 +3,60 @@ source: crates/crom-anthropic/src/lib.rs
 expression: body
 ---
 {
-  "max_tokens": 1024,
-  "messages": [
-    {
-      "content": [
-        {
-          "text": "read /etc/hosts",
-          "type": "text"
-        }
-      ],
-      "role": "user"
-    },
-    {
-      "content": [
-        {
-          "text": "Reading it now.",
-          "type": "text"
-        },
-        {
-          "id": "toolu_abc",
-          "input": {
-            "path": "/etc/hosts"
-          },
-          "name": "Read",
-          "type": "tool_use"
-        }
-      ],
-      "role": "assistant"
-    },
-    {
-      "content": [
-        {
-          "content": [
-            {
-              "text": "127.0.0.1 localhost",
-              "type": "text"
-            }
-          ],
-          "is_error": false,
-          "tool_use_id": "toolu_abc",
-          "type": "tool_result"
-        }
-      ],
-      "role": "user"
-    }
-  ],
   "model": "claude-sonnet-4-6",
+  "max_tokens": 1024,
   "stream": true,
   "system": "You are a careful coding agent.",
-  "tool_search": {
-    "type": "bm25"
-  },
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "read /etc/hosts"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Reading it now."
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_abc",
+          "name": "Read",
+          "input": {
+            "path": "/etc/hosts"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_abc",
+          "content": [
+            {
+              "type": "text",
+              "text": "127.0.0.1 localhost"
+            }
+          ],
+          "is_error": false
+        }
+      ]
+    }
+  ],
   "tools": [
     {
+      "name": "SearchTools",
       "description": "search the tool catalog",
       "input_schema": {
+        "type": "object",
         "properties": {
           "query": {
             "type": "string"
@@ -65,18 +64,19 @@ expression: body
         },
         "required": [
           "query"
-        ],
-        "type": "object"
-      },
-      "name": "SearchTools"
+        ]
+      }
     },
     {
-      "deferred": true,
+      "name": "mcp__github__list_issues",
       "description": "List GitHub issues",
       "input_schema": {
         "type": "object"
       },
-      "name": "mcp__github__list_issues"
+      "deferred": true
     }
-  ]
+  ],
+  "tool_search": {
+    "type": "bm25"
+  }
 }

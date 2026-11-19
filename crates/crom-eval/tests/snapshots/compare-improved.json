@@ -8,12 +8,12 @@
       "tasks": 1,
       "example_task": "t00",
       "baseline": {
-        "model": "deepseek-chat",
-        "profile": "deepseek"
+        "profile": "deepseek",
+        "model": "deepseek-chat"
       },
       "candidate": {
-        "model": "gpt-4.1-mini",
-        "profile": "deepseek"
+        "profile": "deepseek",
+        "model": "gpt-4.1-mini"
       },
       "allowed": true
     }

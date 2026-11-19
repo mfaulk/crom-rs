@@ -1,7 +1,7 @@
 Paired comparison: base -> cand (kind: capability, experiment: model)
 
 Metadata diff:
-  [expected] model (1 task(s), e.g. t00): {"model":"deepseek-chat","profile":"deepseek"} != {"model":"gpt-4.1-mini","profile":"deepseek"}
+  [expected] model (1 task(s), e.g. t00): {"profile":"deepseek","model":"deepseek-chat"} != {"profile":"deepseek","model":"gpt-4.1-mini"}
 
 Verdict: IMPROVED (delta +0.500, McNemar p = 0.0005, bootstrap 95% CI [+0.292, +0.708], non-overlapping Wilson intervals)
 

@@ -22,6 +22,7 @@ mod error;
 mod grant;
 mod handle;
 mod ids;
+mod pdp;
 mod resource;
 mod store;
 mod time;
@@ -55,6 +56,10 @@ pub use handle::{HandleError, SessionHandle, HANDLE_PREFIX};
 pub use ids::{
     ActionId, AgentId, AppId, ApprovalId, DecisionId, GrantId, IdError, PolicyId, RunId, TenantId,
     UserId, MAX_ID_LEN, RESERVED_ID_PREFIX,
+};
+pub use pdp::{
+    CedarPdp, Evaluation, GrantEvaluation, PdpLoadError, ACTION_DIGEST_DOMAIN,
+    APPROVAL_PLACEHOLDER_ID, MAX_POLICY_SOURCE_BYTES,
 };
 pub use resource::{ResolvedResource, ResourceVersion};
 pub use store::{GrantStoreConfig, MemoryGrantStore, DEFAULT_MAX_TTL_SECONDS};
