@@ -35,6 +35,7 @@ pub mod compare;
 pub mod external;
 pub mod failure;
 pub mod fixture;
+pub mod guard_board;
 pub mod index;
 pub mod isolation;
 pub mod multirun;

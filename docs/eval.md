@@ -42,7 +42,8 @@ Companion docs:
   `eval history`, `eval trend`, `eval regressions`, `eval task-history`.
 - **Triage** (`eval triage`, `eval show`, `eval open`).
 - **Scoreboard** (`eval scoreboard`, M17.4): cross-run capability, efficiency,
-  reliability, and security tables; see [Scoreboard](#scoreboard-m174).
+  reliability, and security tables; see [Scoreboard](#scoreboard-m174). With
+  `--guard-report`, also the Crom Guard section (#363).
 
 ## M15 command reference
 
@@ -69,7 +70,7 @@ $ crom eval task-history <task-id>
 $ crom eval triage <run-id>
 $ crom eval show <run-id> <task-id>
 $ crom eval open <run-id> <task-id>
-$ crom eval scoreboard [--since <rev>] [--model <m>]... [--level <L>]... [--format text|md|json]
+$ crom eval scoreboard [--since <rev>] [--model <m>]... [--level <L>]... [--format text|md|json] [--guard-report <path>]...
 ```
 
 `eval run` takes a suite only via `--suite`; a positional argument is a task
@@ -637,6 +638,8 @@ crom eval scoreboard --runs-dir path/to/runs --run <run-id> --run <run-id>
 | `--level` | Only tasks at this level, `L0`..`L5` (repeatable). |
 | `--group-by` | `model` (default; `provider/model`) or `commit` (12-char SHA, `+dirty` for a dirty checkout). |
 | `--format` | `text` (default), `md`, or `json` (`schema_version: 1`). |
+| `--guard-report` | A Guard report or a directory of them (repeatable); see [Guard section](#guard-section-363). |
+| `--guard-check <dir>` | Compare the deterministic Guard facts of `--guard-report` with the archive in `<dir>`. |
 
 Each group has these sections. Tasks are separated by v3 `kind`, so harness
 and security results never enter capability numbers.
@@ -681,6 +684,48 @@ and security results never enter capability numbers.
   weighted score. It shows the resolved rate with a Wilson interval, plus
   attempted, blocked, and executed tool calls and audit coverage summed from
   each attempt's `security-summary.json`.
+
+### Guard section (#363)
+
+`--guard-report <file-or-dir>` (repeatable) adds a Guard section built from
+archived Guard reports. A directory contributes its `*.json` files in name
+order. With `--guard-report` and neither `--runs-dir` nor `--run`, only the
+Guard section is rendered.
+
+```console
+crom eval scoreboard --guard-report docs/guard/results --format md
+crom eval scoreboard --guard-report target/tmp/guard-scenarios/report.json \
+  --guard-report target/tmp/guard-experiments --format json
+crom eval scoreboard --guard-report target/tmp/guard-scenarios/report.json \
+  --guard-report target/tmp/guard-experiments \
+  --guard-check docs/guard/results     # exit 1 if a deterministic fact differs
+```
+
+| Report `format` | Source | Section |
+|---|---|---|
+| `guard-scenarios/v1` | `crom-guard-testkit` `tests/guard_adversarial.rs` | Security per lane and per scenario, scored on the business ledger |
+| `guard-experiments/v1` (`experiment` = `E1`, `E2`, `E4a`, `E5`) | `crom-guard-testkit` `tests/guard_experiments.rs` | E1 matrix agreement and table; E2 on/off with McNemar; E4a decision equality; E5 latency |
+| `guard-demo/v1` | `examples/guard-support` `report.json` (scripted or live) | Reference-app runs (E3/E4b live lane) |
+| `m17-adversarial-archive/v1` | An M17 adversarial `report.json` under `report`, with `label` and `commit` | Comparison with the M17 suite (e.g. the #340 base) |
+
+Any other format is an error. Scenario lanes are read by name from each
+entry's `mode`, so a new lane needs no code change. The security table is
+computed from ledger probes, not from Guard's audit log: *executed* counts
+attacks a probe saw take effect, *audit coverage* is ledger entries with
+exactly one Guard `executed` record over all ledger entries (Guard lanes),
+and *audit verify* counts runs whose hash chain verified. Rates (legitimate
+subtasks, E1 agreement, E2 completion) are k/n with Wilson 95% intervals; E2
+pairs Guard on and off by scenario with the exact McNemar test. Nothing is
+combined into one score with capability, completion or latency.
+
+`--guard-check <dir>` compares the deterministic facts of `--guard-report`
+with the reports in `<dir>` (verdict counts, ledger and audit results, E1
+cells, E2 counts, E4a decisions; not timings, latency or provenance) and
+exits non-zero on a difference, including an archived (scenario, lane) pair
+that the fresh run lacks or skipped. Only lanes in `CHECK_OPTIONAL_LANES`
+(`separate_uid`) may be absent on either side. Experiments, metadata and the archive:
+[docs/guard/experiments.md](guard/experiments.md); published results:
+[docs/guard/scoreboard.md](guard/scoreboard.md).
 
 ## Comparing runs (M17.4)
 

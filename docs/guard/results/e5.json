@@ -1,0 +1,287 @@
+{
+  "format": "guard-experiments/v1",
+  "experiment": "E5",
+  "title": "Overhead",
+  "meta": {
+    "commit": "e73ceab3f7d79292d24e3f15341d3f11bf8c07d8",
+    "dirty": false,
+    "policy_set_hash": "fb613aee4b6ba7b39e27aba7fc9b06ac1f864c2b44bacba8fd331ff04362d768",
+    "schema_hash": "651db5dc9cb1bfab60c434df84dd9a8ae05a3bbae53aa228785393577a460405",
+    "grant_fixtures_hash": "90790e5fa37e0354548fbd7b551f45b5b0502045e28238cfcb157acdcf567ead",
+    "sandbox": {
+      "bwrap": "/usr/bin/bwrap",
+      "require_sandbox_tests": false,
+      "require_separate_uid_tests": false
+    },
+    "provider": null,
+    "model": null,
+    "build": "release",
+    "machine": {
+      "os": "linux",
+      "arch": "x86_64",
+      "kernel": "7.3.3-200.fc44.x86_64",
+      "cpu": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+      "cpus": 128
+    },
+    "command": "CROM_GUARD_E5_ITERS=1000 cargo test --release -p crom-guard-testkit --test guard_experiments e5_ -- --nocapture"
+  },
+  "results": {
+    "iterations": 1000,
+    "warmup": 100,
+    "audit_sink": "FileAuditSink (hash-chained JSONL, fsync per record) in /var/tmp (btrfs)",
+    "rows": [
+      {
+        "operation": "customer.read (allow)",
+        "path": "direct",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 56.276,
+          "p95_us": 64.382,
+          "p99_us": 76.485,
+          "mean_us": 56.916263,
+          "max_us": 155.946
+        }
+      },
+      {
+        "operation": "invoice.list (allow)",
+        "path": "direct",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 58.491,
+          "p95_us": 71.275,
+          "p99_us": 80.843,
+          "mean_us": 60.436227,
+          "max_us": 128.824
+        }
+      },
+      {
+        "operation": "refund.issue 0.01 (allow)",
+        "path": "direct",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 69.862,
+          "p95_us": 80.752,
+          "p99_us": 93.026,
+          "mean_us": 69.213254,
+          "max_us": 154.272
+        }
+      },
+      {
+        "operation": "customer.read (allow)",
+        "path": "guard_in_process",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 1524.917,
+          "p95_us": 1750.114,
+          "p99_us": 1882.123,
+          "mean_us": 1527.988587,
+          "max_us": 3130.817
+        }
+      },
+      {
+        "operation": "invoice.list (allow)",
+        "path": "guard_in_process",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 1613.875,
+          "p95_us": 1833.441,
+          "p99_us": 1959.861,
+          "mean_us": 1633.333022,
+          "max_us": 6780.697
+        }
+      },
+      {
+        "operation": "refund.issue 0.01 (allow)",
+        "path": "guard_in_process",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 1628.613,
+          "p95_us": 1878.776,
+          "p99_us": 2097.711,
+          "mean_us": 1652.693416,
+          "max_us": 6775.317
+        }
+      },
+      {
+        "operation": "refund.issue other customer (policy_deny)",
+        "path": "guard_in_process",
+        "result": "policy_deny",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 798.873,
+          "p95_us": 948.366,
+          "p99_us": 1224.969,
+          "mean_us": 836.014618,
+          "max_us": 10735.094
+        }
+      },
+      {
+        "operation": "customer.export (policy_deny)",
+        "path": "guard_in_process",
+        "result": "policy_deny",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 750.891,
+          "p95_us": 883.603,
+          "p99_us": 969.425,
+          "mean_us": 775.5347489999999,
+          "max_us": 5948.572
+        }
+      },
+      {
+        "operation": "customer.read (allow)",
+        "path": "policy_only",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 50.0,
+          "p95_us": 67.0,
+          "p99_us": 78.0,
+          "mean_us": 52.998,
+          "max_us": 182.0
+        }
+      },
+      {
+        "operation": "invoice.list (allow)",
+        "path": "policy_only",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 49.0,
+          "p95_us": 67.0,
+          "p99_us": 79.0,
+          "mean_us": 51.946,
+          "max_us": 130.0
+        }
+      },
+      {
+        "operation": "refund.issue 0.01 (allow)",
+        "path": "policy_only",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 59.0,
+          "p95_us": 82.0,
+          "p99_us": 91.0,
+          "mean_us": 61.702,
+          "max_us": 144.0
+        }
+      },
+      {
+        "operation": "refund.issue other customer (policy_deny)",
+        "path": "policy_only",
+        "result": "policy_deny",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 78.0,
+          "p95_us": 105.0,
+          "p99_us": 131.0,
+          "mean_us": 82.325,
+          "max_us": 159.0
+        }
+      },
+      {
+        "operation": "customer.export (policy_deny)",
+        "path": "policy_only",
+        "result": "policy_deny",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 45.0,
+          "p95_us": 66.0,
+          "p99_us": 75.0,
+          "mean_us": 47.998,
+          "max_us": 113.0
+        }
+      },
+      {
+        "operation": "customer.read (allow)",
+        "path": "guard_http",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 1793.857,
+          "p95_us": 2048.318,
+          "p99_us": 2229.21,
+          "mean_us": 1807.55422,
+          "max_us": 7287.506
+        }
+      },
+      {
+        "operation": "invoice.list (allow)",
+        "path": "guard_http",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 1852.898,
+          "p95_us": 2100.356,
+          "p99_us": 2214.182,
+          "mean_us": 1872.2887819999999,
+          "max_us": 7124.698
+        }
+      },
+      {
+        "operation": "refund.issue 0.01 (allow)",
+        "path": "guard_http",
+        "result": "executed",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 1873.076,
+          "p95_us": 2112.941,
+          "p99_us": 2442.294,
+          "mean_us": 1905.19744,
+          "max_us": 13186.645
+        }
+      },
+      {
+        "operation": "refund.issue other customer (policy_deny)",
+        "path": "guard_http",
+        "result": "policy_deny",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 1011.124,
+          "p95_us": 1170.566,
+          "p99_us": 1224.177,
+          "mean_us": 1025.038402,
+          "max_us": 2558.443
+        }
+      },
+      {
+        "operation": "customer.export (policy_deny)",
+        "path": "guard_http",
+        "result": "policy_deny",
+        "warmup": 100,
+        "stats": {
+          "n": 1000,
+          "p50_us": 965.067,
+          "p95_us": 1132.645,
+          "p99_us": 1339.376,
+          "mean_us": 991.133036,
+          "max_us": 6186.021
+        }
+      }
+    ]
+  }
+}

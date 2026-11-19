@@ -4,6 +4,8 @@
 
 pub mod api;
 pub mod data;
+#[cfg(unix)]
+pub mod experiments;
 pub mod ledger;
 #[cfg(unix)]
 pub mod scenario;

@@ -465,6 +465,8 @@ pub struct ScenarioReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct SuiteReport {
     pub format: &'static str,
+    /// Commit, policy and fixture hashes, sandbox, and machine (#363).
+    pub meta: crate::experiments::ReproMeta,
     pub scenarios: Vec<ScenarioReport>,
 }
 
@@ -472,6 +474,9 @@ impl SuiteReport {
     pub fn new(scenarios: Vec<ScenarioReport>) -> Self {
         Self {
             format: REPORT_FORMAT,
+            meta: crate::experiments::ReproMeta::collect(
+                "cargo test -p crom-guard-testkit --test guard_adversarial -- --nocapture",
+            ),
             scenarios,
         }
     }

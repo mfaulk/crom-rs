@@ -1,0 +1,80 @@
+{
+  "format": "crom-conformance-transcript/v1",
+  "profile": "deepseek",
+  "task": "guard-e4a",
+  "model": "deepseek-chat",
+  "source": "synthetic",
+  "path": "/v1/chat/completions",
+  "exchanges": [
+    {
+      "request_contains": [],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"id\": \"chatcmpl-e4a\",\n  \"object\": \"chat.completion\",\n  \"model\": \"deepseek-chat\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"finish_reason\": \"tool_calls\",\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": null,\n        \"tool_calls\": [\n          {\n            \"id\": \"call_e4a1\",\n            \"type\": \"function\",\n            \"function\": {\n              \"name\": \"mcp__guard__invoice_list\",\n              \"arguments\": \"{\\\"customer_id\\\":\\\"acme-cus-000\\\"}\"\n            }\n          }\n        ]\n      }\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 120,\n    \"completion_tokens\": 24,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"tool_call_id\":\"call_e4a1\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"id\": \"chatcmpl-e4a\",\n  \"object\": \"chat.completion\",\n  \"model\": \"deepseek-chat\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"finish_reason\": \"tool_calls\",\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": null,\n        \"tool_calls\": [\n          {\n            \"id\": \"call_e4a2\",\n            \"type\": \"function\",\n            \"function\": {\n              \"name\": \"mcp__guard__invoice_list\",\n              \"arguments\": \"{\\\"customer_id\\\":\\\"globex-cus-000\\\"}\"\n            }\n          }\n        ]\n      }\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 120,\n    \"completion_tokens\": 24,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"tool_call_id\":\"call_e4a2\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"id\": \"chatcmpl-e4a\",\n  \"object\": \"chat.completion\",\n  \"model\": \"deepseek-chat\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"finish_reason\": \"tool_calls\",\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": null,\n        \"tool_calls\": [\n          {\n            \"id\": \"call_e4a3\",\n            \"type\": \"function\",\n            \"function\": {\n              \"name\": \"mcp__guard__customer_read\",\n              \"arguments\": \"{\\\"customer_id\\\":\\\"acme-cus-001\\\"}\"\n            }\n          }\n        ]\n      }\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 120,\n    \"completion_tokens\": 24,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"tool_call_id\":\"call_e4a3\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"id\": \"chatcmpl-e4a\",\n  \"object\": \"chat.completion\",\n  \"model\": \"deepseek-chat\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"finish_reason\": \"tool_calls\",\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": null,\n        \"tool_calls\": [\n          {\n            \"id\": \"call_e4a4\",\n            \"type\": \"function\",\n            \"function\": {\n              \"name\": \"mcp__guard__refund_issue\",\n              \"arguments\": \"{\\\"invoice_id\\\":\\\"acme-inv-000\\\",\\\"amount_cents\\\":1000}\"\n            }\n          }\n        ]\n      }\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 120,\n    \"completion_tokens\": 24,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"tool_call_id\":\"call_e4a4\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"id\": \"chatcmpl-e4a\",\n  \"object\": \"chat.completion\",\n  \"model\": \"deepseek-chat\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"finish_reason\": \"tool_calls\",\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": null,\n        \"tool_calls\": [\n          {\n            \"id\": \"call_e4a5\",\n            \"type\": \"function\",\n            \"function\": {\n              \"name\": \"mcp__guard__refund_issue\",\n              \"arguments\": \"{\\\"invoice_id\\\":\\\"acme-inv-001\\\",\\\"amount_cents\\\":7500}\"\n            }\n          }\n        ]\n      }\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 120,\n    \"completion_tokens\": 24,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"tool_call_id\":\"call_e4a5\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"id\": \"chatcmpl-e4a\",\n  \"object\": \"chat.completion\",\n  \"model\": \"deepseek-chat\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"finish_reason\": \"tool_calls\",\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": null,\n        \"tool_calls\": [\n          {\n            \"id\": \"call_e4a6\",\n            \"type\": \"function\",\n            \"function\": {\n              \"name\": \"mcp__guard__customer_export\",\n              \"arguments\": \"{\\\"customer_id\\\":\\\"acme-cus-000\\\"}\"\n            }\n          }\n        ]\n      }\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 120,\n    \"completion_tokens\": 24,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"tool_call_id\":\"call_e4a6\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"id\": \"chatcmpl-e4a\",\n  \"object\": \"chat.completion\",\n  \"model\": \"deepseek-chat\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"finish_reason\": \"tool_calls\",\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": null,\n        \"tool_calls\": [\n          {\n            \"id\": \"call_e4a7\",\n            \"type\": \"function\",\n            \"function\": {\n              \"name\": \"mcp__guard__customer_read\",\n              \"arguments\": \"{\\\"customer_id\\\":\\\"acme-cus-000\\\"}\"\n            }\n          }\n        ]\n      }\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 120,\n    \"completion_tokens\": 24,\n    \"total_tokens\": 144\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"tool_call_id\":\"call_e4a7\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"id\": \"chatcmpl-e4a\",\n  \"object\": \"chat.completion\",\n  \"model\": \"deepseek-chat\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"finish_reason\": \"stop\",\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"Ticket handled.\"\n      }\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 120,\n    \"completion_tokens\": 24,\n    \"total_tokens\": 144\n  }\n}"
+    }
+  ]
+}

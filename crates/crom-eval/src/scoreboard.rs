@@ -235,6 +235,10 @@ pub struct Scoreboard {
     pub models: Vec<String>,
     pub levels: Vec<Level>,
     pub groups: Vec<GroupBoard>,
+    /// Guard section from `--guard-report` files (#363); kept apart from
+    /// every eval number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<crate::guard_board::GuardBoard>,
 }
 
 impl Scoreboard {
@@ -258,7 +262,14 @@ impl Scoreboard {
                 .into_iter()
                 .map(|(key, g)| group_board(key, &g))
                 .collect(),
+            guard: None,
         }
+    }
+
+    /// Adds the Guard section.
+    pub fn with_guard(mut self, guard: crate::guard_board::GuardBoard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 }
 
@@ -604,14 +615,14 @@ impl std::str::FromStr for Format {
     }
 }
 
-struct Table {
-    title: String,
-    header: Vec<&'static str>,
-    rows: Vec<Vec<String>>,
+pub(crate) struct Table<'a> {
+    pub(crate) title: String,
+    pub(crate) header: Vec<&'a str>,
+    pub(crate) rows: Vec<Vec<String>>,
 }
 
-impl Table {
-    fn render(&self, fmt: Format, out: &mut String) {
+impl Table<'_> {
+    pub(crate) fn render(&self, fmt: Format, out: &mut String) {
         match fmt {
             Format::Markdown => {
                 out.push_str(&format!("### {}\n\n", self.title));
@@ -655,7 +666,7 @@ impl Table {
     }
 }
 
-fn opt_f(v: Option<f64>, digits: usize) -> String {
+pub(crate) fn opt_f(v: Option<f64>, digits: usize) -> String {
     v.map_or("-".into(), |x| format!("{x:.digits$}"))
 }
 
@@ -708,8 +719,20 @@ impl Scoreboard {
         if fmt == Format::Json {
             return serde_json::to_string_pretty(self).unwrap_or_default() + "\n";
         }
-        let md = fmt == Format::Markdown;
         let mut s = String::new();
+        if let (Some(g), true) = (&self.guard, self.groups.is_empty()) {
+            g.render(fmt, true, &mut s);
+            return s;
+        }
+        self.render_eval(fmt, &mut s);
+        if let Some(g) = &self.guard {
+            g.render(fmt, false, &mut s);
+        }
+        s
+    }
+
+    fn render_eval(&self, fmt: Format, s: &mut String) {
+        let md = fmt == Format::Markdown;
         s.push_str(if md {
             "# Eval scoreboard\n\n"
         } else {
@@ -740,7 +763,7 @@ impl Scoreboard {
         );
         if self.groups.is_empty() {
             s.push_str("No results matched.\n");
-            return s;
+            return;
         }
         for g in &self.groups {
             s.push_str(&if md {
@@ -749,9 +772,8 @@ impl Scoreboard {
                 format!("== {} ==\n\n", g.key)
             });
             s.push_str(&format!("runs: {}, attempts: {}\n\n", g.runs, g.attempts));
-            self.render_group(g, fmt, &mut s);
+            self.render_group(g, fmt, s);
         }
-        s
     }
 
     fn render_group(&self, g: &GroupBoard, fmt: Format, s: &mut String) {
@@ -898,6 +920,21 @@ impl Scoreboard {
             .render(fmt, s);
         }
     }
+}
+
+/// Compare `actual` with `tests/snapshots/<name>`; `UPDATE_SNAPSHOTS=1` rewrites it.
+#[cfg(test)]
+pub(crate) fn assert_snapshot(name: &str, actual: &str) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/snapshots")
+        .join(name);
+    if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, actual).unwrap();
+    }
+    let expected = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("missing snapshot {name}; rerun with UPDATE_SNAPSHOTS=1"));
+    assert_eq!(actual, expected, "snapshot {name} differs");
 }
 
 #[cfg(test)]
@@ -1149,19 +1186,5 @@ mod tests {
         let back: Scoreboard =
             serde_json::from_str(&b.render(Format::Json)).expect("json round-trips");
         assert_eq!(back, b);
-    }
-
-    /// Compare `actual` with `tests/snapshots/<name>`; `UPDATE_SNAPSHOTS=1` rewrites it.
-    fn assert_snapshot(name: &str, actual: &str) {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/snapshots")
-            .join(name);
-        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, actual).unwrap();
-        }
-        let expected = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("missing snapshot {name}; rerun with UPDATE_SNAPSHOTS=1"));
-        assert_eq!(actual, expected, "snapshot {name} differs");
     }
 }

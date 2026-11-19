@@ -1,0 +1,80 @@
+{
+  "format": "crom-conformance-transcript/v1",
+  "profile": "gemini",
+  "task": "guard-e4a",
+  "model": "gemini-2.5-pro",
+  "source": "synthetic",
+  "path": "/v1beta/models/gemini-2.5-pro:generateContent",
+  "exchanges": [
+    {
+      "request_contains": [],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"role\": \"model\",\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"name\": \"mcp__guard__invoice_list\",\n              \"args\": {\n                \"customer_id\": \"acme-cus-000\"\n              }\n            }\n          }\n        ]\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"promptTokenCount\": 120,\n    \"candidatesTokenCount\": 24\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"functionResponse\":{\"name\":\"mcp__guard__invoice_list\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"role\": \"model\",\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"name\": \"mcp__guard__invoice_list\",\n              \"args\": {\n                \"customer_id\": \"globex-cus-000\"\n              }\n            }\n          }\n        ]\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"promptTokenCount\": 120,\n    \"candidatesTokenCount\": 24\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"functionResponse\":{\"name\":\"mcp__guard__invoice_list\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"role\": \"model\",\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"name\": \"mcp__guard__customer_read\",\n              \"args\": {\n                \"customer_id\": \"acme-cus-001\"\n              }\n            }\n          }\n        ]\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"promptTokenCount\": 120,\n    \"candidatesTokenCount\": 24\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"functionResponse\":{\"name\":\"mcp__guard__customer_read\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"role\": \"model\",\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"name\": \"mcp__guard__refund_issue\",\n              \"args\": {\n                \"invoice_id\": \"acme-inv-000\",\n                \"amount_cents\": 1000\n              }\n            }\n          }\n        ]\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"promptTokenCount\": 120,\n    \"candidatesTokenCount\": 24\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"functionResponse\":{\"name\":\"mcp__guard__refund_issue\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"role\": \"model\",\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"name\": \"mcp__guard__refund_issue\",\n              \"args\": {\n                \"invoice_id\": \"acme-inv-001\",\n                \"amount_cents\": 7500\n              }\n            }\n          }\n        ]\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"promptTokenCount\": 120,\n    \"candidatesTokenCount\": 24\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"functionResponse\":{\"name\":\"mcp__guard__refund_issue\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"role\": \"model\",\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"name\": \"mcp__guard__customer_export\",\n              \"args\": {\n                \"customer_id\": \"acme-cus-000\"\n              }\n            }\n          }\n        ]\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"promptTokenCount\": 120,\n    \"candidatesTokenCount\": 24\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"functionResponse\":{\"name\":\"mcp__guard__customer_export\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"role\": \"model\",\n        \"parts\": [\n          {\n            \"functionCall\": {\n              \"name\": \"mcp__guard__customer_read\",\n              \"args\": {\n                \"customer_id\": \"acme-cus-000\"\n              }\n            }\n          }\n        ]\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"promptTokenCount\": 120,\n    \"candidatesTokenCount\": 24\n  }\n}"
+    },
+    {
+      "request_contains": [
+        "\"functionResponse\":{\"name\":\"mcp__guard__customer_read\""
+      ],
+      "request_excludes": [],
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\n  \"candidates\": [\n    {\n      \"content\": {\n        \"role\": \"model\",\n        \"parts\": [\n          {\n            \"text\": \"Ticket handled.\"\n          }\n        ]\n      },\n      \"finishReason\": \"STOP\"\n    }\n  ],\n  \"usageMetadata\": {\n    \"promptTokenCount\": 120,\n    \"candidatesTokenCount\": 24\n  }\n}"
+    }
+  ]
+}

@@ -708,6 +708,8 @@ async fn finish(
     let rows_pass = rows.iter().all(Row::pass);
     let checks_pass = checks.iter().all(|c| c.pass);
     let report = json!({
+        "format": "guard-demo/v1",
+        "meta": demo_meta(&ctx.args),
         "agent": agent,
         "rows": rows.iter().map(Row::to_json).collect::<Vec<_>>(),
         "checks": report::checks_json(&checks),
@@ -736,6 +738,26 @@ fn supervisor_mode(arg: Option<&str>) -> Result<Supervisor> {
         None => Supervisor::Always(false),
         Some(other) => bail!("--supervisor must be prompt, approve or deny, not {other:?}"),
     })
+}
+
+/// Reproducibility metadata for `report.json` (#363): commit, policy and
+/// fixture hashes, machine, the command line, and the live provider/model.
+fn demo_meta(args: &Args) -> serde_json::Value {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut meta = crom_guard_testkit::experiments::ReproMeta::collect(&format!(
+        "cargo run --manifest-path examples/guard-support/Cargo.toml -- {}",
+        argv.join(" ")
+    ));
+    if args.agent == "live" {
+        meta.provider = args.provider.clone();
+        meta.model = args.model.clone().or_else(|| {
+            let id = args.provider.as_deref()?;
+            crom_core::provider_profile::resolve_profile(id, &Default::default())
+                .ok()?
+                .default_model
+        });
+    }
+    serde_json::to_value(meta).unwrap_or_default()
 }
 
 /// The live model, spend-capped. Refuses to start without a cap it can enforce.

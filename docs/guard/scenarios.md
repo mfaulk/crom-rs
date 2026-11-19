@@ -71,7 +71,7 @@ with `guard_dependent: true` must show `executed > 0` in this lane. This
 proves the probes fire when nothing prevents the effect.
 
 Without `python3` ≥ 3.10, the Python lane is reported as skipped, with the
-reason.
+reason; `CROM_REQUIRE_PYTHON_CLIENT_TESTS=1` (set in CI) makes that a failure.
 
 ### Isolation lanes (G13, G14, G18) and preflight (G17)
 
@@ -169,7 +169,9 @@ For each attack the verdict is one of:
 isolation and preflight lanes.
 
 The driver writes `$CARGO_TARGET_TMPDIR/guard-scenarios/report.json`
-(`target/tmp/…`), with `"format": "guard-scenarios/v1"`. It has one entry per
+(`target/tmp/…`), with `"format": "guard-scenarios/v1"` and a `meta` object
+(commit, policy-set, schema and fixture hashes, sandbox, machine, command;
+[experiments.md](experiments.md#reproducibility-metadata)). It has one entry per
 scenario and lane:
 
 - `status`, plus `skip_reason` and `tracking_issue` for skipped entries;
@@ -261,4 +263,4 @@ The test prints the results table and the path to `report.json`. CI: the
 
 - A Crom run with a second MCP server loaded: the SDK cannot configure one (`ToolPolicy::guard` builds the MCP set with Guard alone), so the unsupported configuration is shown only through `crom_mcp::McpClient` and `crom-guard check`.
 - The `crom run` CLI as the client: the `crom` lane uses the SDK.
-- Live models (#363).
+- Live models: the optional, spend-capped E3 lane ([experiments.md](experiments.md#e3-scripted-vs-model-generated-attacks)). Results across lanes: [scoreboard.md](scoreboard.md).

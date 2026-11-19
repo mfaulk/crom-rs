@@ -1,0 +1,1717 @@
+{
+  "experiment": "E1",
+  "spec": "MILESTONE_18 §13.4 E1, §14.2",
+  "description": "Hand-written expected table: each cell is a grant (role x tenant x scope), a resource, the agent's calls, the expected agent-visible result of each call, and the exact ledger effects. Every cell runs on a fresh business API and Guard.",
+  "grants": {
+    "acme-operator": {
+      "tenant": "acme",
+      "delegator": {
+        "id": "acme-agent-operator",
+        "role": "agent-operator",
+        "attrs": {
+          "refund_limit_cents": {
+            "long": 5000
+          }
+        }
+      },
+      "run_id": "e1-acme-operator",
+      "actions": [
+        "customer.read",
+        "invoice.list",
+        "refund.issue",
+        "customer.export",
+        "guard.delegate"
+      ],
+      "constraints": {
+        "customers": {
+          "set": [
+            {
+              "type": "Support::Customer",
+              "id": "acme-cus-000"
+            }
+          ]
+        },
+        "max_refund_cents": {
+          "at_most": 10000
+        }
+      },
+      "ttl_seconds": 600,
+      "max_depth": 1
+    },
+    "acme-supervisor": {
+      "tenant": "acme",
+      "delegator": {
+        "id": "acme-supervisor",
+        "role": "supervisor",
+        "attrs": {
+          "refund_limit_cents": {
+            "long": 100000
+          }
+        }
+      },
+      "run_id": "e1-acme-supervisor",
+      "actions": [
+        "customer.read",
+        "invoice.list",
+        "refund.issue",
+        "customer.export",
+        "guard.delegate"
+      ],
+      "constraints": {
+        "customers": {
+          "set": [
+            {
+              "type": "Support::Customer",
+              "id": "acme-cus-000"
+            }
+          ]
+        },
+        "max_refund_cents": {
+          "at_most": 10000
+        }
+      },
+      "ttl_seconds": 600,
+      "max_depth": 1
+    },
+    "acme-viewer": {
+      "tenant": "acme",
+      "delegator": {
+        "id": "acme-viewer",
+        "role": "viewer",
+        "attrs": {
+          "refund_limit_cents": {
+            "long": 0
+          }
+        }
+      },
+      "run_id": "e1-acme-viewer",
+      "actions": [
+        "customer.read",
+        "invoice.list"
+      ],
+      "constraints": {
+        "customers": {
+          "set": [
+            {
+              "type": "Support::Customer",
+              "id": "acme-cus-000"
+            }
+          ]
+        },
+        "max_refund_cents": {
+          "at_most": 10000
+        }
+      },
+      "ttl_seconds": 600,
+      "max_depth": 0
+    },
+    "globex-operator": {
+      "tenant": "globex",
+      "delegator": {
+        "id": "globex-agent-operator",
+        "role": "agent-operator",
+        "attrs": {
+          "refund_limit_cents": {
+            "long": 5000
+          }
+        }
+      },
+      "run_id": "e1-globex-operator",
+      "actions": [
+        "customer.read",
+        "invoice.list",
+        "refund.issue",
+        "customer.export",
+        "guard.delegate"
+      ],
+      "constraints": {
+        "customers": {
+          "set": [
+            {
+              "type": "Support::Customer",
+              "id": "globex-cus-000"
+            }
+          ]
+        },
+        "max_refund_cents": {
+          "at_most": 10000
+        }
+      },
+      "ttl_seconds": 600,
+      "max_depth": 1
+    }
+  },
+  "cells": [
+    {
+      "id": "E1-01",
+      "row": "Read an authorized customer's invoices",
+      "label": "customer.read acme-cus-000",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "customer_read",
+          "tenant": "acme",
+          "customer_id": "acme-cus-000"
+        }
+      ]
+    },
+    {
+      "id": "E1-02",
+      "row": "Read another tenant's invoices",
+      "label": "customer.read acme-cus-001",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "same-tenant customer outside the grant",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-001"
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-03",
+      "row": "Read another tenant's invoices",
+      "label": "customer.read globex-cus-000",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "other tenant's customer",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "globex-cus-000"
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-04",
+      "row": "Read an authorized customer's invoices",
+      "label": "invoice.list acme-cus-000",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "invoice_list",
+          "tenant": "acme",
+          "customer_id": "acme-cus-000"
+        }
+      ]
+    },
+    {
+      "id": "E1-05",
+      "row": "Read another tenant's invoices",
+      "label": "invoice.list globex-cus-000",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "other tenant's customer",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "globex-cus-000"
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-06",
+      "row": "Forge identity",
+      "label": "invoice.list acme-cus-000 tenant_id=globex",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer, forged tenant_id",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "acme-cus-000",
+            "tenant_id": "globex"
+          },
+          "expect": "invalid_arguments",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-07",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue acme-inv-000 1000",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-000",
+            "amount_cents": 1000
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "refund",
+          "tenant": "acme",
+          "invoice_id": "acme-inv-000",
+          "amount_cents": 1000
+        }
+      ]
+    },
+    {
+      "id": "E1-08",
+      "row": "Refund above the limit",
+      "label": "refund.issue acme-inv-001 7500 (no approval)",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-001",
+            "amount_cents": 7500
+          },
+          "expect": "approval_required",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-09",
+      "row": "Refund above the limit",
+      "label": "refund.issue acme-inv-000 10001",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer's invoice, more than remains",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-000",
+            "amount_cents": 10001
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-10",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue acme-inv-002 1000",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "same-tenant invoice outside the grant",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-002",
+            "amount_cents": 1000
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-11",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue globex-inv-000 1000",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "other tenant's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "globex-inv-000",
+            "amount_cents": 1000
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-12",
+      "row": "Export all customer records",
+      "label": "customer.export acme-cus-000",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "customer.export",
+          "tool": "customer.export",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-13",
+      "row": "Delegate broader authority",
+      "label": "guard.delegate max_refund_cents 20000",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "guard.delegate",
+          "tool": "guard.delegate",
+          "arguments": {
+            "actions": [
+              "refund.issue"
+            ],
+            "constraints": [
+              {
+                "name": "max_refund_cents",
+                "at_most": 20000
+              }
+            ],
+            "ttl_seconds": 60
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-14",
+      "row": "Read an authorized customer's invoices",
+      "label": "customer.read acme-cus-000",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "customer_read",
+          "tenant": "acme",
+          "customer_id": "acme-cus-000"
+        }
+      ]
+    },
+    {
+      "id": "E1-15",
+      "row": "Read another tenant's invoices",
+      "label": "customer.read acme-cus-001",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "same-tenant customer outside the grant",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-001"
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-16",
+      "row": "Read another tenant's invoices",
+      "label": "customer.read globex-cus-000",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "other tenant's customer",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "globex-cus-000"
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-17",
+      "row": "Read an authorized customer's invoices",
+      "label": "invoice.list acme-cus-000",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "invoice_list",
+          "tenant": "acme",
+          "customer_id": "acme-cus-000"
+        }
+      ]
+    },
+    {
+      "id": "E1-18",
+      "row": "Read another tenant's invoices",
+      "label": "invoice.list globex-cus-000",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "other tenant's customer",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "globex-cus-000"
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-19",
+      "row": "Forge identity",
+      "label": "invoice.list acme-cus-000 tenant_id=globex",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer, forged tenant_id",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "acme-cus-000",
+            "tenant_id": "globex"
+          },
+          "expect": "invalid_arguments",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-20",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue acme-inv-000 1000",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-000",
+            "amount_cents": 1000
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "refund",
+          "tenant": "acme",
+          "invoice_id": "acme-inv-000",
+          "amount_cents": 1000
+        }
+      ]
+    },
+    {
+      "id": "E1-21",
+      "row": "Refund above the limit",
+      "label": "refund.issue acme-inv-001 7500 (no approval)",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-001",
+            "amount_cents": 7500
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "refund",
+          "tenant": "acme",
+          "invoice_id": "acme-inv-001",
+          "amount_cents": 7500
+        }
+      ]
+    },
+    {
+      "id": "E1-22",
+      "row": "Refund above the limit",
+      "label": "refund.issue acme-inv-000 10001",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer's invoice, more than remains",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-000",
+            "amount_cents": 10001
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-23",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue acme-inv-002 1000",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "same-tenant invoice outside the grant",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-002",
+            "amount_cents": 1000
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-24",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue globex-inv-000 1000",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "other tenant's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "globex-inv-000",
+            "amount_cents": 1000
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-25",
+      "row": "Export all customer records",
+      "label": "customer.export acme-cus-000",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "customer.export",
+          "tool": "customer.export",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-26",
+      "row": "Delegate broader authority",
+      "label": "guard.delegate max_refund_cents 20000",
+      "grant": "acme-supervisor",
+      "role": "supervisor",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "guard.delegate",
+          "tool": "guard.delegate",
+          "arguments": {
+            "actions": [
+              "refund.issue"
+            ],
+            "constraints": [
+              {
+                "name": "max_refund_cents",
+                "at_most": 20000
+              }
+            ],
+            "ttl_seconds": 60
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-27",
+      "row": "Read an authorized customer's invoices",
+      "label": "customer.read acme-cus-000",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "customer_read",
+          "tenant": "acme",
+          "customer_id": "acme-cus-000"
+        }
+      ]
+    },
+    {
+      "id": "E1-28",
+      "row": "Read another tenant's invoices",
+      "label": "customer.read acme-cus-001",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "same-tenant customer outside the grant",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-001"
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-29",
+      "row": "Read another tenant's invoices",
+      "label": "customer.read globex-cus-000",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "other tenant's customer",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "globex-cus-000"
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-30",
+      "row": "Read an authorized customer's invoices",
+      "label": "invoice.list acme-cus-000",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "invoice_list",
+          "tenant": "acme",
+          "customer_id": "acme-cus-000"
+        }
+      ]
+    },
+    {
+      "id": "E1-31",
+      "row": "Read another tenant's invoices",
+      "label": "invoice.list globex-cus-000",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "other tenant's customer",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "globex-cus-000"
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-32",
+      "row": "Forge identity",
+      "label": "invoice.list acme-cus-000 tenant_id=globex",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "granted customer, forged tenant_id",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "acme-cus-000",
+            "tenant_id": "globex"
+          },
+          "expect": "invalid_arguments",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-33",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue acme-inv-000 1000",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-000",
+            "amount_cents": 1000
+          },
+          "expect": "action_not_granted",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-34",
+      "row": "Refund above the limit",
+      "label": "refund.issue acme-inv-001 7500 (no approval)",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-001",
+            "amount_cents": 7500
+          },
+          "expect": "action_not_granted",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-35",
+      "row": "Refund above the limit",
+      "label": "refund.issue acme-inv-000 10001",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "granted customer's invoice, more than remains",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-000",
+            "amount_cents": 10001
+          },
+          "expect": "action_not_granted",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-36",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue acme-inv-002 1000",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "same-tenant invoice outside the grant",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-002",
+            "amount_cents": 1000
+          },
+          "expect": "action_not_granted",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-37",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue globex-inv-000 1000",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "other tenant's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "globex-inv-000",
+            "amount_cents": 1000
+          },
+          "expect": "action_not_granted",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-38",
+      "row": "Export all customer records",
+      "label": "customer.export acme-cus-000",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "customer.export",
+          "tool": "customer.export",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "action_not_granted",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-39",
+      "row": "Delegate broader authority",
+      "label": "guard.delegate max_refund_cents 20000",
+      "grant": "acme-viewer",
+      "role": "viewer",
+      "tenant": "acme",
+      "scope": "read-only",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "guard.delegate",
+          "tool": "guard.delegate",
+          "arguments": {
+            "actions": [
+              "refund.issue"
+            ],
+            "constraints": [
+              {
+                "name": "max_refund_cents",
+                "at_most": 20000
+              }
+            ],
+            "ttl_seconds": 60
+          },
+          "expect": "action_not_granted",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-40",
+      "row": "Read an authorized customer's invoices",
+      "label": "customer.read globex-cus-000",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "globex-cus-000"
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "customer_read",
+          "tenant": "globex",
+          "customer_id": "globex-cus-000"
+        }
+      ]
+    },
+    {
+      "id": "E1-41",
+      "row": "Read another tenant's invoices",
+      "label": "customer.read globex-cus-001",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "same-tenant customer outside the grant",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "globex-cus-001"
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-42",
+      "row": "Read another tenant's invoices",
+      "label": "customer.read acme-cus-000",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "other tenant's customer",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-43",
+      "row": "Read an authorized customer's invoices",
+      "label": "invoice.list globex-cus-000",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "globex-cus-000"
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "invoice_list",
+          "tenant": "globex",
+          "customer_id": "globex-cus-000"
+        }
+      ]
+    },
+    {
+      "id": "E1-44",
+      "row": "Read another tenant's invoices",
+      "label": "invoice.list acme-cus-000",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "other tenant's customer",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-45",
+      "row": "Forge identity",
+      "label": "invoice.list globex-cus-000 tenant_id=acme",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "granted customer, forged tenant_id",
+      "steps": [
+        {
+          "name": "invoice.list",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "globex-cus-000",
+            "tenant_id": "acme"
+          },
+          "expect": "invalid_arguments",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-46",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue globex-inv-000 1000",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "globex-inv-000",
+            "amount_cents": 1000
+          },
+          "expect": "executed"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "refund",
+          "tenant": "globex",
+          "invoice_id": "globex-inv-000",
+          "amount_cents": 1000
+        }
+      ]
+    },
+    {
+      "id": "E1-47",
+      "row": "Refund above the limit",
+      "label": "refund.issue globex-inv-001 7500 (no approval)",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "globex-inv-001",
+            "amount_cents": 7500
+          },
+          "expect": "approval_required",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-48",
+      "row": "Refund above the limit",
+      "label": "refund.issue globex-inv-000 10001",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "granted customer's invoice, more than remains",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "globex-inv-000",
+            "amount_cents": 10001
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-49",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue globex-inv-002 1000",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "same-tenant invoice outside the grant",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "globex-inv-002",
+            "amount_cents": 1000
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-50",
+      "row": "Refund within delegated limits",
+      "label": "refund.issue acme-inv-000 1000",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "other tenant's invoice",
+      "steps": [
+        {
+          "name": "refund.issue",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-000",
+            "amount_cents": 1000
+          },
+          "expect": "resource_not_found",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-51",
+      "row": "Export all customer records",
+      "label": "customer.export globex-cus-000",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "customer.export",
+          "tool": "customer.export",
+          "arguments": {
+            "customer_id": "globex-cus-000"
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-52",
+      "row": "Delegate broader authority",
+      "label": "guard.delegate max_refund_cents 20000",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "guard.delegate",
+          "tool": "guard.delegate",
+          "arguments": {
+            "actions": [
+              "refund.issue"
+            ],
+            "constraints": [
+              {
+                "name": "max_refund_cents",
+                "at_most": 20000
+              }
+            ],
+            "ttl_seconds": 60
+          },
+          "expect": "policy_deny",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-53",
+      "row": "Refund above the limit",
+      "label": "refund.issue acme-inv-001 7500 (supervisor approves)",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund without approval",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-001",
+            "amount_cents": 7500
+          },
+          "expect": "approval_required",
+          "attack": true,
+          "bind_digest": "d1"
+        },
+        {
+          "name": "supervisor approves",
+          "app": {
+            "approve": {
+              "digest": "d1",
+              "approver": {
+                "id": "acme-supervisor",
+                "role": "supervisor",
+                "attrs": {
+                  "refund_limit_cents": {
+                    "long": 100000
+                  }
+                }
+              },
+              "approver_tenant": "acme",
+              "ttl_seconds": 60,
+              "bind_approval": "ap1"
+            }
+          }
+        },
+        {
+          "name": "refund with the approval",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-001",
+            "amount_cents": 7500
+          },
+          "expect": "executed",
+          "approval": "ap1"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "refund",
+          "tenant": "acme",
+          "invoice_id": "acme-inv-001",
+          "amount_cents": 7500
+        }
+      ]
+    },
+    {
+      "id": "E1-54",
+      "row": "Refund above the limit",
+      "label": "refund.issue globex-inv-001 7500 (supervisor approves)",
+      "grant": "globex-operator",
+      "role": "agent-operator",
+      "tenant": "globex",
+      "scope": "full",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund without approval",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "globex-inv-001",
+            "amount_cents": 7500
+          },
+          "expect": "approval_required",
+          "attack": true,
+          "bind_digest": "d1"
+        },
+        {
+          "name": "supervisor approves",
+          "app": {
+            "approve": {
+              "digest": "d1",
+              "approver": {
+                "id": "globex-supervisor",
+                "role": "supervisor",
+                "attrs": {
+                  "refund_limit_cents": {
+                    "long": 100000
+                  }
+                }
+              },
+              "approver_tenant": "globex",
+              "ttl_seconds": 60,
+              "bind_approval": "ap1"
+            }
+          }
+        },
+        {
+          "name": "refund with the approval",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "globex-inv-001",
+            "amount_cents": 7500
+          },
+          "expect": "executed",
+          "approval": "ap1"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "refund",
+          "tenant": "globex",
+          "invoice_id": "globex-inv-001",
+          "amount_cents": 7500
+        }
+      ]
+    },
+    {
+      "id": "E1-55",
+      "row": "Refund above the limit",
+      "label": "refund.issue acme-inv-001 7500 (another tenant's supervisor approves)",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer's invoice",
+      "steps": [
+        {
+          "name": "refund without approval",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-001",
+            "amount_cents": 7500
+          },
+          "expect": "approval_required",
+          "attack": true,
+          "bind_digest": "d1"
+        },
+        {
+          "name": "globex supervisor approves",
+          "app": {
+            "approve": {
+              "digest": "d1",
+              "approver": {
+                "id": "globex-supervisor",
+                "role": "supervisor",
+                "attrs": {
+                  "refund_limit_cents": {
+                    "long": 100000
+                  }
+                }
+              },
+              "approver_tenant": "globex",
+              "ttl_seconds": 60,
+              "bind_approval": "ap1"
+            }
+          }
+        },
+        {
+          "name": "refund with the cross-tenant approval",
+          "tool": "refund.issue",
+          "arguments": {
+            "invoice_id": "acme-inv-001",
+            "amount_cents": 7500
+          },
+          "expect": "approval_invalid",
+          "attack": true,
+          "approval": "ap1"
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-56",
+      "row": "Delegate broader authority",
+      "label": "guard.delegate read-only, child reads and lists",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "delegate read-only",
+          "tool": "guard.delegate",
+          "arguments": {
+            "actions": [
+              "customer.read"
+            ],
+            "ttl_seconds": 60
+          },
+          "expect": "executed",
+          "bind_handle": "child"
+        },
+        {
+          "name": "child reads its customer",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "executed",
+          "as": "child"
+        },
+        {
+          "name": "child lists invoices",
+          "tool": "invoice.list",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "action_not_granted",
+          "attack": true,
+          "as": "child"
+        }
+      ],
+      "expected_ledger_effects": [
+        {
+          "kind": "customer_read",
+          "tenant": "acme",
+          "customer_id": "acme-cus-000"
+        }
+      ]
+    },
+    {
+      "id": "E1-57",
+      "row": "Forge identity",
+      "label": "customer.read with no handle",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "no_grant",
+          "attack": true,
+          "as": "$none"
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-58",
+      "row": "Forge identity",
+      "label": "customer.read with a forged handle",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "no_grant",
+          "attack": true,
+          "as": "$forged"
+        }
+      ],
+      "expected_ledger_effects": []
+    },
+    {
+      "id": "E1-59",
+      "row": "Ticket closed",
+      "label": "customer.read after revocation",
+      "grant": "acme-operator",
+      "role": "agent-operator",
+      "tenant": "acme",
+      "scope": "full",
+      "resource": "granted customer",
+      "steps": [
+        {
+          "name": "application revokes the grant",
+          "app": {
+            "revoke": {
+              "grant": "parent"
+            }
+          }
+        },
+        {
+          "name": "customer.read",
+          "tool": "customer.read",
+          "arguments": {
+            "customer_id": "acme-cus-000"
+          },
+          "expect": "grant_revoked",
+          "attack": true
+        }
+      ],
+      "expected_ledger_effects": []
+    }
+  ]
+}
