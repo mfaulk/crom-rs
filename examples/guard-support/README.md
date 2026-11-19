@@ -45,7 +45,7 @@ The first run builds `crom-guard-support` from the workspace
 
 | Artifact | Contents |
 |---|---|
-| `matrix.txt`, `report.json` | The matrix, evidence checks, Guard audit summary, supervisor decisions |
+| `matrix.txt`, `report.json` | The matrix, evidence checks, Guard audit summary, supervisor decisions. `report.json` is `guard-demo/v1` with a `meta` object (commit, policy and fixture hashes, machine, command, and the live provider/model), so `crom eval scoreboard --guard-report` can render it ([experiments.md](../../docs/guard/experiments.md)) |
 | `audit.jsonl` | Guard's `guard-audit/v1` log (hash-chained; verified by `crom-guard audit verify`) |
 | `ledger.jsonl` | The business API's effect ledger, the independent oracle |
 | `approvals.jsonl` | Each approval request the supervisor was shown (from Guard's pending record) and the decision |

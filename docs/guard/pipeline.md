@@ -141,8 +141,14 @@ Exactly one `decision` record per call, and at most one `outcome` record, both w
 cargo test -p crom-guard --test pipeline
 cargo test -p crom-guard-testkit --test pipeline_e2e --test canary
 cargo run -p crom-guard --example embedded
-# E5 in-process latency (release; in-memory sink, so no fsync)
+# In-process latency with an in-memory sink (release; no fsync)
 cargo test --release -p crom-guard --test pipeline pipeline_latency -- --ignored --nocapture
 ```
+
+The recorded E5 measurement, with `FileAuditSink`, the HTTP server, the direct
+executor and the policy-only component, is `e5_latency` in
+`crates/crom-guard-testkit/tests/guard_experiments.rs`
+([experiments.md](experiments.md#e5-overhead); results in
+[scoreboard.md](scoreboard.md)).
 
 On the development machine this measured p50 ≈ 67 µs for an allowed call and ≈ 76 µs for a policy deny (the deny also runs the approval probe), without fsync. With `FileAuditSink`, each call adds one or two `fsync`s.

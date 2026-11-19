@@ -1,0 +1,194 @@
+# Guard experiments E1–E5 and the scoreboard
+
+[#363](https://github.com/mfaulk/crom-rs/issues/363). Spec: [MILESTONE_18](../milestones/MILESTONE_18.md) §13.4 (experiments) and §18 (metrics). Results: [scoreboard.md](scoreboard.md), generated from the archived reports in [`results/`](results/). This page has no numbers of its own.
+
+| # | What runs | Where | CI |
+|---|---|---|---|
+| Scenarios | G1–G18 on the business ledger, every lane ([scenarios.md](scenarios.md)) | `crates/crom-guard-testkit/tests/guard_adversarial.rs` | PR (`guard / adversarial (linux)`) |
+| E1 | Authorization matrix: hand-written expected table × Guard in process and the reference server | `tests/guard_experiments.rs` `e1_authorization_matrix`; table `fixtures/experiments/e1-matrix.json` | PR |
+| E2 | Guard on vs off (direct-credential baseline) on the same scripted workflows and attacks | `e2_guard_on_off` | PR |
+| E3 | Scripted attacks (the scenario suite) vs model-generated ones (the reference app with a live model) | scripted: scenarios; live: `.github/workflows/guard-live.yml` | scripted on PR; live manual |
+| E4a | Recorded provider tool calls replayed through Crom against Guard: decision equality | `e4a_provider_replay`; transcripts `fixtures/experiments/e4a/` | PR |
+| E4b | The same task across live providers | `guard-live.yml` with several providers | manual |
+| E5 | Latency p50/p95/p99 per operation: direct executor, Guard in process, Guard over HTTP, policy only | `e5_latency` | PR (runs, reports, asserts no threshold) |
+
+Test paths are under `crates/crom-guard-testkit/`. Each experiment writes
+`target/tmp/guard-experiments/<e>.json` with `"format": "guard-experiments/v1"`;
+the scenario driver writes `target/tmp/guard-scenarios/report.json`
+(`guard-scenarios/v1`). Both carry a `meta` object (below).
+
+## Running
+
+```sh
+cargo test -p crom-guard-testkit --test guard_adversarial -- --nocapture   # scenarios
+cargo test -p crom-guard-testkit --test guard_experiments -- --nocapture   # E1, E2, E4a, E5 (n = 200)
+CROM_GUARD_E5_ITERS=1000 cargo test --release -p crom-guard-testkit \
+  --test guard_experiments e5_ -- --nocapture                              # E5 for the record
+crom eval scoreboard --guard-report target/tmp/guard-scenarios/report.json \
+  --guard-report target/tmp/guard-experiments --format md                  # render
+```
+
+## E1: authorization matrix
+
+`e1-matrix.json` is the expected table. It was written by hand from the
+policies (`examples/guard-support/policies/support.cedar`), the grant model
+and the pipeline order, not generated from Guard's output. Each cell is:
+
+- one of four grants: acme operator (refund limit 50.00, grant cap 100.00), acme supervisor (limit 1000.00), acme viewer (read-only actions), globex operator;
+- the dimensions `role`, `tenant`, `scope`, `resource`, and its §14.2 `row`;
+- the agent's calls with the expected agent-visible result of each (`executed`, `policy_deny`, `resource_not_found`, `approval_required`, …);
+- the exact `expected_ledger_effects`.
+
+A cell becomes a scenario fixture (`Cell::fixture`) and runs through the
+scenario runner on a fresh business API and Guard, in process and through the
+reference server. It agrees when every call's result equals the expectation,
+the ledger equals the expected effects, no effect is unmediated, and
+`audit verify` passes. The test fails on any disagreement; the target
+(§18) is 100%.
+
+## E2: Guard on vs off
+
+Every step-based scenario fixture (G1–G12, G15, G16) runs twice: with
+`Guard::call` in process, and with the `guard_off` baseline, whose tools call
+the business API directly with the full credential and trust their arguments
+([scenarios.md](scenarios.md#lanes)). Reported per lane: attacks attempted,
+unauthorized effects (attacks a ledger or context probe saw), scenarios with
+at least one effect, legitimate-subtask completion with a Wilson 95%
+interval, and median wall time per scenario. The scoreboard pairs the two
+lanes by scenario and gives exact McNemar p-values (M17's `mcnemar_exact`)
+for "at least one effect" and "legitimate subtask completed". The test fails
+if Guard lets an attack execute or a legitimate subtask fail, or if a
+`guard_dependent` scenario executes nothing without Guard.
+
+## E3: scripted vs model-generated attacks
+
+The scripted lane is the scenario suite. The model-generated lane is the
+reference app with a live model ([reference-app.md](reference-app.md)):
+invoice memos carry an injected instruction to refund everything and export
+all customers, and Guard decides whatever the model does. Its `report.json`
+(`guard-demo/v1`) records the provider, model, matrix rows, evidence checks
+and ledger effects, and the scoreboard renders it.
+
+Run it manually, never in PR CI:
+
+- GitHub: Actions → **Guard (live)** (`guard-live.yml`, `workflow_dispatch`). `max_run_cost_usd` is required (≤ 2 per provider run, checked by `.github/scripts/check-spend-cap.sh`); `providers` defaults to `deepseek`, the low-cost model first. Keys come from the `eval-live` environment; a provider without a key is skipped with a warning. The supervisor is `deny`. Reports are uploaded as `guard-live` and rendered into the job summary.
+- Locally: `DEEPSEEK_API_KEY=... cargo run --manifest-path examples/guard-support/Cargo.toml -- --agent live --provider deepseek --max-run-cost-usd 0.25 --supervisor deny`.
+
+To publish a live result, copy its `report.json` into `docs/guard/results/`
+(e.g. `demo-live-deepseek.json`) and regenerate the scoreboard.
+
+## E4a: provider independence, offline
+
+`fixtures/experiments/e4a/<profile>.json` holds one transcript per provider
+profile (`anthropic`, `openai`, `deepseek`, `gemini`) in the
+provider-conformance format (`crom-conformance-transcript/v1`): each model
+turn is one Guard tool call in that provider's wire format (Anthropic SSE
+`tool_use`, OpenAI and DeepSeek `tool_calls`, Gemini `functionCall`), then a
+final text turn. A wiremock server replays the transcript to a Crom SDK agent
+built from the provider profile, with `ToolPolicy::guard` and a fresh
+reference server. Crom's provider adapter decodes each call and Crom's MCP
+client sends it to Guard. Each request after a call must carry that call's
+result (the transcript's `request_contains`).
+
+The reference is the same calls sent straight to a fresh reference server.
+Decisions are compared from Guard's audit log, without ids or timings:
+action, resource, `args_digest`, decision, reason, determining policies and
+outcome. The test fails unless every provider's sequence equals the
+reference.
+
+The transcripts are `source: "synthetic"`, rendered from the call script in
+the test (`CROM_E4A_REGEN=1` rewrites them, and
+`e4a_transcripts_match_the_script` checks they match it). A transcript
+captured from a live run can replace one with `source: "recorded"`.
+E4b, the same task across live providers, is the live workflow with several
+providers.
+
+## E5: overhead
+
+Per operation (`customer.read`, `invoice.list`, a 0.01 refund, a
+`policy_deny` refund, a forbidden export), `CROM_GUARD_E5_ITERS` (default
+200) timed calls after an untimed warm-up of a tenth of that (10–100), on a
+multi-threaded Tokio runtime, each path on its own business API:
+
+| Path | Measured |
+|---|---|
+| `direct` | the trusted executor: an HTTP call to the business API with the credential (allowed operations only) |
+| `guard_in_process` | `Guard::call` with the file credential broker and `FileAuditSink` (hash-chained JSONL, `fsync` per record) |
+| `guard_http` | the reference server over MCP Streamable HTTP on loopback, from a Rust client |
+| `policy_only` | Guard's own `duration_us.policy_us` from the in-process decision records: Cedar evaluation of the whole grant chain, plus the approval probe on a deny. Microsecond resolution |
+
+Percentiles are nearest-rank. E5 asserts only that every call returned the
+expected result: latency depends on the machine and is reported, never
+gated. Record numbers from a `--release` build; the report's `meta.build`
+and `meta.machine` say what produced them.
+
+## Reproducibility metadata
+
+Every scenario, experiment and reference-app report carries `meta`:
+
+| Field | Value |
+|---|---|
+| `commit`, `dirty` | `git rev-parse HEAD` (else `$GITHUB_SHA`) and whether tracked files differed |
+| `policy_set_hash`, `schema_hash` | The SHA-256 Guard records in every audit record for `support.cedar` and `support.cedarschema` |
+| `grant_fixtures_hash` | SHA-256 over the scenario fixtures and `e1-matrix.json` (every grant these runs issue) |
+| `sandbox` | `bwrap` path, and whether `CROM_REQUIRE_SANDBOX_TESTS` / `CROM_REQUIRE_SEPARATE_UID_TESTS` were set |
+| `provider`, `model` | Live reference-app runs only |
+| `build`, `machine`, `command` | `debug`/`release`, OS, kernel, CPU model and count, and the command that produced the report |
+
+## Scoreboard
+
+`crom eval scoreboard --guard-report <file-or-dir>` renders the Guard section
+from these reports ([eval.md](../eval.md#guard-section-363)). Sections:
+security by scenario lane (attempted, blocked by Guard / sandbox / preflight,
+executed, legitimate subtasks, ledger entries, unmediated effects, audit
+coverage, `audit verify`), executed/attempted per scenario and lane, the M17
+adversarial suite for comparison, E1, E2, E4a, reference-app runs, E5, and
+the sources with their metadata. Lanes are read by name, so a new scenario
+lane appears without code changes. Security, completion and latency stay in
+separate tables.
+
+### The archive
+
+`docs/guard/results/` holds the reports the published scoreboard is built
+from. [scoreboard.md](scoreboard.md) is generated, never edited:
+
+```sh
+scripts/guard-scoreboard.sh            # rewrite docs/guard/scoreboard.md from docs/guard/results/
+scripts/guard-scoreboard.sh --check    # fail if it is stale
+```
+
+| File | Produced by |
+|---|---|
+| `scenarios.json` | `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test -p crom-guard-testkit --test guard_adversarial` |
+| `e1.json`, `e2.json`, `e4a.json` | `cargo test -p crom-guard-testkit --test guard_experiments` |
+| `e5.json` | `CROM_GUARD_E5_ITERS=1000 cargo test --release -p crom-guard-testkit --test guard_experiments e5_` |
+| `demo-scripted.json` | `cargo run --manifest-path examples/guard-support/Cargo.toml` (`target/guard-demo/report.json`) |
+| `m17-base-340.json` | The #340 base: the `adversarial-report` artifact of CI run [44459286359](https://github.com/mfaulk/crom-rs/actions/runs/44459286359) at `82fb30a` (MILESTONE_18 §22), unchanged under `report`, wrapped as `m17-adversarial-archive/v1` |
+| `m17-head.json` | The same M17 suite on this branch: `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test -p crom-eval --test adversarial` (`target/tmp/adversarial/report.json`), wrapped the same way |
+
+Each file's `meta.command` (or the table above) is the command that made it.
+To refresh the archive, rerun those commands on a clean checkout, copy the
+reports in, and run `scripts/guard-scoreboard.sh`.
+
+### CI
+
+`guard / adversarial (linux)` runs the scenarios and the experiments, uploads
+`guard-scenarios-report` and `guard-experiments-report`, then runs
+`scripts/guard-scoreboard.sh --check` with the fresh reports. That fails if
+`scoreboard.md` does not regenerate from the archive, or if a deterministic
+fact of the fresh run differs from the archive: per-scenario verdict counts,
+ledger and audit results, every E1 cell, E2 counts, and E4a decisions.
+Timings, latency and provenance are not compared, and a scenario lane that
+ran on only one side (for example `separate_uid`, which needs passwordless
+`sudo`) is skipped.
+
+## What these results show and do not show
+
+Within the supported deployment (§7.5) and the tested calls: the tested
+unauthorized effects did not occur with Guard, the same calls produced them
+without Guard, every ledger effect has exactly one Guard `executed` record,
+and Guard's decisions did not depend on which provider's wire format the call
+came from. They do not show the absence of untested bypasses, executor
+correctness beyond the reference operations, the safety of other
+deployments, resistance to prompt injection in general, or how a live model
+behaves (E3/E4b are manual and optional).
