@@ -23,9 +23,10 @@ consumers as `SdkEvent::SecurityDecision` under **every** verbosity.
 | `policy_source` | `PolicyDecisionSource` stage that decided (`hook`, `disallow_rule`, `permission_mode`, `allow_rule`, `approval_callback`, `approval_memory`, `external_effect_policy`, `default_deny`, `workspace_trust`); absent when the call never reached the policy engine or was refused below it |
 | `rule` | Matching rule as `<list>[<index>]: <rule json>`, e.g. `disallowed_tools[0]: "Write"` |
 | `decision` | `allow` / `deny` / `ask` |
-| `enforcement` | `policy` (policy engine, tool allowlist, tool-catalog loading gate), `hook` (`PreToolUse` hook, or a `PostToolUse`/`PostToolUseFailure` hook `Deny`), `checkpoint` (checkpoint safety gate), `sandbox` (tool-level `PermissionDenied`: the Read/Write/Edit path sandbox, and a Bash call refused because the [OS sandbox](sandbox.md) is `required` but cannot be enforced) |
+| `enforcement` | `policy` (policy engine, tool allowlist, tool-catalog loading gate), `hook` (`PreToolUse` hook, or a `PostToolUse`/`PostToolUseFailure` hook `Deny`), `checkpoint` (checkpoint safety gate), `sandbox` (tool-level `PermissionDenied`: the Read/Write/Edit path sandbox, and a Bash call refused because the [OS sandbox](sandbox.md) is `required` but cannot be enforced), `guard` (the call reached a Crom Guard MCP server, [docs/sdk/guard.md](../sdk/guard.md)) |
 | `outcome` | `blocked`, `executed`, `failed` |
-| `reason` | Redacted free text |
+| `reason` | Redacted free text. At layer `guard`: Guard's stable code (`resource_not_found`, `approval_required`, ...) or `guard_unavailable` / `guard_timeout` / `malformed_response` |
+| `guard_decision_id` | Guard's `_meta.decision_id`; joins Guard's `guard-audit/v1` records. Only on calls to a server configured `guard: true`. Absent in records written before #359, which still deserialize |
 
 Emission points in `run_loop` (`crom-core/src/agent.rs`):
 
@@ -37,6 +38,8 @@ Emission points in `run_loop` (`crom-core/src/agent.rs`):
 | Tool returns `ToolError::PermissionDenied` | `sandbox` | `blocked` |
 | Tool ran, then a post-tool hook returned `Deny` | `hook` (`policy_source: hook`, `decision: deny`) | `blocked` |
 | Tool ran | `policy` or `hook` | `executed` / `failed` (`is_error`) |
+| Guard server: Guard executed / precondition or executor failed | `guard` | `executed` / `failed` |
+| Guard server: denied, `approval_required`, unreachable, timeout, or unreadable result | `guard` (`decision: deny`) | `blocked` |
 
 Policy engine stage order (`PolicyEngine::evaluate_tool`,
 `crom-core/src/policy.rs`); the first stage that decides wins:

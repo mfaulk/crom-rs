@@ -31,8 +31,10 @@ variants:
 - `ModelTurnCompleted` — one model round trip finished (see below).
 - `SecurityDecision` — one audit record per tool call: run id, principal,
   `tool_use_id`, action class, normalized resource, policy source and rule,
-  decision, enforcement layer (`policy | hook | checkpoint | sandbox`), and
-  outcome (`blocked | executed | failed`). Emitted under every verbosity.
+  decision, enforcement layer (`policy | hook | checkpoint | sandbox |
+  guard`), outcome (`blocked | executed | failed`), and, for Crom Guard
+  calls, `guard_decision_id` ([`guard.md`](guard.md)). Emitted under every
+  verbosity.
   See [`../security/audit.md`](../security/audit.md).
 - `PlanningStarted`, `PlanCreated`, `PlanApproved`, `ActStarted`
 - `Internal` — opaque wrapper carrying serialized internal `AgentEvent`.

@@ -43,6 +43,7 @@ impl AuditScope<'_> {
             enforcement,
             outcome: SecurityOutcome::Blocked,
             reason: Some(redact_secrets_in_str(reason)),
+            guard_decision_id: None,
         }
     }
 
@@ -76,6 +77,7 @@ impl AuditScope<'_> {
             enforcement,
             outcome,
             reason: pdec.reason.as_deref().map(redact_secrets_in_str),
+            guard_decision_id: None,
         }
     }
 }

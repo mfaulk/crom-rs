@@ -111,6 +111,7 @@ async fn http_client(url: String) -> McpClient {
         headers: BTreeMap::new(),
         startup_timeout: Some(Duration::from_secs(5)),
         request_timeout: Some(Duration::from_secs(5)),
+        guard: false,
     };
     McpClient::connect(
         "endless",

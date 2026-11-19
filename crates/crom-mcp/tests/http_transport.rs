@@ -177,6 +177,7 @@ async fn http_client(url: String, timeout: Duration) -> McpClient {
         headers: BTreeMap::new(),
         startup_timeout: Some(timeout),
         request_timeout: Some(timeout),
+        guard: false,
     };
     McpClient::connect(
         "docs",
@@ -269,6 +270,7 @@ fn authorization_header_is_redacted() {
                 headers: BTreeMap::from([("Authorization".into(), "Bearer abc123".into())]),
                 startup_timeout: None,
                 request_timeout: None,
+                guard: false,
             }),
         )]),
         ..crom_mcp::McpOptions::default()

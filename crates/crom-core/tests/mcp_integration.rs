@@ -368,6 +368,7 @@ async fn mcp_discovery_runs_in_parallel() {
                 headers: BTreeMap::new(),
                 startup_timeout: Some(Duration::from_secs(5)),
                 request_timeout: Some(Duration::from_secs(5)),
+                guard: false,
             }),
         );
     }

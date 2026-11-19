@@ -115,7 +115,11 @@ drop an `mcp.json` file at `.agent/mcp.json` in your project root:
 }
 ```
 
-HTTP transports are also supported (`"type": "http"` with a `"url"` field).
+HTTP transports are also supported (`"type": "http"` with a `"url"` field
+and optional `"headers"`). Setting `"guard": true` on an http server marks it
+as a [Crom Guard](guard/server.md) endpoint: its denials and failures are
+tool errors recorded at the `guard` audit layer with Guard's decision id. See
+[sdk/guard.md](sdk/guard.md#cli-and-settings).
 
 `.agent/mcp.json` is repository config: it is only loaded after you trust the
 workspace (`crom trust`, see [Workspace trust](#workspace-trust)), and it may
@@ -129,6 +133,11 @@ Allow the MCP tools on the run:
 crom run "Triage the three oldest open issues" \
     --allowed-tools "Read,Grep,mcp__github__list_issues,mcp__github__get_issue"
 ```
+
+Agent tool names are `mcp__<server>__<tool>`. A `.` in a remote tool name
+becomes `_` (model APIs reject dots), so Guard's `customer.read` is
+`mcp__guard__customer_read`; other characters outside `[A-Za-z0-9_]` make the
+server fail to load.
 
 Inspect what each server exposes before granting access:
 

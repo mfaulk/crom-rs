@@ -376,6 +376,7 @@ mod tests {
             enforcement: crom_core::events::EnforcementLayer::Policy,
             outcome: crom_core::events::SecurityOutcome::Blocked,
             reason: None,
+            guard_decision_id: None,
         };
         let ev = AgentEvent::SecurityDecision(d.clone());
         for v in [
@@ -409,6 +410,7 @@ mod tests {
             enforcement: crom_core::events::EnforcementLayer::Policy,
             outcome: crom_core::events::SecurityOutcome::Blocked,
             reason: Some(format!("denied {secret}")),
+            guard_decision_id: None,
         });
         let out = redact_event(&crate::DefaultSecretRedactor, ev);
         let text = serde_json::to_string(&out).unwrap();

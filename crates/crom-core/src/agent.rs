@@ -2181,6 +2181,17 @@ pub(crate) async fn run_loop(
                     _ if is_error => SecurityOutcome::Failed,
                     _ => SecurityOutcome::Executed,
                 };
+                if let Some(verdict) = tool_result_obj.as_ref().and_then(crate::guard::verdict_of) {
+                    audit.enforcement = EnforcementLayer::Guard;
+                    audit.guard_decision_id = verdict.decision_id;
+                    if verdict.status.is_blocked() {
+                        audit.decision = PolicyOutcome::Deny;
+                        audit.outcome = SecurityOutcome::Blocked;
+                        audit.reason = verdict.code;
+                    } else if verdict.status == crate::guard::GuardStatus::Failed {
+                        audit.reason = verdict.code;
+                    }
+                }
                 if let Some(reason) = &post_hook_denial {
                     audit.decision = PolicyOutcome::Deny;
                     audit.policy_source = Some(PolicyDecisionSource::Hook);

@@ -48,10 +48,14 @@ pub fn agent_tool_name(server: &str, tool: &str) -> Result<String, String> {
             "MCP server name {server:?} must not contain \"__\" (reserved as the tool-name delimiter)"
         ));
     }
-    if !is_identifier_safe(tool) {
+    // Model APIs reject `.` in tool names, and Guard names its operations
+    // `customer.read`, so dots map to `_`. The remote name is kept on the
+    // registered tool for the actual call.
+    let mapped = tool.replace('.', "_");
+    if !is_identifier_safe(&mapped) || tool.starts_with('.') {
         return Err(format!("unsafe MCP tool name {tool:?}"));
     }
-    Ok(format!("mcp__{server}__{tool}"))
+    Ok(format!("mcp__{server}__{mapped}"))
 }
 
 pub fn parse_agent_tool_name(name: &str) -> Option<McpToolNameParts> {
@@ -115,6 +119,17 @@ mod tests {
         let parts = parse_agent_tool_name(&name).unwrap();
         assert_eq!(parts.server_name, "prod_github");
         assert_eq!(parts.remote_tool_name, "delete_issue");
+    }
+
+    /// Dots in a remote tool name (Guard's `customer.read`) become `_` in the agent-visible name.
+    #[test]
+    fn dotted_remote_tool_name_maps_to_underscores() {
+        assert_eq!(
+            agent_tool_name("guard", "customer.read").unwrap(),
+            "mcp__guard__customer_read"
+        );
+        assert!(agent_tool_name("guard", ".read").is_err());
+        assert!(agent_tool_name("guard", "a.b c").is_err());
     }
 
     #[test]

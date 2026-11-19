@@ -49,7 +49,8 @@ pub async fn register_mcp_tools(
                 let server_config = server_config.clone();
                 let secrets = secrets.clone();
                 async move {
-                    discover_one_server(
+                    let guard = server_config.is_guard();
+                    let mut discovery = discover_one_server(
                         server_name,
                         server_config,
                         limits,
@@ -58,7 +59,9 @@ pub async fn register_mcp_tools(
                         load_prompts,
                         max_tools_per_server,
                     )
-                    .await
+                    .await;
+                    discovery.guard = guard;
+                    discovery
                 }
             });
     let outcomes = join_all(discovery_futures).await;
@@ -71,6 +74,7 @@ pub async fn register_mcp_tools(
             tools,
             client,
             logs: failure_logs,
+            guard,
         } = outcome;
         if status.status == McpConnectionStatus::Failed || client.is_none() {
             // Surface stderr/log lines captured before the failure so
@@ -115,6 +119,7 @@ pub async fn register_mcp_tools(
                 tool,
                 client.clone(),
                 limits,
+                guard,
             )));
         }
         status.status = if status.error.is_some() {
@@ -149,6 +154,8 @@ struct ServerDiscovery {
     tools: Vec<McpToolDefinition>,
     client: Option<McpClientHandle>,
     logs: Vec<crom_mcp::McpServerLogEntry>,
+    /// The server is configured `guard: true`.
+    guard: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -186,6 +193,7 @@ async fn discover_one_server(
                     tools: Vec::new(),
                     client: None,
                     logs: Vec::new(),
+                    guard: false,
                 };
             }
         };
@@ -202,6 +210,7 @@ async fn discover_one_server(
                 tools: Vec::new(),
                 client: None,
                 logs: drain_logs_after_failure(&mut client).await,
+                guard: false,
             };
         }
     }
@@ -215,6 +224,7 @@ async fn discover_one_server(
                 tools: Vec::new(),
                 client: None,
                 logs: drain_logs_after_failure(&mut client).await,
+                guard: false,
             };
         }
     };
@@ -230,6 +240,7 @@ async fn discover_one_server(
             tools: Vec::new(),
             client: None,
             logs: drain_logs_after_failure(&mut client).await,
+            guard: false,
         };
     }
     // Optionally fetch resources/prompts. Errors here are non-fatal and
@@ -245,6 +256,7 @@ async fn discover_one_server(
         tools,
         client: Some(McpClientHandle::new(client)),
         logs: Vec::new(),
+        guard: false,
     }
 }
 
@@ -306,6 +318,8 @@ pub struct McpTool {
     transport: crom_mcp::McpTransportKind,
     client: McpClientHandle,
     limits: McpLimits,
+    /// Results are Guard verdicts (`crate::guard`).
+    guard: bool,
 }
 
 /// Shared handle to a connected MCP client, dispatched according to the
@@ -346,6 +360,7 @@ impl McpTool {
         definition: McpToolDefinition,
         client: McpClientHandle,
         limits: McpLimits,
+        guard: bool,
     ) -> Self {
         let description = definition.description.clone().unwrap_or_else(|| {
             format!(
@@ -364,6 +379,7 @@ impl McpTool {
             transport,
             client,
             limits,
+            guard,
         }
     }
 
@@ -420,23 +436,30 @@ impl Tool for McpTool {
         // shared reference so multiple tool calls to the same server can be in
         // flight at once: a slow call no longer blocks a fast one. Single-flight
         // transports (stdio) still serialize behind the client `Mutex`.
-        let result = match &self.client {
-            McpClientHandle::Concurrent(client) => client
-                .call_tool_concurrent(&self.remote_tool_name, input)
-                .await
-                .map_err(tool_error_from_mcp)?,
+        let called = match &self.client {
+            McpClientHandle::Concurrent(client) => {
+                client
+                    .call_tool_concurrent(&self.remote_tool_name, input)
+                    .await
+            }
             McpClientHandle::Serial(client) => {
                 let mut client = client.lock().await;
-                client
-                    .call_tool(&self.remote_tool_name, input)
-                    .await
-                    .map_err(tool_error_from_mcp)?
+                client.call_tool(&self.remote_tool_name, input).await
             }
+        };
+        let result = match called {
+            Ok(result) => result,
+            // Guard gave no verdict: a tool error, never an `Err` that the
+            // loop would audit as an ordinary failure.
+            Err(err) if self.guard => {
+                return Ok(crate::guard::verdict_from_error(&err).into_unavailable_result())
+            }
+            Err(err) => return Err(tool_error_from_mcp(err)),
         };
         let (text, metadata, result_bytes, truncated) =
             mcp_result_to_text_and_metadata(&result, self.limits.max_tool_result_bytes)
                 .map_err(tool_error_from_mcp)?;
-        let metadata = json!({
+        let mut metadata = json!({
             "mcp": {
                 "server_name": self.server_name,
                 "remote_tool_name": self.remote_tool_name,
@@ -451,9 +474,16 @@ impl Tool for McpTool {
                 "checkpoint_coverage": "not_applicable",
             }
         });
+        let mut is_error = result.is_error;
+        if self.guard {
+            let verdict = crate::guard::verdict_from_result(&result);
+            // Only an `executed` verdict may reach the model as success.
+            is_error |= verdict.status != crate::guard::GuardStatus::Executed;
+            metadata[crate::guard::GUARD_METADATA_KEY] = json!(verdict);
+        }
         Ok(ToolResult {
             content: vec![ToolContent::Text(text)],
-            is_error: result.is_error,
+            is_error,
             metadata,
         })
     }
