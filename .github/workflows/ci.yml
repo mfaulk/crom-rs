@@ -402,11 +402,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: guard-adversarial
-      # #361: G1–G12, G15, G16 in process, through the reference server,
-      # through the stdlib Python client (runner python3), and without
-      # Guard; scored on the business ledger. #360: G13, G14, G18 from agent
-      # Bash (sandbox required, required + network, off, separate uid) and
-      # G17 against `crom-guard check`.
+      # #361: G1–G12, G15–G17 in process, through the reference server,
+      # through the stdlib Python client (runner python3), through Crom's
+      # MCP client with a scripted provider (#413), and without Guard;
+      # scored on the business ledger. #360: G13, G14, G18 from agent Bash
+      # (sandbox required, required + network, off, separate uid) and G17
+      # against `crom-guard check`.
       - name: Guard adversarial scenarios (ledger-scored)
         run: cargo test --locked -p crom-guard-testkit --test guard_adversarial -- --nocapture
       - name: Upload Guard scenario report

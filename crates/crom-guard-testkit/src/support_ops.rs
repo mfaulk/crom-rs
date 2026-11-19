@@ -183,6 +183,7 @@ pub fn operations(
 pub struct SupportOperation {
     kind: SupportAction,
     action: ActionId,
+    description: Option<String>,
     schema: Value,
     resolver: TimeoutResolver<SupportResolver>,
     downstream: Downstream,
@@ -206,6 +207,7 @@ impl SupportOperation {
         Ok(Self {
             kind,
             action: ActionId::new(kind.id()).expect("static action ids are valid"),
+            description: None,
             schema: kind.input_schema(),
             resolver: TimeoutResolver::new(SupportResolver { kind, api }, move || {
                 Box::pin(tokio::time::sleep(timeout))
@@ -217,6 +219,14 @@ impl SupportOperation {
     pub fn kind(&self) -> SupportAction {
         self.kind
     }
+
+    /// Advertises `description` instead of the built-in one. Descriptions
+    /// are informational to Guard; adversarial scenario G17 serves hostile
+    /// text this way.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
 }
 
 impl ProtectedOperation for SupportOperation {
@@ -225,7 +235,9 @@ impl ProtectedOperation for SupportOperation {
     }
 
     fn description(&self) -> &str {
-        self.kind.description()
+        self.description
+            .as_deref()
+            .unwrap_or_else(|| self.kind.description())
     }
 
     fn input_schema(&self) -> &Value {

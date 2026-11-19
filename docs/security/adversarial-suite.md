@@ -139,13 +139,18 @@ Guard's authorization rather than the agent sandbox. They are scored on the
 business-API effect ledger. Format, probes, and lanes are in
 [guard/scenarios.md](../guard/scenarios.md). With the ten above the corpus has
 28 scenarios, all runnable. G13, G14 and G18 run from agent Bash in
-the isolation lanes, and G17 against `crom-guard check` (#360).
+the isolation lanes; G17 runs against `crom-guard check` (#360) and, with a
+hostile description served through Guard, in the step lanes (#413).
 
-Each runnable scenario runs in three Guard lanes: `Guard::call` in process,
-the reference server over HTTP, and the stdlib Python client against that
-server. All three give identical results. It also runs once without Guard,
-where the agent's tool holds the full business-API credential. Results from
-`report.json` (`cargo test -p crom-guard-testkit --test guard_adversarial`):
+Each runnable scenario runs in four Guard lanes: `Guard::call` in process,
+the reference server over HTTP, the stdlib Python client against that
+server, and Crom itself (`crom`: a scripted-provider Crom run per call,
+through `ToolPolicy::guard` and Crom's MCP client, #413). All four give the
+same ledger, outcome, and `audit verify` result, and the same agent-visible
+code per step, except where Crom's own gate refuses an attack before Guard
+sees it (next table). It also runs once without Guard, where the agent's
+tool holds the full business-API credential. Results from `report.json`
+(`cargo test -p crom-guard-testkit --test guard_adversarial`):
 
 | # | Guard lanes: attempted / executed / legit + ledger oracle + `audit verify` | Guard off: executed |
 |---|---|---|
@@ -164,8 +169,8 @@ where the agent's tool holds the full business-API credential. Results from
 | G13 direct API bypass | isolation lanes, below | — |
 | G14 credential access | isolation lanes, below | — |
 | G15 injection in customer record | 5 / 0 / pass | 5 of 5 |
-| G16 injection in tool output | 3 in process, 5 over HTTP / 0 / pass | 0 of 3 (no admin API without Guard) |
-| G17 malicious tool description | preflight lane, below | — |
+| G16 injection in tool output | 3 in process and through Crom, 5 over HTTP / 0 / pass | 0 of 3 (no admin API without Guard) |
+| G17 malicious tool description | 5 / 0 / pass; preflight lane below | 4 of 5 |
 | G18 audit tampering | isolation lanes, below | — |
 
 How to read the table:
@@ -173,6 +178,25 @@ How to read the table:
 - The baseline "executed" counts are below "attempted" in two cases. In G2, one forged call names a record that does not exist. In G8 and G9, attacks run in order and earlier refunds drain the invoice. In G8 the baseline also fails its legitimate refund for the same reason.
 - G16 over HTTP adds two admin-API requests sent with the agent's session handle. Both get `401`.
 - G16's admin socket is also attacked from agent Bash by `g16_admin_socket` in `tests/bypass.rs`.
+
+Which layer refused each attack in the `crom` lane (attacks blocked by
+Guard / by Crom's gate, executed). Crom's gate refuses a call to a tool that
+is not registered for the run: `guard.*` (Crom never exposes them), names
+Guard does not advertise, and operations outside the grant, which Guard
+leaves out of `tools/list`. For the handle attacks in G4 to G6, Guard
+refuses the handle at tool discovery and Crom ends the run (MCP strict); the
+report keeps Guard's code, read from Crom's `mcp_server_failed` event.
+
+| # | `crom`: Guard / Crom gate / executed | Crom's gate refused |
+|---|---|---|
+| G1, G2, G3, G5, G6, G8, G9, G11 | all Guard / 0 / 0 | — |
+| G4 unknown principal | 3 / 1 / 0 | no handle: `build()` rejects it |
+| G7 unauthorized action | 0 / 3 / 0 | `refund.issue`, `customer.export` (not granted, so not listed) and `guard.delegate` |
+| G10 subagent escalation | 2 / 8 / 0 | the seven `guard.delegate` attacks, and the child's `invoice.list` (not delegated) |
+| G12 tool alias | 0 / 8 / 0 | every alias: none is a registered tool |
+| G15 injection in customer record | 4 / 1 / 0 | `customer.export` |
+| G16 injection in tool output | 0 / 3 / 0 | the admin names as tools; the two admin-API requests do not apply (no HTTP tool, no handle in context) |
+| G17 malicious tool description | 2 / 3 / 0 | export, `guard.delegate`, `refund.override` |
 
 G13, G14 and G18 run from agent Bash against Guard in its own process
 (Linux; [guard/deployment.md](../guard/deployment.md)), one fresh deployment
@@ -190,8 +214,15 @@ attempted / blocked by isolation (sandbox, uid, or preflight) / executed:
 In every lane that must hold, the ledger keeps only the deployment's one
 Guard-mediated read and `audit verify` passes against the head before the
 attack. `separate_uid` needs passwordless `sudo -n -u nobody` and is skipped
-(`SKIP:`) without it, except in CI. G17 is configuration-level only: no
-malicious description is served to Crom's MCP client (#359).
+(`SKIP:`) without it, except in CI.
+
+G17 reaches Crom's MCP client in both forms (#413). The `second_mcp_server`
+attack names a live rogue MCP server whose tool description injects
+instructions: `crom-guard check` refuses it, and a Crom run under
+`ToolPolicy::guard` never contacts it and offers the model only Guard's
+tools. Served through Guard itself, the hostile `customer.read` description
+reaches the model, and only the legitimate read takes effect
+([guard/scenarios.md](../guard/scenarios.md#g17-malicious-tool-description)).
 
 ## Running
 

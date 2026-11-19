@@ -101,7 +101,7 @@ For the E2 "Guard off" baseline, configure a credential for the trusted test dri
   A `412`, or a `404` marked with `X-Resource-Not-Found`, returns `ExecuteError::Precondition`, and the API performed no effect. An unmarked `404` returns `ExecuteError::Failed`. `refund.issue` reads only `amount_cents` from the arguments.
 - **Export never executes.** `customer.export` resolves the named customer, because the schema declares a `Customer` resource. The export endpoint is tenant-wide, though, so a policy that permitted export on one customer would leak every customer in the tenant. The executor therefore always returns `ExecuteError::Failed` without a downstream call or ledger entry. A real export needs a `Tenant`-typed resource, which is a schema change and out of scope for v1. The operation exists so that `no-bulk-export` can forbid it (G11).
 
-`support_registry(&api, &config)` returns an `OperationRegistry` with all four plus `guard.delegate`. `ApiCredential::from_broker_json` reads a `FileCredentialBroker` file, so the API can accept exactly the credentials Guard's broker hands out.
+`support_registry(&api, &config)` returns an `OperationRegistry` with all four plus `guard.delegate`. `SupportOperation::with_description` advertises a different tool description (G17 serves a hostile one; `scenario::scenario_registry` applies a fixture's `tool_descriptions`). `ApiCredential::from_broker_json` reads a `FileCredentialBroker` file, so the API can accept exactly the credentials Guard's broker hands out.
 
 ## `crom-guard-support` example binary
 
@@ -124,7 +124,7 @@ cargo test -p crom-guard-testkit
 - `tests/pipeline_e2e.rs` runs a full `crom_guard::Guard` over `support_ops`, a `FileCredentialBroker`, and a `FileAuditSink`, against the HTTP API (#351). The ledger is the oracle: an allowed refund has one effect carrying the decision id; an ownership change or revoke between authorize and execute has none; `customer.export` is denied, and fails closed even under a permitting policy.
 - `tests/canary.rs` checks that the broker's secret and the session handle never appear in any `CallOutcome`, audit line, ledger entry, or `tracing` output. It installs a global trace subscriber, so it is its own test binary.
   The test environment registers `guard.delegate`; the canary also delegates a child and checks that the child handle appears only in the delegate result (#353).
-- `tests/guard_adversarial.rs` runs the scenarios below in every lane and writes `$CARGO_TARGET_TMPDIR/guard-scenarios/report.json`. It needs `python3` 3.10 or newer for the Python client lane; without it, that lane is reported as skipped.
+- `tests/guard_adversarial.rs` runs the scenarios below in every lane and writes `$CARGO_TARGET_TMPDIR/guard-scenarios/report.json`. It needs `python3` 3.10 or newer for the Python client lane; without it, that lane is reported as skipped. The `crom` lane (`tests/crom_lane/mod.rs`, #413) drives each call through a scripted Crom run; for it the crate dev-depends on `crom-sdk` (`fake-provider`) and `crom-mcp`.
 - `tests/bypass.rs` (Linux) attacks a Guard child process from agent Bash run through Crom's `BashTool`, with the sandbox `required` and `off`, and as a separate uid via `sudo -n` (#360, G13, G14, G16, G18). The ledger and audit log are the oracle. It dev-depends on `crom-core` and `crom-tools`; see [docs/guard/deployment.md](../../docs/guard/deployment.md).
 
 ## Scenarios (`scenario`)
@@ -133,6 +133,6 @@ cargo test -p crom-guard-testkit
 
 - `InProcessEnv`: `Guard::call` with a manual clock, approvals, and a file audit log;
 - `DirectEnv`: the unguarded baseline, a direct business-API tool holding the full credential;
-- the driver adds the reference server, and the server with the Python client.
+- the driver adds the reference server, the server with the Python client, and the server with Crom as the client (`crom`).
 
-G13, G14 and G18 run from agent Bash in the Linux isolation lanes (sandbox required, required with network, off, and a separate uid; harness in `tests/isolation/mod.rs`), and G17 against `crom-guard check` (#360). A lane that cannot run is reported as skipped, never as passing. The fixture format, probes, verdicts and `report.json` schema are in [docs/guard/scenarios.md](../../docs/guard/scenarios.md).
+G13, G14 and G18 run from agent Bash in the Linux isolation lanes (sandbox required, required with network, off, and a separate uid; harness in `tests/isolation/mod.rs`), and G17 against `crom-guard check` (#360) as well as in the step lanes with a hostile description served through Guard (#413). A lane that cannot run is reported as skipped, never as passing. The fixture format, probes, verdicts and `report.json` schema are in [docs/guard/scenarios.md](../../docs/guard/scenarios.md).
