@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{GrantId, PolicyId};
 
 /// Why a request was denied. Every variant means the executor does not run.
-/// `code()` is the stable reason code shown to agents; it never reveals
-/// whether a resource exists in another tenant.
+/// Only `code()` is shown to agents: it never reveals whether a resource
+/// exists in another tenant, nor ancestor grant ids. The full value
+/// (including `ChainDeny { grant_id }`) is for the audit log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -134,6 +135,7 @@ pub struct ApprovalRequirement {
 /// pipeline builds only from `Allow`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Decision {
     Allow {
         determining_policies: Vec<PolicyId>,

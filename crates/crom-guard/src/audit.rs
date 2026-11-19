@@ -66,7 +66,7 @@ impl From<&crate::TrustedPrincipal> for AuditIdentity {
         Self {
             issuer: p.issuer().clone(),
             tenant: p.tenant().clone(),
-            delegator: p.delegator().id.clone(),
+            delegator: p.delegator().id().clone(),
             agent: p.agent().clone(),
             run_id: p.run_id().clone(),
             grant_id: p.grant_id().clone(),
@@ -167,8 +167,11 @@ pub enum AuditError {
     Unavailable(String),
 }
 
-/// Durable, append-only audit log (#352). `append` must return only after
+/// Durable, append-only audit log (#352). `append` must resolve only after
 /// the record is durable; on `Err` the pipeline does not execute.
 pub trait AuditSink: Send + Sync {
-    fn append(&self, record: &AuditRecord) -> Result<AuditReceipt, AuditError>;
+    fn append<'a>(
+        &'a self,
+        record: &'a AuditRecord,
+    ) -> crate::BoxFuture<'a, Result<AuditReceipt, AuditError>>;
 }

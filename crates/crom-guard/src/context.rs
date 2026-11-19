@@ -82,6 +82,12 @@ pub enum ChainError {
     IdentityMismatch(GrantId),
     #[error("grant {0} does not have less delegation depth than its parent")]
     DepthNotDecreasing(GrantId),
+    #[error("grant {0} has an unsupported schema version")]
+    UnsupportedSchema(GrantId),
+    #[error("grant {0} has an empty validity window")]
+    EmptyWindow(GrantId),
+    #[error("grant {0} appears more than once in the chain")]
+    Duplicate(GrantId),
 }
 
 /// Authority for one request: the authenticated grant chain and the
@@ -110,6 +116,18 @@ impl ExecutionContext {
     #[allow(dead_code)] // used by the grant store (#348)
     pub(crate) fn from_chain(chain: Vec<Grant>) -> Result<Self, ChainError> {
         let leaf = chain.first().ok_or(ChainError::Empty)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for g in &chain {
+            if g.schema_version() != crate::GRANT_SCHEMA_VERSION {
+                return Err(ChainError::UnsupportedSchema(g.grant_id().clone()));
+            }
+            if g.not_before() >= g.expires_at() {
+                return Err(ChainError::EmptyWindow(g.grant_id().clone()));
+            }
+            if !seen.insert(g.grant_id()) {
+                return Err(ChainError::Duplicate(g.grant_id().clone()));
+            }
+        }
         for pair in chain.windows(2) {
             let (child, parent) = (&pair[0], &pair[1]);
             if child.parent() != Some(parent.grant_id()) {
@@ -226,6 +244,25 @@ mod tests {
             grant("g1", None, spec()),
         ]);
         assert!(matches!(r, Err(ChainError::DepthNotDecreasing(_))));
+    }
+
+    /// Records with another schema version or an empty validity window are rejected.
+    #[test]
+    fn unsupported_or_empty_records_rejected() {
+        let mut v = serde_json::to_value(grant("g1", None, spec())).unwrap();
+        v["schema_version"] = 2.into();
+        let g: Grant = serde_json::from_value(v.clone()).unwrap();
+        assert!(matches!(
+            ExecutionContext::from_chain(vec![g]),
+            Err(ChainError::UnsupportedSchema(_))
+        ));
+        v["schema_version"] = 1.into();
+        v["expires_at"] = v["not_before"].clone();
+        let g: Grant = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            ExecutionContext::from_chain(vec![g]),
+            Err(ChainError::EmptyWindow(_))
+        ));
     }
 
     /// Revoking the root makes the whole chain unusable.

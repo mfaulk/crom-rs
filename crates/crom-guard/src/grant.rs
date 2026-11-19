@@ -14,13 +14,65 @@ pub const GRANT_SCHEMA_VERSION: u32 = 1;
 /// Cedar `User` entity referenced by `principal.delegator`; `tenant` is the
 /// grant's tenant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawDelegator")]
 pub struct Delegator {
-    pub id: UserId,
-    pub role: String,
+    id: UserId,
+    role: String,
     /// Further Cedar attributes, e.g. `refund_limit_cents`.
+    attrs: Attrs,
+}
+
+/// Attributes Guard sets on the Cedar `User` itself; `attrs` cannot
+/// override them (e.g. a different `tenant`).
+pub const RESERVED_USER_ATTRS: [&str; 3] = ["id", "tenant", "role"];
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("delegator attribute {0:?} is reserved for Guard")]
+pub struct ReservedUserAttr(pub String);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDelegator {
+    id: UserId,
+    role: String,
     #[serde(default)]
-    pub attrs: Attrs,
+    attrs: Attrs,
+}
+
+impl TryFrom<RawDelegator> for Delegator {
+    type Error = ReservedUserAttr;
+    fn try_from(r: RawDelegator) -> Result<Self, ReservedUserAttr> {
+        Self::new(r.id, r.role, r.attrs)
+    }
+}
+
+impl Delegator {
+    pub fn new(
+        id: UserId,
+        role: impl Into<String>,
+        attrs: Attrs,
+    ) -> Result<Self, ReservedUserAttr> {
+        if let Some(k) = attrs
+            .keys()
+            .find(|k| RESERVED_USER_ATTRS.contains(&k.as_str()))
+        {
+            return Err(ReservedUserAttr(k.clone()));
+        }
+        Ok(Self {
+            id,
+            role: role.into(),
+            attrs,
+        })
+    }
+    pub fn id(&self) -> &UserId {
+        &self.id
+    }
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+    pub fn attrs(&self) -> &Attrs {
+        &self.attrs
+    }
 }
 
 /// One grant constraint. Narrowing is defined per kind: a child [`Set`]
@@ -150,6 +202,20 @@ pub struct GrantSpec {
     /// Lifetime from issuance. The store caps it at its configured maximum.
     pub ttl_seconds: u64,
     /// Remaining delegation depth. 0 (the default) forbids `delegate`.
+    #[serde(default)]
+    pub max_depth: u8,
+}
+
+/// What a grant holder submits through `delegate` to obtain a child grant
+/// (#353). Tenant, delegator, issuer, and run are copied from the parent and
+/// cannot be supplied here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationSpec {
+    pub actions: BTreeSet<ActionId>,
+    #[serde(default)]
+    pub constraints: Constraints,
+    pub ttl_seconds: u64,
     #[serde(default)]
     pub max_depth: u8,
 }
@@ -294,11 +360,12 @@ pub(crate) mod tests {
     pub(crate) fn spec() -> GrantSpec {
         GrantSpec {
             tenant: TenantId::new("acme").unwrap(),
-            delegator: Delegator {
-                id: UserId::new("acme-agent-operator").unwrap(),
-                role: "agent-operator".into(),
-                attrs: [("refund_limit_cents".to_owned(), AttrValue::Long(5_000))].into(),
-            },
+            delegator: Delegator::new(
+                UserId::new("acme-agent-operator").unwrap(),
+                "agent-operator",
+                [("refund_limit_cents".to_owned(), AttrValue::Long(5_000))].into(),
+            )
+            .unwrap(),
             run_id: RunId::new("run-1").unwrap(),
             actions: [ActionId::new("customer.read").unwrap()].into(),
             constraints: cons(vec![
@@ -322,6 +389,20 @@ pub(crate) mod tests {
                 parent: parent.map(|p| GrantId::new(p).unwrap()),
             },
         )
+    }
+
+    /// Delegator attributes cannot override the Guard-set `id`, `tenant`, or `role`, by constructor or JSON.
+    #[test]
+    fn delegator_reserved_attrs_rejected() {
+        for k in RESERVED_USER_ATTRS {
+            let attrs: Attrs = [(k.to_owned(), AttrValue::String("globex".into()))].into();
+            assert_eq!(
+                Delegator::new(UserId::new("u1").unwrap(), "viewer", attrs),
+                Err(ReservedUserAttr(k.to_owned()))
+            );
+            let json = serde_json::json!({"id": "u1", "role": "viewer", "attrs": {k: {"string": "globex"}}});
+            assert!(serde_json::from_value::<Delegator>(json).is_err());
+        }
     }
 
     /// The JSON a trusted app submits round-trips through `GrantSpec`, and unknown fields are rejected.

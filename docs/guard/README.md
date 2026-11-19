@@ -12,7 +12,7 @@ Only three kinds of value carry authority, and only `crom-guard` can construct t
 |---|---|---|
 | `ExecutionContext` | the grant store (#348), from an authenticated `SessionHandle` | Holds the live grant chain (leaf first) and the `TrustedPrincipal` derived from it |
 | `TrustedPrincipal` | `ExecutionContext` | Agent, tenant, delegator, issuer, run, and grant chain. Every field comes from grant records, never from the request |
-| `AuthorizedAction` | the pipeline (#351), from `Decision::Allow` only | Proof that one request was allowed. Not `Clone`. It is the only input an executor accepts |
+| `AuthorizedAction` | the pipeline (#351): `bind(decision_id, &Decision, &AuthorizationRequest)` returns `None` unless the decision is `Allow`, and copies the action, resource, version, args and principal from that request | Proof that one request was allowed. Not `Clone`. It is the only input an executor accepts |
 
 All of `ValidatedArgs`, `AuthorizationRequest` and `ApprovalContext` are crate-built too. So resolvers, the policy decision point (PDP) and executors only ever see schema-validated input and approvals that matched.
 
@@ -22,14 +22,14 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 
 | Module | Types | Notes |
 |---|---|---|
-| ids | `GrantId`, `AgentId`, `RunId`, `DecisionId`, `ApprovalId`, `ActionId`, `TenantId`, `UserId`, `AppId`, `PolicyId` | Validated on construction and on deserialization: 1–128 bytes of `[A-Za-z0-9._:@-]` |
-| value | `EntityUid`, `AttrValue`, `Attrs` | Cedar-typed values. Externally tagged in JSON, e.g. `{"long": 5}` |
-| grant | `GrantSpec`, `Grant`, `Delegator`, `Constraints`, `Constraint` | `GrantSpec` is what the app submits (`deny_unknown_fields`). `Grant` is the §8.2 record. Its fields are private, so it is immutable except for revocation |
+| ids | `GrantId`, `AgentId`, `RunId`, `DecisionId`, `ApprovalId`, `ActionId`, `TenantId`, `UserId`, `AppId`, `PolicyId` | Validated on construction and on deserialization: 1–128 bytes of `[A-Za-z0-9._:@-]`. The `__guard` prefix is reserved for Guard-internal ids such as the approval placeholder user |
+| value | `EntityUid`, `AttrValue`, `Attrs` | Cedar-typed values. Externally tagged in JSON, e.g. `{"long": 5}`. `EntityUid` is validated on deserialization too: the type is a `::` path, and the id is 1–256 bytes with no control characters. Build Cedar UIDs from `entity_type()` and `id()`, never from `Display` |
+| grant | `GrantSpec`, `DelegationSpec`, `Grant`, `Delegator`, `Constraints`, `Constraint` | `GrantSpec` is what the app submits, and `DelegationSpec` is what `delegate` accepts; both use `deny_unknown_fields`. `Grant` is the §8.2 record. Its fields are private, so it is immutable except for revocation. `Delegator.attrs` cannot set `id`, `tenant` or `role` |
 | handle | `SessionHandle` | `gsh_` plus 64 lowercase hex digits. No `Debug`, `Display`, `Serialize` or `Clone` |
-| context | `ExecutionContext`, `TrustedPrincipal`, `ChainError` | Chain checks: parent links, shared tenant/delegator/issuer/run, depth strictly decreasing |
+| context | `ExecutionContext`, `TrustedPrincipal`, `ChainError` | Chain checks: parent links, shared tenant/delegator/issuer/run, depth strictly decreasing, schema version 1, a non-empty validity window, and no repeated grant ids |
 | resource | `ResolvedResource`, `ResourceVersion` | Built by the trusted resolver. The version is the executor's precondition |
-| action | `ValidatedArgs`, `AuthorizationContext`, `ApprovalContext`, `AuthorizationRequest`, `AuthorizedAction` | `AuthorizationContext` rejects the Guard-owned keys `grant` and `approval` |
-| decision | `Decision`, `DenyReason`, `ApprovalRequirement`, `ActionDigest` | `DenyReason::code()` is the stable reason code agents see |
+| action | `ValidatedArgs`, `AuthorizationContext`, `ApprovalContext`, `AuthorizationRequest`, `AuthorizedAction` | `AuthorizationContext` rejects the Guard-owned keys `grant` and `approval`. `AuthorizationRequest` carries the validated args, so the PDP can compute the approval digest |
+| decision | `Decision`, `DenyReason`, `ApprovalRequirement`, `ActionDigest` | Agents see only `DenyReason::code()`. The full value, including ancestor grant ids, goes to the audit log |
 | credential | `CredentialLease`, `CredentialBroker` | The lease exposes its secret only inside `with_secret(\|s\| ..)` |
 | audit | `AuditRecord`, `AuditSink`, `AuditReceipt`, … | The `guard-audit/v1` fields from §12.1. The sink adds the chaining (#352) |
 | time | `Timestamp`, `Clock`, `SystemClock` | Unix milliseconds on Guard's clock |
@@ -38,12 +38,12 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 
 | Trait | Sealed | Implemented in | Notes |
 |---|---|---|---|
-| `GrantStore` | yes | #348 | `issue`, `authenticate`, `recheck` (just before execution), `revoke` |
-| `PolicyDecisionPoint` | yes | #349 | `authorize` returns a `Decision` and cannot return an error. Engine errors become `Deny` |
+| `GrantStore` | yes | #348, #353 | Async: `issue`, `delegate`, `authenticate`, `recheck` (just before execution), and `revoke`, which is scoped to the issuing app |
+| `PolicyDecisionPoint` | yes | #349 | Sync, because evaluation is CPU-only. `authorize` returns a `Decision` and cannot return an error. Engine errors become `Deny` |
 | `ResourceResolver` | no | app code, #350 | Async (`BoxFuture`). Not-found and other-tenant both return the same `ResolveError::NotFound` |
 | `ProtectedOperation` | no | app code, #351, #356 | One `ActionId` per MCP tool. Provides the input schema, resolver, Cedar context, and `execute(AuthorizedAction, CredentialLease)` |
-| `CredentialBroker` | no | #355 | Hands out leases. The agent never receives one |
-| `AuditSink` | no | #352 | `append` must be durable before it returns. On `Err`, nothing executes |
+| `CredentialBroker` | no | #355 | Async. Hands out leases. The agent never receives one |
+| `AuditSink` | no | #352 | Async. `append` must be durable before it resolves. On `Err`, nothing executes |
 
 Sealed traits produce authority, so implementations outside this crate are rejected at compile time.
 
@@ -63,7 +63,7 @@ Sealed traits produce authority, so implementations outside this crate are rejec
   - `ApprovalInvalid`;
   - `AuditUnavailable`.
 
-  The enum is `#[non_exhaustive]`.
+  `DenyReason`, `Decision` and `AttrValue` are `#[non_exhaustive]`.
 
 ## Tests
 

@@ -18,7 +18,13 @@ pub enum IdError {
     TooLong { kind: &'static str },
     #[error("{kind} contains {found:?}; allowed: ASCII letters, digits, and . _ - : @")]
     InvalidChar { kind: &'static str, found: char },
+    #[error("{kind} uses the prefix {RESERVED_ID_PREFIX:?}, which is reserved for Guard")]
+    Reserved { kind: &'static str },
 }
+
+/// Prefix of Guard-internal identifiers, such as the approval-probe
+/// placeholder user (ADR 0003 §4.4). No externally supplied id may use it.
+pub const RESERVED_ID_PREFIX: &str = "__guard";
 
 /// Allowed identifier bytes: ASCII alphanumerics and `. _ - : @`. The set
 /// excludes whitespace, quotes, `/`, and control characters, so an id can
@@ -36,6 +42,9 @@ fn validate(kind: &'static str, s: &str) -> Result<(), IdError> {
         .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '@')))
     {
         return Err(IdError::InvalidChar { kind, found });
+    }
+    if s.starts_with(RESERVED_ID_PREFIX) {
+        return Err(IdError::Reserved { kind });
     }
     Ok(())
 }
@@ -159,6 +168,12 @@ mod tests {
             Err(IdError::TooLong { .. })
         ));
         assert!(TenantId::new("a".repeat(MAX_ID_LEN)).is_ok());
+        assert!(matches!(
+            UserId::new("__guard_approval_placeholder__"),
+            Err(IdError::Reserved { .. })
+        ));
+        assert!(serde_json::from_str::<UserId>("\"__guard_x\"").is_err());
+        assert!(UserId::new("_guard").is_ok());
         for bad in ["acme corp", "a/b", "a\"b", "a\nb", "é", "a\\b", "a\0b"] {
             assert!(
                 matches!(TenantId::new(bad), Err(IdError::InvalidChar { .. })),

@@ -5,7 +5,7 @@ use crate::action::{AuthorizationContext, AuthorizationRequest, AuthorizedAction
 use crate::context::ExecutionContext;
 use crate::credential::CredentialLease;
 use crate::decision::{Decision, DenyReason};
-use crate::grant::{Grant, GrantSpec};
+use crate::grant::{DelegationSpec, Grant, GrantSpec};
 use crate::handle::SessionHandle;
 use crate::ids::{ActionId, AppId, GrantId, TenantId};
 use crate::resource::ResolvedResource;
@@ -48,44 +48,77 @@ pub enum GrantStoreError {
 /// ```compile_fail
 /// struct Fake;
 /// impl crom_guard::GrantStore for Fake {
-///     fn issue(&self, _: &crom_guard::AppId, _: crom_guard::GrantSpec, _: crom_guard::Timestamp)
-///         -> Result<crom_guard::IssuedGrant, crom_guard::GrantStoreError> { todo!() }
-///     fn authenticate(&self, _: &crom_guard::SessionHandle, _: crom_guard::Timestamp)
-///         -> Result<crom_guard::ExecutionContext, crom_guard::DenyReason> { todo!() }
-///     fn recheck(&self, _: &crom_guard::ExecutionContext, _: crom_guard::Timestamp)
-///         -> Result<(), crom_guard::DenyReason> { todo!() }
-///     fn revoke(&self, _: &crom_guard::GrantId, _: crom_guard::Timestamp)
-///         -> Result<(), crom_guard::GrantStoreError> { todo!() }
+///     fn issue<'a>(&'a self, _: &'a crom_guard::AppId, _: crom_guard::GrantSpec, _: crom_guard::Timestamp)
+///         -> crom_guard::BoxFuture<'a, Result<crom_guard::IssuedGrant, crom_guard::GrantStoreError>> { todo!() }
+///     fn delegate<'a>(&'a self, _: &'a crom_guard::ExecutionContext, _: crom_guard::DelegationSpec, _: crom_guard::Timestamp)
+///         -> crom_guard::BoxFuture<'a, Result<crom_guard::IssuedGrant, crom_guard::GrantStoreError>> { todo!() }
+///     fn authenticate<'a>(&'a self, _: &'a crom_guard::SessionHandle, _: crom_guard::Timestamp)
+///         -> crom_guard::BoxFuture<'a, Result<crom_guard::ExecutionContext, crom_guard::DenyReason>> { todo!() }
+///     fn recheck<'a>(&'a self, _: &'a crom_guard::ExecutionContext, _: crom_guard::Timestamp)
+///         -> crom_guard::BoxFuture<'a, Result<(), crom_guard::DenyReason>> { todo!() }
+///     fn revoke<'a>(&'a self, _: &'a crom_guard::AppId, _: &'a crom_guard::GrantId, _: crom_guard::Timestamp)
+///         -> crom_guard::BoxFuture<'a, Result<(), crom_guard::GrantStoreError>> { todo!() }
 /// }
 /// ```
 pub trait GrantStore: sealed::Sealed + Send + Sync {
     /// Issues a root grant for `issuer`, the authenticated admin caller.
-    fn issue(
-        &self,
-        issuer: &AppId,
+    fn issue<'a>(
+        &'a self,
+        issuer: &'a AppId,
         spec: GrantSpec,
         now: Timestamp,
-    ) -> Result<IssuedGrant, GrantStoreError>;
+    ) -> BoxFuture<'a, Result<IssuedGrant, GrantStoreError>>;
+
+    /// Issues a child of `parent.leaf()` (#353): actions and constraints
+    /// must narrow, expiry is capped at the parent's, and depth decreases.
+    /// Tenant, delegator, issuer, and run are copied from the parent.
+    fn delegate<'a>(
+        &'a self,
+        parent: &'a ExecutionContext,
+        spec: DelegationSpec,
+        now: Timestamp,
+    ) -> BoxFuture<'a, Result<IssuedGrant, GrantStoreError>>;
 
     /// Maps a presented handle to its live grant chain. Unknown handles,
     /// and chains with any expired, not-yet-valid, or revoked grant, are
     /// denied.
-    fn authenticate(
-        &self,
-        handle: &SessionHandle,
+    fn authenticate<'a>(
+        &'a self,
+        handle: &'a SessionHandle,
         now: Timestamp,
-    ) -> Result<ExecutionContext, DenyReason>;
+    ) -> BoxFuture<'a, Result<ExecutionContext, DenyReason>>;
 
     /// Re-reads expiry and revocation for every grant in `ctx` from the
     /// store, immediately before execution (MILESTONE_18 §10.2 step 6).
-    fn recheck(&self, ctx: &ExecutionContext, now: Timestamp) -> Result<(), DenyReason>;
+    fn recheck<'a>(
+        &'a self,
+        ctx: &'a ExecutionContext,
+        now: Timestamp,
+    ) -> BoxFuture<'a, Result<(), DenyReason>>;
 
     /// Revokes `grant` and, through the chain walk, every descendant.
-    fn revoke(&self, grant: &GrantId, now: Timestamp) -> Result<(), GrantStoreError>;
+    /// Fails with `UnknownGrant` unless `issuer` issued it, so one
+    /// application cannot revoke another's grants.
+    fn revoke<'a>(
+        &'a self,
+        issuer: &'a AppId,
+        grant: &'a GrantId,
+        now: Timestamp,
+    ) -> BoxFuture<'a, Result<(), GrantStoreError>>;
 }
 
 /// The Cedar policy decision point (#349). Sealed: only this crate decides.
 /// Infallible by signature: every engine error becomes a `Deny`.
+/// Synchronous: evaluation is CPU-bound and does no I/O.
+///
+/// ```compile_fail
+/// struct Fake;
+/// impl crom_guard::PolicyDecisionPoint for Fake {
+///     fn authorize(&self, _: &crom_guard::AuthorizationRequest<'_>) -> crom_guard::Decision { todo!() }
+///     fn policy_set_hash(&self) -> &str { "" }
+///     fn schema_hash(&self) -> &str { "" }
+/// }
+/// ```
 pub trait PolicyDecisionPoint: sealed::Sealed + Send + Sync {
     fn authorize(&self, request: &AuthorizationRequest<'_>) -> Decision;
     /// Hex SHA-256 of the loaded policy set, recorded in audit.
@@ -129,6 +162,7 @@ pub enum ExecuteError {
     /// The downstream precondition failed (e.g. `If-Match` mismatch).
     #[error("downstream precondition failed")]
     Precondition,
+    /// The detail is for the audit log; agents see only a generic code.
     #[error("downstream call failed: {0}")]
     Failed(String),
 }

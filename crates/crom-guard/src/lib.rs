@@ -40,12 +40,13 @@ pub use credential::{BrokerError, CredentialBroker, CredentialLease};
 pub use decision::{ActionDigest, ApprovalRequirement, Decision, DenyReason};
 pub use error::GuardError;
 pub use grant::{
-    Constraint, ConstraintError, Constraints, Delegator, Grant, GrantSpec, GRANT_SCHEMA_VERSION,
+    Constraint, ConstraintError, Constraints, DelegationSpec, Delegator, Grant, GrantSpec,
+    ReservedUserAttr, GRANT_SCHEMA_VERSION, RESERVED_USER_ATTRS,
 };
 pub use handle::{HandleError, SessionHandle, HANDLE_PREFIX};
 pub use ids::{
     ActionId, AgentId, AppId, ApprovalId, DecisionId, GrantId, IdError, PolicyId, RunId, TenantId,
-    UserId, MAX_ID_LEN,
+    UserId, MAX_ID_LEN, RESERVED_ID_PREFIX,
 };
 pub use resource::{ResolvedResource, ResourceVersion};
 pub use time::{Clock, SystemClock, Timestamp};
@@ -53,4 +54,4 @@ pub use traits::{
     BoxFuture, ExecuteError, ExecutionOutput, GrantStore, GrantStoreError, IssuedGrant,
     PolicyDecisionPoint, ProtectedOperation, ResolveError, ResourceResolver,
 };
-pub use value::{AttrValue, Attrs, EntityUid, EntityUidError};
+pub use value::{AttrValue, Attrs, EntityUid, EntityUidError, MAX_ENTITY_ID_LEN};

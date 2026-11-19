@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::context::{ExecutionContext, TrustedPrincipal};
+use crate::decision::Decision;
 use crate::grant::Delegator;
 use crate::ids::{ActionId, ApprovalId, DecisionId};
 use crate::resource::{ResolvedResource, ResourceVersion};
@@ -111,9 +112,10 @@ impl ApprovalContext {
 ///     ctx: &'a crom_guard::ExecutionContext,
 ///     action: &'a crom_guard::ActionId,
 ///     resource: &'a crom_guard::ResolvedResource,
+///     args: &'a crom_guard::ValidatedArgs,
 ///     context: &'a crom_guard::AuthorizationContext,
 /// ) -> crom_guard::AuthorizationRequest<'a> {
-///     crom_guard::AuthorizationRequest { ctx, action, resource, context, approval: None }
+///     crom_guard::AuthorizationRequest { ctx, action, resource, args, context, approval: None }
 /// }
 /// ```
 #[derive(Debug)]
@@ -121,6 +123,7 @@ pub struct AuthorizationRequest<'a> {
     ctx: &'a ExecutionContext,
     action: &'a ActionId,
     resource: &'a ResolvedResource,
+    args: &'a ValidatedArgs,
     context: &'a AuthorizationContext,
     approval: Option<&'a ApprovalContext>,
 }
@@ -131,6 +134,7 @@ impl<'a> AuthorizationRequest<'a> {
         ctx: &'a ExecutionContext,
         action: &'a ActionId,
         resource: &'a ResolvedResource,
+        args: &'a ValidatedArgs,
         context: &'a AuthorizationContext,
         approval: Option<&'a ApprovalContext>,
     ) -> Self {
@@ -138,9 +142,14 @@ impl<'a> AuthorizationRequest<'a> {
             ctx,
             action,
             resource,
+            args,
             context,
             approval,
         }
+    }
+    /// The validated arguments; part of the approval action digest.
+    pub fn args(&self) -> &ValidatedArgs {
+        self.args
     }
     /// The full chain; the PDP evaluates every grant (MILESTONE_18 §8.3).
     pub fn execution_context(&self) -> &ExecutionContext {
@@ -196,24 +205,26 @@ pub struct AuthorizedAction {
 }
 
 impl AuthorizedAction {
+    /// Binds exactly what `request` described, and only for an `Allow`
+    /// decision; any other decision yields `None`.
     #[allow(dead_code)] // used by the pipeline (#351)
     pub(crate) fn bind(
         decision_id: DecisionId,
-        action: ActionId,
-        resource: &ResolvedResource,
-        args: ValidatedArgs,
-        principal: TrustedPrincipal,
-        approval_id: Option<ApprovalId>,
-    ) -> Self {
-        Self {
-            decision_id,
-            action,
-            resource: resource.uid().clone(),
-            resource_version: resource.version().clone(),
-            args,
-            principal,
-            approval_id,
+        decision: &Decision,
+        request: &AuthorizationRequest<'_>,
+    ) -> Option<Self> {
+        if !decision.is_allow() {
+            return None;
         }
+        Some(Self {
+            decision_id,
+            action: request.action().clone(),
+            resource: request.resource().uid().clone(),
+            resource_version: request.resource().version().clone(),
+            args: request.args().clone(),
+            principal: request.execution_context().principal().clone(),
+            approval_id: request.approval().map(|a| a.approval_id().clone()),
+        })
     }
 
     /// Send downstream as `X-Guard-Decision-Id`.
@@ -270,6 +281,50 @@ mod tests {
         }
         let ok: Attrs = [("amount_cents".to_owned(), AttrValue::Long(100))].into();
         assert!(AuthorizationContext::new(ok).is_ok());
+    }
+
+    /// `bind` yields an action only for `Allow`, and copies the action, resource, version, args, and principal from the request.
+    #[test]
+    fn bind_only_from_allow_and_from_the_request() {
+        use crate::decision::{ActionDigest, ApprovalRequirement, DenyReason};
+        use crate::grant::tests::{grant, spec};
+        use crate::resource::ResourceVersion;
+        use crate::value::EntityUid;
+
+        let ctx = ExecutionContext::from_chain(vec![grant("g1", None, spec())]).unwrap();
+        let action = ActionId::new("refund.issue").unwrap();
+        let resource = ResolvedResource::new(
+            EntityUid::new("Support::Invoice", "acme-inv-001").unwrap(),
+            ResourceVersion::new("3"),
+        );
+        let args = ValidatedArgs::new(
+            serde_json::json!({"invoice_id": "acme-inv-001", "amount_cents": 5}),
+        );
+        let context = AuthorizationContext::default();
+        let req = AuthorizationRequest::new(&ctx, &action, &resource, &args, &context, None);
+        let id = || DecisionId::new("d1").unwrap();
+
+        assert!(
+            AuthorizedAction::bind(id(), &Decision::deny(DenyReason::PolicyDeny), &req).is_none()
+        );
+        let approval = Decision::ApprovalRequired {
+            requirement: ApprovalRequirement {
+                role: "supervisor".into(),
+                action_digest: ActionDigest::from_bytes([0; 32]),
+            },
+        };
+        assert!(AuthorizedAction::bind(id(), &approval, &req).is_none());
+
+        let allow = Decision::Allow {
+            determining_policies: vec![],
+        };
+        let a = AuthorizedAction::bind(id(), &allow, &req).unwrap();
+        assert_eq!(a.action(), &action);
+        assert_eq!(a.resource(), resource.uid());
+        assert_eq!(a.resource_version().as_str(), "3");
+        assert_eq!(a.args(), &args);
+        assert_eq!(a.principal(), ctx.principal());
+        assert_eq!(a.approval_id(), None);
     }
 
     /// Debug output of validated arguments never includes their values.

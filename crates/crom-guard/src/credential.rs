@@ -58,5 +58,8 @@ pub enum BrokerError {
 /// Holds downstream credentials inside the Guard process and lends them to
 /// executors (#355). The agent never receives one.
 pub trait CredentialBroker: Send + Sync {
-    fn lease(&self, action: &ActionId) -> Result<CredentialLease, BrokerError>;
+    fn lease<'a>(
+        &'a self,
+        action: &'a ActionId,
+    ) -> crate::BoxFuture<'a, Result<CredentialLease, BrokerError>>;
 }

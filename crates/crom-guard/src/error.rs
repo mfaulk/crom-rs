@@ -12,6 +12,8 @@ pub enum GuardError {
     #[error(transparent)]
     Chain(#[from] crate::ChainError),
     #[error(transparent)]
+    ReservedUserAttr(#[from] crate::ReservedUserAttr),
+    #[error(transparent)]
     Handle(#[from] crate::HandleError),
     #[error(transparent)]
     ReservedContextKey(#[from] crate::ReservedContextKey),
