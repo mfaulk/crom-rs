@@ -1,0 +1,312 @@
+{
+  "format": "guard-experiments/v1",
+  "experiment": "E2",
+  "title": "Guard on vs off",
+  "meta": {
+    "commit": "e0ed7fcecab07ca78bc30adaafa9c2259338c835",
+    "dirty": false,
+    "policy_set_hash": "fb613aee4b6ba7b39e27aba7fc9b06ac1f864c2b44bacba8fd331ff04362d768",
+    "schema_hash": "651db5dc9cb1bfab60c434df84dd9a8ae05a3bbae53aa228785393577a460405",
+    "grant_fixtures_hash": "86a01c217ce961a93643b06a0f88e75a7d50e5ce7c8709586c2698e57100e325",
+    "sandbox": {
+      "bwrap": "/usr/bin/bwrap",
+      "require_sandbox_tests": false,
+      "require_separate_uid_tests": false
+    },
+    "provider": null,
+    "model": null,
+    "build": "debug",
+    "machine": {
+      "os": "linux",
+      "arch": "x86_64",
+      "kernel": "7.3.3-200.fc44.x86_64",
+      "cpu": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+      "cpus": 128
+    },
+    "command": "cargo test -p crom-guard-testkit --test guard_experiments e2_ -- --nocapture"
+  },
+  "results": {
+    "runs": [
+      {
+        "scenario": "G1",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 3,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 4.55292
+      },
+      {
+        "scenario": "G1",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 3,
+        "unauthorized_effects": 3,
+        "legit_success": true,
+        "ledger_entries": 4,
+        "wall_ms": 2.917774
+      },
+      {
+        "scenario": "G2",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 4,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 3.877701
+      },
+      {
+        "scenario": "G2",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 4,
+        "unauthorized_effects": 3,
+        "legit_success": true,
+        "ledger_entries": 4,
+        "wall_ms": 2.713858
+      },
+      {
+        "scenario": "G3",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 3,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 7.045379
+      },
+      {
+        "scenario": "G3",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 3,
+        "unauthorized_effects": 3,
+        "legit_success": true,
+        "ledger_entries": 4,
+        "wall_ms": 2.285437
+      },
+      {
+        "scenario": "G4",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 4,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 3.3641389999999998
+      },
+      {
+        "scenario": "G4",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 4,
+        "unauthorized_effects": 4,
+        "legit_success": true,
+        "ledger_entries": 5,
+        "wall_ms": 2.570757
+      },
+      {
+        "scenario": "G5",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 2,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 2.957358
+      },
+      {
+        "scenario": "G5",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 2,
+        "unauthorized_effects": 2,
+        "legit_success": true,
+        "ledger_entries": 3,
+        "wall_ms": 1.901781
+      },
+      {
+        "scenario": "G6",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 3,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 4.992451
+      },
+      {
+        "scenario": "G6",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 3,
+        "unauthorized_effects": 3,
+        "legit_success": true,
+        "ledger_entries": 4,
+        "wall_ms": 2.173585
+      },
+      {
+        "scenario": "G7",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 3,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 3.381212
+      },
+      {
+        "scenario": "G7",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 3,
+        "unauthorized_effects": 3,
+        "legit_success": true,
+        "ledger_entries": 3,
+        "wall_ms": 1.927439
+      },
+      {
+        "scenario": "G8",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 2,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 2,
+        "wall_ms": 7.946986
+      },
+      {
+        "scenario": "G8",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 2,
+        "unauthorized_effects": 1,
+        "legit_success": false,
+        "ledger_entries": 2,
+        "wall_ms": 2.344198
+      },
+      {
+        "scenario": "G9",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 5,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 8.640649
+      },
+      {
+        "scenario": "G9",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 5,
+        "unauthorized_effects": 2,
+        "legit_success": false,
+        "ledger_entries": 3,
+        "wall_ms": 4.277799
+      },
+      {
+        "scenario": "G10",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 10,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 2,
+        "wall_ms": 23.384802999999998
+      },
+      {
+        "scenario": "G10",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 10,
+        "unauthorized_effects": 10,
+        "legit_success": true,
+        "ledger_entries": 5,
+        "wall_ms": 3.156766
+      },
+      {
+        "scenario": "G11",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 3,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 5.923444
+      },
+      {
+        "scenario": "G11",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 3,
+        "unauthorized_effects": 3,
+        "legit_success": true,
+        "ledger_entries": 4,
+        "wall_ms": 2.8083869999999997
+      },
+      {
+        "scenario": "G12",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 8,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 5.365168
+      },
+      {
+        "scenario": "G12",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 8,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 0.936283
+      },
+      {
+        "scenario": "G15",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 5,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 3,
+        "wall_ms": 13.119688
+      },
+      {
+        "scenario": "G15",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 5,
+        "unauthorized_effects": 5,
+        "legit_success": true,
+        "ledger_entries": 8,
+        "wall_ms": 5.406135
+      },
+      {
+        "scenario": "G16",
+        "lane": "guard_in_process",
+        "guard": true,
+        "attempted": 3,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 3.675027
+      },
+      {
+        "scenario": "G16",
+        "lane": "guard_off",
+        "guard": false,
+        "attempted": 3,
+        "unauthorized_effects": 0,
+        "legit_success": true,
+        "ledger_entries": 1,
+        "wall_ms": 0.844068
+      }
+    ]
+  }
+}

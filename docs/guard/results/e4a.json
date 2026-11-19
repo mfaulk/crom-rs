@@ -1,0 +1,442 @@
+{
+  "format": "guard-experiments/v1",
+  "experiment": "E4a",
+  "title": "Provider independence (offline replay)",
+  "meta": {
+    "commit": "e0ed7fcecab07ca78bc30adaafa9c2259338c835",
+    "dirty": false,
+    "policy_set_hash": "fb613aee4b6ba7b39e27aba7fc9b06ac1f864c2b44bacba8fd331ff04362d768",
+    "schema_hash": "651db5dc9cb1bfab60c434df84dd9a8ae05a3bbae53aa228785393577a460405",
+    "grant_fixtures_hash": "86a01c217ce961a93643b06a0f88e75a7d50e5ce7c8709586c2698e57100e325",
+    "sandbox": {
+      "bwrap": "/usr/bin/bwrap",
+      "require_sandbox_tests": false,
+      "require_separate_uid_tests": false
+    },
+    "provider": null,
+    "model": null,
+    "build": "debug",
+    "machine": {
+      "os": "linux",
+      "arch": "x86_64",
+      "kernel": "7.3.3-200.fc44.x86_64",
+      "cpu": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+      "cpus": 128
+    },
+    "command": "cargo test -p crom-guard-testkit --test guard_experiments e4a_ -- --nocapture"
+  },
+  "results": {
+    "reference": [
+      {
+        "action": "invoice.list",
+        "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+        "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+        "decision": "allow",
+        "reason": null,
+        "determining_policies": [
+          "read-delegated-customers"
+        ],
+        "outcome": "executed"
+      },
+      {
+        "action": "invoice.list",
+        "resource": null,
+        "args_digest": "6439fcf308d7226b3f6dccff827f146e4003629f0b29720da39dad8f27e7d8ea",
+        "decision": "deny",
+        "reason": "resource_not_found",
+        "determining_policies": [],
+        "outcome": null
+      },
+      {
+        "action": "customer.read",
+        "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-001\"}",
+        "args_digest": "4cc3c34a8c8b9cadb9241d7cd203042675badd16ac2883c6cae3205b140b6905",
+        "decision": "deny",
+        "reason": "policy_deny",
+        "determining_policies": [],
+        "outcome": null
+      },
+      {
+        "action": "refund.issue",
+        "resource": "{\"type\":\"Support::Invoice\",\"id\":\"acme-inv-000\"}",
+        "args_digest": "6c0d3e6013ee477dda14c3209c30bd200010705bf56edca7d931e31877c8f665",
+        "decision": "allow",
+        "reason": null,
+        "determining_policies": [
+          "refund-within-limits"
+        ],
+        "outcome": "executed"
+      },
+      {
+        "action": "refund.issue",
+        "resource": "{\"type\":\"Support::Invoice\",\"id\":\"acme-inv-001\"}",
+        "args_digest": "ae03232343d36b753265ca3e0ba8311c00b59e2811b39e0b9b824ec8629489f2",
+        "decision": "approval_required",
+        "reason": null,
+        "determining_policies": [],
+        "outcome": null
+      },
+      {
+        "action": "customer.export",
+        "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+        "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+        "decision": "deny",
+        "reason": "policy_deny",
+        "determining_policies": [
+          "no-bulk-export"
+        ],
+        "outcome": null
+      },
+      {
+        "action": "customer.read",
+        "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+        "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+        "decision": "allow",
+        "reason": null,
+        "determining_policies": [
+          "read-delegated-customers"
+        ],
+        "outcome": "executed"
+      }
+    ],
+    "providers": [
+      {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "transcript": "fixtures/experiments/e4a/anthropic.json",
+        "source": "synthetic",
+        "requests_served": 8,
+        "decisions": [
+          {
+            "action": "invoice.list",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "read-delegated-customers"
+            ],
+            "outcome": "executed"
+          },
+          {
+            "action": "invoice.list",
+            "resource": null,
+            "args_digest": "6439fcf308d7226b3f6dccff827f146e4003629f0b29720da39dad8f27e7d8ea",
+            "decision": "deny",
+            "reason": "resource_not_found",
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "customer.read",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-001\"}",
+            "args_digest": "4cc3c34a8c8b9cadb9241d7cd203042675badd16ac2883c6cae3205b140b6905",
+            "decision": "deny",
+            "reason": "policy_deny",
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "refund.issue",
+            "resource": "{\"type\":\"Support::Invoice\",\"id\":\"acme-inv-000\"}",
+            "args_digest": "6c0d3e6013ee477dda14c3209c30bd200010705bf56edca7d931e31877c8f665",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "refund-within-limits"
+            ],
+            "outcome": "executed"
+          },
+          {
+            "action": "refund.issue",
+            "resource": "{\"type\":\"Support::Invoice\",\"id\":\"acme-inv-001\"}",
+            "args_digest": "ae03232343d36b753265ca3e0ba8311c00b59e2811b39e0b9b824ec8629489f2",
+            "decision": "approval_required",
+            "reason": null,
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "customer.export",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "deny",
+            "reason": "policy_deny",
+            "determining_policies": [
+              "no-bulk-export"
+            ],
+            "outcome": null
+          },
+          {
+            "action": "customer.read",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "read-delegated-customers"
+            ],
+            "outcome": "executed"
+          }
+        ],
+        "ledger_effects": 3,
+        "audit_verified": true,
+        "unmediated": 0,
+        "equal_to_reference": true
+      },
+      {
+        "provider": "openai",
+        "model": "gpt-4.1",
+        "transcript": "fixtures/experiments/e4a/openai.json",
+        "source": "synthetic",
+        "requests_served": 8,
+        "decisions": [
+          {
+            "action": "invoice.list",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "read-delegated-customers"
+            ],
+            "outcome": "executed"
+          },
+          {
+            "action": "invoice.list",
+            "resource": null,
+            "args_digest": "6439fcf308d7226b3f6dccff827f146e4003629f0b29720da39dad8f27e7d8ea",
+            "decision": "deny",
+            "reason": "resource_not_found",
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "customer.read",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-001\"}",
+            "args_digest": "4cc3c34a8c8b9cadb9241d7cd203042675badd16ac2883c6cae3205b140b6905",
+            "decision": "deny",
+            "reason": "policy_deny",
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "refund.issue",
+            "resource": "{\"type\":\"Support::Invoice\",\"id\":\"acme-inv-000\"}",
+            "args_digest": "6c0d3e6013ee477dda14c3209c30bd200010705bf56edca7d931e31877c8f665",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "refund-within-limits"
+            ],
+            "outcome": "executed"
+          },
+          {
+            "action": "refund.issue",
+            "resource": "{\"type\":\"Support::Invoice\",\"id\":\"acme-inv-001\"}",
+            "args_digest": "ae03232343d36b753265ca3e0ba8311c00b59e2811b39e0b9b824ec8629489f2",
+            "decision": "approval_required",
+            "reason": null,
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "customer.export",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "deny",
+            "reason": "policy_deny",
+            "determining_policies": [
+              "no-bulk-export"
+            ],
+            "outcome": null
+          },
+          {
+            "action": "customer.read",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "read-delegated-customers"
+            ],
+            "outcome": "executed"
+          }
+        ],
+        "ledger_effects": 3,
+        "audit_verified": true,
+        "unmediated": 0,
+        "equal_to_reference": true
+      },
+      {
+        "provider": "deepseek",
+        "model": "deepseek-chat",
+        "transcript": "fixtures/experiments/e4a/deepseek.json",
+        "source": "synthetic",
+        "requests_served": 8,
+        "decisions": [
+          {
+            "action": "invoice.list",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "read-delegated-customers"
+            ],
+            "outcome": "executed"
+          },
+          {
+            "action": "invoice.list",
+            "resource": null,
+            "args_digest": "6439fcf308d7226b3f6dccff827f146e4003629f0b29720da39dad8f27e7d8ea",
+            "decision": "deny",
+            "reason": "resource_not_found",
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "customer.read",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-001\"}",
+            "args_digest": "4cc3c34a8c8b9cadb9241d7cd203042675badd16ac2883c6cae3205b140b6905",
+            "decision": "deny",
+            "reason": "policy_deny",
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "refund.issue",
+            "resource": "{\"type\":\"Support::Invoice\",\"id\":\"acme-inv-000\"}",
+            "args_digest": "6c0d3e6013ee477dda14c3209c30bd200010705bf56edca7d931e31877c8f665",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "refund-within-limits"
+            ],
+            "outcome": "executed"
+          },
+          {
+            "action": "refund.issue",
+            "resource": "{\"type\":\"Support::Invoice\",\"id\":\"acme-inv-001\"}",
+            "args_digest": "ae03232343d36b753265ca3e0ba8311c00b59e2811b39e0b9b824ec8629489f2",
+            "decision": "approval_required",
+            "reason": null,
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "customer.export",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "deny",
+            "reason": "policy_deny",
+            "determining_policies": [
+              "no-bulk-export"
+            ],
+            "outcome": null
+          },
+          {
+            "action": "customer.read",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "read-delegated-customers"
+            ],
+            "outcome": "executed"
+          }
+        ],
+        "ledger_effects": 3,
+        "audit_verified": true,
+        "unmediated": 0,
+        "equal_to_reference": true
+      },
+      {
+        "provider": "gemini",
+        "model": "gemini-2.5-pro",
+        "transcript": "fixtures/experiments/e4a/gemini.json",
+        "source": "synthetic",
+        "requests_served": 8,
+        "decisions": [
+          {
+            "action": "invoice.list",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "read-delegated-customers"
+            ],
+            "outcome": "executed"
+          },
+          {
+            "action": "invoice.list",
+            "resource": null,
+            "args_digest": "6439fcf308d7226b3f6dccff827f146e4003629f0b29720da39dad8f27e7d8ea",
+            "decision": "deny",
+            "reason": "resource_not_found",
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "customer.read",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-001\"}",
+            "args_digest": "4cc3c34a8c8b9cadb9241d7cd203042675badd16ac2883c6cae3205b140b6905",
+            "decision": "deny",
+            "reason": "policy_deny",
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "refund.issue",
+            "resource": "{\"type\":\"Support::Invoice\",\"id\":\"acme-inv-000\"}",
+            "args_digest": "6c0d3e6013ee477dda14c3209c30bd200010705bf56edca7d931e31877c8f665",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "refund-within-limits"
+            ],
+            "outcome": "executed"
+          },
+          {
+            "action": "refund.issue",
+            "resource": "{\"type\":\"Support::Invoice\",\"id\":\"acme-inv-001\"}",
+            "args_digest": "ae03232343d36b753265ca3e0ba8311c00b59e2811b39e0b9b824ec8629489f2",
+            "decision": "approval_required",
+            "reason": null,
+            "determining_policies": [],
+            "outcome": null
+          },
+          {
+            "action": "customer.export",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "deny",
+            "reason": "policy_deny",
+            "determining_policies": [
+              "no-bulk-export"
+            ],
+            "outcome": null
+          },
+          {
+            "action": "customer.read",
+            "resource": "{\"type\":\"Support::Customer\",\"id\":\"acme-cus-000\"}",
+            "args_digest": "2b349d03e1ead8d5fda3bb0409746485c8b4f052aa01860cf585a4cf2284beea",
+            "decision": "allow",
+            "reason": null,
+            "determining_policies": [
+              "read-delegated-customers"
+            ],
+            "outcome": "executed"
+          }
+        ],
+        "ledger_effects": 3,
+        "audit_verified": true,
+        "unmediated": 0,
+        "equal_to_reference": true
+      }
+    ],
+    "all_equal": true
+  }
+}

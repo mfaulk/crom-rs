@@ -119,7 +119,10 @@ multi-threaded Tokio runtime, each path on its own business API:
 
 Percentiles are nearest-rank. E5 asserts only that every call returned the
 expected result: latency depends on the machine and is reported, never
-gated. Record numbers from a `--release` build; the report's `meta.build`
+gated. `FileAuditSink` `fsync`s every record, so the guarded paths depend on
+the filesystem of the temp directory, where the audit log lives: on `tmpfs`
+an `fsync` costs almost nothing. The report's `audit_sink` names that
+filesystem; set `TMPDIR` to measure on another one. Record numbers from a `--release` build; the report's `meta.build`
 and `meta.machine` say what produced them.
 
 ## Reproducibility metadata
@@ -159,9 +162,9 @@ scripts/guard-scoreboard.sh --check    # fail if it is stale
 
 | File | Produced by |
 |---|---|
-| `scenarios.json` | `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test -p crom-guard-testkit --test guard_adversarial` |
+| `scenarios.json` | `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test -p crom-guard-testkit --test guard_adversarial`. The archived run had no passwordless `sudo`, so `separate_uid` is skipped there; CI runs it |
 | `e1.json`, `e2.json`, `e4a.json` | `cargo test -p crom-guard-testkit --test guard_experiments` |
-| `e5.json` | `CROM_GUARD_E5_ITERS=1000 cargo test --release -p crom-guard-testkit --test guard_experiments e5_` |
+| `e5.json` | `TMPDIR=/var/tmp CROM_GUARD_E5_ITERS=1000 cargo test --release -p crom-guard-testkit --test guard_experiments e5_` (audit logs on disk, not `tmpfs`; the report's `audit_sink` names the filesystem) |
 | `demo-scripted.json` | `cargo run --manifest-path examples/guard-support/Cargo.toml` (`target/guard-demo/report.json`) |
 | `m17-base-340.json` | The #340 base: the `adversarial-report` artifact of CI run [44459286359](https://github.com/mfaulk/crom-rs/actions/runs/44459286359) at `82fb30a` (MILESTONE_18 §22), unchanged under `report`, wrapped as `m17-adversarial-archive/v1` |
 | `m17-head.json` | The same M17 suite on this branch: `CROM_REQUIRE_SANDBOX_TESTS=1 cargo test -p crom-eval --test adversarial` (`target/tmp/adversarial/report.json`), wrapped the same way |
