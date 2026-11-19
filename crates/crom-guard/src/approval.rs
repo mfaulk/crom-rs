@@ -1,64 +1,92 @@
 //! Approvals for `ApprovalRequired` decisions (MILESTONE_18 §9.4, #354).
 //!
 //! Only the trusted application's admin path calls [`MemoryApprovalStore::approve`];
-//! no agent-facing operation reaches it. The approval id is an identifier,
-//! not a credential: it authorizes nothing without the leaf grant's session
-//! handle and the exact digested action, so it may appear in audit.
+//! no agent-facing operation reaches it. What an approval covers (version,
+//! fields) is copied from the pending request Guard recorded when it
+//! returned `ApprovalRequired`, never from the admin call. The approval id
+//! is an identifier, not a credential: it authorizes nothing without the
+//! leaf grant's session handle and the exact digested action, so it may
+//! appear in audit.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::action::ApprovalContext;
+use crate::action::{ApprovalContext, AuthorizationRequest};
 use crate::context::ExecutionContext;
-use crate::decision::{ActionDigest, DenyReason};
+use crate::decision::{ActionDigest, ApprovalRequirement, DenyReason};
 use crate::grant::Delegator;
-use crate::ids::{AppId, ApprovalId, TenantId};
+use crate::ids::{ActionId, AppId, ApprovalId, GrantId, TenantId};
 use crate::pipeline::ApprovalVerifier;
 use crate::resource::{ResolvedResource, ResourceVersion};
 use crate::time::Timestamp;
 use crate::traits::{BoxFuture, Sealed};
-use crate::value::Attrs;
+use crate::value::{Attrs, EntityUid};
 
 /// Default and upper bound for [`ApprovalStoreConfig::max_ttl_seconds`].
 pub const DEFAULT_APPROVAL_MAX_TTL_SECONDS: u64 = 900;
+/// Default for [`ApprovalStoreConfig::pending_ttl_seconds`].
+pub const DEFAULT_PENDING_TTL_SECONDS: u64 = 900;
 /// Default for [`ApprovalStoreConfig::max_approvals`].
 pub const DEFAULT_MAX_APPROVALS: usize = 10_000;
+/// Default for both per-issuer quotas in [`ApprovalStoreConfig`].
+pub const DEFAULT_MAX_PER_ISSUER: usize = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalStoreConfig {
     pub max_ttl_seconds: u64,
-    /// When full, `approve` first drops used and expired approvals, then
-    /// fails with `Unavailable`.
+    /// How long a pending request can be approved after Guard records it.
+    pub pending_ttl_seconds: u64,
+    /// Total cap, applied separately to approvals and pending requests.
     pub max_approvals: usize,
+    pub max_approvals_per_issuer: usize,
+    pub max_pending_per_issuer: usize,
 }
 
 impl Default for ApprovalStoreConfig {
     fn default() -> Self {
         Self {
             max_ttl_seconds: DEFAULT_APPROVAL_MAX_TTL_SECONDS,
+            pending_ttl_seconds: DEFAULT_PENDING_TTL_SECONDS,
             max_approvals: DEFAULT_MAX_APPROVALS,
+            max_approvals_per_issuer: DEFAULT_MAX_PER_ISSUER,
+            max_pending_per_issuer: DEFAULT_MAX_PER_ISSUER,
         }
     }
 }
 
-/// What a human approved. Built by the trusted application from its own
-/// authenticated admin session, never from agent arguments.
+/// A human's decision on a pending request. Built by the trusted
+/// application from its own authenticated admin session, never from agent
+/// arguments. Everything the approval covers comes from the pending
+/// request for `action_digest`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalSpec {
-    /// From `CallResult::ApprovalRequired`; binds leaf grant, action,
-    /// resource uid, and validated arguments.
+    /// From `CallResult::ApprovalRequired` or [`MemoryApprovalStore::pending`].
     pub action_digest: ActionDigest,
-    /// The resource version the approver saw; a retry against any other
-    /// version is `approval_invalid`.
-    pub resource_version: ResourceVersion,
     pub approver: Delegator,
     /// Must equal the principal's tenant at use, or the approval is
     /// rejected before Cedar sees it.
     pub approver_tenant: TenantId,
-    /// Approved values exposed as `context.approval.<field>`, e.g.
-    /// `amount_cents`. May not contain `approver`.
-    pub fields: Attrs,
     pub ttl_seconds: u64,
+}
+
+/// What Guard evaluated when it returned `ApprovalRequired`: the exact
+/// request a human is asked to approve. Contains no secrets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingApproval {
+    pub action_digest: ActionDigest,
+    pub tenant: TenantId,
+    pub grant_id: GrantId,
+    pub action: ActionId,
+    pub resource: EntityUid,
+    pub resource_version: ResourceVersion,
+    /// The validated (agent-supplied) arguments.
+    pub args: serde_json::Value,
+    /// The operation's Cedar context fields; become `context.approval.<field>`.
+    pub fields: Attrs,
+    /// The `@approval` role required.
+    pub role: String,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +106,9 @@ pub enum ApprovalStatus {
 pub enum ApprovalError {
     #[error("approval spec rejected: {0}")]
     InvalidSpec(String),
+    /// No unexpired pending request from this issuer has the digest.
+    #[error("no pending approval request matches")]
+    UnknownRequest,
     #[error("approval store unavailable")]
     Unavailable,
 }
@@ -105,13 +136,31 @@ impl Stored {
     }
 }
 
+#[derive(Default)]
+struct State {
+    approvals: HashMap<ApprovalId, Stored>,
+    pending: HashMap<(AppId, ActionDigest), PendingApproval>,
+}
+
+impl State {
+    fn approvals_of(&self, issuer: &AppId) -> usize {
+        self.approvals
+            .values()
+            .filter(|s| s.issuer == *issuer)
+            .count()
+    }
+    fn pending_of(&self, issuer: &AppId) -> usize {
+        self.pending.keys().filter(|(i, _)| i == issuer).count()
+    }
+}
+
 /// In-memory, single-use, expiring approvals; the [`ApprovalVerifier`] to
 /// install with `Guard::with_approval_verifier`. Lost on restart, which
 /// fails closed. `verify` checks and consumes under one lock, so of
 /// concurrent uses of one approval exactly one passes.
 pub struct MemoryApprovalStore {
     config: ApprovalStoreConfig,
-    state: Mutex<HashMap<ApprovalId, Stored>>,
+    state: Mutex<State>,
 }
 
 impl std::fmt::Debug for MemoryApprovalStore {
@@ -132,14 +181,27 @@ impl MemoryApprovalStore {
     pub fn new(config: ApprovalStoreConfig) -> Self {
         Self {
             config,
-            state: Mutex::new(HashMap::new()),
+            state: Mutex::new(State::default()),
         }
     }
 
-    /// Records an approval by `issuer` (the trusted application) and
-    /// returns its random id for the agent to present as
-    /// `CallMeta::approval_id`. The id is the only output; nothing about
-    /// the approval is echoed in errors.
+    /// The unexpired pending request `issuer`'s grant produced for
+    /// `digest`, for the admin path to show the approver.
+    pub fn pending(
+        &self,
+        issuer: &AppId,
+        digest: &ActionDigest,
+        now: Timestamp,
+    ) -> Option<PendingApproval> {
+        let state = self.state.lock().ok()?;
+        let p = state.pending.get(&(issuer.clone(), *digest))?;
+        (now < p.expires_at).then(|| p.clone())
+    }
+
+    /// Approves the pending request for `spec.action_digest` and returns a
+    /// random id for the agent to present as `CallMeta::approval_id`. The
+    /// pending request is consumed; the approval binds its resource version
+    /// and operation fields.
     pub fn approve(
         &self,
         issuer: &AppId,
@@ -155,34 +217,50 @@ impl MemoryApprovalStore {
                 self.config.max_ttl_seconds
             )));
         }
-        if spec.fields.contains_key("approver") {
-            return Err(ApprovalError::InvalidSpec(
-                "fields may not contain `approver`".into(),
-            ));
-        }
-        let expires_at = now.saturating_add_secs(spec.ttl_seconds);
         let mut state = self.state.lock().map_err(|_| ApprovalError::Unavailable)?;
-        if state.len() >= self.config.max_approvals {
-            state.retain(|_, s| s.status(now) == ApprovalStatus::Pending);
-            if state.len() >= self.config.max_approvals {
+        let key = (issuer.clone(), spec.action_digest);
+        match state.pending.get(&key) {
+            Some(p) if now < p.expires_at => {
+                if p.fields.contains_key("approver") {
+                    return Err(ApprovalError::InvalidSpec(
+                        "operation context has an `approver` field".into(),
+                    ));
+                }
+            }
+            _ => return Err(ApprovalError::UnknownRequest),
+        }
+        if state.approvals.len() >= self.config.max_approvals
+            || state.approvals_of(issuer) >= self.config.max_approvals_per_issuer
+        {
+            state
+                .approvals
+                .retain(|_, s| s.status(now) == ApprovalStatus::Pending);
+            if state.approvals.len() >= self.config.max_approvals
+                || state.approvals_of(issuer) >= self.config.max_approvals_per_issuer
+            {
                 return Err(ApprovalError::Unavailable);
             }
         }
         let approval_id = loop {
             let id = random_approval_id()?;
-            if !state.contains_key(&id) {
+            if !state.approvals.contains_key(&id) {
                 break id;
             }
         };
-        state.insert(
+        let p = state
+            .pending
+            .remove(&key)
+            .ok_or(ApprovalError::UnknownRequest)?;
+        let expires_at = now.saturating_add_secs(spec.ttl_seconds);
+        state.approvals.insert(
             approval_id.clone(),
             Stored {
                 issuer: issuer.clone(),
                 tenant: spec.approver_tenant,
                 approver: spec.approver,
-                digest: spec.action_digest,
-                version: spec.resource_version,
-                fields: spec.fields,
+                digest: p.action_digest,
+                version: p.resource_version,
+                fields: p.fields,
                 expires_at,
                 used: false,
             },
@@ -201,17 +279,69 @@ impl MemoryApprovalStore {
         now: Timestamp,
     ) -> Option<ApprovalStatus> {
         let state = self.state.lock().ok()?;
-        let s = state.get(approval_id)?;
+        let s = state.approvals.get(approval_id)?;
         (s.issuer == *issuer).then(|| s.status(now))
     }
 
     /// Stored approvals, including used and expired ones not yet swept.
     pub fn len(&self) -> usize {
-        self.state.lock().map_or(0, |s| s.len())
+        self.state.lock().map_or(0, |s| s.approvals.len())
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    fn record_pending_sync(
+        &self,
+        request: &AuthorizationRequest<'_>,
+        requirement: &ApprovalRequirement,
+        now: Timestamp,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let p = request.execution_context().principal();
+        // Recomputed with the function the pipeline uses before `verify`.
+        let digest = ActionDigest::compute(
+            p.grant_id(),
+            request.action(),
+            request.resource().uid(),
+            request.args(),
+        );
+        let key = (p.issuer().clone(), digest);
+        // The first unexpired record wins, so what a human reviews cannot
+        // be swapped (e.g. for a newer resource version) before approval.
+        if state.pending.get(&key).is_some_and(|x| now < x.expires_at) {
+            return;
+        }
+        let full = |s: &State| {
+            s.pending.len() >= self.config.max_approvals
+                || s.pending_of(&key.0) >= self.config.max_pending_per_issuer
+        };
+        if full(&state) {
+            state.pending.retain(|_, x| now < x.expires_at);
+            if full(&state) {
+                tracing::warn!("approval request not recorded: pending quota reached");
+                return;
+            }
+        }
+        state.pending.insert(
+            key,
+            PendingApproval {
+                action_digest: digest,
+                tenant: p.tenant().clone(),
+                grant_id: p.grant_id().clone(),
+                action: request.action().clone(),
+                resource: request.resource().uid().clone(),
+                resource_version: request.resource().version().clone(),
+                args: request.args().as_json().clone(),
+                fields: request.context().fields().clone(),
+                role: requirement.role.clone(),
+                created_at: now,
+                expires_at: now.saturating_add_secs(self.config.pending_ttl_seconds),
+            },
+        );
     }
 
     fn verify_sync(
@@ -224,6 +354,7 @@ impl MemoryApprovalStore {
     ) -> Result<ApprovalContext, DenyReason> {
         let mut state = self.state.lock().map_err(|_| DenyReason::ApprovalInvalid)?;
         let s = state
+            .approvals
             .get_mut(approval_id)
             .ok_or(DenyReason::ApprovalInvalid)?;
         let p = ctx.principal();
@@ -260,58 +391,13 @@ impl ApprovalVerifier for MemoryApprovalStore {
         let r = self.verify_sync(approval_id, ctx, digest, resource, now);
         Box::pin(async move { r })
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ids::UserId;
-
-    fn spec(ttl: u64) -> ApprovalSpec {
-        ApprovalSpec {
-            action_digest: ActionDigest::from_bytes([7; 32]),
-            resource_version: ResourceVersion::new("1"),
-            approver: Delegator::new(UserId::new("u").unwrap(), "supervisor", Attrs::new())
-                .unwrap(),
-            approver_tenant: TenantId::new("t").unwrap(),
-            fields: Attrs::new(),
-            ttl_seconds: ttl,
-        }
-    }
-
-    /// Ids are random `ap_` + 32 hex digits and distinct across calls.
-    #[test]
-    fn ids_are_random() {
-        let s = MemoryApprovalStore::new(ApprovalStoreConfig::default());
-        let app = AppId::new("app").unwrap();
-        let a = s
-            .approve(&app, spec(1), Timestamp::from_unix_millis(0))
-            .unwrap();
-        let b = s
-            .approve(&app, spec(1), Timestamp::from_unix_millis(0))
-            .unwrap();
-        assert_ne!(a.approval_id, b.approval_id);
-        assert_eq!(a.approval_id.as_str().len(), 3 + 32);
-        assert_eq!(a.expires_at, Timestamp::from_unix_millis(1000));
-    }
-
-    /// A full store drops expired approvals to make room, and fails `Unavailable` when every one is still pending.
-    #[test]
-    fn capacity_sweeps_then_fails() {
-        let s = MemoryApprovalStore::new(ApprovalStoreConfig {
-            max_approvals: 2,
-            ..ApprovalStoreConfig::default()
-        });
-        let app = AppId::new("app").unwrap();
-        let t0 = Timestamp::from_unix_millis(0);
-        s.approve(&app, spec(1), t0).unwrap();
-        s.approve(&app, spec(10), t0).unwrap();
-        assert_eq!(
-            s.approve(&app, spec(1), t0),
-            Err(ApprovalError::Unavailable)
-        );
-        let t1 = Timestamp::from_unix_millis(1000);
-        s.approve(&app, spec(1), t1).unwrap();
-        assert_eq!(s.len(), 2);
+    fn record_pending(
+        &self,
+        request: &AuthorizationRequest<'_>,
+        requirement: &ApprovalRequirement,
+        now: Timestamp,
+    ) {
+        self.record_pending_sync(request, requirement, now);
     }
 }

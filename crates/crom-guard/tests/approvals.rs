@@ -57,8 +57,11 @@ fn uid(ty: &str, id: &str) -> EntityUid {
 
 /// Invoices in tenant `acme`; `version` is the resource version the
 /// resolver reports, so a test can change it between approval and retry.
+/// Each resolution advances `clock` by `advance_ms`.
 struct Resolver {
     version: Arc<AtomicU64>,
+    clock: Arc<TestClock>,
+    advance_ms: Arc<AtomicU64>,
 }
 
 impl ResourceResolver for Resolver {
@@ -77,6 +80,9 @@ impl ResourceResolver for Resolver {
             if tenant.as_str() != "acme" {
                 return Err(ResolveError::NotFound);
             }
+            self.clock
+                .0
+                .fetch_add(self.advance_ms.load(Ordering::SeqCst), Ordering::SeqCst);
             let v = self.version.load(Ordering::SeqCst).to_string();
             Ok(
                 ResolvedResource::new(uid("Invoice", id), ResourceVersion::new(v))
@@ -176,13 +182,20 @@ struct Fixture {
     sink: Arc<MemorySink>,
     clock: Arc<TestClock>,
     version: Arc<AtomicU64>,
+    advance_ms: Arc<AtomicU64>,
     executed: Arc<AtomicUsize>,
     handle: String,
 }
 
 fn fixture() -> Fixture {
+    fixture_with(ApprovalStoreConfig::default())
+}
+
+fn fixture_with(config: ApprovalStoreConfig) -> Fixture {
     traces();
     let version = Arc::new(AtomicU64::new(1));
+    let advance_ms = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(TestClock(AtomicU64::new(START_MS)));
     let executed = Arc::new(AtomicUsize::new(0));
     let mut reg = OperationRegistry::new();
     reg.register(Arc::new(Refund {
@@ -198,6 +211,8 @@ fn fixture() -> Fixture {
         }),
         resolver: Resolver {
             version: version.clone(),
+            clock: clock.clone(),
+            advance_ms: advance_ms.clone(),
         },
         executed: executed.clone(),
     }))
@@ -205,9 +220,8 @@ fn fixture() -> Fixture {
     let grants = Arc::new(MemoryGrantStore::new(GrantStoreConfig::new(
         reg.action_ids(),
     )));
-    let clock = Arc::new(TestClock(AtomicU64::new(START_MS)));
     let issued = block_on(grants.issue(&app(), grant_spec(), clock.now())).unwrap();
-    let approvals = Arc::new(MemoryApprovalStore::new(ApprovalStoreConfig::default()));
+    let approvals = Arc::new(MemoryApprovalStore::new(config));
     let sink = Arc::new(MemorySink::default());
     let guard = Guard::new(
         reg,
@@ -225,6 +239,7 @@ fn fixture() -> Fixture {
         sink,
         clock,
         version,
+        advance_ms,
         executed,
         handle: issued.handle.expose_secret().to_owned(),
     }
@@ -280,10 +295,8 @@ impl Fixture {
     fn spec(&self, digest: ActionDigest) -> ApprovalSpec {
         ApprovalSpec {
             action_digest: digest,
-            resource_version: ResourceVersion::new("1"),
             approver: supervisor(),
             approver_tenant: TenantId::new("acme").unwrap(),
-            fields: [("amount_cents".to_owned(), AttrValue::Long(BIG))].into(),
             ttl_seconds: 300,
         }
     }
@@ -448,19 +461,20 @@ fn cross_tenant_approver_denied() {
     );
 }
 
-/// An approval issued by one application cannot be used with a grant another application issued.
+/// Another application can neither view nor approve a pending request that arose under a grant it did not issue.
 #[test]
-fn other_issuer_approval_denied() {
+fn other_issuer_cannot_see_or_approve() {
     let f = fixture();
     let d = f.required(refund("acme-inv-001", BIG));
-    let id = f
-        .approvals
-        .approve(&AppId::new("other-app").unwrap(), f.spec(d), f.clock.now())
-        .unwrap()
-        .approval_id;
-    f.assert_invalid(&f.call(refund("acme-inv-001", BIG), with_id(&id)));
-    assert_eq!(f.approvals.status(&app(), &id, f.clock.now()), None);
-    assert_eq!(f.executed(), 0);
+    let other = AppId::new("other-app").unwrap();
+    assert_eq!(f.approvals.pending(&other, &d, f.clock.now()), None);
+    assert_eq!(
+        f.approvals.approve(&other, f.spec(d), f.clock.now()),
+        Err(ApprovalError::UnknownRequest)
+    );
+    // The application that issued the grant still can.
+    let id = f.approve(f.spec(d));
+    assert!(!f.call(refund("acme-inv-001", BIG), with_id(&id)).is_error());
 }
 
 /// Cedar sees the stored approver: an approval by a non-supervisor matches the digest but Cedar denies, and the approval is consumed anyway.
@@ -483,20 +497,135 @@ fn stored_approver_role_reaches_cedar_and_deny_burns_approval() {
     );
 }
 
-/// Cedar still evaluates an approved request: approved fields that differ from the request deny.
+/// The pending request records exactly what Guard evaluated: action, resource, version, validated args, operation fields, and role.
 #[test]
-fn approved_fields_must_match_in_cedar() {
+fn pending_request_shows_what_is_approved() {
     let f = fixture();
     let d = f.required(refund("acme-inv-001", BIG));
-    let id = f.approve(ApprovalSpec {
-        fields: [("amount_cents".to_owned(), AttrValue::Long(1))].into(),
-        ..f.spec(d)
-    });
+    let p = f.approvals.pending(&app(), &d, f.clock.now()).unwrap();
+    assert_eq!(p.action_digest, d);
+    assert_eq!(p.action.as_str(), "refund.issue");
+    assert_eq!(p.resource, uid("Invoice", "acme-inv-001"));
+    assert_eq!(p.resource_version, ResourceVersion::new("1"));
+    assert_eq!(p.args, refund("acme-inv-001", BIG));
     assert_eq!(
-        f.call(refund("acme-inv-001", BIG), with_id(&id)).code(),
-        Some("policy_deny")
+        p.fields,
+        [("amount_cents".to_owned(), AttrValue::Long(BIG))].into()
     );
+    assert_eq!(p.role, "supervisor");
+    assert_eq!(p.tenant.as_str(), "acme");
+    assert_eq!(
+        p.expires_at,
+        Timestamp::from_unix_millis(START_MS + 900_000)
+    );
+}
+
+/// `approve` fails for a digest with no pending request, including one already approved, and for an expired pending request.
+#[test]
+fn approve_requires_pending_request() {
+    let f = fixture();
+    let unknown = ActionDigest::from_bytes([9; 32]);
+    assert_eq!(
+        f.approvals.approve(&app(), f.spec(unknown), f.clock.now()),
+        Err(ApprovalError::UnknownRequest)
+    );
+    let d = f.required(refund("acme-inv-001", BIG));
+    f.approve(f.spec(d));
+    assert_eq!(f.approvals.pending(&app(), &d, f.clock.now()), None);
+    assert_eq!(
+        f.approvals.approve(&app(), f.spec(d), f.clock.now()),
+        Err(ApprovalError::UnknownRequest)
+    );
+    let d2 = f.required(refund("acme-inv-002", BIG));
+    f.clock.0.store(START_MS + 900_000, Ordering::SeqCst);
+    assert_eq!(
+        f.approvals.approve(&app(), f.spec(d2), f.clock.now()),
+        Err(ApprovalError::UnknownRequest)
+    );
+    assert_eq!(f.approvals.len(), 1);
+}
+
+/// A repeated `ApprovalRequired` for the same digest keeps the first pending record, so the version a human reviewed cannot be swapped underneath them.
+#[test]
+fn pending_request_not_replaced_by_newer_version() {
+    let f = fixture();
+    let d = f.required(refund("acme-inv-001", BIG));
+    f.version.store(2, Ordering::SeqCst);
+    assert_eq!(f.required(refund("acme-inv-001", BIG)), d);
+    let p = f.approvals.pending(&app(), &d, f.clock.now()).unwrap();
+    assert_eq!(p.resource_version, ResourceVersion::new("1"));
+    // The approval binds version 1, so a retry against version 2 is refused.
+    let id = f.approve(f.spec(d));
+    f.assert_invalid(&f.call(refund("acme-inv-001", BIG), with_id(&id)));
+}
+
+/// The approval binds the version recorded with the pending request, whatever version the admin might assume.
+#[test]
+fn approval_binds_pending_version() {
+    let f = fixture();
+    f.version.store(2, Ordering::SeqCst);
+    let id = f.approve_big();
+    f.version.store(1, Ordering::SeqCst);
+    f.assert_invalid(&f.call(refund("acme-inv-001", BIG), with_id(&id)));
+    f.version.store(2, Ordering::SeqCst);
+    assert!(!f.call(refund("acme-inv-001", BIG), with_id(&id)).is_error());
+}
+
+/// The approved fields Cedar sees are the request's own operation fields, so any approved amount works without the admin restating it.
+#[test]
+fn approval_fields_come_from_request() {
+    let f = fixture();
+    let d = f.required(refund("acme-inv-002", 6_000));
+    let id = f.approve(f.spec(d));
+    assert!(!f
+        .call(refund("acme-inv-002", 6_000), with_id(&id))
+        .is_error());
+    assert_eq!(f.executed(), 1);
+}
+
+/// Expiry is judged on Guard's clock at the moment of `verify`, not at call start: time spent resolving counts.
+#[test]
+fn expiry_checked_after_resolution() {
+    let f = fixture();
+    let id = f.approve_big();
+    f.clock.0.store(START_MS + 299_000, Ordering::SeqCst);
+    f.advance_ms.store(1_000, Ordering::SeqCst);
+    f.assert_invalid(&f.call(refund("acme-inv-001", BIG), with_id(&id)));
     assert_eq!(f.executed(), 0);
+}
+
+/// Pending requests are capped per issuer; a full issuer records nothing new until expired ones are swept.
+#[test]
+fn pending_quota_per_issuer() {
+    let f = fixture_with(ApprovalStoreConfig {
+        max_pending_per_issuer: 1,
+        ..ApprovalStoreConfig::default()
+    });
+    let d1 = f.required(refund("acme-inv-001", BIG));
+    let d2 = f.required(refund("acme-inv-002", BIG));
+    assert!(f.approvals.pending(&app(), &d1, f.clock.now()).is_some());
+    assert_eq!(f.approvals.pending(&app(), &d2, f.clock.now()), None);
+    f.clock.0.store(START_MS + 900_000, Ordering::SeqCst);
+    let d3 = f.required(refund("acme-inv-002", BIG + 1));
+    assert!(f.approvals.pending(&app(), &d3, f.clock.now()).is_some());
+}
+
+/// Stored approvals are capped per issuer; `approve` sweeps used and expired ones before failing `Unavailable`, and a refused approve keeps the pending request.
+#[test]
+fn approval_quota_per_issuer() {
+    let f = fixture_with(ApprovalStoreConfig {
+        max_approvals_per_issuer: 1,
+        ..ApprovalStoreConfig::default()
+    });
+    let id = f.approve_big();
+    let d2 = f.required(refund("acme-inv-002", BIG));
+    assert_eq!(
+        f.approvals.approve(&app(), f.spec(d2), f.clock.now()),
+        Err(ApprovalError::Unavailable)
+    );
+    assert!(f.approvals.pending(&app(), &d2, f.clock.now()).is_some());
+    assert!(!f.call(refund("acme-inv-001", BIG), with_id(&id)).is_error());
+    f.approve(f.spec(d2));
 }
 
 /// Two simultaneous uses of one approval execute exactly once; the rest are `approval_invalid`.
@@ -553,31 +682,26 @@ fn rejected_approval_id_not_echoed() {
     );
 }
 
-/// `approve` rejects a zero or over-long TTL and an `approver` field, and stores nothing.
+/// `approve` rejects a zero or over-long TTL, stores nothing, and keeps the pending request.
 #[test]
 fn approve_rejects_bad_specs() {
     let f = fixture();
     let d = f.required(refund("acme-inv-001", BIG));
-    for spec in [
-        ApprovalSpec {
-            ttl_seconds: 0,
-            ..f.spec(d)
-        },
-        ApprovalSpec {
-            ttl_seconds: DEFAULT_APPROVAL_MAX_TTL_SECONDS + 1,
-            ..f.spec(d)
-        },
-        ApprovalSpec {
-            fields: [("approver".to_owned(), AttrValue::Long(1))].into(),
-            ..f.spec(d)
-        },
-    ] {
+    for ttl_seconds in [0, DEFAULT_APPROVAL_MAX_TTL_SECONDS + 1] {
         assert!(matches!(
-            f.approvals.approve(&app(), spec, f.clock.now()),
+            f.approvals.approve(
+                &app(),
+                ApprovalSpec {
+                    ttl_seconds,
+                    ..f.spec(d)
+                },
+                f.clock.now()
+            ),
             Err(ApprovalError::InvalidSpec(_))
         ));
     }
     assert_eq!(f.approvals.len(), 0);
+    assert!(f.approvals.pending(&app(), &d, f.clock.now()).is_some());
 }
 
 #[derive(Clone, Default)]

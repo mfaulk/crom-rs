@@ -40,7 +40,8 @@ pub use action::{
 };
 pub use approval::{
     ApprovalError, ApprovalSpec, ApprovalStatus, ApprovalStoreConfig, IssuedApproval,
-    MemoryApprovalStore, DEFAULT_APPROVAL_MAX_TTL_SECONDS, DEFAULT_MAX_APPROVALS,
+    MemoryApprovalStore, PendingApproval, DEFAULT_APPROVAL_MAX_TTL_SECONDS, DEFAULT_MAX_APPROVALS,
+    DEFAULT_MAX_PER_ISSUER, DEFAULT_PENDING_TTL_SECONDS,
 };
 pub use audit::{
     verify_file, verify_log, verify_log_with, AuditEntry, AuditStorage, ChainSummary,

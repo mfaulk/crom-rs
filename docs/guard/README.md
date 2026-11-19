@@ -40,7 +40,7 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | pdp | `CedarPdp`, `Evaluation`, `GrantEvaluation`, `PdpLoadError` | The Cedar PDP (#349): load-time checks, per-grant evaluation, the approval probe, and `ActionDigest::compute`. See [policies.md](policies.md) |
 | resolution | `TimeoutResolver`, `ResolveTimer`; `From<ResolveError> for DenyReason` | Bounds a resolver by a host-supplied timer. A timeout returns `ResolveError::Unavailable`, which maps to `engine_unavailable`. `NotFound` maps to `resource_not_found` (#350) |
 | executor | `ConditionalCall` | The version-condition contract for executors. See [protected-operations.md](protected-operations.md) (#350) |
-| approval | `MemoryApprovalStore`, `ApprovalSpec`, `IssuedApproval`, `ApprovalStatus`, `ApprovalStoreConfig`, `ApprovalError` | Single-use, expiring approvals bound to the action digest and resource version (#354). `approve` is for the trusted admin path only. See [approvals.md](approvals.md) |
+| approval | `MemoryApprovalStore`, `ApprovalSpec`, `PendingApproval`, `IssuedApproval`, `ApprovalStatus`, `ApprovalStoreConfig`, `ApprovalError` | Single-use, expiring approvals of a pending request Guard recorded on `ApprovalRequired`, bound to its digest and resource version (#354). `pending` and `approve` are for the trusted admin path only. See [approvals.md](approvals.md) |
 | pipeline | `Guard`, `CallMeta`, `CallOutcome`, `CallResult`, `ApprovalVerifier`, `NoApprovals` | MILESTONE_18 §10.2 steps 1–8 with the audit and recheck ordering. Agents see only stable codes. See [pipeline.md](pipeline.md) (#351) |
 | registry | `OperationRegistry`, `RegistryError`, `ToolInfo`, `RESERVED_ACTION_PREFIX`, `MAX_ARGUMENT_BYTES` | One exact tool name per action. Schemas must pass a keyword allowlist at registration: closed objects, typed arrays, no composition, no `$ref`, and asserted formats (#351) |
 
@@ -54,7 +54,7 @@ Everything else is data. Ids, `GrantSpec`, `Grant` and `ResolvedResource` are pu
 | `ProtectedOperation` | no | app code; reference: `crom_guard_testkit::support_ops` (#350, #356) | One `ActionId` per MCP tool. Provides the input schema, resolver, Cedar context, and `execute(AuthorizedAction, CredentialLease)`. Executors follow `ConditionalCall` |
 | `CredentialBroker` | no | `FileCredentialBroker`, `EnvCredentialBroker` ([credentials.md](credentials.md)) | Async. Hands out leases. The agent never receives one |
 | `AuditSink` | no | #352 (`ChainedAuditSink` / `FileAuditSink`) | Async. `append` must be durable before it resolves. On `Err`, nothing executes |
-| `ApprovalVerifier` | yes | `NoApprovals` (default), `MemoryApprovalStore` ([approvals.md](approvals.md)) | Async. Matches a presented approval to the request's action digest and resource version, and consumes it. See [pipeline.md](pipeline.md) |
+| `ApprovalVerifier` | yes | `NoApprovals` (default), `MemoryApprovalStore` ([approvals.md](approvals.md)) | Async. Matches a presented approval to the request's action digest and resource version, and consumes it. `record_pending` (default no-op) keeps the request behind an `ApprovalRequired`. See [pipeline.md](pipeline.md) |
 
 Sealed traits produce authority, so implementations outside this crate are rejected at compile time.
 

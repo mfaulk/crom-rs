@@ -23,7 +23,7 @@ use crate::audit::{
 };
 use crate::context::ExecutionContext;
 use crate::credential::CredentialBroker;
-use crate::decision::{ActionDigest, Decision, DenyReason};
+use crate::decision::{ActionDigest, ApprovalRequirement, Decision, DenyReason};
 use crate::handle::SessionHandle;
 use crate::ids::{ApprovalId, DecisionId};
 use crate::registry::{OpKind, OperationRegistry, Registered};
@@ -117,6 +117,16 @@ pub trait ApprovalVerifier: Sealed + Send + Sync {
         resource: &'a ResolvedResource,
         now: Timestamp,
     ) -> BoxFuture<'a, Result<ApprovalContext, DenyReason>>;
+
+    /// Called after an `ApprovalRequired` decision record is written, so
+    /// the store can keep what is to be approved. The default keeps nothing.
+    fn record_pending(
+        &self,
+        _request: &AuthorizationRequest<'_>,
+        _requirement: &ApprovalRequirement,
+        _now: Timestamp,
+    ) {
+    }
 }
 
 /// The default: every presented approval is `ApprovalInvalid`.
@@ -409,6 +419,8 @@ impl Call<'_> {
                     resource.uid(),
                     &args,
                 );
+                // Fresh: expiry is judged after resolution, not at call start.
+                let now = g.clock.now();
                 match guarded(|| g.approvals.verify(&id, &ctx, &digest, &resource, now)).await {
                     Ok(Ok(a)) => Some(a),
                     Ok(Err(_)) | Err(Panicked) => {
@@ -453,6 +465,11 @@ impl Call<'_> {
                 self.rec.outcome = Some(Outcome::Blocked);
                 if let Err(r) = self.write_decision().await {
                     return *r;
+                }
+                let now = g.clock.now();
+                if guarded_sync(|| g.approvals.record_pending(&request, &requirement, now)).is_err()
+                {
+                    tracing::warn!(stage = "record_pending", "approval store panicked");
                 }
                 return self.respond(CallResult::ApprovalRequired {
                     role: requirement.role,
