@@ -372,6 +372,7 @@ impl MemoryApprovalStore {
         Ok(ApprovalContext::new(
             approval_id.clone(),
             s.approver.clone(),
+            s.tenant.clone(),
             s.fields.clone(),
         ))
     }

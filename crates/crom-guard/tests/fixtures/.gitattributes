@@ -1,0 +1,2 @@
+# Byte-exact hash-chained logs; never normalize line endings.
+*.jsonl -text

@@ -18,8 +18,8 @@ use crate::action::{
     ApprovalContext, AuthorizationContext, AuthorizationRequest, AuthorizedAction, ValidatedArgs,
 };
 use crate::audit::{
-    AuditIdentity, AuditReceipt, AuditRecord, AuditSink, DecisionKind, Enforcement, Outcome,
-    RecordKind, UntrustedCorrelation,
+    AuditApprover, AuditIdentity, AuditReceipt, AuditRecord, AuditSink, DecisionKind, Enforcement,
+    Outcome, RecordKind, UntrustedCorrelation,
 };
 use crate::context::ExecutionContext;
 use crate::credential::CredentialBroker;
@@ -447,6 +447,7 @@ impl Call<'_> {
             }
         };
         self.rec.approval_id = approval.as_ref().map(|a| a.approval_id().clone());
+        self.rec.approver = approval.as_ref().map(AuditApprover::from);
 
         // 4. Authorize.
         let request = AuthorizationRequest::new(

@@ -4,14 +4,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crom_guard::{
-    verify_file, verify_log, verify_log_with, ActionId, AgentId, AppId, AuditError, AuditIdentity,
-    AuditReceipt, AuditRecord, AuditSink, AuditStorage, ChainedAuditSink, DecisionId, DecisionKind,
-    DenyReason, Enforcement, EntityUid, FileAuditSink, GrantId, Outcome, PolicyId, RecordKind,
-    RunId, TenantId, Timestamp, UserId, VerifyErrorKind, AUDIT_FORMAT, GENESIS_HASH,
+    verify_file, verify_log, verify_log_with, ActionId, AgentId, AppId, ApprovalId, AuditApprover,
+    AuditError, AuditIdentity, AuditReceipt, AuditRecord, AuditSink, AuditStorage,
+    ChainedAuditSink, DecisionId, DecisionKind, DenyReason, Enforcement, EntityUid, FileAuditSink,
+    GrantId, Outcome, PolicyId, RecordKind, RunId, TenantId, Timestamp, UserId, VerifyErrorKind,
+    AUDIT_FORMAT, GENESIS_HASH,
 };
 use sha2::{Digest, Sha256};
 
 const SCHEMA: &str = include_str!("../schemas/guard-audit-v1.schema.json");
+/// A log written before `approver` existed (#402), including an approved
+/// decision and its outcome. Never regenerate it.
+const PRE_APPROVER_LOG: &[u8] = include_bytes!("fixtures/guard-audit-v1-pre-approver.jsonl");
+const APPROVER_JSON: &str =
+    r#""approver":{"id":"acme-supervisor","role":"supervisor","tenant":"acme"}"#;
 
 fn decision_record(n: u64) -> AuditRecord {
     let mut r = AuditRecord::new(
@@ -62,6 +68,17 @@ fn denied_record(n: u64) -> AuditRecord {
     });
     r.enforcement = Some(Enforcement::GuardChain);
     r.outcome = Some(Outcome::Blocked);
+    r
+}
+
+fn approved_record(n: u64) -> AuditRecord {
+    let mut r = decision_record(n);
+    r.approval_id = Some(ApprovalId::new(format!("ap_{n:032x}")).unwrap());
+    r.approver = Some(AuditApprover {
+        id: UserId::new("acme-supervisor").unwrap(),
+        role: "supervisor".into(),
+        tenant: TenantId::new("acme").unwrap(),
+    });
     r
 }
 
@@ -365,6 +382,78 @@ fn schema_violations_are_detected() {
     ));
 }
 
+/// A log written before the `approver` field existed still verifies, and its approved records have no approver.
+#[test]
+fn pre_approver_log_still_verifies() {
+    let mut records = Vec::new();
+    let summary = verify_log_with(Cursor::new(PRE_APPROVER_LOG), &[], |e| {
+        records.push(e.record)
+    })
+    .unwrap();
+    assert_eq!(summary.records, 3);
+    assert!(records[0].approval_id.is_some());
+    assert!(records.iter().all(|r| r.approver.is_none()));
+}
+
+/// Re-appending the pre-approver records reproduces the fixture byte for byte, so records without an approver hash as before.
+#[test]
+fn records_without_approver_encode_unchanged() {
+    let mut records = Vec::new();
+    verify_log_with(Cursor::new(PRE_APPROVER_LOG), &[], |e| {
+        records.push(e.record)
+    })
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let sink = FileAuditSink::open(&path).unwrap();
+    for r in &records {
+        append(&sink, r).unwrap();
+    }
+    assert_eq!(fs::read(&path).unwrap(), PRE_APPROVER_LOG);
+}
+
+/// An approver is written right after `approval_id` with exactly id, role, and tenant, and the record verifies.
+#[test]
+fn approver_is_recorded_and_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let sink = FileAuditSink::open(&path).unwrap();
+    append(&sink, &approved_record(1)).unwrap();
+    let line = &lines(&path)[0];
+    let expected = format!(
+        r#""approval_id":"ap_00000000000000000000000000000001",{APPROVER_JSON},"enforcement""#
+    );
+    assert!(line.contains(&expected), "{line}");
+    let mut seen = Vec::new();
+    let file = io::BufReader::new(fs::File::open(&path).unwrap());
+    verify_log_with(file, &[], |e| seen.push(e.record)).unwrap();
+    assert_eq!(seen, vec![approved_record(1)]);
+}
+
+/// A re-hashed line whose approver has an extra attribute, a missing member, or a null value fails schema checks.
+#[test]
+fn approver_schema_violations_are_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let sink = FileAuditSink::open(&path).unwrap();
+    append(&sink, &approved_record(1)).unwrap();
+    drop(sink);
+    let orig = lines(&path)[0].clone();
+    for replacement in [
+        r#""approver":{"id":"acme-supervisor","role":"supervisor","tenant":"acme","refund_limit_cents":1}"#,
+        r#""approver":{"id":"acme-supervisor","role":"supervisor"}"#,
+        r#""approver":null"#,
+    ] {
+        let bad = orig.replace(APPROVER_JSON, replacement);
+        assert_ne!(bad, orig);
+        write_lines(&path, &[rehash(&bad)]);
+        assert!(
+            matches!(kind_at(&path, &[]), (1, VerifyErrorKind::Schema(_))),
+            "{bad}"
+        );
+    }
+}
+
 /// An empty log verifies with zero records and no head.
 #[test]
 fn empty_log_verifies() {
@@ -585,9 +674,11 @@ fn published_schema_validates_records() {
         decision_record(1),
         outcome_record(1),
         denied_record(2),
+        approved_record(3),
     ] {
         append(&sink, &r).unwrap();
     }
+    let mut approvers = 0;
     for line in lines(&path) {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         let errors: Vec<String> = validator.iter_errors(&v).map(|e| e.to_string()).collect();
@@ -612,5 +703,21 @@ fn published_schema_validates_records() {
             mutate(bad.as_object_mut().unwrap());
             assert!(!validator.is_valid(&bad), "accepted {bad}");
         }
+
+        if let Some(approver) = v.get("approver") {
+            approvers += 1;
+            assert_eq!(approver["id"], "acme-supervisor");
+            for bad_approver in [
+                serde_json::json!(null),
+                serde_json::json!({"id": "acme-supervisor", "role": "supervisor"}),
+                serde_json::json!({"id": "acme-supervisor", "role": "supervisor",
+                                   "tenant": "acme", "refund_limit_cents": 1}),
+            ] {
+                let mut bad = v.clone();
+                bad["approver"] = bad_approver;
+                assert!(!validator.is_valid(&bad), "accepted {bad}");
+            }
+        }
     }
+    assert_eq!(approvers, 1);
 }

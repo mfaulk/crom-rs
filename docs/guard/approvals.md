@@ -28,7 +28,7 @@
    and gets an `IssuedApproval { approval_id, expires_at }`. `approval_id` is `ap_` plus 32 hex digits from the OS RNG. The pending request is consumed. The approval's resource version and approved fields are copied from it; the admin call cannot set them. A digest with no unexpired pending request from that issuer is `ApprovalError::UnknownRequest`.
 5. The agent retries the same call with `CallMeta { approval_id: Some(..) }` (MCP `_meta`).
 6. After resolving the resource, the pipeline recomputes `ActionDigest::compute(leaf grant, action, resource uid, validated args)`, reads Guard's clock again, and calls `verify`. Under one lock, the store checks and consumes the approval. It then builds the `ApprovalContext`, which Cedar sees as `context.approval` (`approver` plus the approved fields).
-7. Cedar evaluates. On `Allow` the call executes, and the audit decision record carries `approval_id`.
+7. Cedar evaluates. On `Allow` the call executes. The audit decision and outcome records carry `approval_id` and `approver` (see [Audit](#audit)).
 
 **First pending record wins.** While a pending request for a digest is unexpired, a repeated `ApprovalRequired` for the same digest does not replace it, so the resource version a human reviewed cannot be swapped underneath them. If the resource changes before the retry, the approval no longer matches (`approval_invalid`), and the next request records a fresh pending request.
 
@@ -46,7 +46,7 @@ Any failure is `approval_invalid` (`enforcement: guard_approval`). A failed chec
 | `action_digest` equals the recomputed digest | a different leaf grant, action, resource, or argument (e.g. amount) |
 | The pending request's resource version equals the resolved version | an approval of a resource that has since changed |
 
-**Approver tenant.** `ApprovalContext` carries the approver as a `Delegator`, which has no tenant. The PDP therefore sets the approver entity's tenant to the principal's, so the Cedar test `context.approval.approver.tenant == principal.tenant` is always true (see [policies.md](policies.md)). The tenant check above is the real enforcement. It runs before any `ApprovalContext` exists.
+**Approver tenant.** The PDP sets the approver entity's tenant to the principal's, not to the stored `approver_tenant` (which `ApprovalContext` carries only for audit), so the Cedar test `context.approval.approver.tenant == principal.tenant` is always true (see [policies.md](policies.md)). The tenant check above is the real enforcement. It runs before any `ApprovalContext` exists.
 
 ## Single use and consumption point (decided)
 
@@ -60,7 +60,8 @@ The approval is consumed in `verify`, **before** Cedar, the decision record, and
 
 - **No agent-facing operation creates or changes approvals.** `approve` and `pending` are library calls for the trusted application; neither is a registered operation. The agent supplies only the approval id. Pending requests are written only by the pipeline, from Guard's own evaluation.
 - **The admin supplies only who approved and for how long.** What is approved (action, resource, version, args, fields) comes from the pending request.
-- **The approval id is an identifier, not a credential.** On its own it authorizes nothing: it works only with the leaf grant's session handle, for the exact digested action. So it is written to audit (`approval_id`) and may be shown to the approver. A presented id that fails `verify` is written nowhere: not to the outcome, the audit record (whose `approval_id` stays empty), or `tracing`.
+- **The approval id is an identifier, not a credential.** On its own it authorizes nothing: it works only with the leaf grant's session handle, for the exact digested action. So it is written to audit (`approval_id`) and may be shown to the approver.
+- **The audited approver comes from the store.** The agent has no way to name an approver; `approver` in audit is copied from the approval `verify` matched. A presented id that fails `verify` is written nowhere: not to the outcome, the audit record (whose `approval_id` stays empty), or `tracing`.
 - **Nothing secret is stored.** `PendingApproval` holds the validated args, which the agent supplied. The store's `Debug` shows only its config. `ApprovalError` messages contain no approval data.
 
 ## Store limits
@@ -77,18 +78,28 @@ All fields are on `ApprovalStoreConfig`. The store is in memory only: a restart 
 
 `status(issuer, approval_id, now)` returns `Pending`, `Used`, or `Expired`, or `None` if `issuer` has no approval with that id. It is for the admin path, e.g. to show whether an approval was used.
 
+## Audit
+
+When `verify` matches, the decision record and (if it executes) the outcome record carry `approval_id` and `approver` (#402):
+
+```json
+"approval_id":"ap_…","approver":{"id":"acme-supervisor","role":"supervisor","tenant":"acme"}
+```
+
+`approver` is `AuditApprover { id, role, tenant }`, copied from the stored approval: the `Delegator`'s id and role from the admin call, and its `approver_tenant`. The `Delegator`'s other Cedar `attrs` and store internals (digest, version, expiry, issuer) are not recorded. Because the approval is consumed before Cedar, a record that ends in a deny after a matched approval also names the approver, so audit shows whose approval was burned. Records with no matched approval have neither member; see [audit.md](audit.md#approver).
+
 ## Not in scope
 
-An approval UI, multi-party approvals, and Crom's `ApprovalCallback`, which is not a Guard approval source. The audit record carries `approval_id` but not the approver; adding the approver to audit (a `guard-audit/v1` format change) is tracked in a follow-up issue. Until then, join on `approval_id` with the application's own record of the admin action.
+An approval UI, multi-party approvals, and Crom's `ApprovalCallback`, which is not a Guard approval source.
 
 ## Tests
 
 `crates/crom-guard/tests/approvals.rs`:
 
-- a valid approval executes once and is recorded in audit;
+- a valid approval executes once, and its decision and outcome records carry `approval_id` and the stored approver (id, role, tenant; no `attrs`); an `approval_required` record has neither;
 - the pending request shows exactly the evaluated action, resource, version, args, fields, and role; another issuer can neither view nor approve it; `approve` fails for an unknown, already-approved, or expired digest;
 - replay, random id, different amount, different invoice, changed resource version (including a newer version that does not replace the pending record), different grant, expired (at the boundary millisecond and during resolution), and cross-tenant approver are each `approval_invalid` with no execution;
-- Cedar sees the stored approver role, and a Cedar deny burns the approval;
+- Cedar sees the stored approver role, a Cedar deny burns the approval, and its audit record names that approver;
 - 16 concurrent uses execute exactly once;
 - per-issuer quotas for pending requests and approvals, with sweeping;
 - a rejected id is in no outcome, audit record, or `tracing` output.

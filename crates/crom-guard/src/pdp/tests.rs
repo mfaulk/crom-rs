@@ -215,6 +215,7 @@ impl Parts {
                 ApprovalContext::new(
                     ApprovalId::new("ap1").unwrap(),
                     approver,
+                    TenantId::new("t1").unwrap(),
                     [("amount_cents".to_owned(), AttrValue::Long(amount))].into(),
                 )
             }),

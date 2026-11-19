@@ -50,7 +50,7 @@ Loading fails with `PdpLoadError` if any of these is true:
   The action's declared context must match this shape exactly, or the request is denied.
 - For an approvable permit, annotate it `@approval("<role>")`. Inside it, test `context has approval`, `context.approval.approver.role == "<role>"`, and every field the approval must match. Also test `context.approval.approver.tenant == principal.tenant`.
 
-> **Approver tenant: the Cedar check is defense in depth only.** `ApprovalContext` carries the approver as a `Delegator`, which has no tenant. The PDP therefore sets the approver entity's `tenant` to the principal's tenant, so `context.approval.approver.tenant == principal.tenant` is always true on the public path. **`MemoryApprovalStore` (#354) rejects an approver from a different tenant before it builds an `ApprovalContext`** ([approvals.md](approvals.md)). Keep the Cedar test anyway: it starts to bite if the approval model later carries the approver's own tenant.
+> **Approver tenant: the Cedar check is defense in depth only.** The PDP sets the approver entity's `tenant` to the principal's tenant, not the stored approver tenant (which `ApprovalContext` carries only for audit), so `context.approval.approver.tenant == principal.tenant` is always true on the public path. **`MemoryApprovalStore` (#354) rejects an approver from a different tenant before it builds an `ApprovalContext`** ([approvals.md](approvals.md)). Keep the Cedar test anyway: it starts to bite if the PDP later uses the stored approver tenant.
 
 ## Evaluation
 
