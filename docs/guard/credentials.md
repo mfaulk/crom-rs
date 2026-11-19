@@ -38,7 +38,7 @@ For containers. `EnvCredentialBroker::from_env(vec![EnvCredential { id, var, act
 
 ## Rotation
 
-`reload()` on either broker re-reads its source and swaps the whole action table at once. The admin API (#357) will call it.
+`reload()` on either broker re-reads its source and swaps the whole action table at once. The admin API calls it on `POST /admin/credentials/reload` ([server.md](server.md)).
 
 - New leases get the new value; leases already handed out keep the old one until dropped.
 - A reload that fails any check keeps the previous table in use.
