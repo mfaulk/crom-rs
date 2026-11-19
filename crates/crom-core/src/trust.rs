@@ -85,6 +85,7 @@ impl UntrustedConfigDenial {
             outcome: SecurityOutcome::Blocked,
             reason: Some(crate::builtin_hooks::redact_secrets_in_str(&self.reason)),
             guard_decision_id: None,
+            guard_approval: None,
         }
     }
 }

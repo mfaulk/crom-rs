@@ -89,6 +89,8 @@ sudo -u crom-guard env -i PATH=/usr/bin:/bin \
 
 The trusted application runs as `crom-guard` (or root) to reach `admin.sock`. For agent (a), copy `examples/guard-support/agent/crom-settings.json` into the agent user's Crom settings, export the session handle as `CROM_GUARD_HANDLE` for Crom (the settings interpolate it into the MCP `Authorization` header; the sandbox's environment allowlist keeps it out of Bash), and adjust the URL if Guard's agent port is not 8470.
 
+The reference application's driver runs `check` this way, for an in-process SDK agent (a), before every scripted or live start and stops on failure ([reference-app.md](reference-app.md)).
+
 ## Bypass tests
 
 `crates/crom-guard-testkit/tests/bypass.rs` (Linux). Guard and the business API run in a child process (the test binary re-executed) with a 0700 state directory, the credential in `credentials.json` and the admin token only in Guard's environment. The trusted app issues the agent a grant, and one legitimate Guard call puts a mediated entry in the ledger. Each attack then runs through Crom's own `BashTool`, once per agent configuration.

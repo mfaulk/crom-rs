@@ -366,6 +366,7 @@ pub(crate) async fn execute_request(
         allowed_tool_rules: runtime.tool_policy.allowed_tools.clone(),
         disallowed_tool_rules: runtime.tool_policy.disallowed_tools.clone(),
         mcp: runtime.tool_policy.mcp_options(),
+        guard_approval: runtime.tool_policy.guard_approval(),
         ..Default::default()
     };
     if let Some(root) = workspace_for_run.filesystem_root() {
@@ -960,6 +961,7 @@ pub(crate) async fn execute_act(
         allowed_tool_rules: runtime.tool_policy.allowed_tools.clone(),
         disallowed_tool_rules: runtime.tool_policy.disallowed_tools.clone(),
         mcp: runtime.tool_policy.mcp_options(),
+        guard_approval: runtime.tool_policy.guard_approval(),
         ..Default::default()
     };
     if let Some(root) = workspace_for_run.filesystem_root() {

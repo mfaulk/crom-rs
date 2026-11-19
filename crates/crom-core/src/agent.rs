@@ -1890,6 +1890,8 @@ pub(crate) async fn run_loop(
                 run_id: Some(cfg.run_id.clone()),
                 turn_index: turns,
                 tool_call_id: Some(call.id.clone()),
+                cancel: Some(cfg.cancel.clone()),
+                guard_approval: options.guard_approval.clone(),
             };
             let started = Instant::now();
             emit_telemetry(

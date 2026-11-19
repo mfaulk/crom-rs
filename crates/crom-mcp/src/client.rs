@@ -42,6 +42,14 @@ pub struct McpServerInit {
     pub instructions: Option<String>,
 }
 
+fn call_params(name: &str, arguments: Value, meta: Option<Value>) -> Value {
+    let mut params = json!({ "name": name, "arguments": arguments });
+    if let Some(meta) = meta {
+        params["_meta"] = meta;
+    }
+    params
+}
+
 impl McpClient {
     pub async fn connect(
         server_name: impl Into<String>,
@@ -143,11 +151,19 @@ impl McpClient {
     }
 
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> McpResult<McpToolResult> {
+        self.call_tool_with_meta(name, arguments, None).await
+    }
+
+    /// `tools/call` with an optional `_meta` object (e.g. Crom Guard's
+    /// `approval_id`).
+    pub async fn call_tool_with_meta(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        meta: Option<Value>,
+    ) -> McpResult<McpToolResult> {
         let value = self
-            .request(
-                "tools/call",
-                Some(json!({ "name": name, "arguments": arguments })),
-            )
+            .request("tools/call", Some(call_params(name, arguments, meta)))
             .await?;
         serde_json::from_value(value).map_err(McpError::from)
     }
@@ -171,10 +187,21 @@ impl McpClient {
         name: &str,
         arguments: Value,
     ) -> McpResult<McpToolResult> {
+        self.call_tool_concurrent_with_meta(name, arguments, None)
+            .await
+    }
+
+    /// [`McpClient::call_tool_concurrent`] with an optional `_meta` object.
+    pub async fn call_tool_concurrent_with_meta(
+        &self,
+        name: &str,
+        arguments: Value,
+        meta: Option<Value>,
+    ) -> McpResult<McpToolResult> {
         let request = JsonRpcRequest::new(
             self.ids.next_id(),
             "tools/call",
-            Some(json!({ "name": name, "arguments": arguments })),
+            Some(call_params(name, arguments, meta)),
         );
         let started = Instant::now();
         let response = tokio::time::timeout(
@@ -649,6 +676,42 @@ mod tests {
         assert_eq!(
             params.as_ref().expect("tools/call params present"),
             &json!({ "name": "echo", "arguments": { "x": 1 } }),
+        );
+    }
+
+    /// `call_tool_with_meta` sends `_meta` beside the name and arguments, and omits it when `None`.
+    #[tokio::test]
+    async fn call_tool_with_meta_sends_meta() {
+        let transport = MockTransport::default();
+        let reqs = transport.requests.clone();
+        let ok = || MockTransport::ok(0, json!({"content": [], "isError": false}));
+        transport.push("tools/call", ok());
+        transport.push("tools/call", ok());
+        let mut client = client_with(transport);
+        client
+            .call_tool_with_meta(
+                "refund.issue",
+                json!({"amount_cents": 1}),
+                Some(json!({"approval_id": "ap_1"})),
+            )
+            .await
+            .unwrap();
+        client
+            .call_tool_with_meta("refund.issue", json!({}), None)
+            .await
+            .unwrap();
+        let reqs = reqs.lock().unwrap();
+        assert_eq!(
+            reqs[0].1,
+            Some(json!({
+                "name": "refund.issue",
+                "arguments": {"amount_cents": 1},
+                "_meta": {"approval_id": "ap_1"}
+            }))
+        );
+        assert_eq!(
+            reqs[1].1,
+            Some(json!({"name": "refund.issue", "arguments": {}}))
         );
     }
 

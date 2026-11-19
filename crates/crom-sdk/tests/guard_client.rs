@@ -12,11 +12,12 @@ use crom_core::events::{EnforcementLayer, SecurityDecision, SecurityOutcome};
 use crom_core::{ModelEvent, ModelProvider, ModelRequest, ProviderError, ToolCall};
 use crom_guard_server::{AdminAddr, ServerHandle};
 use crom_guard_testkit::{
-    operations, ApiCredential, BusinessApi, Ledger, RunningApi, SupportConfig,
+    operations, ApiCredential, BusinessApi, Effect, Ledger, RunningApi, SupportConfig,
 };
 use crom_sdk::fake_provider::ScriptedFakeProvider;
 use crom_sdk::{
-    AgentRequest, AgentRunStatus, AgentRuntime, FileStorage, GuardConnection, ProviderConfig,
+    AgentRequest, AgentRunStatus, AgentRuntime, CancellationHandle, FileStorage,
+    GuardApprovalRequest, GuardApprovalStep, GuardApprover, GuardConnection, ProviderConfig,
     SdkEvent, SecretString, SessionPolicy, ToolPolicy,
 };
 use futures::stream::BoxStream;
@@ -34,7 +35,8 @@ struct Guard {
     dir: tempfile::TempDir,
     mcp_url: String,
     server: Option<ServerHandle>,
-    _api: RunningApi,
+    api: Arc<BusinessApi>,
+    _running: RunningApi,
 }
 
 fn write_private(path: &Path, contents: &str) {
@@ -95,7 +97,8 @@ impl Guard {
             dir,
             mcp_url: format!("http://{}/mcp", server.agent_addr),
             server: Some(server),
-            _api: running,
+            api,
+            _running: running,
         }
     }
 
@@ -246,6 +249,17 @@ async fn run_crom(
     turns: Vec<Vec<ModelEvent>>,
     before_turn: Option<BeforeTurn>,
 ) -> RunOutput {
+    let connection =
+        GuardConnection::new(guard.mcp_url.clone(), SecretString::new(handle.to_owned()));
+    run_crom_with(connection, turns, before_turn, None).await
+}
+
+async fn run_crom_with(
+    connection: GuardConnection,
+    turns: Vec<Vec<ModelEvent>>,
+    before_turn: Option<BeforeTurn>,
+    cancel_slot: Option<Arc<OnceLock<CancellationHandle>>>,
+) -> RunOutput {
     let traces = trace_buffer();
     let storage_dir = tempfile::tempdir().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -255,8 +269,6 @@ async fn run_crom(
         turn: Mutex::new(0),
         before_turn,
     };
-    let connection =
-        GuardConnection::new(guard.mcp_url.clone(), SecretString::new(handle.to_owned()));
     let runtime = AgentRuntime::builder()
         .provider(ProviderConfig::fake(Arc::new(provider)))
         .tool_policy(ToolPolicy::guard(connection))
@@ -268,6 +280,9 @@ async fn run_crom(
         .session_policy(SessionPolicy::Persisted)
         .max_turns(3);
     let mut run = runtime.run(request).await.unwrap();
+    if let Some(slot) = cancel_slot {
+        let _ = slot.set(run.cancellation.clone());
+    }
     let mut events = Vec::new();
     while let Some(ev) = run.events.next().await {
         events.push(ev.unwrap());
@@ -550,4 +565,252 @@ async fn act_reaches_guard_only_for_planned_tools() {
         !audit.iter().any(|r| r["action"] == "invoice.list"),
         "{audit:?}"
     );
+}
+
+const REFUND: &str = "mcp__guard__refund_issue";
+
+#[derive(Clone, Copy)]
+enum ApproverMode {
+    Approve,
+    /// Approves, but the run is cancelled before the approver answers.
+    CancelThenApprove,
+    Decline,
+    Bogus,
+    Unsafe,
+}
+
+/// The trusted application's approver: reviews Guard's pending request over
+/// the admin API and approves it as a supervisor.
+struct AdminApprover {
+    admin: std::net::SocketAddr,
+    mode: ApproverMode,
+    seen: Mutex<Vec<GuardApprovalRequest>>,
+    /// Approval ids issued by Guard's admin API.
+    issued: Mutex<Vec<String>>,
+    cancel: Arc<OnceLock<CancellationHandle>>,
+}
+
+impl AdminApprover {
+    fn new(guard: &Guard, mode: ApproverMode) -> Arc<Self> {
+        let AdminAddr::Tcp(admin) = &guard.server.as_ref().unwrap().admin_addr else {
+            panic!("tcp admin listener expected");
+        };
+        Arc::new(Self {
+            admin: *admin,
+            mode,
+            seen: Mutex::new(Vec::new()),
+            issued: Mutex::new(Vec::new()),
+            cancel: Arc::new(OnceLock::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl GuardApprover for AdminApprover {
+    async fn request_approval(&self, request: GuardApprovalRequest) -> Option<String> {
+        self.seen.lock().unwrap().push(request.clone());
+        let http = reqwest::Client::new();
+        let base = format!("http://{}/admin/approvals", self.admin);
+        let pending: Value = http
+            .get(format!("{base}/{}", request.action_digest))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pending["action"], "refund.issue", "{pending}");
+        match self.mode {
+            ApproverMode::Decline => return None,
+            ApproverMode::Bogus => return Some(format!("ap_{}", "0".repeat(32))),
+            ApproverMode::Unsafe => return Some("ap_1\nInjected: x".into()),
+            ApproverMode::Approve | ApproverMode::CancelThenApprove => {}
+        }
+        let body: Value = http
+            .post(&base)
+            .bearer_auth(ADMIN_TOKEN)
+            .json(&json!({
+                "action_digest": request.action_digest,
+                "approver": {"id": "acme-supervisor", "role": "supervisor",
+                             "attrs": {"refund_limit_cents": {"long": 100000}}},
+                "approver_tenant": "acme",
+                "ttl_seconds": 300
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = body["approval_id"].as_str().unwrap().to_owned();
+        self.issued.lock().unwrap().push(id.clone());
+        if let ApproverMode::CancelThenApprove = self.mode {
+            self.cancel.get().expect("run started").cancel();
+        }
+        Some(id)
+    }
+}
+
+async fn run_refund_with(guard: &Guard, approver: Option<Arc<AdminApprover>>) -> RunOutput {
+    let handle = guard.issue_handle().await;
+    let mut connection = GuardConnection::new(guard.mcp_url.clone(), SecretString::new(handle));
+    let mut cancel_slot = None;
+    if let Some(a) = approver {
+        cancel_slot = Some(a.cancel.clone());
+        connection = connection.with_approver(a);
+    }
+    run_crom_with(
+        connection,
+        tool_turn(&[(
+            "r1",
+            REFUND,
+            json!({"invoice_id": "acme-inv-001", "amount_cents": 7500}),
+        )]),
+        None,
+        cancel_slot,
+    )
+    .await
+}
+
+fn refund_records(guard: &Guard) -> Vec<Value> {
+    guard
+        .audit()
+        .into_iter()
+        .filter(|r| r["action"] == "refund.issue" && r["record"] == "decision")
+        .collect()
+}
+
+/// With an approver, Guard's `approval_required` is approved through the admin API and the call is retried once with `_meta.approval_id`, executing exactly once.
+#[tokio::test]
+async fn approver_approval_retries_once_and_executes() {
+    let guard = Guard::start().await;
+    let approver = AdminApprover::new(&guard, ApproverMode::Approve);
+    let out = run_refund_with(&guard, Some(approver.clone())).await;
+
+    let seen = approver.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].server_name, "guard");
+    assert_eq!(seen[0].tool_name, "refund.issue");
+    assert_eq!(seen[0].required_role.as_deref(), Some("supervisor"));
+    assert_eq!(seen[0].tool_use_id.as_deref(), Some("r1"));
+
+    let d = decision(&out.decisions, "r1");
+    assert_eq!(seen[0].session_id, d.session_id.as_str());
+    assert_eq!(d.enforcement, EnforcementLayer::Guard, "{d:?}");
+    assert_eq!(d.outcome, SecurityOutcome::Executed, "{d:?}");
+    let approval = d.guard_approval.clone().expect("approval round recorded");
+    assert_eq!(approval.step, GuardApprovalStep::Retried);
+    assert!(!tool_completed_is_error(&out.events, "r1"));
+    let audit = guard.audit();
+    let executed: Vec<_> = audit
+        .iter()
+        .filter(|r| r["record"] == "outcome" && r["outcome"] == "executed")
+        .collect();
+    assert_eq!(executed.len(), 1, "{audit:?}");
+    assert_eq!(executed[0]["approver"]["id"], "acme-supervisor");
+    assert_eq!(
+        executed[0]["decision_id"].as_str(),
+        d.guard_decision_id.as_deref()
+    );
+    let decisions = refund_records(&guard);
+    assert_eq!(
+        decisions.len(),
+        2,
+        "first call and one retry: {decisions:?}"
+    );
+    assert_eq!(decisions[0]["decision"], "approval_required");
+    assert_eq!(
+        decisions[0]["decision_id"].as_str(),
+        approval.approval_required_decision_id.as_deref()
+    );
+}
+
+/// The approval id Guard issued appears in no Crom output: events, model requests, persisted session, or traces.
+#[tokio::test]
+async fn approval_id_canary_is_absent_from_crom_outputs() {
+    let guard = Guard::start().await;
+    let approver = AdminApprover::new(&guard, ApproverMode::Approve);
+    let out = run_refund_with(&guard, Some(approver.clone())).await;
+    assert_eq!(
+        decision(&out.decisions, "r1").outcome,
+        SecurityOutcome::Executed
+    );
+    // The retry really carried the id, and traces include the MCP requests.
+    assert!(out.outputs.contains("tools/call"));
+    let issued = approver.issued.lock().unwrap().clone();
+    assert_eq!(issued.len(), 1);
+    let id = &issued[0];
+    assert!(id.starts_with("ap_"), "{id}");
+    // Guard runs in this process and logs the ids it issues to the shared
+    // trace capture; only Crom's output is in scope here.
+    let crom: String = out
+        .outputs
+        .lines()
+        .filter(|l| !l.contains(" crom_guard_server::") && !l.contains(" crom_guard::"))
+        .collect();
+    assert!(!crom.contains(id.as_str()), "approval id leaked");
+    assert!(!crom.contains(id.trim_start_matches("ap_")));
+}
+
+/// A run cancelled while the approver is answering never sends the retry: Guard records one decision and the ledger has no refund.
+#[tokio::test]
+async fn cancel_during_approval_sends_no_retry_and_has_no_effect() {
+    let guard = Guard::start().await;
+    let approver = AdminApprover::new(&guard, ApproverMode::CancelThenApprove);
+    let out = run_refund_with(&guard, Some(approver.clone())).await;
+    assert_eq!(approver.issued.lock().unwrap().len(), 1, "approval issued");
+    let recs = refund_records(&guard);
+    assert_eq!(recs.len(), 1, "no retry reached Guard: {recs:?}");
+    assert_eq!(recs[0]["decision"], "approval_required");
+    let refunds: Vec<_> = guard
+        .api
+        .ledger()
+        .entries()
+        .into_iter()
+        .filter(|e| matches!(e.effect, Effect::Refund { .. }))
+        .collect();
+    assert!(refunds.is_empty(), "{refunds:?}");
+    // A cancelled run may end before it emits the call's decision.
+    if let Some(d) = out.decisions.iter().find(|d| d.tool_use_id == "r1") {
+        assert_eq!(d.outcome, SecurityOutcome::Blocked, "{d:?}");
+        assert_eq!(
+            d.guard_approval.as_ref().map(|a| a.step),
+            Some(GuardApprovalStep::Cancelled)
+        );
+    }
+}
+
+/// Without an approver, or when the approver declines, the call stays blocked with `approval_required` and is not retried.
+#[tokio::test]
+async fn no_or_declining_approver_leaves_approval_required() {
+    for mode in [None, Some(ApproverMode::Decline)] {
+        let guard = Guard::start().await;
+        let approver = mode.map(|m| AdminApprover::new(&guard, m));
+        let out = run_refund_with(&guard, approver).await;
+        let d = decision(&out.decisions, "r1");
+        assert_eq!(d.outcome, SecurityOutcome::Blocked, "{d:?}");
+        assert_eq!(d.reason.as_deref(), Some("approval_required"));
+        let recs = refund_records(&guard);
+        assert_eq!(recs.len(), 1, "one Guard decision, no retry: {recs:?}");
+    }
+}
+
+/// An approval id Guard does not recognize is retried once and blocked as `approval_invalid`; an id with unsafe characters is never sent.
+#[tokio::test]
+async fn bogus_or_unsafe_approval_ids_do_not_execute() {
+    let guard = Guard::start().await;
+    let approver = AdminApprover::new(&guard, ApproverMode::Bogus);
+    let out = run_refund_with(&guard, Some(approver)).await;
+    let d = decision(&out.decisions, "r1");
+    assert_eq!(d.outcome, SecurityOutcome::Blocked, "{d:?}");
+    assert_eq!(d.reason.as_deref(), Some("approval_invalid"));
+    assert_eq!(refund_records(&guard).len(), 2);
+
+    let guard = Guard::start().await;
+    let approver = AdminApprover::new(&guard, ApproverMode::Unsafe);
+    let out = run_refund_with(&guard, Some(approver)).await;
+    let d = decision(&out.decisions, "r1");
+    assert_eq!(d.reason.as_deref(), Some("approval_required"));
+    assert_eq!(refund_records(&guard).len(), 1);
 }

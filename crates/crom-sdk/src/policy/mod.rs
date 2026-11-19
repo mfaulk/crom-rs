@@ -258,6 +258,12 @@ pub struct GuardConnection {
     handle: SecretString,
     /// Per-request timeout; `None` uses the MCP default (60 s).
     pub request_timeout: Option<std::time::Duration>,
+    /// The trusted application's source of Guard approvals; `None` leaves
+    /// every `approval_required` result as a tool error.
+    pub approver: Option<Arc<dyn crom_core::guard::GuardApprover>>,
+    /// How long to wait for `approver`; `None` waits until it answers or the
+    /// run is cancelled.
+    pub approval_timeout: Option<std::time::Duration>,
 }
 
 impl GuardConnection {
@@ -266,11 +272,27 @@ impl GuardConnection {
             url: url.into(),
             handle,
             request_timeout: None,
+            approver: None,
+            approval_timeout: None,
         }
     }
 
     pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// On `approval_required`, ask `approver` and, given an approval id,
+    /// retry the call once with `_meta.approval_id` (`docs/sdk/guard.md`).
+    pub fn with_approver(mut self, approver: Arc<dyn crom_core::guard::GuardApprover>) -> Self {
+        self.approver = Some(approver);
+        self
+    }
+
+    /// Stop waiting for the approver after `timeout`; the call then stays
+    /// `approval_required` and is never retried.
+    pub fn with_approval_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.approval_timeout = Some(timeout);
         self
     }
 
@@ -292,6 +314,8 @@ impl std::fmt::Debug for GuardConnection {
             .field("url", &self.url)
             .field("handle", &"[REDACTED]")
             .field("request_timeout", &self.request_timeout)
+            .field("approver", &self.approver.is_some())
+            .field("approval_timeout", &self.approval_timeout)
             .finish()
     }
 }
@@ -344,6 +368,14 @@ impl ToolPolicy {
             names.push(format!("mcp__{GUARD_SERVER_NAME}__*"));
         }
         names
+    }
+
+    pub(crate) fn guard_approval(&self) -> Option<crom_core::guard::GuardApprovalHook> {
+        let guard = self.guard.as_ref()?;
+        Some(crom_core::guard::GuardApprovalHook {
+            approver: guard.approver.clone()?,
+            timeout: guard.approval_timeout,
+        })
     }
 
     /// The MCP options a run uses: only the Guard server, or MCP disabled.

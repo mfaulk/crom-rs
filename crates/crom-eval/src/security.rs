@@ -100,6 +100,7 @@ mod tests {
             outcome,
             reason: None,
             guard_decision_id: None,
+            guard_approval: None,
         })
     }
 

@@ -111,6 +111,7 @@ jobs:
           - headless-sdk-demo
           - tool-search-demo
           - tui-demo
+          - guard-support
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -440,6 +441,38 @@ jobs:
         run: |
           cargo test --locked -p crom-guard-server --lib check::
           cargo test --locked -p crom-guard-server --test cli check_
+
+  guard-reference-app:
+    name: guard / reference app (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # One target dir for the example crate and the crom-guard-support build it triggers.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: guard-reference-app
+      # #362: no lockfile flag, as in `examples / check` (the example ships its own Cargo.lock).
+      - name: Reference app unit tests
+        run: cargo test --manifest-path examples/guard-support/Cargo.toml
+      # Scripted Crom agent, offline: `crom-guard check` must pass before Guard
+      # starts, the MILESTONE_18 §14.2 matrix must match
+      # examples/guard-support/snapshots/scripted-matrix.txt and every evidence check must pass.
+      - name: Scripted demo (MILESTONE_18 §14.2 matrix)
+        run: |
+          cargo run --manifest-path examples/guard-support/Cargo.toml -- --agent scripted
+          jq -e '.checks[] | select(.check | startswith("crom-guard check")) | .pass' target/guard-demo/report.json
+          ! grep -q '^FAIL' target/guard-demo/guard-check.txt
+      - name: Upload demo artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: guard-demo
+          path: target/guard-demo/
+          if-no-files-found: ignore
 
   workflows:
     name: lint / workflows + spend-cap gate

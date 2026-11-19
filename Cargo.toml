@@ -29,6 +29,7 @@ exclude = [
     "examples/beta-demo",
     "examples/planning-demo",
     "examples/headless-sdk-demo",
+    "examples/guard-support",
 ]
 
 [workspace.package]

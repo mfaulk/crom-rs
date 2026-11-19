@@ -329,6 +329,7 @@ mod tests {
                 outcome,
                 reason: Some("nope".into()),
                 guard_decision_id: None,
+                guard_approval: None,
             })
         };
         let card = map_sdk_event(&mk(crom_core::events::SecurityOutcome::Blocked))

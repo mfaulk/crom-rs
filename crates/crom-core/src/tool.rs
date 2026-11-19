@@ -74,6 +74,11 @@ pub struct ToolContext {
     /// `None` for tool invocations outside a turn loop. M6 uses this to
     /// link a subagent run to a specific Agent-tool call in the parent.
     pub tool_call_id: Option<String>,
+    /// The run's cancel flag, for tools that wait on something other than
+    /// their own work (a Guard approval). `None` outside the loop.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The run's Guard approver; only Guard MCP tools read it.
+    pub guard_approval: Option<crate::guard::GuardApprovalHook>,
 }
 
 impl ToolContext {
@@ -86,6 +91,8 @@ impl ToolContext {
             run_id: None,
             turn_index: 0,
             tool_call_id: None,
+            cancel: None,
+            guard_approval: None,
         }
     }
 }
