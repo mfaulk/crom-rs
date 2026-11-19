@@ -10,8 +10,8 @@ pub const ACTION_DIGEST_DOMAIN: &[u8] = b"crom-guard/action-digest/v1\0";
 
 impl ActionDigest {
     /// The digest an approval is bound to (MILESTONE_18 §9.4). The PDP uses
-    /// it for `ApprovalRequired`, and the approval store (#354) must call
-    /// this same function to match a retried request.
+    /// it for `ApprovalRequired`, and the pipeline recomputes it with this
+    /// same function to match a retried request to a stored approval.
     ///
     /// Canonical encoding (v1). The digest is SHA-256 over:
     ///

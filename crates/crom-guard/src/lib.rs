@@ -14,6 +14,7 @@
 #![warn(missing_debug_implementations)]
 
 mod action;
+mod approval;
 mod audit;
 mod context;
 mod credential;
@@ -36,6 +37,11 @@ mod value;
 pub use action::{
     ApprovalContext, AuthorizationContext, AuthorizationRequest, AuthorizedAction,
     ReservedContextKey, ValidatedArgs, RESERVED_CONTEXT_KEYS,
+};
+pub use approval::{
+    ApprovalError, ApprovalSpec, ApprovalStatus, ApprovalStoreConfig, IssuedApproval,
+    MemoryApprovalStore, PendingApproval, DEFAULT_APPROVAL_MAX_TTL_SECONDS, DEFAULT_MAX_APPROVALS,
+    DEFAULT_MAX_PER_ISSUER, DEFAULT_PENDING_TTL_SECONDS,
 };
 pub use audit::{
     verify_file, verify_log, verify_log_with, AuditEntry, AuditStorage, ChainSummary,

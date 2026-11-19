@@ -65,13 +65,14 @@ impl AuthorizationContext {
     }
 }
 
-/// A stored approval that matched the request (digest, grant, expiry,
-/// unused). Becomes `context.approval`. Only the approval store builds it
-/// (#354); the approver comes from the trusted application's admin call.
+/// A stored approval that matched the request (digest, version, tenant,
+/// expiry, unused). Becomes `context.approval`. Only
+/// [`MemoryApprovalStore`](crate::MemoryApprovalStore) builds it; the
+/// approver comes from the trusted application's admin call.
 ///
 /// The approver has no tenant here, so the PDP gives it the principal's
-/// tenant. The approval store must reject an approver from another tenant
-/// before building this value; the Cedar tenant test is defense in depth.
+/// tenant. The store rejects an approver from another tenant before
+/// building this value; the Cedar tenant test is defense in depth.
 ///
 /// ```compile_fail
 /// let a = crom_guard::ApprovalContext {
@@ -89,7 +90,6 @@ pub struct ApprovalContext {
 }
 
 impl ApprovalContext {
-    #[allow(dead_code)] // used by the approval store (#354)
     pub(crate) fn new(approval_id: ApprovalId, approver: Delegator, fields: Attrs) -> Self {
         Self {
             approval_id,

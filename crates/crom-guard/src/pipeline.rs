@@ -23,11 +23,12 @@ use crate::audit::{
 };
 use crate::context::ExecutionContext;
 use crate::credential::CredentialBroker;
-use crate::decision::{ActionDigest, Decision, DenyReason};
+use crate::decision::{ActionDigest, ApprovalRequirement, Decision, DenyReason};
 use crate::handle::SessionHandle;
 use crate::ids::{ApprovalId, DecisionId};
 use crate::registry::{OpKind, OperationRegistry, Registered};
 use crate::resolution::{race, ResolveTimer};
+use crate::resource::ResolvedResource;
 use crate::time::{Clock, Timestamp};
 use crate::traits::{
     BoxFuture, ExecuteError, ExecutionOutput, GrantStore, PolicyDecisionPoint, ResolveError, Sealed,
@@ -100,23 +101,35 @@ impl CallOutcome {
 pub const PRECONDITION_FAILED: &str = "precondition_failed";
 pub const EXECUTION_FAILED: &str = "execution_failed";
 
-/// Matches a presented approval to the request (extension point for #354).
-/// Sealed: only this crate builds an [`ApprovalContext`]. `verify` must
-/// check that the stored approval is for exactly `digest` and the leaf
-/// grant of `ctx`, is unexpired at `now`, and is unused, and must mark it
-/// used atomically; any failure is `ApprovalInvalid`.
+/// Matches a presented approval to the request. Sealed: only this crate
+/// builds an [`ApprovalContext`]. `verify` must check that the stored
+/// approval is for exactly `digest` (which binds the leaf grant of `ctx`)
+/// and `resource`'s version, that its approver is in the principal's
+/// tenant, that it is unexpired at `now` and unused, and must mark it used
+/// atomically; any failure is `ApprovalInvalid`. Implemented by
+/// [`MemoryApprovalStore`](crate::MemoryApprovalStore).
 pub trait ApprovalVerifier: Sealed + Send + Sync {
     fn verify<'a>(
         &'a self,
         approval_id: &'a ApprovalId,
         ctx: &'a ExecutionContext,
         digest: &'a ActionDigest,
+        resource: &'a ResolvedResource,
         now: Timestamp,
     ) -> BoxFuture<'a, Result<ApprovalContext, DenyReason>>;
+
+    /// Called after an `ApprovalRequired` decision record is written, so
+    /// the store can keep what is to be approved. The default keeps nothing.
+    fn record_pending(
+        &self,
+        _request: &AuthorizationRequest<'_>,
+        _requirement: &ApprovalRequirement,
+        _now: Timestamp,
+    ) {
+    }
 }
 
-/// The default until approvals exist (#354): every presented approval is
-/// `ApprovalInvalid`.
+/// The default: every presented approval is `ApprovalInvalid`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoApprovals;
 
@@ -128,6 +141,7 @@ impl ApprovalVerifier for NoApprovals {
         _: &'a ApprovalId,
         _: &'a ExecutionContext,
         _: &'a ActionDigest,
+        _: &'a ResolvedResource,
         _: Timestamp,
     ) -> BoxFuture<'a, Result<ApprovalContext, DenyReason>> {
         Box::pin(async { Err(DenyReason::ApprovalInvalid) })
@@ -405,7 +419,9 @@ impl Call<'_> {
                     resource.uid(),
                     &args,
                 );
-                match guarded(|| g.approvals.verify(&id, &ctx, &digest, now)).await {
+                // Fresh: expiry is judged after resolution, not at call start.
+                let now = g.clock.now();
+                match guarded(|| g.approvals.verify(&id, &ctx, &digest, &resource, now)).await {
                     Ok(Ok(a)) => Some(a),
                     Ok(Err(_)) | Err(Panicked) => {
                         return self.deny(DenyReason::ApprovalInvalid).await
@@ -449,6 +465,11 @@ impl Call<'_> {
                 self.rec.outcome = Some(Outcome::Blocked);
                 if let Err(r) = self.write_decision().await {
                     return *r;
+                }
+                let now = g.clock.now();
+                if guarded_sync(|| g.approvals.record_pending(&request, &requirement, now)).is_err()
+                {
+                    tracing::warn!(stage = "record_pending", "approval store panicked");
                 }
                 return self.respond(CallResult::ApprovalRequired {
                     role: requirement.role,
