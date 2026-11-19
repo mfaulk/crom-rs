@@ -584,10 +584,17 @@ pub(crate) async fn run_loop(
         && !options.agents.is_empty()
         && agent_tool_allowed
     {
+        // Children draw from the parent's name-filtered registry, never the
+        // unfiltered one, so they cannot reach tools the parent cannot (#342).
+        let child_base_tools = if options.allowed_tools.is_empty() {
+            tools.clone()
+        } else {
+            tools.filter(&options.allowed_tools)
+        };
         let runtime = crate::agents::SubagentRuntime::new(
             Arc::new(options.agents.clone()),
             provider.clone(),
-            tools.clone(),
+            child_base_tools,
             options.clone(),
             hooks.clone(),
             options.agent_runtime.clone(),

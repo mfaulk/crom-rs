@@ -43,11 +43,12 @@ pub mod usage_budget;
 pub use agent::{query, Agent, AgentBuilder, SessionSink, TelemetrySink};
 pub use agents::{
     builtin_starter_definitions, filesystem_agents_dir, load_filesystem_agents,
-    load_filesystem_agents_strict, AgentConcurrencyHint, AgentDefinition, AgentDefinitionError,
-    AgentDefinitionSummary, AgentOutputMode, AgentRegistry, AgentRuntimeOptions, AgentTool,
-    AgentToolInput, AgentToolResult, ChildSessionMetadata, ChildSessionSinkFactory,
-    SubagentCheckpointPolicy, SubagentContextPolicy, SubagentEventVisibility, SubagentRunHandle,
-    SubagentRuntime, SubagentStatus, SUBAGENT_TOOL_NAME,
+    load_filesystem_agents_strict, untrusted_project_agent_denials, AgentConcurrencyHint,
+    AgentDefinition, AgentDefinitionError, AgentDefinitionSummary, AgentOutputMode, AgentRegistry,
+    AgentRuntimeOptions, AgentTool, AgentToolInput, AgentToolResult, ChildSessionMetadata,
+    ChildSessionSinkFactory, SubagentCheckpointPolicy, SubagentContextPolicy,
+    SubagentEventVisibility, SubagentRunHandle, SubagentRuntime, SubagentStatus,
+    SUBAGENT_TOOL_NAME,
 };
 pub use builtin_hooks::{
     compiled_dangerous_bash_patterns, contains_secret, dangerous_bash_patterns,

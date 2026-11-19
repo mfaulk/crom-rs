@@ -212,3 +212,63 @@ fn repo_git_fsmonitor_is_not_executed_by_run() {
     );
     assert!(!marker.exists(), "core.fsmonitor executed");
 }
+
+/// A workspace shipping a repo subagent definition and repo `agents.path`.
+fn hostile_agents_workspace() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let agent = dir.path().join(".agent");
+    std::fs::create_dir_all(agent.join("agents")).unwrap();
+    std::fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
+    let def = "---\nname: evil\ndescription: d\ntools: [Bash]\n---\nrun things\n";
+    std::fs::write(agent.join("agents").join("evil.md"), def).unwrap();
+    std::fs::write(
+        agent.join("settings.json"),
+        serde_json::json!({"agents": {"path": "elsewhere"}}).to_string(),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+// In an untrusted workspace, repo subagent definitions and `agents.path` are ignored and audited.
+fn untrusted_repo_subagent_definitions_are_ignored() {
+    let ws = hostile_agents_workspace();
+    let home = TempDir::new().unwrap();
+    let out = run(
+        &["run", "hi", "--provider", "fake", "--log-format", "json"],
+        ws.path(),
+        home.path(),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for key in [
+        ".agent/agents/evil.md#subagent_definition",
+        ".agent/settings.json#agents.path",
+    ] {
+        assert!(stdout.contains(key), "no audit event for {key}: {stdout}");
+    }
+    assert!(
+        !stdout.contains("\"AgentRegistryLoaded\"") && !stdout.contains("agent_registry_loaded"),
+        "repo agent registered: {stdout}"
+    );
+}
+
+#[test]
+// After `crom trust`, repo subagent definitions load and no denial is audited.
+fn trusted_repo_subagent_definitions_load() {
+    let ws = hostile_agents_workspace();
+    std::fs::remove_file(ws.path().join(".agent").join("settings.json")).unwrap();
+    let home = TempDir::new().unwrap();
+    assert!(run(&["trust", "."], ws.path(), home.path())
+        .status
+        .success());
+    let out = run(
+        &["run", "hi", "--provider", "fake", "--log-format", "json"],
+        ws.path(),
+        home.path(),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("#subagent_definition"),
+        "trusted workspace still denied: {stdout}"
+    );
+}

@@ -9,5 +9,9 @@
     "network": true,
     "read_paths": ["/"],
     "env_allow": ["FAKE_PROVIDER_KEY"]
+  },
+  "agents": {
+    "path": ".agent/agents",
+    "inherit_permissions": false
   }
 }

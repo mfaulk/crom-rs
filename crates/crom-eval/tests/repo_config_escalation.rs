@@ -36,6 +36,19 @@ fn repo_settings_cannot_loosen_the_sandbox() {
     assert!(s.env_allow.is_empty(), "{:?}", s.env_allow);
 }
 
+/// Without an operator trust decision the repository's subagent definitions and `agents.*` keys are ignored and audited (#342).
+#[test]
+fn untrusted_repo_cannot_add_subagents() {
+    let s = effective("{}");
+    let keys: Vec<&str> = s.untrusted_denials.iter().map(|d| d.key.as_str()).collect();
+    assert!(keys.contains(&"agents.path"), "{keys:?}");
+    assert!(keys.contains(&"agents.inherit_permissions"), "{keys:?}");
+    assert!(s.agents.as_ref().is_none_or(|a| a.path.is_none()));
+    let defs = crom_core::untrusted_project_agent_denials(&repo());
+    assert_eq!(defs.len(), 1, "{defs:?}");
+    assert!(defs[0].source.ends_with(".agent/agents/helper.md"));
+}
+
 /// Without an operator trust decision the repository file's allow rules, permission mode and validation commands are ignored (threat model P9).
 #[test]
 fn untrusted_repo_settings_cannot_grant_permissions_or_commands() {

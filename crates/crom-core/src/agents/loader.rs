@@ -33,6 +33,31 @@ pub fn filesystem_agents_dir(cwd: &Path) -> PathBuf {
     cwd.join(".agent").join("agents")
 }
 
+/// One denial per project-local definition file. Callers load
+/// [`filesystem_agents_dir`] only for a trusted workspace (threat model P9);
+/// in an untrusted one these are reported instead.
+pub fn untrusted_project_agent_denials(cwd: &Path) -> Vec<crate::trust::UntrustedConfigDenial> {
+    let Ok(entries) = std::fs::read_dir(filesystem_agents_dir(cwd)) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .map(|p| {
+            crate::trust::UntrustedConfigDenial::new(
+                p,
+                "subagent_definition",
+                "untrusted workspace cannot add subagent definitions",
+            )
+        })
+        .collect()
+}
+
 /// Load every `*.md` definition under `dir`. Skips non-`.md` files and files
 /// that are *not* contained inside `dir` (symlink-escape protection). Errors
 /// from individual files are collected and returned as the second element of

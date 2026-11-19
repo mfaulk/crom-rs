@@ -83,7 +83,7 @@ pub fn cmd_untrust(args: UntrustArgs) -> Result<()> {
 /// Repo-local config an untrusted workspace would have applied: denied
 /// settings keys plus `.agent/mcp.json` when present.
 pub fn pending_repo_config(cwd: &Path, settings: &Settings) -> Vec<String> {
-    if settings.workspace_trust.is_trusted() {
+    if settings.workspace_trust.is_trusted() || trust::workspace_trust(cwd).is_trusted() {
         return Vec::new();
     }
     let mut out: Vec<String> = settings
@@ -94,7 +94,25 @@ pub fn pending_repo_config(cwd: &Path, settings: &Settings) -> Vec<String> {
     if cwd.join(".agent").join("mcp.json").exists() {
         out.push(".agent/mcp.json: MCP servers".into());
     }
+    for d in crom_core::untrusted_project_agent_denials(cwd) {
+        let file = d
+            .source
+            .strip_prefix(cwd)
+            .unwrap_or(&d.source)
+            .display()
+            .to_string();
+        out.push(format!("{file}: subagent definition"));
+    }
     out
+}
+
+/// Project subagent definitions skipped because the workspace is untrusted.
+fn project_agent_denials(cwd: &Path, settings: &Settings) -> Vec<UntrustedConfigDenial> {
+    if settings.workspace_trust.is_trusted() || trust::workspace_trust(cwd).is_trusted() {
+        Vec::new()
+    } else {
+        crom_core::untrusted_project_agent_denials(cwd)
+    }
 }
 
 /// Interactive only (stdin and stderr are terminals): ask whether to trust
@@ -159,6 +177,7 @@ pub fn trust_denial_decisions(
         .iter()
         .cloned()
         .chain(mcp_denials)
+        .chain(project_agent_denials(cwd, settings))
         .enumerate()
         .map(|(i, d)| d.to_security_decision(&session_id, &run_id, cwd, i))
         .collect()
@@ -192,6 +211,40 @@ mod tests {
                     ask_trust(ws.path(), &pending, &mut "Y\n".as_bytes(), &mut Vec::new()).unwrap();
                 assert!(trusted);
                 assert!(trust::workspace_trust(ws.path()).is_trusted());
+            },
+        );
+    }
+
+    #[test]
+    // Repo subagent definitions are pending config and audited denials until the workspace is trusted.
+    fn project_agents_are_denied_until_trusted() {
+        let home = tempfile::TempDir::new().unwrap();
+        let ws = tempfile::TempDir::new().unwrap();
+        let cwd = ws.path().canonicalize().unwrap();
+        std::fs::create_dir_all(cwd.join(".agent/agents")).unwrap();
+        std::fs::write(cwd.join(".agent/agents/evil.md"), "x").unwrap();
+        std::fs::write(cwd.join(".agent/agents/notes.txt"), "x").unwrap();
+        temp_env::with_vars(
+            [
+                ("CROM_CONFIG_HOME", Some(home.path().to_str().unwrap())),
+                ("CODE_AGENT_CONFIG_HOME", None),
+            ],
+            || {
+                let s = Settings::default();
+                let mcp = crom_mcp::McpOptions::default();
+                assert_eq!(
+                    pending_repo_config(&cwd, &s),
+                    vec![".agent/agents/evil.md: subagent definition".to_string()]
+                );
+                let ds = trust_denial_decisions(&cwd, &s, &mcp);
+                assert_eq!(ds.len(), 1);
+                assert_eq!(
+                    ds[0].resource.as_deref(),
+                    Some(".agent/agents/evil.md#subagent_definition")
+                );
+                trust::set_workspace_trust(&cwd, WorkspaceTrust::Trusted).unwrap();
+                assert!(pending_repo_config(&cwd, &s).is_empty());
+                assert!(trust_denial_decisions(&cwd, &s, &mcp).is_empty());
             },
         );
     }
