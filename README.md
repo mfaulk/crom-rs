@@ -80,7 +80,9 @@ Several important pieces are not built yet:
   `crates/crom-guard-server` (binary `crom-guard`) serves it to any MCP client
   over Streamable HTTP, with a separate admin API for grants and approvals
   ([docs/guard/server.md](docs/guard/server.md)): `crom-guard serve --config
-  guard.toml`, `crom-guard policy validate`, `crom-guard audit verify <log>`.
+  guard.toml`, `crom-guard policy validate`, `crom-guard audit verify <log>`, and the
+  isolation preflight `crom-guard check`
+  ([docs/guard/deployment.md](docs/guard/deployment.md)).
   Crom itself connects to Guard as an MCP client (`ToolPolicy::guard` in the
   SDK, or `"guard": true` on an http MCP server) and records each call at the
   `guard` audit layer with Guard's decision id

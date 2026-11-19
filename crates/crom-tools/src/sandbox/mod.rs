@@ -35,6 +35,21 @@ pub fn probe(cfg: &SandboxConfig) -> Result<SandboxInfo, String> {
     }
 }
 
+/// Paths every sandboxed command may read before `sandbox.read_paths`,
+/// computed from the current environment. Empty where there is no backend.
+/// `crom-guard check` keeps its own copy, pinned to this by
+/// `crom-guard-testkit/tests/bypass.rs`.
+pub fn builtin_read_paths() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::builtin_read_paths()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Parent-side handle for a sandboxed spawn; keep it alive until the child
 /// has been reaped (it owns the private tmp dir).
 pub(crate) struct Prepared {

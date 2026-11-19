@@ -190,9 +190,8 @@ suite that measures executed effects is [`adversarial-suite.md`](adversarial-sui
 
 ## 9. Crom Guard (M18)
 
-Planned; nothing in this section is implemented yet beyond the empty crates
-and the dependency check from ADR 0002. Statements here are the targets the
-M18 tests must meet.
+Statements here are the targets the M18 tests must meet. The Status column
+of §9.2 records which properties the M18 tests now cover.
 
 ### 9.1 Supported deployment
 
@@ -215,6 +214,10 @@ What does not: every policy decision, tenant isolation through the protected
 API, expiry, revocation, attenuation, and approval binding (GP1–GP5, GP7,
 GP8). Those hold for any client, including the unsandboxed Python client.
 
+The isolation profile that makes GP6 hold, and the `crom-guard check`
+preflight that refuses deployments outside it, are in
+[`docs/guard/deployment.md`](../guard/deployment.md) (#360).
+
 ### 9.2 Guard properties
 
 GP1–GP6 are the falsifiable claims of [`MILESTONE_18.md` §18](../milestones/MILESTONE_18.md#18-measurable-acceptance-criteria);
@@ -228,7 +231,7 @@ This table is the property-coverage table reused by #364.
 | GP3 | An agent cannot obtain a child grant with an action, constraint, expiry, or depth exceeding its own. | Attenuation tests in #353 (each widening dimension rejected); broader-child-grant scenario in #361 | Planned |
 | GP4 | A grant is unusable after expiry or revocation for every request that starts after the revocation is recorded. | Lifecycle tests in #348 (expiry, revoke, re-check immediately before execute, MILESTONE_18 §10.2 step 6); replay scenario in #361 | Planned |
 | GP5 | Every protected effect in the business ledger has exactly one Guard `executed` record, and the audit chain verifies. | Hash-chain and `audit verify` tests in #352; ledger reconciliation in #361 and #363 | Planned |
-| GP6 | In the supported deployment, agent Bash cannot reach the business API or read Guard's credential, state, or audit log. | Alternate-path bypass tests and preflight in #360 (sandbox `required`: `executed = 0`; `off`: probes live) | Planned |
+| GP6 | In the supported deployment, agent Bash cannot reach the business API or read Guard's credential, state, or audit log. | #360: `crates/crom-guard-testkit/tests/bypass.rs` (G13, G14, G16, G18 from agent Bash; sandbox `required`: no unmediated ledger effect, audit verifies; `off`: every probe fires; the same attacks as a separate uid) and the `crom-guard check` preflight (`crates/crom-guard-server/src/check.rs`, one test per failing condition). CI: `guard / isolation (linux)`. Profile: [deployment.md](../guard/deployment.md) | Tested |
 | GP7 | Guard fails closed: a missing, unknown, expired, or revoked handle; an unknown action name; arguments failing the schema; an unresolvable resource; any Cedar evaluation error; or a policy set failing schema validation each yield deny (or refusal to start), never allow. | PDP fail-closed tests in #349; pipeline tests in #351 | Planned |
 | GP8 | Audit before execute: if the `decision` record cannot be written, the executor is not called; executors accept only a sealed `AuthorizedAction` with no public constructor. | Pipeline tests with a failing audit sink in #351 and #352 (no ledger effect) | Planned |
 
@@ -244,8 +247,14 @@ Crom as a client relies on P9 and the #341–#343 fixes.
 - Bugs in application-supplied resolvers or executors (trusted code; Guard
   cannot make a buggy executor safe).
 - A process running as Guard's user outside the sandbox reading Guard's
-  credential file. Running Guard as a separate user is recommended, not
-  enforced.
+  credential file, including the Crom host process of a sandboxed agent on
+  Guard's uid. Running the agent as a separate user removes this;
+  `crom-guard check --agent-user` verifies that profile, but nothing forces
+  an operator to use it.
+- An agent under a separate uid can still reach the business API over
+  loopback; only the API's own authentication (credential held by Guard)
+  stops it. Removing the route needs a network namespace or firewall rule
+  outside Guard's view.
 - Bypass guarantees (GP6) on platforms without the Linux sandbox. Guard-only
   properties still hold there.
 - User authentication by the trusted application, OAuth 2.1 resource-server

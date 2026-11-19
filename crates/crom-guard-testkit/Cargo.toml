@@ -24,6 +24,10 @@ tempfile = { workspace = true }
 # and the server lanes of tests/guard_adversarial.rs.
 # crom-guard-server must not depend on this crate (scripts/check-guard-deps.sh).
 crom-guard-server = { path = "../crom-guard-server" }
+# Bypass tests (tests/bypass.rs): the agent's Bash runs through Crom's own
+# Bash tool and OS sandbox, and the reference Crom settings must parse.
+crom-core = { workspace = true }
+crom-tools = { workspace = true }
 jsonschema = { version = "0.61", default-features = false }
 # Canary test: captures every trace event.
 tracing = { workspace = true }

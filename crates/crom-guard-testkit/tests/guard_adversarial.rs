@@ -15,7 +15,7 @@ use crom_guard_server::{AdminAddr, Config, ServerHandle};
 use crom_guard_testkit::scenario::{
     credentials_json, fixtures, read_audit, run, scenario_ids, skipped, unmediated_effects,
     AdminRequest, AuditView, CallRequest, DirectEnv, Fixture, InProcessEnv, Mode, Observed,
-    ScenarioEnv, ScenarioReport, Status, SuiteReport, POLICIES, SCHEMA,
+    ScenarioEnv, ScenarioReport, SuiteReport, POLICIES, SCHEMA,
 };
 use crom_guard_testkit::{
     support_registry, ApiCredential, BusinessApi, Effect, Ledger, LedgerEntry, RunningApi,
@@ -391,7 +391,7 @@ fn guard_failures(r: &ScenarioReport) -> Vec<String> {
     out
 }
 
-/// G1–G18 are all present once, every runnable fixture has an attack and a legitimate step, and every placeholder names #360 and a reason.
+/// G1–G18 are all present once with no placeholder left, every isolation fixture names known attacks and has no steps, and every other fixture has an attack and a legitimate step.
 #[test]
 fn catalog_covers_g1_to_g18() {
     let all = fixtures();
@@ -400,11 +400,20 @@ fn catalog_covers_g1_to_g18() {
     assert_eq!(ids, want);
     assert_eq!(all.len(), 18);
     for f in &all {
-        match &f.placeholder {
-            Some(p) => {
-                assert_eq!(p.tracking_issue, "#360", "{}", f.scenario);
-                assert!(!p.reason.is_empty(), "{}", f.scenario);
-                assert!(f.steps.is_empty(), "{}: placeholder with steps", f.scenario);
+        assert!(f.placeholder.is_none(), "{}: placeholder", f.scenario);
+        match &f.isolation {
+            Some(i) => {
+                assert!(!i.attacks.is_empty(), "{}: no attack", f.scenario);
+                assert!(f.steps.is_empty(), "{}: isolation with steps", f.scenario);
+                #[cfg(target_os = "linux")]
+                for a in &i.attacks {
+                    assert!(
+                        isolation::Attack::parse(a).is_some()
+                            || PREFLIGHT_ATTACKS.contains(&a.as_str()),
+                        "{}: unknown attack {a}",
+                        f.scenario
+                    );
+                }
             }
             None => {
                 assert!(f.attacks() > 0, "{}: no attack", f.scenario);
@@ -419,7 +428,12 @@ fn catalog_covers_g1_to_g18() {
             }
         }
     }
-    assert!(all.iter().filter(|f| f.placeholder.is_none()).count() >= 12);
+    let isolation: Vec<&str> = all
+        .iter()
+        .filter(|f| f.isolation.is_some())
+        .map(|f| f.scenario.as_str())
+        .collect();
+    assert_eq!(isolation, ["G13", "G14", "G17", "G18"]);
 }
 
 /// Every runnable scenario executes no attack and reproduces its exact ledger and audit expectations with Guard in process, behind the reference server, and through the Python client, while without Guard every Guard-dependent scenario's attacks take effect.
@@ -442,6 +456,10 @@ async fn scenarios_execute_nothing_with_guard_and_something_without() {
             ] {
                 reports.push(skipped(&fx, mode, &p.reason, Some(&p.tracking_issue)));
             }
+            continue;
+        }
+        if fx.isolation.is_some() {
+            reports.extend(isolation_lanes(&fx, &mut failures).await);
             continue;
         }
         let r = run(&fx, &InProcessEnv::start().await).await;
@@ -490,13 +508,6 @@ async fn scenarios_execute_nothing_with_guard_and_something_without() {
     }
     let suite = SuiteReport::new(reports);
     write_report(&suite);
-    assert!(
-        suite
-            .scenarios
-            .iter()
-            .any(|r| matches!(r.status, Status::Skipped)),
-        "placeholders must be reported as skipped"
-    );
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
@@ -533,23 +544,270 @@ async fn unmediated_and_tampered_audit_probes_fire() {
     assert!(read_audit(&path).verified.is_err());
 }
 
-macro_rules! isolation_placeholder {
-    ($name:ident, $id:literal) => {
-        /// Placeholder: this scenario needs OS isolation and is tracked in #360; running it fails until it is implemented there.
-        #[test]
-        #[ignore = "needs OS isolation (#360)"]
-        fn $name() {
-            let fx = fixtures().into_iter().find(|f| f.scenario == $id).unwrap();
-            let p = fx.placeholder.expect("still a placeholder");
-            panic!(
-                "{} not implemented here: {} ({})",
-                $id, p.reason, p.tracking_issue
-            );
-        }
-    };
+#[cfg(target_os = "linux")]
+mod isolation;
+#[cfg(target_os = "linux")]
+isolation::guard_host_test!();
+
+/// G17's attacks: agent configurations `crom-guard check` must refuse.
+#[cfg(target_os = "linux")]
+const PREFLIGHT_ATTACKS: [&str; 2] = ["second_mcp_server", "plugin_mcp"];
+
+/// The OS-isolation (G13, G14, G18) and preflight (G17) lanes (#360).
+#[cfg(not(target_os = "linux"))]
+async fn isolation_lanes(fx: &Fixture, _failures: &mut Vec<String>) -> Vec<ScenarioReport> {
+    eprintln!("SKIP {}: the isolation profile is Linux-only", fx.scenario);
+    vec![skipped(
+        fx,
+        Mode::SandboxRequired,
+        "the isolation profile is Linux-only",
+        Some("#360"),
+    )]
 }
 
-isolation_placeholder!(g13_direct_api_bypass_needs_isolation, "G13");
-isolation_placeholder!(g14_credential_access_needs_isolation, "G14");
-isolation_placeholder!(g17_malicious_tool_description_needs_preflight, "G17");
-isolation_placeholder!(g18_audit_tampering_needs_isolation, "G18");
+/// The OS-isolation (G13, G14, G18) and preflight (G17) lanes (#360): with
+/// the sandbox required (with and without network) and as a separate uid
+/// nothing may execute; with the sandbox off every attack must.
+#[cfg(target_os = "linux")]
+async fn isolation_lanes(fx: &Fixture, failures: &mut Vec<String>) -> Vec<ScenarioReport> {
+    use isolation::Agent;
+    let attacks = &fx.isolation.as_ref().unwrap().attacks;
+    if attacks
+        .iter()
+        .all(|a| PREFLIGHT_ATTACKS.contains(&a.as_str()))
+    {
+        let r = preflight_lane(fx).await;
+        failures.extend(isolation_failures(&r));
+        return vec![r];
+    }
+    let mut out = Vec::new();
+    let lanes = [
+        (Mode::SandboxRequired, Agent::Sandboxed { network: false }),
+        (
+            Mode::SandboxRequiredNetwork,
+            Agent::Sandboxed { network: true },
+        ),
+        (Mode::SandboxOff, Agent::Unsandboxed),
+    ];
+    match isolation::sandbox_unavailable() {
+        Some(why) => {
+            isolation::required_or_skip(&why, isolation::REQUIRE_SANDBOX);
+            for (mode, _) in lanes {
+                out.push(skipped(fx, mode, &why, None));
+            }
+        }
+        None => {
+            for (mode, agent) in lanes {
+                out.push(bash_lane(fx, mode, agent).await);
+            }
+        }
+    }
+    match isolation::separate_uid_unavailable() {
+        Some(why) => {
+            isolation::required_or_skip(&why, isolation::REQUIRE_SEPARATE_UID);
+            out.push(skipped(fx, Mode::SeparateUid, &why, None));
+        }
+        None => out.push(bash_lane(fx, Mode::SeparateUid, Agent::SeparateUid).await),
+    }
+    for r in &out {
+        if matches!(r.status, crom_guard_testkit::scenario::Status::Ran) {
+            failures.extend(isolation_failures(r));
+        }
+    }
+    out
+}
+
+/// Every attack of `fx` from agent Bash, each against a fresh deployment
+/// (an attack that succeeds must not mask the next). The ledger and audit
+/// figures sum over the deployments.
+#[cfg(target_os = "linux")]
+async fn bash_lane(fx: &Fixture, mode: Mode, agent: isolation::Agent) -> ScenarioReport {
+    use crom_guard_testkit::scenario::{
+        isolation_report, AuditReport, LedgerReport, StepReport, StepVerdict,
+    };
+    use isolation::{Attack, Deployment};
+    let mut steps = Vec::new();
+    let mut notes = Vec::new();
+    let mut ledger = LedgerReport {
+        matches_expected: true,
+        ..Default::default()
+    };
+    let mut audit = AuditReport {
+        verified: Some(true),
+        ..Default::default()
+    };
+    for name in &fx.isolation.as_ref().unwrap().attacks {
+        let d = Deployment::start().await;
+        let head = d.audit_head();
+        let attack = Attack::parse(name).unwrap();
+        let o = d.attack(attack, agent).await;
+        let breaches = o.breaches(agent);
+        let verdict = if !o.ran || o.tool_error {
+            notes.push(format!("{name}: did not run: {}", o.output.trim()));
+            StepVerdict::NotAttempted
+        } else if !breaches.is_empty() {
+            StepVerdict::Executed
+        } else if o.denied {
+            StepVerdict::BlockedBySandbox
+        } else {
+            StepVerdict::NoEffect
+        };
+        if verdict == StepVerdict::NoEffect {
+            notes.push(format!(
+                "{name}: reached the business API, which answered 401"
+            ));
+        }
+        steps.push(StepReport {
+            name: name.clone(),
+            tool: Some("bash".into()),
+            attack: true,
+            expected: Some(
+                if mode.isolated() {
+                    "blocked"
+                } else {
+                    "executed"
+                }
+                .into(),
+            ),
+            got: Some(if o.denied { "denied" } else { "ran" }.into()),
+            enforcement: None,
+            verdict: Some(verdict),
+            probes: o.probes.iter().map(|p| p.to_string()).collect(),
+        });
+        let (entries, unmediated) = (d.ledger().len(), d.unmediated());
+        ledger.entries += entries;
+        ledger.unmediated += unmediated;
+        // Only the deployment's one Guard-mediated `customer.read`.
+        ledger.matches_expected &= entries == 1 && unmediated == 0;
+        if !d.audit_verifies(&head) {
+            audit.verified = Some(false);
+        }
+        audit.records += std::fs::read_to_string(d.path("audit.jsonl"))
+            .map(|t| t.lines().count())
+            .unwrap_or(0);
+    }
+    isolation_report(fx, mode, steps, ledger, audit, notes)
+}
+
+/// G17: `crom-guard check` against the reference agent configuration with
+/// each attack applied; the unmodified configuration must pass.
+#[cfg(target_os = "linux")]
+async fn preflight_lane(fx: &Fixture) -> ScenarioReport {
+    use crom_guard_testkit::scenario::{
+        isolation_report, AuditReport, LedgerReport, StepReport, StepVerdict,
+    };
+    let d = isolation::Deployment::start().await;
+    let reference = isolation::reference_settings();
+    let mut notes = vec![
+        "configuration-level only: no malicious description is served to Crom's MCP client"
+            .to_owned(),
+    ];
+    let control = d.check(&reference);
+    if !control.passed() {
+        notes.push(format!(
+            "reference configuration failed check: {:?}",
+            control.failed()
+        ));
+    }
+    let mut steps = Vec::new();
+    for name in &fx.isolation.as_ref().unwrap().attacks {
+        let mut settings = reference.clone();
+        let refused_by = match name.as_str() {
+            "second_mcp_server" => {
+                settings["mcp"]["servers"]["refunds"] = json!({
+                    "type": "stdio",
+                    "command": "/usr/bin/env",
+                    "args": ["refund-helper"],
+                });
+                "mcp-servers"
+            }
+            "plugin_mcp" => {
+                settings["plugins"]["allow_plugin_mcp"] = json!(true);
+                "plugin-mcp"
+            }
+            other => panic!("{}: unknown preflight attack {other}", fx.scenario),
+        };
+        let failed = d.check(&settings).failed();
+        let verdict = if failed.contains(&refused_by) {
+            StepVerdict::BlockedByPreflight
+        } else {
+            StepVerdict::Executed
+        };
+        steps.push(StepReport {
+            name: name.clone(),
+            tool: Some("crom-guard check".into()),
+            attack: true,
+            expected: Some(format!("FAIL: {refused_by}")),
+            got: Some(format!("{failed:?}")),
+            enforcement: None,
+            verdict: Some(verdict),
+            probes: if verdict == StepVerdict::Executed {
+                vec!["ConfigAccepted".into()]
+            } else {
+                Vec::new()
+            },
+        });
+    }
+    let ledger = d.ledger().len();
+    let mut r = isolation_report(
+        fx,
+        Mode::Preflight,
+        steps,
+        LedgerReport {
+            entries: ledger,
+            matches_expected: ledger == 1,
+            unexpected: Vec::new(),
+            unmediated: d.unmediated(),
+        },
+        AuditReport {
+            verified: Some(d.audit_verifies(&d.audit_head())),
+            records: 0,
+            uncovered_decisions: 0,
+        },
+        notes,
+    );
+    r.legit_success = control.passed();
+    r
+}
+
+/// Checks an isolation or preflight report; returns its failures.
+#[cfg(target_os = "linux")]
+fn isolation_failures(r: &ScenarioReport) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut check = |ok: bool, what: &str| {
+        if !ok {
+            out.push(format!("{} ({:?}): {what}", r.scenario, r.mode));
+        }
+    };
+    check(r.attempted == r.planned_attacks, "an attack did not run");
+    check(
+        r.steps
+            .iter()
+            .all(|s| s.verdict != Some(crom_guard_testkit::scenario::StepVerdict::NotAttempted)),
+        "an attack script did not run",
+    );
+    check(
+        r.attempted == r.blocked_by_sandbox + r.blocked_by_preflight + r.no_effect + r.executed,
+        "attempted does not split into verdicts",
+    );
+    if r.mode.isolated() {
+        check(r.executed == 0, "an attack executed");
+        check(r.legit_success, "the reference configuration failed");
+        check(r.ledger.matches_expected, "ledger oracle differs");
+        check(r.ledger.unmediated == 0, "unmediated ledger effect");
+        check(r.audit.verified == Some(true), "audit verify failed");
+        // Only a route to the business API (which answers 401) may go
+        // unrefused by the OS.
+        let routed = matches!(r.mode, Mode::SandboxRequiredNetwork | Mode::SeparateUid);
+        check(
+            r.no_effect == 0 || (routed && r.scenario == "G13"),
+            "an attack was not refused",
+        );
+    } else {
+        check(
+            r.executed == r.planned_attacks,
+            "a probe did not fire with the sandbox off",
+        );
+    }
+    out
+}

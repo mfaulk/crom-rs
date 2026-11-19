@@ -13,6 +13,7 @@ The Crom-based demo driver arrives with #362. This directory is not a crate.
 | `guard.toml` | Reference Guard config; all paths relative, for a private state directory |
 | `grants/acme-agent-operator.json` | `GrantSpec` the trusted app issues: acme operator, customer `acme-cus-000`, refunds up to 100.00, one level of `guard.delegate` |
 | `clients/python/` | Standard-library Python MCP client, scripted §14.2 agent, and admin client ([README](clients/python/README.md)) |
+| `agent/crom-settings.json` | Crom settings for an agent in the isolation profile: Bash sandbox required without network, Guard as the only MCP server ([deployment.md](../../docs/guard/deployment.md), #360) |
 | `run-python-client.sh` | Starts Guard and the business API, issues grants, runs the Python client (#358) |
 
 ## Run the Python client

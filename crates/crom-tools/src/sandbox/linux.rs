@@ -367,6 +367,26 @@ fn clamp_rlimit(resource: Resource, want: u64) -> Rlimit {
 
 /// Directories holding the `cargo`/`rustc`/`rustup` the host PATH resolves
 /// to (rustup proxies may live outside `$CARGO_HOME/bin`).
+/// The read-only set every sandboxed command gets before `read_paths`:
+/// system roots, Cargo/rustup homes, and toolchain bin directories found on
+/// `PATH`. Computed from the current environment, as `prepare` does.
+pub(crate) fn builtin_read_paths() -> Vec<PathBuf> {
+    let host_home = std::env::var_os("HOME").map(PathBuf::from);
+    let cargo_home = env_path("CARGO_HOME", host_home.as_deref(), ".cargo");
+    let rustup_home = env_path("RUSTUP_HOME", host_home.as_deref(), ".rustup");
+    let mut ro: Vec<PathBuf> = BUILTIN_READ_ROOTS.iter().map(PathBuf::from).collect();
+    if let Some(ch) = &cargo_home {
+        for sub in ["bin", "registry", "git", "config.toml", "config"] {
+            ro.push(ch.join(sub));
+        }
+    }
+    if let Some(rh) = &rustup_home {
+        ro.push(rh.clone());
+    }
+    ro.extend(toolchain_bin_dirs());
+    ro
+}
+
 fn toolchain_bin_dirs() -> Vec<PathBuf> {
     let Some(path) = std::env::var_os("PATH") else {
         return Vec::new();
@@ -396,6 +416,24 @@ fn env_path(var: &str, home: Option<&Path>, default_rel: &str) -> Option<PathBuf
         .or_else(|| home.map(|h| h.join(default_rel)))
         .filter(|p| p.exists())
 }
+
+/// Fixed read-only roots, independent of the environment.
+pub(crate) const BUILTIN_READ_ROOTS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/etc",
+    "/proc",
+    "/sys/devices/system/cpu",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/nix/store",
+];
 
 /// Environment names passed through from the host when set.
 const ENV_PASSTHROUGH: &[&str] = &[
@@ -462,34 +500,7 @@ pub(crate) fn prepare(
 
     let cargo_home = env_path("CARGO_HOME", host_home.as_deref(), ".cargo");
     let rustup_home = env_path("RUSTUP_HOME", host_home.as_deref(), ".rustup");
-    let mut ro: Vec<PathBuf> = [
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/lib",
-        "/lib32",
-        "/lib64",
-        "/libx32",
-        "/etc",
-        "/proc",
-        "/sys/devices/system/cpu",
-        "/dev/zero",
-        "/dev/random",
-        "/dev/urandom",
-        "/nix/store",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .collect();
-    if let Some(ch) = &cargo_home {
-        for sub in ["bin", "registry", "git", "config.toml", "config"] {
-            ro.push(ch.join(sub));
-        }
-    }
-    if let Some(rh) = &rustup_home {
-        ro.push(rh.clone());
-    }
-    ro.extend(toolchain_bin_dirs());
+    let mut ro = builtin_read_paths();
     ro.extend(cfg.read_paths.iter().cloned());
     let rw = vec![ws.clone(), tmp_path.clone(), PathBuf::from("/dev/null")];
     let ruleset = build_ruleset(info.landlock_abi, cfg.network, &rw, &ro)?;
