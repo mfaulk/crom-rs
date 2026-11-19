@@ -141,7 +141,8 @@ crom mcp call github list_issues --args-json '{}' --yes
 
 MCP tools use `PermissionKind::External`. `acceptEdits` does *not* approve
 them, `dontAsk` denies any unresolved MCP tool, and the default
-external-effect policy requires an explicit allow rule. Live MCP effects are
+external-effect policy requires an explicit allow rule; a hook `Allow` or
+`dontAsk` does not substitute for one. Live MCP effects are
 not covered by workspace rewind — approve them deliberately. MCP stdio
 servers are not sandboxed.
 

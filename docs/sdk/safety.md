@@ -81,3 +81,10 @@ consults the trust store) or `load_with_trust`, and MCP options with
 - **Resource exhaustion**: `RunBudgets` caps tokens/turns/time/patch size.
 - **Path traversal**: `WorkspacePath` rejects absolute paths, `..` and
   symlink escapes.
+- **Unapproved MCP effects**: the MCP external-effect policy (default
+  `RequireExplicitAllowRule`) is a floor in the policy engine. A
+  `PreToolUse` hook `Allow`, the `dontAsk` tool-name list, permission modes
+  and approval memory cannot run an MCP tool that no explicit allow rule
+  names; the denial is audited with `policy_source: external_effect_policy`.
+  A `PostToolUse` hook `Deny` (e.g. `McpResultSizeLimitHook`) withholds
+  the result from the model but cannot undo an effect the tool already had.

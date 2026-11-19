@@ -33,7 +33,10 @@ use crate::mcp::{
 };
 use crate::options::{AgentOptions, SessionId};
 use crate::permission::PermissionMode;
-use crate::policy::{ApprovalMemory, PolicyConfig, PolicyEngine, PolicyOutcome, PolicyToolContext};
+use crate::policy::{
+    ApprovalMemory, PolicyConfig, PolicyDecisionSource, PolicyEngine, PolicyOutcome,
+    PolicyToolContext,
+};
 use crate::provider::{ModelEvent, ModelProvider, ModelRequest, ToolSchema};
 use crate::run_id::RunId;
 use crate::telemetry::{AgentTelemetryEvent, ModelPricing, TelemetryOutcome};
@@ -2113,36 +2116,17 @@ pub(crate) async fn run_loop(
                     }),
                 )
                 .await;
-                audit.outcome = match &exec {
-                    Err(ToolError::PermissionDenied(_)) => SecurityOutcome::Blocked,
-                    _ if is_error => SecurityOutcome::Failed,
-                    _ => SecurityOutcome::Executed,
-                };
-                emit_security(&tx, &session_sink, &session_id, audit).await;
-                emit_telemetry(
-                    &telemetry_sink,
-                    AgentTelemetryEvent::ToolExecutionCompleted {
-                        session_id: session_id.clone(),
-                        run_id: cfg.run_id.clone(),
-                        turn_index: turns,
-                        tool_name: call.name.clone(),
-                        duration_ms,
-                        outcome: if is_error {
-                            TelemetryOutcome::Error
-                        } else {
-                            TelemetryOutcome::Ok
-                        },
-                        error_category: if is_error { Some("tool".into()) } else { None },
-                    },
-                )
-                .await;
 
-                // Post-tool-use hooks (success or failure).
+                // Post-tool-use hooks (success or failure). They run before
+                // the audit record so a `Deny` can withhold the result: the
+                // tool has already executed, so its side effects stand, but
+                // the model receives an error instead of the output.
                 let post_event = if is_error {
                     HookEventName::PostToolUseFailure
                 } else {
                     HookEventName::PostToolUse
                 };
+                let mut post_hook_denial: Option<String> = None;
                 if !hooks.is_empty() {
                     let mut hi = HookInput::new(
                         post_event,
@@ -2179,11 +2163,52 @@ pub(crate) async fn run_loop(
                         &agg,
                     )
                     .await;
+                    if let HookAggregateDecision::Deny { reason } = agg {
+                        post_hook_denial = Some(reason);
+                    }
                 }
 
-                pending_results[idx] = Some(PendingResult {
-                    body: text,
-                    is_error,
+                audit.outcome = match &exec {
+                    Err(ToolError::PermissionDenied(_)) => SecurityOutcome::Blocked,
+                    _ if post_hook_denial.is_some() => SecurityOutcome::Blocked,
+                    _ if is_error => SecurityOutcome::Failed,
+                    _ => SecurityOutcome::Executed,
+                };
+                if let Some(reason) = &post_hook_denial {
+                    audit.decision = PolicyOutcome::Deny;
+                    audit.policy_source = Some(PolicyDecisionSource::Hook);
+                    audit.rule = None;
+                    audit.enforcement = EnforcementLayer::Hook;
+                    audit.reason = Some(redact_secrets_in_str(reason));
+                }
+                emit_security(&tx, &session_sink, &session_id, audit).await;
+                emit_telemetry(
+                    &telemetry_sink,
+                    AgentTelemetryEvent::ToolExecutionCompleted {
+                        session_id: session_id.clone(),
+                        run_id: cfg.run_id.clone(),
+                        turn_index: turns,
+                        tool_name: call.name.clone(),
+                        duration_ms,
+                        outcome: if is_error {
+                            TelemetryOutcome::Error
+                        } else {
+                            TelemetryOutcome::Ok
+                        },
+                        error_category: if is_error { Some("tool".into()) } else { None },
+                    },
+                )
+                .await;
+
+                pending_results[idx] = Some(match post_hook_denial {
+                    Some(reason) => PendingResult {
+                        body: format!("Tool result blocked by post-tool hook: {reason}"),
+                        is_error: true,
+                    },
+                    None => PendingResult {
+                        body: text,
+                        is_error,
+                    },
                 });
             }
         }
