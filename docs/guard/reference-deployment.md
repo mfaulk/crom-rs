@@ -12,6 +12,7 @@
 | Driver | `examples/guard-support/run-python-client.sh` |
 | Python client | `examples/guard-support/clients/python/` ([README](../../examples/guard-support/clients/python/README.md)) |
 | Crom agent settings for the isolation profile (#360) | `examples/guard-support/agent/crom-settings.json` |
+| Reference application (support app, Crom agents) | `examples/guard-support/src/` ([reference-app.md](reference-app.md)) |
 
 ## `crom-guard-support`
 
@@ -45,3 +46,5 @@ Every path in it is relative (`admin.sock`, `admin.token`, `credentials.json`, `
 The driver runs the Python agent on Guard's uid without a sandbox, so it is outside the isolation profile and `crom-guard check` fails for it; it demonstrates the properties that do not depend on isolation (GP1–GP5, GP7, GP8). Bash and credential-file bypass, and the profile that prevents it, are covered by [deployment.md](deployment.md) (#360).
 
 The admin client (`trusted_app.py`) and the grant fixture are independent of the Python agent, so other drivers can reuse them to issue grants, revoke them, and approve pending requests.
+
+The reference application (#362, [reference-app.md](reference-app.md)) starts `crom-guard-support` the same way, from Rust: `cargo run --manifest-path examples/guard-support/Cargo.toml` (`--agent python` runs `run-python-client.sh`).

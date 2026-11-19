@@ -90,6 +90,9 @@ Several important pieces are not built yet:
   effect ledger the M18 tests measure against, a standard-library Python
   MCP client runs the reference matrix against a real Guard in CI
   ([docs/guard/reference-deployment.md](docs/guard/reference-deployment.md)),
+  the customer-support reference application runs a scripted Crom agent
+  through the same matrix in CI (`cargo run --manifest-path
+  examples/guard-support/Cargo.toml`, [docs/guard/reference-app.md](docs/guard/reference-app.md)),
   and the reference policy set
   (`examples/guard-support/policies/`) is validated in CI by
   `scripts/validate-guard-policies.sh`.

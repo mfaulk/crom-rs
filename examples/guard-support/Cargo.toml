@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "guard-support"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Crom Guard customer-support reference application (MILESTONE_18 §14)."
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+crom-core = { path = "../../crates/crom-core" }
+crom-mcp = { path = "../../crates/crom-mcp" }
+crom-sdk = { path = "../../crates/crom-sdk", features = ["fake-provider"] }
+# Synthetic data only: the seed's per-record canaries for the leak check.
+crom-guard-testkit = { path = "../../crates/crom-guard-testkit" }
