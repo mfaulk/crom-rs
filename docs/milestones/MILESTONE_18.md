@@ -1,6 +1,6 @@
 # Milestone 18 — Crom Guard v0: Enforceable Agent Authority
 
-**Status:** implemented; the optional spend-capped live demo has not been run, and #340 is still open
+**Status:** implemented; one spend-capped live demo run (DeepSeek, about $0.0036) is archived; E4b (several live providers) has not been run, and #340 is still open
 (see [Status](#status)) · **GitHub milestone:**
 [M18 — Crom Guard v0: Enforceable Agent Authority](https://github.com/mfaulk/crom-rs/milestone/2)
 
@@ -23,7 +23,8 @@ report measures against.
 |---|---|
 | §20 definition of done | Met except where noted in §20 |
 | §18 targets | Met in the archived run and in PR CI: `executed = 0` in every Guard lane and > 0 without Guard (`guard_off`) or with the sandbox off; audit coverage 1.000 with `audit verify` passing; E1 59/59 cells agree; E4a decisions equal across four provider profiles; Python client passes the §14.2 matrix in PR CI; `guard / adversarial (linux)` needs no paid inference. Numbers: [M18-guard.md](../benchmarks/M18-guard.md#results-generated-from-the-archive) |
-| Live demo (E3 model-generated lane, E4b) | Not run. Manual and spend-capped: `.github/workflows/guard-live.yml` (`max_total_cost_usd` ≤ $2). See [experiments.md](../guard/experiments.md#e3-scripted-vs-model-generated-attacks) |
+| Live demo (E3 model-generated lane) | One live run so far: DeepSeek `deepseek-flash`, [run 44788189803](https://github.com/mfaulk/crom-rs/actions/runs/44788189803) at `094459a`, about $0.0036 (4 model requests; 3,018 input, 2,210 output and 5,632 cache-read tokens at the built-in prices), archived as `docs/guard/results/demo-live-deepseek.json`; 4/4 rows and 5/5 evidence checks pass. Manual and spend-capped: `.github/workflows/guard-live.yml` (`max_total_cost_usd` ≤ $2). See [M18-guard.md](../benchmarks/M18-guard.md#limitations) |
+| E4b (several live providers) | Not run |
 | E4a transcripts | Synthetic (rendered in each provider's wire format), not captured from providers |
 | #340 | Readiness record (§22) filled; the issue is still open |
 
@@ -1189,8 +1190,9 @@ in [docs/benchmarks/M18-guard.md](../benchmarks/M18-guard.md).
       they exercise Crom's sandbox and policy without Guard and are not
       scored on the business ledger.
 - [x] Scoreboard with E1–E5 results; `docs/benchmarks/M18-guard.md` published
-      with limitations. E3's model-generated lane and E4b (live, optional)
-      have not been run.
+      with limitations. E3's model-generated lane has one live run
+      (DeepSeek, `demo-live-deepseek.json`); E4b (live, optional) has not
+      been run.
 - [x] Tutorial lets a new developer run the demo offline
       ([docs/guard/tutorial.md](../guard/tutorial.md); CI runs its commands
       with `scripts/guard-tutorial.sh`).

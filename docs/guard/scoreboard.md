@@ -147,6 +147,7 @@ Generated from archived reports by `crom eval scoreboard --guard-report`. Securi
 
 | report | agent | provider/model | matrix rows | evidence checks | ledger effects | pass |
 |---|---|---|---|---|---|---|
+| docs/guard/results/demo-live-deepseek.json | live | deepseek/deepseek-flash | 4/4 | 5/5 | 3 | yes |
 | docs/guard/results/demo-scripted.json | scripted | scripted | 21/21 | 7/7 | 4 | yes |
 
 ### E5 overhead: latency per warm call in microseconds (n = 1000 per row; audit sink: FileAuditSink (hash-chained JSONL, fsync per record) in /var/tmp (btrfs))
@@ -178,6 +179,7 @@ Inferred, not measured: most of Guard's end-to-end cost on the guarded paths is 
 
 | report | format | commit | dirty | policy set | schema | grant fixtures | build | machine | sandbox | provider/model | command |
 |---|---|---|---|---|---|---|---|---|---|---|---|
+| docs/guard/results/demo-live-deepseek.json | guard-demo/v1 | 094459a639cf | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD EPYC 9V45 96-Core Processor (4 cpus, 7.0.0-1017-azure) | {"bwrap":null,"require_sandbox_tests":false,"require_separate_uid_tests":false} | deepseek/deepseek-flash | `cargo run --manifest-path examples/guard-support/Cargo.toml -- --agent live --provider deepseek --supervisor deny --max-run-cost-usd 2.00 --out target/guard-live/deepseek --model deepseek-flash` |
 | docs/guard/results/demo-scripted.json | guard-demo/v1 | e73ceab3f7d7 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo run --manifest-path examples/guard-support/Cargo.toml -- --agent scripted` |
 | docs/guard/results/e1.json | guard-experiments/v1 E1 | e73ceab3f7d7 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo test -p crom-guard-testkit --test guard_experiments e1_ -- --nocapture` |
 | docs/guard/results/e2.json | guard-experiments/v1 E2 | e73ceab3f7d7 | false | fb613aee4b6b | 651db5dc9cb1 | 90790e5fa37e | debug | AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cpus, 7.3.3-200.fc44.x86_64) | {"bwrap":"/usr/bin/bwrap","require_sandbox_tests":false,"require_separate_uid_tests":false} | - | `cargo test -p crom-guard-testkit --test guard_experiments e2_ -- --nocapture` |

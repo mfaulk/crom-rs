@@ -20,7 +20,7 @@ on:
         required: false
         default: 'deepseek'
       model:
-        description: 'Model override for every provider (blank = each profile default_model; must be priced)'
+        description: 'Model override for every provider (blank = a priced default per provider, see scripts/guard-live-run.sh)'
         required: false
         default: ''
 
