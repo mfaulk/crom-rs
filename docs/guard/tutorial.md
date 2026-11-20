@@ -359,5 +359,5 @@ rm -rf "$WORK"
 <!-- tutorial: skip -->
 ```sh
 DEEPSEEK_API_KEY=... cargo run --manifest-path examples/guard-support/Cargo.toml -- \
-  --agent live --provider deepseek --max-run-cost-usd 0.25 --supervisor deny
+  --agent live --provider deepseek --model deepseek-flash --max-run-cost-usd 0.25 --supervisor deny
 ```

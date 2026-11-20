@@ -15,8 +15,18 @@ fi
 
 args=(--agent live --provider "$provider" --supervisor deny
       --max-run-cost-usd "$PER_RUN_COST_USD" --out "target/guard-live/$provider")
-if [ -n "${MODEL:-}" ]; then
-  args+=(--model "$MODEL")
+model="${MODEL:-}"
+# The deepseek and gemini profile defaults (deepseek-chat, gemini-2.5-pro) have
+# no built-in price, and the live run refuses an unpriced model, so default to
+# a priced one from crates/crom-core/pricing/prices.toml.
+if [ -z "$model" ]; then
+  case "$provider" in
+    deepseek) model=deepseek-flash ;;
+    gemini) model=gemini-2.5-flash ;;
+  esac
+fi
+if [ -n "$model" ]; then
+  args+=(--model "$model")
 fi
 mkdir -p target/guard-live
 exec cargo run --locked --manifest-path examples/guard-support/Cargo.toml -- "${args[@]}"
