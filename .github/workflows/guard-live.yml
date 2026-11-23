@@ -68,7 +68,7 @@ jobs:
           fi
           echo "per-run cap: \$$per_run ($n providers, total \$$MAX_TOTAL_COST_USD)"
           echo "PER_RUN_COST_USD=$per_run" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: guard-live
